@@ -16,7 +16,7 @@ const PREVIOUS: &str = "previous";
 const NEXT: &str = "next";
 const LIBRARY_SHELF: &str = "library-shelf";
 const RECENT_SHELF: &str = "recent-shelf";
-const ITEMS_PER_PAGE: usize = 6;
+const ITEMS_PER_PAGE: usize = 5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum View {
