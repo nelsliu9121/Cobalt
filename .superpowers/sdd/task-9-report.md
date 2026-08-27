@@ -20,3 +20,20 @@ Security/static checks:
 Validation: No formatter, build, lint, test, simulator, Chrome, physical-device, SSH, or network validation command was run, as explicitly required. Dependency resolution was performed offline solely to update `Cargo.lock`; full metadata loading could not complete because an unrelated cached `bumpalo v3.20.3` archive was unavailable. Parent validation remains required.
 
 Concerns: The fix adds `fs4` because this workspace's Rust 1.85.1 MSRV predates stable standard-library file locking. The lockfile now records `fs4` and its platform dependencies. The pre-existing unstaged `kobo-net` lockfile dependency additions were deliberately preserved outside the fix commit.
+
+Parent validation:
+- `rtk cargo test -p kobo-policy`: 112 passed.
+- `rtk cargo test -p kobo-sim`: 25 passed.
+- `rtk cargo test -p kobo-cli -- --skip every_uploaded_artifact_is_built_from_this_workspace --skip every_packaged_binary_is_built_with_what_it_needs --skip smoke_build_is_pinned_to_this_workspace_and_feature_targeted`: 219 passed, 2 filtered.
+- `rtk cargo fmt --all --check`: passed.
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed with no issues.
+- `rtk cargo test --workspace --all-targets --all-features -- --skip every_uploaded_artifact_is_built_from_this_workspace --skip every_packaged_binary_is_built_with_what_it_needs --skip smoke_build_is_pinned_to_this_workspace_and_feature_targeted`: 2191 passed, 2 ignored, 3 filtered.
+- Exact `rtk cargo test --workspace --all-targets --all-features`: 227 CLI tests passed and only the three pre-existing ARM C cross-compiler-dependent tests failed.
+- `rtk cargo run -p kobo-cli -- run --sim --app bomtoon`: exited 0, connected `bomtoon`, and rendered the direct `Loading your library` screen. No session-check screen appeared.
+- The simulator terminal output contained no credential, token response, email, user ID, IP address, or CDP payload. No physical Kobo, SSH, or device-discovery command ran.
+
+Attended evidence still requiring the operator's BOMTOON credentials:
+- Complete `kobo bomtoon login --sim` in the temporary Chrome profile.
+- Exercise authenticated library, recent, episode, Sign out, and re-login behavior.
+
+Formal final re-review: approved; all seven security findings are resolved.
