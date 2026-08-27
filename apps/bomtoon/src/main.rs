@@ -16,7 +16,7 @@ const PREVIOUS: &str = "previous";
 const NEXT: &str = "next";
 const LIBRARY_SHELF: &str = "library-shelf";
 const RECENT_SHELF: &str = "recent-shelf";
-const LIBRARY_ITEMS_PER_PAGE: usize = 4;
+const LIBRARY_ITEMS_PER_PAGE: usize = 3;
 const EPISODE_ITEMS_PER_PAGE: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -576,6 +576,21 @@ mod tests {
             "totalElements":1
         }
     }"#;
+    const REMOTE_LIBRARY_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{
+            "content":[{
+                "alias":"remote-first",
+                "title":"Remote First",
+                "collectionCount":1,
+                "episodeCount":1
+            }],
+            "number":1,
+            "totalPages":2,
+            "totalElements":31
+        }
+    }"#;
+    const REMOTE_LIBRARY_PAGE_SIZE: usize = 30;
     const CONTENT_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
         "data":{"episodes":[{
@@ -798,15 +813,15 @@ mod tests {
     #[test]
     fn a_full_middle_library_page_fits_and_loads_remote_only_at_the_boundary() {
         let (mut runner, _) = loaded_library();
-        for index in 1..(LIBRARY_ITEMS_PER_PAGE * 2) {
+        for index in 1..REMOTE_LIBRARY_PAGE_SIZE {
             runner.app_mut().comics.push(Comic {
                 alias: format!("comic-{index}"),
                 title: format!("Comic {index}"),
                 owned_episodes: index,
-                total_episodes: LIBRARY_ITEMS_PER_PAGE * 3,
+                total_episodes: REMOTE_LIBRARY_PAGE_SIZE + 1,
             });
         }
-        runner.app_mut().total_library_titles = LIBRARY_ITEMS_PER_PAGE * 3;
+        runner.app_mut().total_library_titles = REMOTE_LIBRARY_PAGE_SIZE + 1;
         runner.app_mut().next_library_page = Some(1);
 
         let commands = runner.action(action_id(NEXT));
@@ -819,14 +834,45 @@ mod tests {
         assert!(drawn.contains("Sign out"), "missing sign out: {drawn}");
         assert_fits(&screen);
 
+        for expected_page in 2..(REMOTE_LIBRARY_PAGE_SIZE / LIBRARY_ITEMS_PER_PAGE) {
+            let commands = runner.action(action_id(NEXT));
+            assert_eq!(runner.app().page, expected_page);
+            assert_eq!(runner.app().pending, None);
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| !matches!(command, Command::Spawn { .. })),
+                "remote page loaded before the local boundary"
+            );
+        }
+
         let commands = runner.action(action_id(NEXT));
-        let (_, work) = only_spawn(&commands);
+        let (task, work) = only_spawn(&commands);
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. } if url.contains("page=1")
         ));
-        assert_eq!(runner.app().page, 1);
+        assert_eq!(runner.app().page, 9);
         assert_eq!(runner.app().pending, Some(Pending::Library(1)));
+
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Completed(REMOTE_LIBRARY_RESPONSE.to_vec()),
+        );
+        assert_eq!(runner.app().page, 10);
+        assert_eq!(
+            page_bounds(
+                runner.app().page,
+                runner.app().comics.len(),
+                LIBRARY_ITEMS_PER_PAGE,
+            ),
+            (30, 31)
+        );
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(
+            drawn.contains("Remote First"),
+            "first appended title is not visible: {drawn}"
+        );
     }
 
     #[test]
