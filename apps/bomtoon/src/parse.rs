@@ -239,6 +239,12 @@ mod tests {
     }
 
     #[test]
+    fn episodes_rejects_non_json_content() {
+        let body = br#"<html><script id="__NEXT_DATA__" type="application/json">{"result":"SUCCESS","data":{"episodes":[]}}</script></html>"#;
+        assert!(matches!(episodes(body), Err(ParseError::Json(_))));
+    }
+
+    #[test]
     fn paid_may_be_absent_or_null() {
         let body = br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"absent","title":"Absent","purchaseStatus":"NONE","isSample":false},{"alias":"null","title":"Null","purchaseStatus":"NONE","isSample":false,"paid":null}]}}"#;
         let parsed = episodes(body).expect("optional paid values");

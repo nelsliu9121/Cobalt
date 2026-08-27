@@ -16,7 +16,8 @@ const PREVIOUS: &str = "previous";
 const NEXT: &str = "next";
 const LIBRARY_SHELF: &str = "library-shelf";
 const RECENT_SHELF: &str = "recent-shelf";
-const ITEMS_PER_PAGE: usize = 5;
+const LIBRARY_ITEMS_PER_PAGE: usize = 4;
+const EPISODE_ITEMS_PER_PAGE: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum View {
@@ -163,7 +164,7 @@ impl Bomtoon {
                     "Recent"
                 },
             );
-        let (start, end) = page_bounds(self.page, count);
+        let (start, end) = page_bounds(self.page, count, LIBRARY_ITEMS_PER_PAGE);
         for index in start..end {
             let label = if self.shelf == Shelf::Recent {
                 let recent = &self.recent[index];
@@ -258,7 +259,11 @@ impl Bomtoon {
         let mut screen = ScreenBuilder::new("bomtoon-episodes")
             .top_bar(self.selected_title.clone())
             .text(format!("{} episodes", self.episodes.len()));
-        let (start, end) = page_bounds(self.page, self.episodes.len());
+        let (start, end) = page_bounds(
+            self.page,
+            self.episodes.len(),
+            EPISODE_ITEMS_PER_PAGE,
+        );
         for episode in &self.episodes[start..end] {
             let title_fallback = format!("Episode {}", episode.alias);
             let status = display_text(episode.purchase.label(), "Other status");
@@ -399,6 +404,9 @@ impl KoboApp for Bomtoon {
         let ready = self.account == AccountState::Active
             && self.problem.is_none()
             && self.pending.is_none();
+        let retry_visible = self.problem.is_some()
+            || self.account != AccountState::Active
+            || self.view == View::Status;
         if action == ActionId::BACK && ready && self.view == View::Episodes {
             self.view = View::Library;
             self.page = match self.shelf {
@@ -408,7 +416,7 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        if action == action_id(RETRY) && self.pending.is_none() {
+        if action == action_id(RETRY) && self.pending.is_none() && retry_visible {
             self.restart(context);
         } else if !ready {
             self.show(context);
@@ -422,10 +430,15 @@ impl KoboApp for Bomtoon {
         } else if action == action_id(PREVIOUS) {
             self.page = self.page.saturating_sub(1);
         } else if action == action_id(NEXT) {
+            let items_per_page = if self.view == View::Library {
+                LIBRARY_ITEMS_PER_PAGE
+            } else {
+                EPISODE_ITEMS_PER_PAGE
+            };
             let next_start = self
                 .page
                 .saturating_add(1)
-                .saturating_mul(ITEMS_PER_PAGE);
+                .saturating_mul(items_per_page);
             if self.view != View::Library || next_start < self.shelf_len() {
                 self.page = self.page.saturating_add(1);
             } else if let Some(next) = self.shelf_next_page() {
@@ -501,13 +514,17 @@ impl KoboApp for Bomtoon {
     }
 }
 
-fn page_bounds(page: usize, count: usize) -> (usize, usize) {
-    let start = page.saturating_mul(ITEMS_PER_PAGE).min(count);
-    (start, start.saturating_add(ITEMS_PER_PAGE).min(count))
+fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usize) {
+    let start = page.saturating_mul(items_per_page).min(count);
+    (start, start.saturating_add(items_per_page).min(count))
 }
 
 fn library_has_next_page(page: usize, loaded: usize, remote_more: bool) -> bool {
-    page.saturating_add(1).saturating_mul(ITEMS_PER_PAGE) < loaded || remote_more
+    page
+        .saturating_add(1)
+        .saturating_mul(LIBRARY_ITEMS_PER_PAGE)
+        < loaded
+        || remote_more
 }
 
 fn should_load_recent(page: usize, total_items: usize) -> bool {
@@ -518,7 +535,11 @@ fn page_controls(mut screen: ScreenBuilder, page: usize, count: usize) -> Screen
     if page > 0 {
         screen = screen.button(PREVIOUS, "Previous page");
     }
-    if page.saturating_add(1).saturating_mul(ITEMS_PER_PAGE) < count {
+    if page
+        .saturating_add(1)
+        .saturating_mul(EPISODE_ITEMS_PER_PAGE)
+        < count
+    {
         screen = screen.button(NEXT, "Next page");
     }
     screen.build()
@@ -747,12 +768,12 @@ mod tests {
     #[test]
     fn a_loaded_library_shows_sign_out() {
         let (mut runner, _) = loaded_library();
-        for index in 1..ITEMS_PER_PAGE {
+        for index in 1..LIBRARY_ITEMS_PER_PAGE {
             runner.app_mut().comics.push(Comic {
                 alias: format!("comic-{index}"),
                 title: format!("Comic {index}"),
                 owned_episodes: index,
-                total_episodes: ITEMS_PER_PAGE,
+                total_episodes: LIBRARY_ITEMS_PER_PAGE,
             });
         }
         runner.app_mut().total_library_titles = 30;
@@ -772,6 +793,57 @@ mod tests {
                 .all(|command| !matches!(command, Command::Spawn { .. })),
             "a stale sign-out action started overlapping work"
         );
+    }
+
+    #[test]
+    fn a_full_middle_library_page_fits_and_loads_remote_only_at_the_boundary() {
+        let (mut runner, _) = loaded_library();
+        for index in 1..(LIBRARY_ITEMS_PER_PAGE * 2) {
+            runner.app_mut().comics.push(Comic {
+                alias: format!("comic-{index}"),
+                title: format!("Comic {index}"),
+                owned_episodes: index,
+                total_episodes: LIBRARY_ITEMS_PER_PAGE * 3,
+            });
+        }
+        runner.app_mut().total_library_titles = LIBRARY_ITEMS_PER_PAGE * 3;
+        runner.app_mut().next_library_page = Some(1);
+
+        let commands = runner.action(action_id(NEXT));
+        assert_eq!(runner.app().page, 1);
+        assert_eq!(runner.app().pending, None);
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Previous page"), "missing previous: {drawn}");
+        assert!(drawn.contains("Next page"), "missing next: {drawn}");
+        assert!(drawn.contains("Sign out"), "missing sign out: {drawn}");
+        assert_fits(&screen);
+
+        let commands = runner.action(action_id(NEXT));
+        let (_, work) = only_spawn(&commands);
+        assert!(matches!(
+            work,
+            Task::Fetch { ref url, .. } if url.contains("page=1")
+        ));
+        assert_eq!(runner.app().page, 1);
+        assert_eq!(runner.app().pending, Some(Pending::Library(1)));
+    }
+
+    #[test]
+    fn a_hidden_stale_retry_keeps_the_loaded_library() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id(RETRY));
+
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, Command::Spawn { .. })),
+            "a hidden retry started work"
+        );
+        assert_eq!(runner.app().view, View::Library);
+        assert_eq!(runner.app().comics.len(), 1);
+        assert_eq!(runner.app().total_library_titles, 1);
+        assert!(runner.app().library_loaded);
     }
 
     #[test]
@@ -936,12 +1008,25 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_library_page_is_loaded_only_at_the_local_boundary() {
+    fn library_pagination_uses_its_smaller_capacity_at_the_remote_boundary() {
         let page = 4;
-        let loaded = (page + 1) * ITEMS_PER_PAGE;
+        let loaded = (page + 1) * LIBRARY_ITEMS_PER_PAGE;
         assert!(library_has_next_page(page, loaded + 1, false));
         assert!(library_has_next_page(page, loaded, true));
         assert!(!library_has_next_page(page, loaded, false));
+    }
+
+    #[test]
+    fn episode_pagination_keeps_six_items_per_page() {
+        assert_eq!(EPISODE_ITEMS_PER_PAGE, 6);
+        assert_eq!(
+            page_bounds(0, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
+            (0, 6)
+        );
+        assert_eq!(
+            page_bounds(1, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
+            (6, 7)
+        );
     }
 
     #[test]
