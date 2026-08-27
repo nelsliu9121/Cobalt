@@ -937,9 +937,11 @@ mod tests {
 
     #[test]
     fn a_remote_library_page_is_loaded_only_at_the_local_boundary() {
-        assert!(library_has_next_page(0, 30, true));
-        assert!(library_has_next_page(4, 30, true));
-        assert!(!library_has_next_page(4, 30, false));
+        let page = 4;
+        let loaded = (page + 1) * ITEMS_PER_PAGE;
+        assert!(library_has_next_page(page, loaded + 1, false));
+        assert!(library_has_next_page(page, loaded, true));
+        assert!(!library_has_next_page(page, loaded, false));
     }
 
     #[test]
