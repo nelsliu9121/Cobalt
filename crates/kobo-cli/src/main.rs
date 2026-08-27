@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod authorize;
+mod bomtoon;
 mod connect;
 mod devsession;
 mod drive;
@@ -62,6 +63,7 @@ const INSTALLED_PACKAGES: &[(&str, Option<&str>)] = &[
 const STORE_PACKAGES: &[&str] = &[
     "kobo-arxiv",
     "kobo-audiobook",
+    "kobo-bomtoon",
     "kobo-brief",
     "kobo-chat",
     "kobo-gallery",
@@ -355,6 +357,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     };
     match canonical(command) {
         "new" => create_app(arguments.get(1).ok_or("usage: kobo new <name>")?),
+        "bomtoon" => bomtoon::command(&arguments[1..]),
         "dev" => dev(&arguments[1..]),
         "drive" => drive_command(&arguments[1..]),
         "shot" => shot_command(&arguments[1..]),
@@ -5305,6 +5308,8 @@ fn print_help() {
                                    over USB; root SSH is an explicit opt-in, and it\n\
                                    installs this machine's key unless --no-key\n\
            deploy --device IP [--package PATH]   Install over Wi-Fi, no reboot\n\
+           bomtoon login --device IP  Sign in with temporary Chrome and install the session\n\
+           bomtoon login --sim        Sign in with temporary Chrome for the simulator\n\
            secret set <name> [--from PATH] --device IP   Install a credential an app can name\n\
            secret list --device IP   Name the installed credentials, never their values\n\
            secret remove <name> --device IP   Take one credential off the reader\n\
