@@ -226,9 +226,8 @@ fn chrome_candidates(home: Option<&Path>) -> Vec<PathBuf> {
     let system_chrome =
         PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
     let system_chromium = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
-    let user_chrome = home.map(|path| {
-        path.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    });
+    let user_chrome =
+        home.map(|path| path.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"));
     let user_chromium =
         home.map(|path| path.join("Applications/Chromium.app/Contents/MacOS/Chromium"));
     [
@@ -273,9 +272,7 @@ fn create_private_profile_at(root: &Path) -> io::Result<PathBuf> {
         builder.mode(0o700);
         match builder.create(&path) {
             Ok(()) => {
-                if let Err(error) =
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                {
+                if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
                     let _ = fs::remove_dir_all(&path);
                     return Err(error);
                 }
@@ -376,9 +373,7 @@ impl<C: BrowserProcess, F: ProfileCleaner> ChromeGuard<C, F> {
             self.process_exited = true;
         }
         if !self.profile_removed {
-            self.cleaner
-                .remove_profile(&self.profile)
-                .map_err(|_| ())?;
+            self.cleaner.remove_profile(&self.profile).map_err(|_| ())?;
             self.profile_removed = true;
         }
         Ok(())
@@ -479,10 +474,7 @@ impl<R: Read, W: Write> DevToolsPipe<R, W> {
             if response.get("error").is_some() {
                 return Err(CdpError::Protocol);
             }
-            return response
-                .get("result")
-                .cloned()
-                .ok_or(CdpError::Protocol);
+            return response.get("result").cloned().ok_or(CdpError::Protocol);
         }
     }
 
@@ -614,14 +606,13 @@ fn browser_login_with<R: Read, W: Write>(
         .call(
             deadline,
             "Network.getCookies",
-            ObjectBuilder::new()
-                .set("urls", vec![COOKIE_URL])
-                .build(),
+            ObjectBuilder::new().set("urls", vec![COOKIE_URL]).build(),
             Some(&session_id),
         )
         .map_err(|error| browser_cdp_error(error, BrowserFlowError::CookieSelection))?;
     let cookies = parse_network_cookies(&cookies).map_err(|_| BrowserFlowError::CookieSelection)?;
-    let selected = select_session_cookie(&cookies).map_err(|_| BrowserFlowError::CookieSelection)?;
+    let selected =
+        select_session_cookie(&cookies).map_err(|_| BrowserFlowError::CookieSelection)?;
     Ok((selected, browser_fingerprint))
 }
 
@@ -743,7 +734,11 @@ fn parse_network_cookies(result: &Value) -> Result<Vec<BrowserCookie>, ()> {
         .iter()
         .map(|cookie| {
             Ok(BrowserCookie {
-                name: cookie.get("name").and_then(Value::as_str).ok_or(())?.to_owned(),
+                name: cookie
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
                 value: cookie
                     .get("value")
                     .and_then(Value::as_str)
@@ -754,7 +749,11 @@ fn parse_network_cookies(result: &Value) -> Result<Vec<BrowserCookie>, ()> {
                     .and_then(Value::as_str)
                     .ok_or(())?
                     .to_owned(),
-                path: cookie.get("path").and_then(Value::as_str).ok_or(())?.to_owned(),
+                path: cookie
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
             })
         })
         .collect()
@@ -770,7 +769,10 @@ fn family_member(name: &str, family: &str) -> Result<Option<CookieMember>, ()> {
     if name == family {
         return Ok(Some(CookieMember::Base));
     }
-    let Some(suffix) = name.strip_prefix(family).and_then(|name| name.strip_prefix('.')) else {
+    let Some(suffix) = name
+        .strip_prefix(family)
+        .and_then(|name| name.strip_prefix('.'))
+    else {
         return Ok(None);
     };
     if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -1036,9 +1038,7 @@ impl SimulatorTransaction {
         let cookie = paths.secrets.join(SESSION_SECRET);
         let state = paths.state.join(MANAGED_STATE);
         Self {
-            cookie_backup: paths
-                .secrets
-                .join(private_name(".bomtoon-session.backup")),
+            cookie_backup: paths.secrets.join(private_name(".bomtoon-session.backup")),
             temporary: paths.secrets.join(private_name(".bomtoon-session.login")),
             state_backup: paths
                 .state
@@ -1270,9 +1270,7 @@ mod tests {
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from(
-                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-                ),
+                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
                 home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
                 PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
                 home.join("Applications/Chromium.app/Contents/MacOS/Chromium"),
@@ -1330,8 +1328,7 @@ mod tests {
         .is_err());
         assert!(select_session_cookie(&[cookie(SECURE_COOKIE, "line\nbreak")]).is_err());
         let prefix_bytes = SECURE_COOKIE.len() + 1;
-        let boundary =
-            "x".repeat(kobo_net::bomtoon::SESSION_COOKIE_MAX_BYTES - prefix_bytes);
+        let boundary = "x".repeat(kobo_net::bomtoon::SESSION_COOKIE_MAX_BYTES - prefix_bytes);
         assert_eq!(
             select_session_cookie(&[cookie(SECURE_COOKIE, &boundary)])
                 .expect("exact ceiling")
@@ -1351,11 +1348,9 @@ mod tests {
         let mut wrong_path = cookie(SECURE_COOKIE, "scoped");
         wrong_path.path = "/user".to_owned();
         assert!(select_session_cookie(&[wrong_path]).is_err());
-        assert!(select_session_cookie(&[cookie(
-            &format!("{SECURE_COOKIE}.01"),
-            "ambiguous"
-        )])
-        .is_err());
+        assert!(
+            select_session_cookie(&[cookie(&format!("{SECURE_COOKIE}.01"), "ambiguous")]).is_err()
+        );
     }
 
     struct PartialReader {
@@ -1410,10 +1405,7 @@ mod tests {
                 Some("flat-session"),
             )
             .expect("matching result");
-        assert_eq!(
-            result.get("accepted").and_then(Value::as_bool),
-            Some(true)
-        );
+        assert_eq!(result.get("accepted").and_then(Value::as_bool), Some(true));
         assert_eq!(pipe.writer.last(), Some(&0));
         let request = std::str::from_utf8(&pipe.writer[..pipe.writer.len() - 1])
             .ok()
@@ -1478,17 +1470,12 @@ mod tests {
         }
         let pauses = Cell::new(0);
         let mut pipe = DevToolsPipe::new(Cursor::new(incoming), Vec::new());
-        let result = browser_login_with(
-            &mut pipe,
-            Instant::now() + Duration::from_secs(1),
-            |_| pauses.set(pauses.get() + 1),
-        );
+        let result = browser_login_with(&mut pipe, Instant::now() + Duration::from_secs(1), |_| {
+            pauses.set(pauses.get() + 1)
+        });
         assert_eq!(
             result,
-            Ok((
-                format!("{SECURE_COOKIE}=selected"),
-                expected_fingerprint
-            ))
+            Ok((format!("{SECURE_COOKIE}=selected"), expected_fingerprint))
         );
         assert_eq!(pauses.get(), 2);
     }
@@ -1585,12 +1572,17 @@ mod tests {
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
             assert_eq!(input, cookie.as_bytes());
-            assert_eq!(arguments.last().map(String::as_str), Some(DEVICE_INSTALL_PROGRAM));
+            assert_eq!(
+                arguments.last().map(String::as_str),
+                Some(DEVICE_INSTALL_PROGRAM)
+            );
             assert!(arguments.iter().all(|argument| !argument.contains(&cookie)));
             assert!(DEVICE_INSTALL_PROGRAM.contains("trap rollback EXIT HUP INT TERM"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("mv \"$backup\" \"$cookie\" || true"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("mv \"$state_backup\" \"$managed\" || true"));
-            let committed = DEVICE_INSTALL_PROGRAM.find("\ncomplete=1\n").expect("commit marker");
+            let committed = DEVICE_INSTALL_PROGRAM
+                .find("\ncomplete=1\n")
+                .expect("commit marker");
             let cookie_cleanup = DEVICE_INSTALL_PROGRAM
                 .rfind("rm -f \"$backup\"")
                 .expect("cookie backup cleanup");
@@ -1630,7 +1622,6 @@ mod tests {
             self.now
         }
 
-
         fn pause(&mut self, duration: Duration) {
             self.now += duration;
         }
@@ -1664,7 +1655,10 @@ mod tests {
         fs::write(&cookie_path, "old-cookie").expect("old cookie");
         fs::write(&state_path, "old-managed-state").expect("old state");
         install_simulator_at("new-cookie", &directories.paths).expect("install");
-        assert_eq!(fs::read_to_string(&cookie_path).expect("new cookie"), "new-cookie");
+        assert_eq!(
+            fs::read_to_string(&cookie_path).expect("new cookie"),
+            "new-cookie"
+        );
         assert!(!state_path.exists());
         assert_eq!(
             fs::metadata(&cookie_path)
@@ -1677,24 +1671,28 @@ mod tests {
         for directory in [&directories.paths.secrets, &directories.paths.state] {
             let names = fs::read_dir(directory)
                 .expect("directory")
-                .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect::<Vec<_>>();
-            assert!(names.iter().all(|name| !name.contains(".login-") && !name.contains(".backup-")));
+            assert!(names
+                .iter()
+                .all(|name| !name.contains(".login-") && !name.contains(".backup-")));
         }
 
         fs::write(&cookie_path, "rollback-cookie").expect("rollback cookie");
         fs::write(&state_path, "rollback-state").expect("rollback state");
-        let failure = install_simulator_at_with(
-            "replacement",
-            &directories.paths,
-            |point| {
-                if point == InstallPoint::StateDetached {
-                    Err(io::Error::other("injected failure"))
-                } else {
-                    Ok(())
-                }
-            },
-        );
+        let failure = install_simulator_at_with("replacement", &directories.paths, |point| {
+            if point == InstallPoint::StateDetached {
+                Err(io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        });
         assert!(failure.is_err());
         assert_eq!(
             fs::read_to_string(&cookie_path).expect("restored cookie"),
@@ -1716,19 +1714,15 @@ mod tests {
         fs::write(&cookie_path, "recoverable-old-cookie").expect("old cookie");
         fs::write(&state_path, "recoverable-old-state").expect("old state");
 
-        let error = install_simulator_at_with(
-            "replacement-cookie",
-            &directories.paths,
-            |point| {
-                if point == InstallPoint::StateDetached {
-                    fs::remove_file(&cookie_path)?;
-                    fs::create_dir(&cookie_path)?;
-                    Err(io::Error::other("injected rollback obstruction"))
-                } else {
-                    Ok(())
-                }
-            },
-        )
+        let error = install_simulator_at_with("replacement-cookie", &directories.paths, |point| {
+            if point == InstallPoint::StateDetached {
+                fs::remove_file(&cookie_path)?;
+                fs::create_dir(&cookie_path)?;
+                Err(io::Error::other("injected rollback obstruction"))
+            } else {
+                Ok(())
+            }
+        })
         .expect_err("rollback must report obstruction");
         assert_eq!(error.to_string(), "simulator rollback failed");
         assert!(!error.to_string().contains("replacement-cookie"));
@@ -1830,10 +1824,7 @@ mod tests {
             },
         );
         assert_eq!(guard.close(), Err(()));
-        assert_eq!(
-            *events.borrow(),
-            ["stop", "wait", "stop", "wait", "remove"]
-        );
+        assert_eq!(*events.borrow(), ["stop", "wait", "stop", "wait", "remove"]);
 
         events.borrow_mut().clear();
         let guard = ChromeGuard::new(

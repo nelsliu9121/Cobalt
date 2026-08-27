@@ -230,9 +230,7 @@ impl Value {
                         // back as an exact Integer rather than a Number.
                         let mut text = number.to_string();
                         if number.fract() == 0.0 {
-                            if let Some(exponent) =
-                                text.find('e').or_else(|| text.find('E'))
-                            {
+                            if let Some(exponent) = text.find('e').or_else(|| text.find('E')) {
                                 text.insert_str(exponent, ".0");
                             } else {
                                 text.push_str(".0");

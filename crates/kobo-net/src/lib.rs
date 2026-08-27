@@ -218,9 +218,7 @@ pub fn credential_allowed(
             ("bomtoon-access-token", SecretHeader::Bearer)
         ) && method == RequestMethod::Get
             && has_origin(url, "www.bomtoon.tw", 443)
-            && (bomtoon_library_url(url)
-                || bomtoon_recent_url(url)
-                || bomtoon_content_url(url));
+            && (bomtoon_library_url(url) || bomtoon_recent_url(url) || bomtoon_content_url(url));
     }
     if app == "audiobook" {
         return match (&*credential.secret, &credential.header) {
@@ -283,10 +281,8 @@ fn bomtoon_content_url(url: &str) -> bool {
 }
 
 fn bomtoon_library_url(url: &str) -> bool {
-    const PREFIX: &str =
-        "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=";
-    const SUFFIX: &str =
-        "&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
+    const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=";
+    const SUFFIX: &str = "&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
 
     url.strip_prefix(PREFIX)
         .and_then(|rest| rest.strip_suffix(SUFFIX))
@@ -610,14 +606,7 @@ fn get(
     credential: Option<(&str, &str)>,
     headers: &[(&str, &str)],
 ) -> Result<Vec<u8>, TaskError> {
-    get_with(
-        url,
-        offset,
-        max_bytes,
-        credential,
-        headers,
-        request,
-    )
+    get_with(url, offset, max_bytes, credential, headers, request)
 }
 
 fn get_with(
@@ -626,11 +615,7 @@ fn get_with(
     max_bytes: u32,
     credential: Option<(&str, &str)>,
     headers: &[(&str, &str)],
-    mut request_once: impl FnMut(
-        &Address,
-        &Method<'_>,
-        u32,
-    ) -> Result<Vec<u8>, TaskError>,
+    mut request_once: impl FnMut(&Address, &Method<'_>, u32) -> Result<Vec<u8>, TaskError>,
 ) -> Result<Vec<u8>, TaskError> {
     let mut target = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
@@ -1922,7 +1907,11 @@ mod tests {
         // device was a download that appeared to hang.
         let request = head(
             &book(),
-            &Method::Get { offset: Some(0), credential: None, headers: &[] },
+            &Method::Get {
+                offset: Some(0),
+                credential: None,
+                headers: &[],
+            },
             262_144,
         );
         assert!(
@@ -1935,7 +1924,11 @@ mod tests {
     fn a_later_piece_starts_where_the_last_one_ended() {
         let request = head(
             &book(),
-            &Method::Get { offset: Some(262_144), credential: None, headers: &[] },
+            &Method::Get {
+                offset: Some(262_144),
+                credential: None,
+                headers: &[],
+            },
             262_144,
         );
         assert!(
@@ -1950,7 +1943,11 @@ mod tests {
         // one is not shorter JSON, it is broken JSON.
         let request = head(
             &book(),
-            &Method::Get { offset: None, credential: None, headers: &[] },
+            &Method::Get {
+                offset: None,
+                credential: None,
+                headers: &[],
+            },
             262_144,
         );
         assert!(!request.contains("Range:"), "{request}");
@@ -2048,7 +2045,11 @@ mod tests {
         let address = parse("https://example.com:8443/path").expect("a URL");
         let request = head(
             &address,
-            &Method::Get { offset: None, credential: None, headers: &[] },
+            &Method::Get {
+                offset: None,
+                credential: None,
+                headers: &[],
+            },
             1024,
         );
         assert!(request.contains("Host: example.com:8443\r\n"), "{request}");
@@ -2117,10 +2118,9 @@ mod tests {
     fn credentialed_post_and_put_reject_redirects_without_a_second_request() {
         let original = "https://a.test/session";
         for location in ["next", "https://b.test/collect"] {
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
-            )
-            .into_bytes();
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+                    .into_bytes();
             let mut attempted = Vec::new();
             let result = post_with(
                 original,
@@ -2142,10 +2142,9 @@ mod tests {
         }
 
         for location in ["next", "https://b.test/collect"] {
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
-            )
-            .into_bytes();
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+                    .into_bytes();
             let mut attempted = Vec::new();
             let result = put_with(
                 original,
@@ -2171,28 +2170,20 @@ mod tests {
     fn an_uncredentialed_get_keeps_following_redirects() {
         let original = "https://a.test/books/index.json";
         let mut attempted = Vec::new();
-        let result = get_with(
-            original,
-            None,
-            CEILING,
-            None,
-            &[],
-            |address, _, _| {
-                attempted.push(format!("https://{}{}", address.authority, address.path));
-                if attempted.len() == 1 {
-                    Ok(b"HTTP/1.1 302 Found\r\nLocation: next.json\r\nContent-Length: 0\r\n\r\n"
-                        .to_vec())
-                } else {
-                    Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec())
-                }
-            },
-        );
+        let result = get_with(original, None, CEILING, None, &[], |address, _, _| {
+            attempted.push(format!("https://{}{}", address.authority, address.path));
+            if attempted.len() == 1 {
+                Ok(
+                    b"HTTP/1.1 302 Found\r\nLocation: next.json\r\nContent-Length: 0\r\n\r\n"
+                        .to_vec(),
+                )
+            } else {
+                Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec())
+            }
+        });
 
         assert_eq!(result, Ok(b"ok".to_vec()));
-        assert_eq!(
-            attempted,
-            vec![original, "https://a.test/books/next.json"]
-        );
+        assert_eq!(attempted, vec![original, "https://a.test/books/next.json"]);
     }
 
     /// Header names are not case sensitive and real servers vary.
@@ -2292,7 +2283,11 @@ mod tests {
         let address = parse("https://feedsearch.dev/api/v1/search?url=nytimes.com").expect("a url");
         let request = head(
             &address,
-            &Method::Get { offset: None, credential: None, headers: &[] },
+            &Method::Get {
+                offset: None,
+                credential: None,
+                headers: &[],
+            },
             512 * 1024,
         );
         assert!(
@@ -2321,7 +2316,11 @@ mod tests {
         let address = parse("https://gutenberg.org/files/2701/2701-0.txt").expect("a url");
         let request = head(
             &address,
-            &Method::Get { offset: Some(262_144), credential: None, headers: &[] },
+            &Method::Get {
+                offset: Some(262_144),
+                credential: None,
+                headers: &[],
+            },
             262_144,
         );
         // A range names bytes the server sends. Compressed, those bytes are a

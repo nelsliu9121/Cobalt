@@ -133,11 +133,9 @@ fn localized_text(value: &Value) -> Option<String> {
             .or_else(|| fields.first())
             .and_then(|(_, text)| text.as_str())
             .and_then(|text| non_empty(text.to_owned())),
-        Value::Null
-        | Value::Bool(_)
-        | Value::Number(_)
-        | Value::Integer(_)
-        | Value::Array(_) => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Integer(_) | Value::Array(_) => {
+            None
+        }
     }
 }
 

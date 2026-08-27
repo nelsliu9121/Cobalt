@@ -8308,10 +8308,7 @@ mod task_error_tests {
         assert_eq!(encode_task_error(TaskError::LocalStorage), 8);
         assert_eq!(encode_task_error(TaskError::RevocationUnconfirmed), 9);
         assert_eq!(decode_task_error(8), Ok(TaskError::LocalStorage));
-        assert_eq!(
-            decode_task_error(9),
-            Ok(TaskError::RevocationUnconfirmed)
-        );
+        assert_eq!(decode_task_error(9), Ok(TaskError::RevocationUnconfirmed));
     }
 
     /// The two refusals have to stay distinguishable in words as well as on

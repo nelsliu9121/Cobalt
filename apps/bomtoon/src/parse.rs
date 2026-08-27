@@ -125,8 +125,7 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
     values
         .iter()
         .map(|item| {
-            let status =
-                nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?;
+            let status = nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?;
             let is_sample = boolean(item, "isSample", "episode.isSample")?;
             let paid = optional_boolean(item, "paid", "episode.paid")?;
             Ok(Episode {

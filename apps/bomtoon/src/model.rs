@@ -75,32 +75,12 @@ mod tests {
     #[test]
     fn purchase_state_uses_remote_precedence_and_nullable_status() {
         let cases = [
-            (
-                Some("POSSESSION"),
-                true,
-                Some(false),
-                PurchaseState::Owned,
-            ),
+            (Some("POSSESSION"), true, Some(false), PurchaseState::Owned),
             (None, true, None, PurchaseState::Sample),
-            (
-                Some("NONE"),
-                true,
-                Some(false),
-                PurchaseState::Sample,
-            ),
+            (Some("NONE"), true, Some(false), PurchaseState::Sample),
             (None, false, Some(false), PurchaseState::Free),
-            (
-                Some("NONE"),
-                false,
-                Some(false),
-                PurchaseState::Free,
-            ),
-            (
-                Some("RENTAL"),
-                false,
-                Some(false),
-                PurchaseState::Free,
-            ),
+            (Some("NONE"), false, Some(false), PurchaseState::Free),
+            (Some("RENTAL"), false, Some(false), PurchaseState::Free),
             (None, false, None, PurchaseState::NotOwned),
             (None, false, Some(true), PurchaseState::NotOwned),
             (Some("NONE"), false, None, PurchaseState::NotOwned),

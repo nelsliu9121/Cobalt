@@ -159,8 +159,7 @@ mod tests {
                 panic!("expected fetch task");
             };
             assert!(headers.iter().any(|header| {
-                header.name.eq_ignore_ascii_case("accept")
-                    && header.value == "application/json"
+                header.name.eq_ignore_ascii_case("accept") && header.value == "application/json"
             }));
             assert!(headers
                 .iter()

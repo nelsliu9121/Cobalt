@@ -71,13 +71,7 @@ pub enum RequestMethod {
 /// to drift apart. The fourth argument is the resolved runtime credential,
 /// kept apart from the fifth argument containing the non-secret headers the
 /// application asked for.
-pub type Fetcher = dyn Fn(
-        &str,
-        u32,
-        u32,
-        Option<(&str, &str)>,
-        &[(&str, &str)],
-    ) -> Result<Vec<u8>, TaskError>
+pub type Fetcher = dyn Fn(&str, u32, u32, Option<(&str, &str)>, &[(&str, &str)]) -> Result<Vec<u8>, TaskError>
     + Send
     + Sync;
 
@@ -96,8 +90,7 @@ pub type Poster = dyn Fn(&str, &[u8], &str, Option<(&str, &str)>, &[(&str, &str)
 ///
 /// Secret files alone are not authority: without this second decision an
 /// application could name a real key and an attacker-controlled destination.
-pub type CredentialAuthorizer =
-    dyn Fn(&Credential, RequestMethod, &str) -> bool + Send + Sync;
+pub type CredentialAuthorizer = dyn Fn(&Credential, RequestMethod, &str) -> bool + Send + Sync;
 
 /// Headers an application may not set, because the runtime decides them.
 ///
@@ -1032,7 +1025,9 @@ mod tests {
     fn a_granted_fetch_reaches_the_backend() {
         let mut runner = TaskRunner::simulated(temp_root("fetch"))
             .with_capabilities([Capability::Network])
-            .with_fetch(Arc::new(|url: &str, _, _, _, _| Ok(url.as_bytes().to_vec())));
+            .with_fetch(Arc::new(|url: &str, _, _, _, _| {
+                Ok(url.as_bytes().to_vec())
+            }));
         runner
             .submit(
                 TaskId(1),
@@ -1329,11 +1324,7 @@ mod tests {
             Ok(managed_pair(&format!("redacted-renewed-{call}")))
         }
 
-        fn revoke(
-            &self,
-            _binding_secret: &str,
-            _pair: &ManagedTokenPair,
-        ) -> Result<(), TaskError> {
+        fn revoke(&self, _binding_secret: &str, _pair: &ManagedTokenPair) -> Result<(), TaskError> {
             self.revokes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1357,13 +1348,8 @@ mod tests {
         std::fs::write(secrets.join("managed-cookie"), "redacted-cookie")
             .expect("write managed binding");
         let recipe = Arc::new(FakeManagedRecipe::default());
-        let managed = ManagedCredentials::new(
-            secrets,
-            state,
-            Arc::new(|| 0),
-            recipe.clone(),
-        )
-        .expect("construct managed provider");
+        let managed = ManagedCredentials::new(secrets, state, Arc::new(|| 0), recipe.clone())
+            .expect("construct managed provider");
         (Arc::new(managed), recipe)
     }
 
@@ -1524,10 +1510,7 @@ mod tests {
                 Ok(Vec::new())
             }));
         runner
-            .submit(
-                TaskId(1),
-                managed_fetch("https://example.test/catalog"),
-            )
+            .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
             .expect("submit denied managed fetch");
 
         assert_eq!(
@@ -1661,10 +1644,7 @@ mod tests {
                         "Authorization".to_owned(),
                         "Bearer redacted-access-1".to_owned(),
                     )),
-                    headers: vec![(
-                        "X-App-Trace".to_owned(),
-                        "redacted-app-header".to_owned(),
-                    )],
+                    headers: vec![("X-App-Trace".to_owned(), "redacted-app-header".to_owned(),)],
                     max_bytes: 777,
                 },
                 ObservedPost {
@@ -1675,10 +1655,7 @@ mod tests {
                         "Authorization".to_owned(),
                         "Bearer redacted-renewed-1".to_owned(),
                     )),
-                    headers: vec![(
-                        "X-App-Trace".to_owned(),
-                        "redacted-app-header".to_owned(),
-                    )],
+                    headers: vec![("X-App-Trace".to_owned(), "redacted-app-header".to_owned(),)],
                     max_bytes: 777,
                 },
             ]

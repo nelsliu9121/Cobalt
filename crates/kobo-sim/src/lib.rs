@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kobo_policy::{
-    shelf::Shelf, store::Store, DeviceServices, ManagedCredentials, TaskRunner,
-};
+use kobo_policy::{shelf::Shelf, store::Store, DeviceServices, ManagedCredentials, TaskRunner};
 use kobo_profile::{DeviceProfile, PanelPose, CLARA_BW_391};
 use kobo_protocol::{read_from, write_to, Frame, Lifecycle, Message};
 use kobo_ui::{
@@ -2095,10 +2093,7 @@ fn epoch_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn managed_credentials(
-    name: &str,
-    root: impl AsRef<Path>,
-) -> Option<Arc<ManagedCredentials>> {
+fn managed_credentials(name: &str, root: impl AsRef<Path>) -> Option<Arc<ManagedCredentials>> {
     if name != "bomtoon" {
         return None;
     }

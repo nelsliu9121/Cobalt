@@ -37,7 +37,10 @@ thread_local! {
 #[cfg(test)]
 fn inject_fault(point: FaultPoint) {
     INJECTED_FAULT.with(|fault| {
-        assert!(fault.replace(Some(point)).is_none(), "fault already injected");
+        assert!(
+            fault.replace(Some(point)).is_none(),
+            "fault already injected"
+        );
     });
 }
 
@@ -92,8 +95,7 @@ pub trait ManagedCredentialRecipe: Send + Sync {
         pair: &ManagedTokenPair,
     ) -> Result<ManagedTokenPair, TaskError>;
     /// Invalidates the provider session and token pair remotely.
-    fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair)
-        -> Result<(), TaskError>;
+    fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair) -> Result<(), TaskError>;
 }
 
 /// Runtime-owned state for one provider-managed credential.
@@ -142,10 +144,7 @@ impl ManagedCredentials {
     }
 
     /// Resolves the managed bearer credential, refreshing it when needed.
-    pub fn resolve(
-        &self,
-        wanted: &Credential,
-    ) -> Result<Option<ResolvedCredential>, TaskError> {
+    pub fn resolve(&self, wanted: &Credential) -> Result<Option<ResolvedCredential>, TaskError> {
         if wanted.secret != self.recipe.credential_name() {
             return Ok(None);
         }
@@ -154,9 +153,7 @@ impl ManagedCredentials {
         }
 
         let mut inner = self.lock_inner()?;
-        let cookie = self
-            .read_binding_secret()?
-            .ok_or(TaskError::NoCredential)?;
+        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
         let digest = self.checked_digest(&cookie)?;
         let pair = self.obtain_pair(&mut inner, &cookie, &digest, false)?;
         if pair.access_expires_at_ms <= (self.clock)() {
@@ -178,9 +175,7 @@ impl ManagedCredentials {
         }
 
         let mut inner = self.lock_inner()?;
-        let cookie = self
-            .read_binding_secret()?
-            .ok_or(TaskError::NoCredential)?;
+        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
         let digest = self.checked_digest(&cookie)?;
         self.obtain_pair(&mut inner, &cookie, &digest, true)?;
         Ok(true)
@@ -422,9 +417,7 @@ impl ManagedCredentials {
 }
 
 fn valid_secret_field(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_SECRET_BYTES
-        && !value.chars().any(char::is_control)
+    !value.is_empty() && value.len() <= MAX_SECRET_BYTES && !value.chars().any(char::is_control)
 }
 
 fn valid_pair(pair: &ManagedTokenPair) -> bool {
@@ -432,9 +425,7 @@ fn valid_pair(pair: &ManagedTokenPair) -> bool {
 }
 
 fn valid_provider_pair(pair: &ManagedTokenPair, now: u64) -> bool {
-    valid_pair(pair)
-        && pair.access_expires_at_ms > now
-        && pair.refresh_expires_at_ms > now
+    valid_pair(pair) && pair.access_expires_at_ms > now && pair.refresh_expires_at_ms > now
 }
 
 fn read_secret(path: &Path) -> Result<Option<String>, TaskError> {
@@ -479,7 +470,9 @@ fn read_bound_pair(path: &Path) -> Result<Option<BoundPair>, TaskError> {
         return Err(TaskError::LocalStorage);
     }
     let encoded = std::str::from_utf8(&bytes).map_err(|_| TaskError::LocalStorage)?;
-    parse_bound_pair(encoded).ok_or(TaskError::LocalStorage).map(Some)
+    parse_bound_pair(encoded)
+        .ok_or(TaskError::LocalStorage)
+        .map(Some)
 }
 
 fn parse_bound_pair(encoded: &str) -> Option<BoundPair> {
@@ -634,21 +627,44 @@ mod tests {
     }
 
     impl ManagedCredentialRecipe for FakeRecipe {
-        fn credential_name(&self) -> &'static str { "bomtoon-access-token" }
-        fn binding_secret_name(&self) -> &'static str { "bomtoon-session" }
-        fn binding_digest(&self, secret: &str) -> String { format!("digest:{secret}") }
+        fn credential_name(&self) -> &'static str {
+            "bomtoon-access-token"
+        }
+        fn binding_secret_name(&self) -> &'static str {
+            "bomtoon-session"
+        }
+        fn binding_digest(&self, secret: &str) -> String {
+            format!("digest:{secret}")
+        }
 
         fn bootstrap(&self, _binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
             self.calls.lock().expect("calls").push("bootstrap");
-            self.bootstrap.lock().expect("bootstrap queue").pop_front().expect("bootstrap result")
+            self.bootstrap
+                .lock()
+                .expect("bootstrap queue")
+                .pop_front()
+                .expect("bootstrap result")
         }
 
-        fn refresh(&self, _binding_secret: &str, _pair: &ManagedTokenPair) -> Result<ManagedTokenPair, TaskError> {
+        fn refresh(
+            &self,
+            _binding_secret: &str,
+            _pair: &ManagedTokenPair,
+        ) -> Result<ManagedTokenPair, TaskError> {
             self.calls.lock().expect("calls").push("refresh");
-            if let Some(observer) = self.refresh_observer.lock().expect("refresh observer").as_ref() {
+            if let Some(observer) = self
+                .refresh_observer
+                .lock()
+                .expect("refresh observer")
+                .as_ref()
+            {
                 observer();
             }
-            self.refresh.lock().expect("refresh queue").pop_front().expect("refresh result")
+            self.refresh
+                .lock()
+                .expect("refresh queue")
+                .pop_front()
+                .expect("refresh result")
         }
 
         fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair) -> Result<(), TaskError> {
@@ -660,33 +676,61 @@ mod tests {
                     cookie_fingerprint: fingerprint(binding_secret),
                     pair_fingerprint: pair_fingerprint(pair),
                 });
-            if let Some(observer) = self.revoke_observer.lock().expect("revoke observer").as_ref() {
+            if let Some(observer) = self
+                .revoke_observer
+                .lock()
+                .expect("revoke observer")
+                .as_ref()
+            {
                 observer();
             }
-            self.revoke.lock().expect("revoke queue").pop_front().expect("revoke result")
+            self.revoke
+                .lock()
+                .expect("revoke queue")
+                .pop_front()
+                .expect("revoke result")
         }
     }
 
-    struct TestDirectories { root: PathBuf, secrets: PathBuf, state: PathBuf }
+    struct TestDirectories {
+        root: PathBuf,
+        secrets: PathBuf,
+        state: PathBuf,
+    }
 
     impl TestDirectories {
         fn new(label: &str) -> Self {
             static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
             let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!("cobalt-managed-{label}-{}-{sequence}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "cobalt-managed-{label}-{}-{sequence}",
+                std::process::id()
+            ));
             let secrets = root.join("secrets");
             let state = root.join("state");
             fs::create_dir_all(&secrets).expect("secret directory");
             fs::create_dir_all(&state).expect("state directory");
-            Self { root, secrets, state }
+            Self {
+                root,
+                secrets,
+                state,
+            }
         }
-        fn cookie(&self) -> PathBuf { self.secrets.join("bomtoon-session") }
-        fn detached(&self) -> PathBuf { self.secrets.join(".bomtoon-session.revoking") }
-        fn managed_state(&self) -> PathBuf { managed_state_path(&self.state, "bomtoon-access-token") }
+        fn cookie(&self) -> PathBuf {
+            self.secrets.join("bomtoon-session")
+        }
+        fn detached(&self) -> PathBuf {
+            self.secrets.join(".bomtoon-session.revoking")
+        }
+        fn managed_state(&self) -> PathBuf {
+            managed_state_path(&self.state, "bomtoon-access-token")
+        }
     }
 
     impl Drop for TestDirectories {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn token_pair(label: &str, access_expires_at_ms: u64) -> ManagedTokenPair {
@@ -720,8 +764,18 @@ mod tests {
         (now, clock)
     }
 
-    fn provider(directories: &TestDirectories, clock: Arc<Clock>, recipe: Arc<FakeRecipe>) -> ManagedCredentials {
-        ManagedCredentials::new(directories.secrets.clone(), directories.state.clone(), clock, recipe).expect("managed provider")
+    fn provider(
+        directories: &TestDirectories,
+        clock: Arc<Clock>,
+        recipe: Arc<FakeRecipe>,
+    ) -> ManagedCredentials {
+        ManagedCredentials::new(
+            directories.secrets.clone(),
+            directories.state.clone(),
+            clock,
+            recipe,
+        )
+        .expect("managed provider")
     }
 
     #[test]
@@ -729,11 +783,28 @@ mod tests {
         let directories = TestDirectories::new("bootstrap");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Ok(Some(ResolvedCredential { header_name: "Authorization".to_owned(), header_value: "Bearer access-a".to_owned() })));
-        assert_eq!(fs::read_to_string(directories.managed_state()).expect("managed state"), "cobalt-managed-v1\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a");
-        let mode = fs::metadata(directories.managed_state()).expect("managed metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Ok(Some(ResolvedCredential {
+                header_name: "Authorization".to_owned(),
+                header_value: "Bearer access-a".to_owned()
+            }))
+        );
+        assert_eq!(
+            fs::read_to_string(directories.managed_state()).expect("managed state"),
+            "cobalt-managed-v1\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a"
+        );
+        let mode = fs::metadata(directories.managed_state())
+            .expect("managed metadata")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -742,11 +813,22 @@ mod tests {
         let directories = TestDirectories::new("cookie-replacement");
         fs::write(directories.cookie(), "cookie-a").expect("cookie a");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").extend([Ok(token_pair("a", 1_000_000)), Ok(token_pair("b", 1_000_000))]);
+        recipe.bootstrap.lock().expect("bootstrap queue").extend([
+            Ok(token_pair("a", 1_000_000)),
+            Ok(token_pair("b", 1_000_000)),
+        ]);
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("first resolution");
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("first resolution");
         fs::write(directories.cookie(), "cookie-b").expect("cookie b");
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Ok(Some(ResolvedCredential { header_name: "Authorization".to_owned(), header_value: "Bearer access-b".to_owned() })));
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Ok(Some(ResolvedCredential {
+                header_name: "Authorization".to_owned(),
+                header_value: "Bearer access-b".to_owned()
+            }))
+        );
         let encoded = fs::read_to_string(directories.managed_state()).expect("managed state");
         assert!(encoded.contains("digest:cookie-b"));
         assert!(encoded.contains("access-b"));
@@ -758,13 +840,29 @@ mod tests {
         let directories = TestDirectories::new("refresh-window");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", REFRESH_WINDOW_MS + 101)));
-        recipe.refresh.lock().expect("refresh queue").push_back(Ok(token_pair("b", 2_000_000)));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", REFRESH_WINDOW_MS + 101)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(token_pair("b", 2_000_000)));
         let (now, clock) = adjustable_clock(100);
         let managed = provider(&directories, clock, Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
         now.store(101, Ordering::SeqCst);
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Ok(Some(ResolvedCredential { header_name: "Authorization".to_owned(), header_value: "Bearer access-b".to_owned() })));
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Ok(Some(ResolvedCredential {
+                header_name: "Authorization".to_owned(),
+                header_value: "Bearer access-b".to_owned()
+            }))
+        );
     }
 
     #[test]
@@ -772,15 +870,36 @@ mod tests {
         let directories = TestDirectories::new("malformed-refresh");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", 1_000_000)));
-        recipe.refresh.lock().expect("refresh queue").push_back(Ok(ManagedTokenPair { access_token: "access-invalid\nvalue".to_owned(), access_expires_at_ms: 2_000_000, refresh_token: "refresh-b".to_owned(), refresh_expires_at_ms: 3_000_000 }));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(ManagedTokenPair {
+                access_token: "access-invalid\nvalue".to_owned(),
+                access_expires_at_ms: 2_000_000,
+                refresh_token: "refresh-b".to_owned(),
+                refresh_expires_at_ms: 3_000_000,
+            }));
         let (now, clock) = adjustable_clock(1);
         let managed = provider(&directories, clock, Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
         let before = fs::read(directories.managed_state()).expect("state before refresh");
         now.store(700_000, Ordering::SeqCst);
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Err(TaskError::Unreachable));
-        assert_eq!(fs::read(directories.managed_state()).expect("state after refresh"), before);
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::Unreachable)
+        );
+        assert_eq!(
+            fs::read(directories.managed_state()).expect("state after refresh"),
+            before
+        );
     }
 
     #[test]
@@ -788,19 +907,53 @@ mod tests {
         let directories = TestDirectories::new("serialized-refresh");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", 1_000_000)));
-        recipe.refresh.lock().expect("refresh queue").push_back(Ok(token_pair("b", 2_000_000)));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(token_pair("b", 2_000_000)));
         let (now, clock) = adjustable_clock(1);
         let managed = Arc::new(provider(&directories, clock, Arc::clone(&recipe)));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
         now.store(800_000, Ordering::SeqCst);
         let barrier = Arc::new(Barrier::new(3));
-        let threads: Vec<_> = (0..2).map(|_| { let managed = Arc::clone(&managed); let barrier = Arc::clone(&barrier); thread::spawn(move || { barrier.wait(); managed.resolve(&Credential::bearer("bomtoon-access-token")) }) }).collect();
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let managed = Arc::clone(&managed);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    managed.resolve(&Credential::bearer("bomtoon-access-token"))
+                })
+            })
+            .collect();
         barrier.wait();
         for worker in threads {
-            assert_eq!(worker.join().expect("resolution thread"), Ok(Some(ResolvedCredential { header_name: "Authorization".to_owned(), header_value: "Bearer access-b".to_owned() })));
+            assert_eq!(
+                worker.join().expect("resolution thread"),
+                Ok(Some(ResolvedCredential {
+                    header_name: "Authorization".to_owned(),
+                    header_value: "Bearer access-b".to_owned()
+                }))
+            );
         }
-        assert_eq!(recipe.calls.lock().expect("calls").iter().filter(|call| **call == "refresh").count(), 1);
+        assert_eq!(
+            recipe
+                .calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|call| **call == "refresh")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -822,12 +975,11 @@ mod tests {
         let cookie = directories.cookie();
         let detached = directories.detached();
         let state = directories.managed_state();
-        *recipe.revoke_observer.lock().expect("revoke observer") =
-            Some(Box::new(move || {
-                assert!(!cookie.exists());
-                assert!(!detached.exists());
-                assert!(!state.exists());
-            }));
+        *recipe.revoke_observer.lock().expect("revoke observer") = Some(Box::new(move || {
+            assert!(!cookie.exists());
+            assert!(!detached.exists());
+            assert!(!state.exists());
+        }));
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
         managed
             .resolve(&Credential::bearer("bomtoon-access-token"))
@@ -852,23 +1004,45 @@ mod tests {
         let directories = TestDirectories::new("revoke-uncertain");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", 1_000_000)));
-        recipe.revoke.lock().expect("revoke queue").push_back(Err(TaskError::Unreachable));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .revoke
+            .lock()
+            .expect("revoke queue")
+            .push_back(Err(TaskError::Unreachable));
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
-        assert_eq!(managed.revoke("bomtoon-access-token"), Err(TaskError::RevocationUnconfirmed));
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Err(TaskError::NoCredential));
-        assert!(!directories.cookie().exists()); assert!(!directories.managed_state().exists());
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
+        assert_eq!(
+            managed.revoke("bomtoon-access-token"),
+            Err(TaskError::RevocationUnconfirmed)
+        );
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::NoCredential)
+        );
+        assert!(!directories.cookie().exists());
+        assert!(!directories.managed_state().exists());
     }
 
     #[test]
     fn startup_removes_a_cookie_left_in_the_detached_path() {
         let directories = TestDirectories::new("stale-detached");
         fs::write(directories.detached(), "cookie-a").expect("detached cookie");
-        fs::write(directories.managed_state(), "cobalt-managed-v1\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a").expect("managed state");
+        fs::write(
+            directories.managed_state(),
+            "cobalt-managed-v1\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a",
+        )
+        .expect("managed state");
         let recipe = Arc::new(FakeRecipe::default());
         let _managed = provider(&directories, Arc::new(|| 1), recipe);
-        assert!(!directories.detached().exists()); assert!(!directories.managed_state().exists());
+        assert!(!directories.detached().exists());
+        assert!(!directories.managed_state().exists());
     }
 
     #[test]
@@ -876,12 +1050,27 @@ mod tests {
         let directories = TestDirectories::new("force-renew");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").push_back(Ok(token_pair("a", 2_000_000)));
-        recipe.refresh.lock().expect("refresh queue").push_back(Ok(token_pair("b", 3_000_000)));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 2_000_000)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(token_pair("b", 3_000_000)));
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
-        assert_eq!(managed.force_renew(&Credential::bearer("bomtoon-access-token")), Ok(true));
-        assert!(fs::read_to_string(directories.managed_state()).expect("managed state").contains("access-b"));
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
+        assert_eq!(
+            managed.force_renew(&Credential::bearer("bomtoon-access-token")),
+            Ok(true)
+        );
+        assert!(fs::read_to_string(directories.managed_state())
+            .expect("managed state")
+            .contains("access-b"));
     }
 
     #[test]
@@ -889,14 +1078,29 @@ mod tests {
         let directories = TestDirectories::new("unauthorized");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe.bootstrap.lock().expect("bootstrap queue").extend([Ok(token_pair("a", 1_000_000)), Err(TaskError::Unauthorized)]);
-        recipe.refresh.lock().expect("refresh queue").push_back(Err(TaskError::Unauthorized));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .extend([Ok(token_pair("a", 1_000_000)), Err(TaskError::Unauthorized)]);
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Err(TaskError::Unauthorized));
         let (now, clock) = adjustable_clock(1);
         let managed = provider(&directories, clock, Arc::clone(&recipe));
-        managed.resolve(&Credential::bearer("bomtoon-access-token")).expect("initial resolution");
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
         now.store(800_000, Ordering::SeqCst);
-        assert_eq!(managed.resolve(&Credential::bearer("bomtoon-access-token")), Err(TaskError::Unauthorized));
-        assert!(!directories.cookie().exists()); assert!(!directories.detached().exists()); assert!(!directories.managed_state().exists());
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::Unauthorized)
+        );
+        assert!(!directories.cookie().exists());
+        assert!(!directories.detached().exists());
+        assert!(!directories.managed_state().exists());
     }
 
     #[test]
@@ -909,22 +1113,14 @@ mod tests {
             .lock()
             .expect("bootstrap queue")
             .push_back(Ok(token_pair("a", 1_000_000)));
-        let managed = provider(
-            &directories,
-            Arc::new(|| 1),
-            Arc::clone(&initial_recipe),
-        );
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&initial_recipe));
         managed
             .resolve(&Credential::bearer("bomtoon-access-token"))
             .expect("initial resolution");
         drop(managed);
 
         let fresh_recipe = Arc::new(FakeRecipe::default());
-        let fresh = provider(
-            &directories,
-            Arc::new(|| 1),
-            Arc::clone(&fresh_recipe),
-        );
+        let fresh = provider(&directories, Arc::new(|| 1), Arc::clone(&fresh_recipe));
         assert_eq!(
             fresh.resolve(&Credential::bearer("bomtoon-access-token")),
             Ok(Some(ResolvedCredential {
@@ -938,8 +1134,7 @@ mod tests {
     #[test]
     fn malformed_durable_state_fails_closed_without_bootstrap() {
         let cases = [
-            "cobalt-managed-v0\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a"
-                .to_owned(),
+            "cobalt-managed-v0\ndigest:cookie-a\n1000000\n4600000\naccess-a\nrefresh-a".to_owned(),
             "cobalt-managed-v1\ndigest:cookie-a\n1000000\n4600000\naccess-\u{7}\nrefresh-a"
                 .to_owned(),
             format!(
@@ -979,14 +1174,11 @@ mod tests {
             .expect("refresh queue")
             .push_back(Ok(token_pair("rotated", now + 2 * REFRESH_WINDOW_MS)));
         let boundary_state = directories.managed_state();
-        *recipe.refresh_observer.lock().expect("refresh observer") =
-            Some(Box::new(move || {
-                assert!(
-                    fs::read_to_string(&boundary_state)
-                        .expect("boundary state")
-                        .contains("access-boundary")
-                );
-            }));
+        *recipe.refresh_observer.lock().expect("refresh observer") = Some(Box::new(move || {
+            assert!(fs::read_to_string(&boundary_state)
+                .expect("boundary state")
+                .contains("access-boundary"));
+        }));
         let managed = provider(&directories, Arc::new(move || now), Arc::clone(&recipe));
 
         assert_eq!(
@@ -1000,11 +1192,9 @@ mod tests {
             *recipe.calls.lock().expect("calls"),
             vec!["bootstrap", "refresh"]
         );
-        assert!(
-            fs::read_to_string(directories.managed_state())
-                .expect("rotated state")
-                .contains("access-rotated")
-        );
+        assert!(fs::read_to_string(directories.managed_state())
+            .expect("rotated state")
+            .contains("access-rotated"));
     }
 
     #[test]
@@ -1012,22 +1202,14 @@ mod tests {
         let directories = TestDirectories::new("expired-refresh");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe
-            .bootstrap
-            .lock()
-            .expect("bootstrap queue")
-            .extend([
-                Ok(token_pair("a", 2_000_000)),
-                Ok(token_pair("fallback", 1_800_000)),
-            ]);
-        recipe
-            .refresh
-            .lock()
-            .expect("refresh queue")
-            .extend([
-                Ok(token_pair("expired", 1_800_000)),
-                Err(TaskError::Unauthorized),
-            ]);
+        recipe.bootstrap.lock().expect("bootstrap queue").extend([
+            Ok(token_pair("a", 2_000_000)),
+            Ok(token_pair("fallback", 1_800_000)),
+        ]);
+        recipe.refresh.lock().expect("refresh queue").extend([
+            Ok(token_pair("expired", 1_800_000)),
+            Err(TaskError::Unauthorized),
+        ]);
         let (now, clock) = adjustable_clock(1);
         let managed = provider(&directories, clock, Arc::clone(&recipe));
         managed
@@ -1065,11 +1247,7 @@ mod tests {
             .lock()
             .expect("bootstrap queue")
             .push_back(Ok(token_pair("a", 1_000_000)));
-        let initial = provider(
-            &directories,
-            Arc::new(|| 1),
-            Arc::clone(&initial_recipe),
-        );
+        let initial = provider(&directories, Arc::new(|| 1), Arc::clone(&initial_recipe));
         initial
             .resolve(&Credential::bearer("bomtoon-access-token"))
             .expect("initial resolution");
@@ -1109,7 +1287,11 @@ mod tests {
         assert!(directories.cookie().exists());
         assert!(directories.managed_state().exists());
         assert!(!directories.detached().exists());
-        assert!(recipe.revoke_inputs.lock().expect("revoke inputs").is_empty());
+        assert!(recipe
+            .revoke_inputs
+            .lock()
+            .expect("revoke inputs")
+            .is_empty());
     }
 
     #[test]
@@ -1190,11 +1372,9 @@ mod tests {
             managed.resolve(&Credential::bearer("bomtoon-access-token")),
             Err(TaskError::LocalStorage)
         );
-        assert!(
-            fs::read_to_string(directories.managed_state())
-                .expect("visible generation")
-                .contains("access-b")
-        );
+        assert!(fs::read_to_string(directories.managed_state())
+            .expect("visible generation")
+            .contains("access-b"));
         assert_eq!(
             managed.resolve(&Credential::bearer("bomtoon-access-token")),
             Ok(Some(ResolvedCredential {
@@ -1233,23 +1413,17 @@ mod tests {
         let release_remote = Arc::new(Barrier::new(2));
         let observer_entered = Arc::clone(&entered_remote);
         let observer_release = Arc::clone(&release_remote);
-        *recipe.revoke_observer.lock().expect("revoke observer") =
-            Some(Box::new(move || {
-                observer_entered.wait();
-                observer_release.wait();
-            }));
-        let managed = Arc::new(provider(
-            &directories,
-            Arc::new(|| 1),
-            Arc::clone(&recipe),
-        ));
+        *recipe.revoke_observer.lock().expect("revoke observer") = Some(Box::new(move || {
+            observer_entered.wait();
+            observer_release.wait();
+        }));
+        let managed = Arc::new(provider(&directories, Arc::new(|| 1), Arc::clone(&recipe)));
         managed
             .resolve(&Credential::bearer("bomtoon-access-token"))
             .expect("initial resolution");
 
         let revoking = Arc::clone(&managed);
-        let revoke_thread =
-            thread::spawn(move || revoking.revoke("bomtoon-access-token"));
+        let revoke_thread = thread::spawn(move || revoking.revoke("bomtoon-access-token"));
         entered_remote.wait();
         let resolving = Arc::clone(&managed);
         let (resolved_tx, resolved_rx) = mpsc::channel();
@@ -1261,18 +1435,12 @@ mod tests {
         let while_remote_blocked = resolved_rx.recv_timeout(Duration::from_secs(1));
         release_remote.wait();
 
-        assert_eq!(
-            revoke_thread.join().expect("revoke thread"),
-            Ok(true)
-        );
+        assert_eq!(revoke_thread.join().expect("revoke thread"), Ok(true));
         assert_eq!(
             resolve_thread.join().expect("resolve thread"),
             Err(TaskError::NoCredential)
         );
-        assert_eq!(
-            while_remote_blocked,
-            Ok(Err(TaskError::NoCredential))
-        );
+        assert_eq!(while_remote_blocked, Ok(Err(TaskError::NoCredential)));
     }
 
     #[test]
@@ -1337,7 +1505,11 @@ mod tests {
         assert!(!directories.cookie().exists());
         assert!(directories.detached().exists());
         assert!(!directories.managed_state().exists());
-        assert!(recipe.revoke_inputs.lock().expect("revoke inputs").is_empty());
+        assert!(recipe
+            .revoke_inputs
+            .lock()
+            .expect("revoke inputs")
+            .is_empty());
         drop(managed);
 
         let recovered = provider(

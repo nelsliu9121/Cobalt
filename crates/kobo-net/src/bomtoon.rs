@@ -186,11 +186,7 @@ impl ManagedCredentialRecipe for Recipe {
         parse_refresh_tokens(&response)
     }
 
-    fn revoke(
-        &self,
-        binding_secret: &str,
-        pair: &ManagedTokenPair,
-    ) -> Result<(), TaskError> {
+    fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair) -> Result<(), TaskError> {
         validate_cookie(binding_secret)?;
         let body = ObjectBuilder::new()
             .set("refreshToken", pair.refresh_token.as_str())
@@ -350,9 +346,8 @@ fn unique_field<'a>(object: &'a Value, name: &str) -> Result<&'a Value, TaskErro
 }
 
 fn pair_fingerprint(pair: &ManagedTokenPair) -> String {
-    let mut material = Vec::with_capacity(
-        pair.access_token.len() + 1_usize + pair.refresh_token.len(),
-    );
+    let mut material =
+        Vec::with_capacity(pair.access_token.len() + 1_usize + pair.refresh_token.len());
     material.extend_from_slice(pair.access_token.as_bytes());
     material.push(0);
     material.extend_from_slice(pair.refresh_token.as_bytes());
@@ -544,7 +539,8 @@ mod tests {
 
     #[test]
     fn partial_or_oversized_token_pairs_are_rejected() {
-        let partial = br#"{"user":{"accessToken":{"token":"ACCESS_A","createdAt":1,"expiredAt":2}}}"#;
+        let partial =
+            br#"{"user":{"accessToken":{"token":"ACCESS_A","createdAt":1,"expiredAt":2}}}"#;
         assert!(matches!(
             parse_session_tokens(partial),
             Err(TaskError::Unreachable)
@@ -604,8 +600,7 @@ mod tests {
             }
           }
         }"#;
-        let pair =
-            parse_session_tokens(beyond_double_precision).expect("exact integer lexemes");
+        let pair = parse_session_tokens(beyond_double_precision).expect("exact integer lexemes");
         assert_eq!(pair.access_expires_at_ms, 9_007_199_254_740_994);
         assert_eq!(pair.refresh_expires_at_ms, 9_007_199_254_740_995);
     }
@@ -633,7 +628,12 @@ mod tests {
                 max_bytes,
             } => {
                 assert_eq!(url, IP_URL);
-                assert_eq!(credential.as_ref().map(|value| (value.0.as_str(), value.1.as_str())), Some(("Cookie", "SESSION_COOKIE_A")));
+                assert_eq!(
+                    credential
+                        .as_ref()
+                        .map(|value| (value.0.as_str(), value.1.as_str())),
+                    Some(("Cookie", "SESSION_COOKIE_A"))
+                );
                 assert_eq!(*max_bytes, IP_RESPONSE_MAX_BYTES);
                 assert_eq!(headers, &common_headers());
             }
@@ -648,7 +648,10 @@ mod tests {
                 max_bytes,
             } => {
                 assert_eq!(url, REFRESH_URL);
-                assert_eq!(body, br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#);
+                assert_eq!(
+                    body,
+                    br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#
+                );
                 assert_eq!(bearer, "ACCESS_A");
                 assert_eq!(*max_bytes, REFRESH_RESPONSE_MAX_BYTES);
                 assert_eq!(headers, &cookie_headers("SESSION_COOKIE_A"));
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn logout_sends_cookie_and_bearer_with_put_without_redirects() {
         let transport = Arc::new(FakeTransport::new([Ok(
-            br#"{"result":"ok","data":{}}"#.to_vec(),
+            br#"{"result":"ok","data":{}}"#.to_vec()
         )]));
         let recipe = Recipe::with_transport(transport.clone());
         recipe
@@ -727,7 +730,12 @@ mod tests {
                 panic!("expected session GET");
             };
             assert_eq!(url, SESSION_URL);
-            assert_eq!(credential.as_ref().map(|value| (value.0.as_str(), value.1.as_str())), Some(("Cookie", "SESSION_COOKIE_A")));
+            assert_eq!(
+                credential
+                    .as_ref()
+                    .map(|value| (value.0.as_str(), value.1.as_str())),
+                Some(("Cookie", "SESSION_COOKIE_A"))
+            );
             assert_eq!(*max_bytes, SESSION_RESPONSE_MAX_BYTES);
             assert_eq!(headers, &common_headers());
         }
@@ -757,7 +765,9 @@ mod tests {
 
         let oversized = Arc::new(FakeTransport::new([Ok(vec![
             b' ';
-            SESSION_RESPONSE_MAX_BYTES as usize + 1
+            SESSION_RESPONSE_MAX_BYTES
+                as usize
+                + 1
         ])]));
         assert_eq!(
             Recipe::with_transport(oversized).bootstrap("SESSION_COOKIE_A"),
@@ -799,10 +809,7 @@ mod tests {
                     br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#
                 );
                 assert_eq!(content_type, "application/json");
-                assert_eq!(
-                    credential,
-                    Some(("Authorization", "Bearer ACCESS_A"))
-                );
+                assert_eq!(credential, Some(("Authorization", "Bearer ACCESS_A")));
                 assert_eq!(sent_headers, &headers);
                 assert_eq!(max_bytes, REFRESH_RESPONSE_MAX_BYTES);
                 Ok(b"ok".to_vec())
@@ -827,6 +834,9 @@ mod tests {
         let Call::Post { body, .. } = &calls[1] else {
             panic!("expected refresh POST");
         };
-        assert_eq!(body, br#"{"refreshToken":"REFRESH_\"A","clientIp":"203.0.113.1\"quoted"}"#);
+        assert_eq!(
+            body,
+            br#"{"refreshToken":"REFRESH_\"A","clientIp":"203.0.113.1\"quoted"}"#
+        );
     }
 }
