@@ -24,6 +24,7 @@ enum FaultPoint {
     RenameCookie,
     RemoveState,
     SyncStateParentAfterRename,
+    SyncSecretsAfterRename,
 }
 
 #[cfg(test)]
@@ -345,7 +346,20 @@ impl ManagedCredentials {
             Err(_) => return Err(TaskError::LocalStorage),
         };
 
-        let rename_sync_failed = renamed && sync_directory(&self.secrets).is_err();
+        let rename_sync_failed = if renamed {
+            #[cfg(test)]
+            if take_fault(FaultPoint::SyncSecretsAfterRename) {
+                true
+            } else {
+                sync_directory(&self.secrets).is_err()
+            }
+            #[cfg(not(test))]
+            {
+                sync_directory(&self.secrets).is_err()
+            }
+        } else {
+            false
+        };
         let state_result = self.clear_state_synced();
         inner.cached = None;
         if state_result.is_err() || rename_sync_failed {
@@ -419,7 +433,7 @@ fn valid_pair(pair: &ManagedTokenPair) -> bool {
 
 fn valid_provider_pair(pair: &ManagedTokenPair, now: u64) -> bool {
     valid_pair(pair)
-        && pair.access_expires_at_ms > now.saturating_add(REFRESH_WINDOW_MS)
+        && pair.access_expires_at_ms > now
         && pair.refresh_expires_at_ms > now
 }
 
@@ -600,7 +614,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    type RevokeObserver = dyn Fn() + Send + Sync;
+    type OperationObserver = dyn Fn() + Send + Sync;
 
     #[derive(Debug, Eq, PartialEq)]
     struct RevokeInput {
@@ -614,7 +628,8 @@ mod tests {
         bootstrap: Mutex<VecDeque<Result<ManagedTokenPair, TaskError>>>,
         refresh: Mutex<VecDeque<Result<ManagedTokenPair, TaskError>>>,
         revoke: Mutex<VecDeque<Result<(), TaskError>>>,
-        revoke_observer: Mutex<Option<Box<RevokeObserver>>>,
+        refresh_observer: Mutex<Option<Box<OperationObserver>>>,
+        revoke_observer: Mutex<Option<Box<OperationObserver>>>,
         revoke_inputs: Mutex<Vec<RevokeInput>>,
     }
 
@@ -630,6 +645,9 @@ mod tests {
 
         fn refresh(&self, _binding_secret: &str, _pair: &ManagedTokenPair) -> Result<ManagedTokenPair, TaskError> {
             self.calls.lock().expect("calls").push("refresh");
+            if let Some(observer) = self.refresh_observer.lock().expect("refresh observer").as_ref() {
+                observer();
+            }
             self.refresh.lock().expect("refresh queue").pop_front().expect("refresh result")
         }
 
@@ -945,8 +963,8 @@ mod tests {
     }
 
     #[test]
-    fn expired_and_inside_window_bootstrap_outputs_are_rejected() {
-        let directories = TestDirectories::new("expired-bootstrap");
+    fn bootstrap_at_the_exact_window_is_persisted_then_refreshed() {
+        let directories = TestDirectories::new("boundary-bootstrap");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
         let now = 1_000_000;
@@ -954,21 +972,39 @@ mod tests {
             .bootstrap
             .lock()
             .expect("bootstrap queue")
-            .extend([
-                Ok(token_pair("expired", now)),
-                Ok(token_pair("window", now + REFRESH_WINDOW_MS)),
-            ]);
+            .push_back(Ok(token_pair("boundary", now + REFRESH_WINDOW_MS)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(token_pair("rotated", now + 2 * REFRESH_WINDOW_MS)));
+        let boundary_state = directories.managed_state();
+        *recipe.refresh_observer.lock().expect("refresh observer") =
+            Some(Box::new(move || {
+                assert!(
+                    fs::read_to_string(&boundary_state)
+                        .expect("boundary state")
+                        .contains("access-boundary")
+                );
+            }));
         let managed = provider(&directories, Arc::new(move || now), Arc::clone(&recipe));
 
         assert_eq!(
             managed.resolve(&Credential::bearer("bomtoon-access-token")),
-            Err(TaskError::Unreachable)
+            Ok(Some(ResolvedCredential {
+                header_name: "Authorization".to_owned(),
+                header_value: "Bearer access-rotated".to_owned(),
+            }))
         );
         assert_eq!(
-            managed.resolve(&Credential::bearer("bomtoon-access-token")),
-            Err(TaskError::Unreachable)
+            *recipe.calls.lock().expect("calls"),
+            vec!["bootstrap", "refresh"]
         );
-        assert!(!directories.managed_state().exists());
+        assert!(
+            fs::read_to_string(directories.managed_state())
+                .expect("rotated state")
+                .contains("access-rotated")
+        );
     }
 
     #[test]
@@ -989,7 +1025,7 @@ mod tests {
             .lock()
             .expect("refresh queue")
             .extend([
-                Ok(token_pair("window", 1_800_000 + REFRESH_WINDOW_MS)),
+                Ok(token_pair("expired", 1_800_000)),
                 Err(TaskError::Unauthorized),
             ]);
         let (now, clock) = adjustable_clock(1);
@@ -1237,5 +1273,83 @@ mod tests {
             while_remote_blocked,
             Ok(Err(TaskError::NoCredential))
         );
+    }
+
+    #[test]
+    fn network_refresh_failure_preserves_the_last_valid_pair() {
+        let directories = TestDirectories::new("network-refresh");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Err(TaskError::Unreachable));
+        let (now, clock) = adjustable_clock(1);
+        let managed = provider(&directories, clock, Arc::clone(&recipe));
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
+        let durable = fs::read(directories.managed_state()).expect("durable state");
+        now.store(800_000, Ordering::SeqCst);
+
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::Unreachable)
+        );
+        assert_eq!(
+            fs::read(directories.managed_state()).expect("state after network failure"),
+            durable
+        );
+        assert!(directories.cookie().exists());
+    }
+
+    #[test]
+    fn cookie_directory_sync_failure_keeps_marker_and_skips_remote_revoke() {
+        let directories = TestDirectories::new("cookie-sync-fault");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        recipe
+            .revoke
+            .lock()
+            .expect("revoke queue")
+            .push_back(Ok(()));
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
+        managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
+
+        inject_fault(FaultPoint::SyncSecretsAfterRename);
+        assert_eq!(
+            managed.revoke("bomtoon-access-token"),
+            Err(TaskError::LocalStorage)
+        );
+        assert!(!directories.cookie().exists());
+        assert!(directories.detached().exists());
+        assert!(!directories.managed_state().exists());
+        assert!(recipe.revoke_inputs.lock().expect("revoke inputs").is_empty());
+        drop(managed);
+
+        let recovered = provider(
+            &directories,
+            Arc::new(|| 1),
+            Arc::new(FakeRecipe::default()),
+        );
+        assert_eq!(
+            recovered.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::NoCredential)
+        );
+        assert!(!directories.detached().exists());
+        assert!(!directories.managed_state().exists());
     }
 }
