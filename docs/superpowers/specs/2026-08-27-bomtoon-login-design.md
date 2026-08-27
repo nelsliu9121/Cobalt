@@ -85,7 +85,7 @@ For each credentialed request, the task runner:
 
 The provider returns a resolved header value only to the runtime task runner. It never returns a token through a protocol frame or `TaskOutcome`.
 
-A managed provider also supports revocation. The protocol gains a revoke operation that identifies a managed credential and returns only completion or a typed error. Provider policy rejects credentials and apps without a registered revocation recipe.
+A managed provider also supports revocation. The protocol gains a revoke operation that identifies a managed credential and returns only completion or a typed error. Revocation serializes with resolution, detaches local credentials before network I/O, and holds only a one-shot in-memory token copy for remote revocation. Provider policy rejects credentials and apps without a registered revocation recipe.
 
 ### BOMTOON credential broker
 
@@ -190,12 +190,15 @@ Refresh operations are serialized per managed account. Two requests cannot rotat
 
 1. The user selects `Sign out` in the Bomtoon app.
 2. The app submits the managed-credential revoke operation.
-3. The runtime attempts the BOMTOON logout request with its current access and refresh tokens.
-4. The runtime deletes `bomtoon-session` and the managed token-state file regardless of the network result.
-5. The app clears loaded library, recent, and episode data and returns to the signed-out screen.
-6. If the remote request failed, the screen warns that remote revocation could not be confirmed. The Kobo remains locally signed out.
+3. Under the provider lock, the runtime copies the current token pair into a one-shot value.
+4. The runtime atomically renames `bomtoon-session` out of its resolvable path, clears the in-memory pair, and removes the managed token-state file.
+5. The detached cookie file is deleted before the provider lock is released. Startup cleanup removes a detached file left by a crash between rename and deletion.
+6. Only after local invalidation succeeds does the runtime attempt the BOMTOON logout request with the one-shot token copy.
+7. The one-shot copy is released when the request finishes, fails, or times out.
+8. The app clears loaded library, recent, and episode data and returns to the signed-out screen.
+9. If the remote request failed, the screen warns that remote revocation could not be confirmed. The Kobo remains locally signed out.
 
-Local deletion is mandatory even while offline. A network failure must not trap an account on the device.
+Local invalidation is complete before network I/O. A hang, cancellation, or process crash during the remote request cannot reactivate the account on the Kobo. Failure to detach the local cookie is a local logout failure; the runtime does not report a signed-out state until the cookie is outside the resolvable path.
 
 ## Error Behavior
 
@@ -208,8 +211,9 @@ Local deletion is mandatory even while offline. A network failure must not trap 
 | Refresh and session rejected | Delete all BOMTOON credentials | Session-expired instructions |
 | Network unavailable | Preserve credentials | Existing retry screen |
 | Authentication response malformed | Preserve last valid state | Service-response error |
-| Remote logout succeeds | Delete all local credentials | Signed-out screen |
-| Remote logout fails | Delete all local credentials | Signed-out screen with revocation warning |
+| Local credential detachment fails | Do not start remote logout; keep current state | Local storage error |
+| Remote logout succeeds | Already invalidated locally | Signed-out screen |
+| Remote logout fails | Already invalidated locally | Signed-out screen with revocation warning |
 | CLI browser closes before login | No device changes | Command reports cancellation |
 | SSH install fails | Existing device state remains | Command reports transfer failure |
 
@@ -227,7 +231,7 @@ Local deletion is mandatory even while offline. A network failure must not trap 
 - The temporary Chrome profile uses mode `0700`, DevTools pipe transport, and unconditional cleanup.
 - Runtime token state uses mode `0600` and atomic replacement.
 - Runtime token state is bound to the digest of the session cookie that produced it. The provider rechecks that digest on every resolve.
-- Logout removes local credentials even when remote revocation fails.
+- Logout serializes with credential resolution and invalidates local credentials before remote network I/O.
 
 ## Testing and Verification
 
@@ -267,8 +271,10 @@ Local deletion is mandatory even while offline. A network failure must not trap 
 - serialize concurrent refresh requests
 - atomically replace token state
 - never return secret-bearing response bytes to the app
-- always delete local state during revoke
-- report remote logout failure after local deletion
+- detach the session cookie and clear the live provider before starting remote logout
+- prove credential resolution fails while the best-effort logout request is in flight
+- recover and delete a detached cookie left by a simulated crash
+- report remote logout failure after local invalidation
 
 ### App tests
 
