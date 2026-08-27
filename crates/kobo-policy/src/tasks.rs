@@ -556,9 +556,9 @@ fn secret(directory: Option<&Path>, name: &str) -> Option<String> {
 
 fn run_fetch(
     url: &str,
-    offset: &u32,
-    max_bytes: &u32,
-    wanted: &Option<Credential>,
+    offset: u32,
+    max_bytes: u32,
+    wanted: Option<&Credential>,
     headers: &[kobo_protocol::Header],
     backends: &Backends<'_>,
 ) -> TaskOutcome {
@@ -570,7 +570,7 @@ fn run_fetch(
         Err(error) => return TaskOutcome::Failed(error),
     };
     let credential = match resolved_credential(
-        wanted.as_ref(),
+        wanted,
         RequestMethod::Get,
         url,
         backends.credentials,
@@ -580,10 +580,10 @@ fn run_fetch(
         Ok(credential) => credential,
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
     let first = fetch(
         url,
-        *offset,
+        offset,
         ceiling,
         credential
             .as_ref()
@@ -593,7 +593,7 @@ fn run_fetch(
     let result = if matches!(&first, Err(TaskError::Unauthorized))
         && credential.as_ref().is_some_and(|header| header.managed)
     {
-        let Some(wanted) = wanted.as_ref() else {
+        let Some(wanted) = wanted else {
             return TaskOutcome::Failed(TaskError::Denied);
         };
         let renewed = match renew_managed_credential(wanted, backends.managed) {
@@ -602,7 +602,7 @@ fn run_fetch(
         };
         fetch(
             url,
-            *offset,
+            offset,
             ceiling,
             Some((renewed.name.as_str(), renewed.value.as_str())),
             &extra,
@@ -620,9 +620,9 @@ fn run_post(
     url: &str,
     body: &str,
     content_type: &str,
-    wanted: &Option<Credential>,
+    wanted: Option<&Credential>,
     headers: &[kobo_protocol::Header],
-    max_bytes: &u32,
+    max_bytes: u32,
     backends: &Backends<'_>,
 ) -> TaskOutcome {
     let Some(post) = backends.post else {
@@ -633,7 +633,7 @@ fn run_post(
         Err(error) => return TaskOutcome::Failed(error),
     };
     let credential = match resolved_credential(
-        wanted.as_ref(),
+        wanted,
         RequestMethod::Post,
         url,
         backends.credentials,
@@ -643,7 +643,7 @@ fn run_post(
         Ok(credential) => credential,
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
     let first = post(
         url,
         body.as_bytes(),
@@ -657,7 +657,7 @@ fn run_post(
     let result = if matches!(&first, Err(TaskError::Unauthorized))
         && credential.as_ref().is_some_and(|header| header.managed)
     {
-        let Some(wanted) = wanted.as_ref() else {
+        let Some(wanted) = wanted else {
             return TaskOutcome::Failed(TaskError::Denied);
         };
         let renewed = match renew_managed_credential(wanted, backends.managed) {
@@ -731,7 +731,14 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             max_bytes,
             credential,
             headers,
-        } => run_fetch(url, offset, max_bytes, credential, headers, &backends),
+        } => run_fetch(
+            url,
+            *offset,
+            *max_bytes,
+            credential.as_ref(),
+            headers,
+            &backends,
+        ),
         Task::Post {
             url,
             body,
@@ -743,9 +750,9 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             url,
             body,
             content_type,
-            credential,
+            credential.as_ref(),
             headers,
-            max_bytes,
+            *max_bytes,
             &backends,
         ),
     }
