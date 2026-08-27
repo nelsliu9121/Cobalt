@@ -113,7 +113,7 @@ The app removes `Pending::Session`, `api::session`, and `parse::session_is_authe
 
 The runtime resolves or bootstraps `bomtoon-access-token` before sending the request. The app receives only library data or a typed failure, never a session or refresh response.
 
-Episode loading uses bearer-authenticated `GET /api/balcony-api-v2/contents/<alias>?isNotLoginAdult=false&isPorch=false` in place of authenticated `GET /detail/<alias>` HTML. The parser consumes the bounded JSON `episodes` array and its purchase fields. This endpoint returns content data without session or refresh tokens.
+Episode loading uses bearer-authenticated `GET /api/balcony-api-v2/contents/<alias>?isNotLoginAdult=false&isPorch=false` without cookies in place of authenticated `GET /detail/<alias>` HTML. The parser consumes `data.episodes` from the bounded JSON response. `purchaseStatus` may be a string or `null`; a null value is not owned unless the episode's sample or free fields prove otherwise. This endpoint returns content data without session or refresh tokens.
 
 The library screen gains a `Sign out` action. Signed-out screens show:
 
@@ -142,10 +142,10 @@ The credential policy validates the alias path segment and the exact query strin
 Session bootstrap sends `bomtoon-session` as `Cookie`. It accepts an authenticated session only when the response contains:
 
 - a `user` object
-- `accessToken.token`
-- `accessToken.expiredAt`
-- `refreshToken.token`
-- `refreshToken.expiredAt`
+- `user.accessToken.token`
+- `user.accessToken.expiredAt`
+- `user.refreshToken.token`
+- `user.refreshToken.expiredAt`
 
 Token strings must be non-empty bounded text, and expiry fields must parse as valid timestamps. Malformed or oversized responses fail without replacing stored state.
 
@@ -154,7 +154,7 @@ Refresh follows BOMTOON's web client:
 1. Fetch the current public client address from `/api/balcony/ip`.
 2. Send the current access token as a bearer credential to `/api/balcony/auth/refresh`.
 3. Send the refresh token and `clientIp` in the bounded JSON body.
-4. Validate both rotated tokens and their expiry fields.
+4. Validate `result.accessToken` and `result.refreshToken`, including their integer millisecond expiry fields.
 5. Atomically replace the durable token state.
 
 Logout follows BOMTOON's web client. It sends a `PUT` to `/api/balcony-api/auth/logout` with the access token as bearer authorization and the refresh token in the bounded JSON body.
