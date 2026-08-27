@@ -151,13 +151,13 @@ Token strings must be non-empty bounded text, and expiry fields must parse as va
 
 Refresh follows BOMTOON's web client:
 
-1. Fetch the current public client address from `/api/balcony/ip`.
-2. Send the current access token as a bearer credential to `/api/balcony/auth/refresh`.
+1. Fetch the current public client address from `/api/balcony/ip` with the current session cookie.
+2. Send the current session cookie and access token as cookie and bearer credentials to `/api/balcony/auth/refresh`.
 3. Send the refresh token and `clientIp` in the bounded JSON body.
 4. Validate `result.accessToken` and `result.refreshToken`, including their integer millisecond expiry fields.
 5. Atomically replace the durable token state.
 
-Logout follows BOMTOON's web client. It sends a `PUT` to `/api/balcony-api/auth/logout` with the access token as bearer authorization and the refresh token in the bounded JSON body.
+Logout follows BOMTOON's web client. It sends a `PUT` to `/api/balcony-api/auth/logout` with the current session cookie, the access token as bearer authorization, and the refresh token in the bounded JSON body.
 
 Credentialed redirects are forbidden, and each response has a service-specific byte ceiling. Authentication bodies and headers are never logged.
 
@@ -194,10 +194,10 @@ Refresh operations are serialized per managed account. Two requests cannot rotat
 
 1. The user selects `Sign out` in the Bomtoon app.
 2. The app submits the managed-credential revoke operation.
-3. Under the provider lock, the runtime copies the current token pair into a one-shot value.
+3. Under the provider lock, the runtime copies the current session cookie and token pair into a one-shot value.
 4. The runtime atomically renames `bomtoon-session` out of its resolvable path, clears the in-memory pair, and removes the managed token-state file.
 5. The detached cookie file is deleted before the provider lock is released. Startup cleanup removes a detached file left by a crash between rename and deletion.
-6. Only after local invalidation succeeds does the runtime attempt the BOMTOON logout request with the one-shot token copy.
+6. Only after local invalidation succeeds does the runtime attempt the BOMTOON logout request with the one-shot credential copy.
 7. The one-shot copy is released when the request finishes, fails, or times out.
 8. The app clears loaded library, recent, and episode data and returns to the signed-out screen.
 9. If the remote request failed, the screen warns that remote revocation could not be confirmed. The Kobo remains locally signed out.
