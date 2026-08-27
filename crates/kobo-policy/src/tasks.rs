@@ -199,7 +199,6 @@ fn renew_managed_credential(
 /// checks have to keep agreeing: `Range` is reserved for exactly the reason
 /// `Authorization` is, and a fork here is how one of them would quietly stop
 /// enforcing it.
-
 fn own_headers(headers: &[kobo_protocol::Header]) -> Result<Vec<(&str, &str)>, TaskError> {
     if headers
         .iter()
@@ -555,16 +554,136 @@ fn secret(directory: Option<&Path>, name: &str) -> Option<String> {
     }
 }
 
+fn run_fetch(
+    url: &str,
+    offset: &u32,
+    max_bytes: &u32,
+    wanted: &Option<Credential>,
+    headers: &[kobo_protocol::Header],
+    backends: &Backends<'_>,
+) -> TaskOutcome {
+    let Some(fetch) = backends.fetch else {
+        return TaskOutcome::Failed(TaskError::Denied);
+    };
+    let extra = match own_headers(headers) {
+        Ok(extra) => extra,
+        Err(error) => return TaskOutcome::Failed(error),
+    };
+    let credential = match resolved_credential(
+        wanted.as_ref(),
+        RequestMethod::Get,
+        url,
+        backends.credentials,
+        backends.managed,
+        backends.secrets,
+    ) {
+        Ok(credential) => credential,
+        Err(error) => return TaskOutcome::Failed(error),
+    };
+    let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+    let first = fetch(
+        url,
+        *offset,
+        ceiling,
+        credential
+            .as_ref()
+            .map(|header| (header.name.as_str(), header.value.as_str())),
+        &extra,
+    );
+    let result = if matches!(&first, Err(TaskError::Unauthorized))
+        && credential.as_ref().is_some_and(|header| header.managed)
+    {
+        let Some(wanted) = wanted.as_ref() else {
+            return TaskOutcome::Failed(TaskError::Denied);
+        };
+        let renewed = match renew_managed_credential(wanted, backends.managed) {
+            Ok(renewed) => renewed,
+            Err(error) => return TaskOutcome::Failed(error),
+        };
+        fetch(
+            url,
+            *offset,
+            ceiling,
+            Some((renewed.name.as_str(), renewed.value.as_str())),
+            &extra,
+        )
+    } else {
+        first
+    };
+    match result {
+        Ok(bytes) => TaskOutcome::Completed(bytes),
+        Err(error) => TaskOutcome::Failed(error),
+    }
+}
+
+fn run_post(
+    url: &str,
+    body: &str,
+    content_type: &str,
+    wanted: &Option<Credential>,
+    headers: &[kobo_protocol::Header],
+    max_bytes: &u32,
+    backends: &Backends<'_>,
+) -> TaskOutcome {
+    let Some(post) = backends.post else {
+        return TaskOutcome::Failed(TaskError::Denied);
+    };
+    let extra = match own_headers(headers) {
+        Ok(extra) => extra,
+        Err(error) => return TaskOutcome::Failed(error),
+    };
+    let credential = match resolved_credential(
+        wanted.as_ref(),
+        RequestMethod::Post,
+        url,
+        backends.credentials,
+        backends.managed,
+        backends.secrets,
+    ) {
+        Ok(credential) => credential,
+        Err(error) => return TaskOutcome::Failed(error),
+    };
+    let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+    let first = post(
+        url,
+        body.as_bytes(),
+        content_type,
+        credential
+            .as_ref()
+            .map(|header| (header.name.as_str(), header.value.as_str())),
+        &extra,
+        ceiling,
+    );
+    let result = if matches!(&first, Err(TaskError::Unauthorized))
+        && credential.as_ref().is_some_and(|header| header.managed)
+    {
+        let Some(wanted) = wanted.as_ref() else {
+            return TaskOutcome::Failed(TaskError::Denied);
+        };
+        let renewed = match renew_managed_credential(wanted, backends.managed) {
+            Ok(renewed) => renewed,
+            Err(error) => return TaskOutcome::Failed(error),
+        };
+        post(
+            url,
+            body.as_bytes(),
+            content_type,
+            Some((renewed.name.as_str(), renewed.value.as_str())),
+            &extra,
+            ceiling,
+        )
+    } else {
+        first
+    };
+    match result {
+        Ok(bytes) => TaskOutcome::Completed(bytes),
+        Err(error) => TaskOutcome::Failed(error),
+    }
+}
+
 fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) -> TaskOutcome {
-    let Backends {
-        fetch,
-        post,
-        secrets,
-        credentials,
-        managed,
-    } = backends;
     match work {
-        Task::RevokeCredential { credential } => match managed {
+        Task::RevokeCredential { credential } => match backends.managed {
             Some(provider) => match provider.revoke(credential) {
                 Ok(true) => TaskOutcome::Completed(Vec::new()),
                 Ok(false) => TaskOutcome::Failed(TaskError::Denied),
@@ -610,125 +729,32 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             url,
             offset,
             max_bytes,
-            credential: wanted,
+            credential,
             headers,
-        } => {
-            let Some(fetch) = fetch else {
-                return TaskOutcome::Failed(TaskError::Denied);
-            };
-            let extra = match own_headers(headers) {
-                Ok(extra) => extra,
-                Err(error) => return TaskOutcome::Failed(error),
-            };
-            let credential = match resolved_credential(
-                wanted.as_ref(),
-                RequestMethod::Get,
-                url,
-                credentials,
-                managed,
-                secrets,
-            ) {
-                Ok(credential) => credential,
-                Err(error) => return TaskOutcome::Failed(error),
-            };
-            let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
-            let first = fetch(
-                url,
-                *offset,
-                ceiling,
-                credential
-                    .as_ref()
-                    .map(|header| (header.name.as_str(), header.value.as_str())),
-                &extra,
-            );
-            let result = if matches!(&first, Err(TaskError::Unauthorized))
-                && credential.as_ref().is_some_and(|header| header.managed)
-            {
-                let Some(wanted) = wanted.as_ref() else {
-                    return TaskOutcome::Failed(TaskError::Denied);
-                };
-                let renewed = match renew_managed_credential(wanted, managed) {
-                    Ok(renewed) => renewed,
-                    Err(error) => return TaskOutcome::Failed(error),
-                };
-                fetch(
-                    url,
-                    *offset,
-                    ceiling,
-                    Some((renewed.name.as_str(), renewed.value.as_str())),
-                    &extra,
-                )
-            } else {
-                first
-            };
-            match result {
-                Ok(bytes) => TaskOutcome::Completed(bytes),
-                Err(error) => TaskOutcome::Failed(error),
-            }
-        }
+        } => run_fetch(
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+            &backends,
+        ),
         Task::Post {
             url,
             body,
             content_type,
-            credential: wanted,
+            credential,
             headers,
             max_bytes,
-        } => {
-            let Some(post) = post else {
-                return TaskOutcome::Failed(TaskError::Denied);
-            };
-            let extra = match own_headers(headers) {
-                Ok(extra) => extra,
-                Err(error) => return TaskOutcome::Failed(error),
-            };
-            let credential = match resolved_credential(
-                wanted.as_ref(),
-                RequestMethod::Post,
-                url,
-                credentials,
-                managed,
-                secrets,
-            ) {
-                Ok(credential) => credential,
-                Err(error) => return TaskOutcome::Failed(error),
-            };
-            let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
-            let first = post(
-                url,
-                body.as_bytes(),
-                content_type,
-                credential
-                    .as_ref()
-                    .map(|header| (header.name.as_str(), header.value.as_str())),
-                &extra,
-                ceiling,
-            );
-            let result = if matches!(&first, Err(TaskError::Unauthorized))
-                && credential.as_ref().is_some_and(|header| header.managed)
-            {
-                let Some(wanted) = wanted.as_ref() else {
-                    return TaskOutcome::Failed(TaskError::Denied);
-                };
-                let renewed = match renew_managed_credential(wanted, managed) {
-                    Ok(renewed) => renewed,
-                    Err(error) => return TaskOutcome::Failed(error),
-                };
-                post(
-                    url,
-                    body.as_bytes(),
-                    content_type,
-                    Some((renewed.name.as_str(), renewed.value.as_str())),
-                    &extra,
-                    ceiling,
-                )
-            } else {
-                first
-            };
-            match result {
-                Ok(bytes) => TaskOutcome::Completed(bytes),
-                Err(error) => TaskOutcome::Failed(error),
-            }
-        }
+        } => run_post(
+            url,
+            body,
+            content_type,
+            credential,
+            headers,
+            max_bytes,
+            &backends,
+        ),
     }
 }
 
@@ -1696,14 +1722,14 @@ mod tests {
             let (managed, recipe) = managed_provider(name);
             let calls = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&calls);
-            let expected = error.clone();
+            let expected = error;
             let mut runner = TaskRunner::simulated(temp_root(&format!("{name}-root")))
                 .with_capabilities([Capability::Network])
                 .with_managed_credentials(managed)
                 .with_credential_policy(Arc::new(|_, _, _| true))
                 .with_fetch(Arc::new(move |_, _, _, _, _| {
                     observed.fetch_add(1, Ordering::SeqCst);
-                    Err(error.clone())
+                    Err(error)
                 }));
             runner
                 .submit(TaskId(1), managed_fetch("https://example.test/catalog"))

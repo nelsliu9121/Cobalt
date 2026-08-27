@@ -87,14 +87,29 @@ pub trait ManagedCredentialRecipe: Send + Sync {
     /// Stable, non-secret identifier for the current session cookie.
     fn binding_digest(&self, secret: &str) -> String;
     /// Creates a token pair from the current provider session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider-specific task error when the binding secret cannot
+    /// be exchanged for a token pair.
     fn bootstrap(&self, binding_secret: &str) -> Result<ManagedTokenPair, TaskError>;
     /// Rotates a token pair using its refresh token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider-specific task error when the token pair cannot be
+    /// rotated for the current binding secret.
     fn refresh(
         &self,
         binding_secret: &str,
         pair: &ManagedTokenPair,
     ) -> Result<ManagedTokenPair, TaskError>;
     /// Invalidates the provider session and token pair remotely.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider-specific task error when the provider session or
+    /// token pair cannot be invalidated.
     fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair) -> Result<(), TaskError>;
 }
 
@@ -126,6 +141,11 @@ pub fn managed_state_path(root: &Path, credential: &str) -> PathBuf {
 
 impl ManagedCredentials {
     /// Constructs a provider and completes any interrupted local revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::LocalStorage`] if recovery from an interrupted
+    /// revocation cannot inspect or remove its durable state.
     pub fn new(
         secrets: impl Into<PathBuf>,
         state: impl Into<PathBuf>,
@@ -144,6 +164,15 @@ impl ManagedCredentials {
     }
 
     /// Resolves the managed bearer credential, refreshing it when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::Denied`] for a matching credential with a
+    /// non-bearer header, [`TaskError::NoCredential`] when its binding secret
+    /// is absent, [`TaskError::LocalStorage`] when local state cannot be read
+    /// or updated, [`TaskError::Unreachable`] for an invalid or expired access
+    /// token, or an error reported by the provider while issuing or rotating
+    /// the token pair.
     pub fn resolve(&self, wanted: &Credential) -> Result<Option<ResolvedCredential>, TaskError> {
         if wanted.secret != self.recipe.credential_name() {
             return Ok(None);
@@ -166,6 +195,14 @@ impl ManagedCredentials {
     }
 
     /// Renews a matching managed bearer credential regardless of its expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::Denied`] for a matching credential with a
+    /// non-bearer header, [`TaskError::NoCredential`] when its binding secret
+    /// is absent, [`TaskError::LocalStorage`] when local state cannot be read
+    /// or updated, or an error reported by the provider while issuing or
+    /// rotating the token pair.
     pub fn force_renew(&self, wanted: &Credential) -> Result<bool, TaskError> {
         if wanted.secret != self.recipe.credential_name() {
             return Ok(false);
@@ -182,6 +219,12 @@ impl ManagedCredentials {
     }
 
     /// Removes local credentials before attempting provider revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::LocalStorage`] when local credential state cannot
+    /// be inspected or removed, or [`TaskError::RevocationUnconfirmed`] when
+    /// the provider cannot confirm remote revocation.
     pub fn revoke(&self, credential: &str) -> Result<bool, TaskError> {
         if credential != self.recipe.credential_name() {
             return Ok(false);
