@@ -217,8 +217,8 @@ impl Bomtoon {
         }
     }
 
-    fn shelf_is_loaded(&self, shelf: Shelf) -> bool {
-        match shelf {
+    fn shelf_is_loaded(&self, target: Shelf) -> bool {
+        match target {
             Shelf::Library => self.library_loaded,
             Shelf::Recent => self.recent_loaded,
         }
@@ -231,19 +231,19 @@ impl Bomtoon {
         }
     }
 
-    fn switch_shelf(&mut self, context: &mut Context, shelf: Shelf) {
-        if self.shelf == shelf {
+    fn switch_shelf(&mut self, context: &mut Context, target: Shelf) {
+        if self.shelf == target {
             return;
         }
         self.remember_shelf_page();
-        self.shelf = shelf;
-        self.page = match shelf {
+        self.shelf = target;
+        self.page = match target {
             Shelf::Library => self.library_view_page,
             Shelf::Recent => self.recent_view_page,
         };
         self.problem = None;
-        if !self.shelf_is_loaded(shelf) {
-            let (pending, work) = match shelf {
+        if !self.shelf_is_loaded(target) {
+            let (pending, work) = match target {
                 Shelf::Library => (Pending::Library(0), api::library(0)),
                 Shelf::Recent => (Pending::Recent(0), api::recent(0)),
             };
@@ -333,7 +333,7 @@ impl Bomtoon {
                     }
                 }
                 Ok(_) => {
-                    self.problem = Some("BOMTOON returned a different library page.".to_owned())
+                    self.problem = Some("BOMTOON returned a different library page.".to_owned());
                 }
                 Err(error) => self.problem = Some(error.to_string()),
             },
@@ -353,7 +353,7 @@ impl Bomtoon {
                     self.view = View::Library;
                 }
                 Ok(_) => {
-                    self.problem = Some("BOMTOON returned a different recent page.".to_owned())
+                    self.problem = Some("BOMTOON returned a different recent page.".to_owned());
                 }
                 Err(error) => self.problem = Some(error.to_string()),
             },

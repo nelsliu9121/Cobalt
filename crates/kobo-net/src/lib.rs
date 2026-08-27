@@ -729,6 +729,10 @@ pub fn post(
 /// Sends one PUT request and refuses every redirect.
 ///
 /// Its arguments and error distinctions are the same as [`post`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`post`].
 pub fn put(
     url: &str,
     body: &[u8],

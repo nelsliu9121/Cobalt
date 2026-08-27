@@ -1195,7 +1195,9 @@ fn host_applications(
             kobo_protocol::TaskError::TimedOut => kobo_protocol::DeviceError::TimedOut,
             kobo_protocol::TaskError::NotFound => kobo_protocol::DeviceError::NotFound,
             kobo_protocol::TaskError::TooLarge => kobo_protocol::DeviceError::InvalidInput,
-            kobo_protocol::TaskError::Denied => kobo_protocol::DeviceError::Backend,
+            kobo_protocol::TaskError::Denied | kobo_protocol::TaskError::LocalStorage => {
+                kobo_protocol::DeviceError::Backend
+            }
             // Unreachable today: a plain fetch names no credential, so the
             // runtime never has one to be missing. Spelled out rather than
             // caught by a wildcard so that giving fetch a credential later
@@ -1207,7 +1209,6 @@ fn host_applications(
             kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
                 kobo_protocol::DeviceError::Authentication
             }
-            kobo_protocol::TaskError::LocalStorage => kobo_protocol::DeviceError::Backend,
         })
     });
     let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher));

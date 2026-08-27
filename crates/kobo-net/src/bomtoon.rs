@@ -25,6 +25,11 @@ const BOMTOON_HEADERS: [(&str, &str); 4] = [
 
 /// The bounded HTTP operations needed by the BOMTOON credential broker.
 pub trait Transport: Send + Sync {
+    /// Performs one bounded GET request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a task error when the transport cannot complete the request.
     fn get(
         &self,
         url: &str,
@@ -33,6 +38,11 @@ pub trait Transport: Send + Sync {
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError>;
 
+    /// Performs one bounded JSON POST request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a task error when the transport cannot complete the request.
     fn post_json(
         &self,
         url: &str,
@@ -42,6 +52,11 @@ pub trait Transport: Send + Sync {
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError>;
 
+    /// Performs one bounded JSON PUT request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a task error when the transport cannot complete the request.
     fn put_json(
         &self,
         url: &str,

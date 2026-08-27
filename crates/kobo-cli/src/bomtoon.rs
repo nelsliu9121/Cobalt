@@ -98,7 +98,7 @@ trap - EXIT HUP INT TERM
 exit 0
 "#;
 
-const BROWSER_SESSION_EXPRESSION: &str = r#"(async () => {
+const BROWSER_SESSION_EXPRESSION: &str = r"(async () => {
     try {
         const response = await fetch('/api/auth/session', {
             credentials: 'same-origin',
@@ -137,7 +137,7 @@ const BROWSER_SESSION_EXPRESSION: &str = r#"(async () => {
     } catch (_) {
         return { authenticated: false };
     }
-})()"#;
+})()";
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -155,7 +155,7 @@ pub fn command(arguments: &[String]) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        login(target)
+        login(&target)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -177,16 +177,13 @@ fn parse_target(arguments: &[String]) -> Result<LoginTarget, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn login(target: LoginTarget) -> Result<(), String> {
+fn login(target: &LoginTarget) -> Result<(), String> {
     let browser = discover_chrome().ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
     let profile = create_private_profile_at(&std::env::temp_dir())
         .map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let child = match launch_chrome(&browser, &profile) {
-        Ok(child) => child,
-        Err(()) => {
-            let _ = fs::remove_dir_all(&profile);
-            return Err(BROWSER_LAUNCH_FAILED.to_owned());
-        }
+    let Ok(child) = launch_chrome(&browser, &profile) else {
+        let _ = fs::remove_dir_all(&profile);
+        return Err(BROWSER_LAUNCH_FAILED.to_owned());
     };
     let mut guard = ChromeGuard::new(child, profile, RealProfileCleaner);
     let input = guard
@@ -218,7 +215,7 @@ fn login(target: LoginTarget) -> Result<(), String> {
             kobo_net::bomtoon::validate_session_cookie(selected)
                 .map_err(|_| SESSION_VALIDATION_FAILED.to_owned())
         },
-        |selected| install_target(&target, selected),
+        |selected| install_target(target, selected),
     )
 }
 
@@ -610,9 +607,10 @@ fn browser_login_with<R: Read, W: Write>(
             Some(&session_id),
         )
         .map_err(|error| browser_cdp_error(error, BrowserFlowError::CookieSelection))?;
-    let cookies = parse_network_cookies(&cookies).map_err(|_| BrowserFlowError::CookieSelection)?;
+    let cookies =
+        parse_network_cookies(&cookies).map_err(|()| BrowserFlowError::CookieSelection)?;
     let selected =
-        select_session_cookie(&cookies).map_err(|_| BrowserFlowError::CookieSelection)?;
+        select_session_cookie(&cookies).map_err(|()| BrowserFlowError::CookieSelection)?;
     Ok((selected, browser_fingerprint))
 }
 
@@ -881,7 +879,7 @@ fn install_target(target: &LoginTarget, cookie: &str) -> Result<(), String> {
         LoginTarget::Device(host) => install_device(host, cookie),
         LoginTarget::Simulator => install_simulator(cookie),
     }
-    .map_err(|_| TARGET_INSTALLATION_FAILED.to_owned())
+    .map_err(|()| TARGET_INSTALLATION_FAILED.to_owned())
 }
 
 fn device_install_command(host: &str) -> Command {
@@ -991,12 +989,9 @@ fn run_device_install(mut command: Command, cookie: &[u8]) -> Result<(), ()> {
         .stderr(Stdio::null());
     let deadline = Instant::now() + DEVICE_INSTALL_TIMEOUT;
     let mut child = command.spawn().map_err(|_| ())?;
-    let mut input = match child.stdin.take() {
-        Some(input) => input,
-        None => {
-            super::terminate_remote_child(&mut child);
-            return Err(());
-        }
+    let Some(mut input) = child.stdin.take() else {
+        super::terminate_remote_child(&mut child);
+        return Err(());
     };
     let mut secret = cookie.to_vec();
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -1021,6 +1016,12 @@ enum InstallPoint {
     StateDetached,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionStatus {
+    Active,
+    Committed,
+}
+
 struct SimulatorTransaction {
     cookie: PathBuf,
     cookie_backup: PathBuf,
@@ -1030,7 +1031,7 @@ struct SimulatorTransaction {
     cookie_moved: bool,
     cookie_installed: bool,
     state_moved: bool,
-    committed: bool,
+    status: TransactionStatus,
 }
 
 impl SimulatorTransaction {
@@ -1048,7 +1049,7 @@ impl SimulatorTransaction {
             cookie_moved: false,
             cookie_installed: false,
             state_moved: false,
-            committed: false,
+            status: TransactionStatus::Active,
         }
     }
 
@@ -1107,10 +1108,13 @@ impl SimulatorTransaction {
 
 impl Drop for SimulatorTransaction {
     fn drop(&mut self) {
-        if self.committed {
-            let _ = self.cleanup_committed();
-        } else {
-            let _ = self.rollback();
+        match self.status {
+            TransactionStatus::Committed => {
+                let _ = self.cleanup_committed();
+            }
+            TransactionStatus::Active => {
+                let _ = self.rollback();
+            }
         }
     }
 }
@@ -1169,7 +1173,7 @@ fn install_simulator_at_with(
             Err(_) => Err(io::Error::other("simulator rollback failed")),
         };
     }
-    transaction.committed = true;
+    transaction.status = TransactionStatus::Committed;
     transaction.cleanup_committed()
 }
 
@@ -1471,7 +1475,7 @@ mod tests {
         let pauses = Cell::new(0);
         let mut pipe = DevToolsPipe::new(Cursor::new(incoming), Vec::new());
         let result = browser_login_with(&mut pipe, Instant::now() + Duration::from_secs(1), |_| {
-            pauses.set(pauses.get() + 1)
+            pauses.set(pauses.get() + 1);
         });
         assert_eq!(
             result,
@@ -1499,7 +1503,7 @@ mod tests {
             ),
             Err(BrowserFlowError::Launch)
         );
-        assert_eq!(pipe.writer.iter().filter(|byte| **byte == 0).count(), 3);
+        assert_eq!(pipe.writer.split(|byte| *byte == 0).count() - 1, 3);
 
         let oversized = vec![b'x'; MAX_CDP_FRAME_BYTES + 1];
         let mut pipe = DevToolsPipe::new(Cursor::new(oversized), Vec::new());
@@ -1592,7 +1596,7 @@ mod tests {
             assert!(committed < cookie_cleanup && committed < state_cleanup);
             Err(())
         });
-        let error = result.map_err(|_| TARGET_INSTALLATION_FAILED.to_owned());
+        let error = result.map_err(|()| TARGET_INSTALLATION_FAILED.to_owned());
         assert_eq!(error, Err(TARGET_INSTALLATION_FAILED.to_owned()));
         assert!(!error.expect_err("fixed error").contains(&cookie));
     }
