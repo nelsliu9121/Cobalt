@@ -5,12 +5,13 @@ Date: 2026-08-27
 
 ## Goal
 
-Let a Kobo Cobalt user sign in to bomtoon.tw through BOMTOON's real Chrome login page, transfer the resulting session to the Kobo over the existing SSH device connection, keep access tokens fresh inside the Cobalt runtime, and sign out from the Bomtoon app.
+Let a Kobo Cobalt user sign in to bomtoon.tw through BOMTOON's real Chrome login page, transfer the resulting session to Cobalt, keep access tokens fresh inside the runtime, and sign out from the Bomtoon app.
 
-The user runs one macOS command:
+The production command targets a Kobo over the existing SSH connection. Development and every acceptance check target the local simulators:
 
 ```sh
 kobo bomtoon login --device <Kobo IP>
+kobo bomtoon login --sim
 ```
 
 The command opens a temporary BOMTOON-only Chrome or Chromium profile where the user may choose email or any social login offered by BOMTOON. After transfer, the CLI closes Chrome and deletes the profile.
@@ -23,6 +24,7 @@ The first version supports:
 - Google Chrome and Chromium
 - one BOMTOON account per Kobo
 - the existing SSH `--device <IP>` connection
+- a local `--sim` target using the credential and state roots shared with `kobo-sim`
 - runtime-owned token bootstrap and refresh
 - in-app logout
 - the existing library, recent-reading, and episode-status workflows
@@ -59,15 +61,17 @@ The command:
 5. Waits for the user to complete BOMTOON's login flow.
 6. Calls `/api/auth/session` inside the browser and accepts the session only when it contains an authenticated user plus valid access and refresh token objects.
 7. Reads only the BOMTOON authentication session cookie needed by `/api/auth/session`.
-8. Installs `bomtoon-session` through the existing SSH secret path.
-9. Removes any previous runtime-managed BOMTOON token state in the same remote operation.
+8. Installs `bomtoon-session` in the selected device or simulator credential root.
+9. Removes any previous runtime-managed BOMTOON token state for that target in the same operation.
 10. Closes the browser process and deletes the temporary profile.
 
-The CLI never reads form fields. Passwords and social-provider credentials remain inside BOMTOON's browser flow. The cookie is sent to the remote shell over stdin, never through a process argument. The command does not create a plaintext cookie file or print secret values.
+The simulator target uses the exact credential and managed-state paths supplied to `kobo-sim`. One shared path function owns these locations so the CLI and both simulators cannot drift.
+
+The CLI never reads form fields. Passwords and social-provider credentials remain inside BOMTOON's browser flow. Device transfer sends the cookie to the remote shell over stdin; simulator transfer writes directly to the simulator credential root. Neither path creates a plaintext staging file, passes the cookie through a process argument, or prints secret values.
 
 Cookie selection accepts only `__Secure-next-auth.session-token` or `next-auth.session-token`, including their numeric chunk suffixes. A chunked family must start at `.0` and remain contiguous. The secure family wins if both base names exist. The assembled `Cookie` value must fit the runtime's 4096-byte secret ceiling and contain no control characters. Analytics, callback, CSRF, and advertising cookies are excluded.
 
-Before SSH transfer, the CLI repeats the bounded session check with only the assembled authentication cookie. Installation proceeds only if that request identifies the same authenticated session and valid token shape seen inside Chrome.
+Before credential transfer, the CLI repeats the bounded session check with only the assembled authentication cookie. Installation proceeds only if that request identifies the same authenticated session and valid token shape seen inside Chrome.
 
 A cleanup guard owns the Chrome process and temporary directory, and it runs after a normal exit, browser cancellation, or interruption. Timeout, SSH, and parse errors take the same cleanup path.
 
@@ -101,7 +105,7 @@ The state is a runtime-owned mode `0600` file under Cobalt's state directory. It
 
 The session cookie remains the named `bomtoon-session` secret installed by the CLI.
 
-The provider computes the session-cookie digest again on every resolve. A mismatch invalidates both the in-memory pair and the durable state before any bearer token is sent. This check covers account replacement while the runtime is already running; deleting the state file over SSH is not enough because a live provider may still hold the old pair in memory.
+The provider computes the session-cookie digest again on every resolve. A mismatch invalidates both the in-memory pair and the durable state before any bearer token is sent. This check covers account replacement while the runtime is already running; deleting the state file through the CLI target is not enough because a live provider may still hold the old pair in memory.
 
 ### Bomtoon app
 
@@ -159,11 +163,11 @@ Credentialed redirects are forbidden, and each response has a service-specific b
 
 ## Login Data Flow
 
-1. The user runs `kobo bomtoon login --device <IP>`.
+1. The user runs `kobo bomtoon login` with either `--device <IP>` or `--sim`.
 2. The CLI opens the temporary Chrome profile at BOMTOON's login page.
 3. The user completes the real BOMTOON login.
 4. The CLI validates the authenticated session and selects only the authentication session cookie.
-5. One SSH operation writes `bomtoon-session` with mode `0600` and removes the old managed token-state file.
+5. One target operation writes `bomtoon-session` with mode `0600` and removes the old managed token-state file.
 6. The CLI reports success without printing cookie or token values.
 7. The CLI closes Chrome and deletes the temporary profile.
 8. The user selects `Try again` in the app.
@@ -216,6 +220,7 @@ Local invalidation is complete before network I/O. A hang, cancellation, or proc
 | Remote logout fails | Already invalidated locally | Signed-out screen with revocation warning |
 | CLI browser closes before login | No device changes | Command reports cancellation |
 | SSH install fails | Existing device state remains | Command reports transfer failure |
+| Simulator install fails | Existing simulator state remains | Command reports local transfer failure |
 
 ## Security Requirements
 
@@ -227,7 +232,7 @@ Local invalidation is complete before network I/O. A hang, cancellation, or proc
 - Credentialed POST and PUT requests do not follow redirects.
 - Credential values and token-bearing response bodies stay out of protocol frames and app memory.
 - Secrets do not appear in logs, terminal output, process arguments, shell history, error strings, screenshots, simulator traces, or test snapshots.
-- The CLI transfers the cookie over stdin and writes it with mode `0600`.
+- Device login transfers the cookie over stdin; simulator login writes directly to its credential root. Both paths use mode `0600`.
 - The temporary Chrome profile uses mode `0700`, DevTools pipe transport, and unconditional cleanup.
 - Runtime token state uses mode `0600` and atomic replacement.
 - Runtime token state is bound to the digest of the session cookie that produced it. The provider rechecks that digest on every resolve.
@@ -235,18 +240,22 @@ Local invalidation is complete before network I/O. A hang, cancellation, or proc
 
 ## Testing and Verification
 
+All tests, trials, screenshots, and attended checks run against Cobalt's browser or runtime simulators. No verification step connects to a physical Kobo. Device SSH behavior is covered by command construction and fake-transport tests.
+
 ### CLI tests
 
-- parse `kobo bomtoon login --device <IP>`
-- reject unsupported flags and malformed device hosts
+- parse `kobo bomtoon login --device <IP>` and `kobo bomtoon login --sim`
+- reject unsupported flags, malformed device hosts, and multiple targets
 - find standard macOS Chrome and Chromium applications
 - identify an authenticated BOMTOON session
 - reject sessions without user, token, refresh token, or expiry fields
 - select only the allowed NextAuth session-cookie family
 - assemble contiguous cookie chunks and reject gaps, mixed families, controls, or an oversized value
-- validate the selected cookie by itself before SSH transfer
+- validate the selected cookie by itself before credential transfer
 - keep secret values out of process arguments, output, and errors
-- install the cookie and remove old state in one generated remote operation
+- install the cookie and remove old state in one target operation
+- install and invalidate state through the shared simulator roots
+- remove simulator credentials and managed state during test cleanup
 - close Chrome and remove the temporary profile on every exit path
 
 ### Network tests
@@ -297,14 +306,15 @@ cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-The attended end-to-end check must:
+The attended end-to-end simulator check must:
 
-1. Run the real CLI login on macOS.
+1. Run `kobo bomtoon login --sim` on macOS.
 2. Complete BOMTOON login in the temporary Chrome profile.
 3. Open the library in the browser simulator and runtime simulator.
-4. Force one token refresh and confirm the original library request completes once.
-5. Select in-app logout.
-6. Confirm the app returns to signed-out state and later library access remains unauthorized.
-7. Confirm the temporary Chrome profile is gone and no credential values were printed or logged.
+4. Select in-app logout.
+5. Confirm the app returns to signed-out state and later library access remains unauthorized.
+6. Confirm the temporary Chrome profile is gone and no credential values were printed or logged.
 
-No test fixture, screenshot, or captured trace may contain a real credential.
+Automated provider tests use an injected simulator clock and fake BOMTOON transport to move the access token inside the five-minute refresh window. They must prove token rotation and the single retry without changing a real account or waiting for expiry.
+
+No test or trial may connect to a physical Kobo. No fixture, screenshot, or captured trace may contain a real credential.
