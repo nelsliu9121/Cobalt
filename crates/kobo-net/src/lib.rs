@@ -24,6 +24,7 @@
 //! requests and Kobo-specific TLS roots stay visible, while Rustls uses its
 //! maintained ring provider instead of an experimental provider.
 
+pub mod bomtoon;
 pub mod gzip;
 pub mod pem;
 pub mod serve;
@@ -212,22 +213,14 @@ pub fn credential_allowed(
     url: &str,
 ) -> bool {
     if app == "bomtoon" {
-        if method != RequestMethod::Get {
-            return false;
-        }
-        return match (&*credential.secret, &credential.header) {
-            ("bomtoon-session", SecretHeader::Named(header)) => {
-                header.eq_ignore_ascii_case("cookie")
-                    && has_origin(url, "www.bomtoon.tw", 443)
-                    && (url == "https://www.bomtoon.tw/api/auth/session"
-                        || bomtoon_detail_url(url))
-            }
-            ("bomtoon-access-token", SecretHeader::Bearer) => {
-                has_origin(url, "www.bomtoon.tw", 443)
-                    && (bomtoon_library_url(url) || bomtoon_recent_url(url))
-            }
-            _ => false,
-        };
+        return matches!(
+            (&*credential.secret, &credential.header),
+            ("bomtoon-access-token", SecretHeader::Bearer)
+        ) && method == RequestMethod::Get
+            && has_origin(url, "www.bomtoon.tw", 443)
+            && (bomtoon_library_url(url)
+                || bomtoon_recent_url(url)
+                || bomtoon_content_url(url));
     }
     if app == "audiobook" {
         return match (&*credential.secret, &credential.header) {
@@ -275,8 +268,12 @@ pub fn credential_allowed(
     }
 }
 
-fn bomtoon_detail_url(url: &str) -> bool {
-    url.strip_prefix("https://www.bomtoon.tw/detail/")
+fn bomtoon_content_url(url: &str) -> bool {
+    const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
+    const SUFFIX: &str = "?isNotLoginAdult=false&isPorch=false";
+
+    url.strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
         .is_some_and(|alias| {
             !alias.is_empty()
                 && alias
@@ -687,6 +684,12 @@ enum Method<'a> {
         /// Further headers the request needs, none of them secret.
         headers: &'a [(&'a str, &'a str)],
     },
+    Put {
+        body: &'a [u8],
+        content_type: &'a str,
+        credential: Option<(&'a str, &'a str)>,
+        headers: &'a [(&'a str, &'a str)],
+    },
 }
 
 impl Method<'_> {
@@ -694,6 +697,7 @@ impl Method<'_> {
         match self {
             Self::Get { .. } => "GET",
             Self::Post { .. } => "POST",
+            Self::Put { .. } => "PUT",
         }
     }
 }
@@ -716,9 +720,8 @@ impl Method<'_> {
 ///
 /// # Errors
 ///
-/// The same distinctions [`fetch`] makes: [`TaskError::Unreachable`] for a
-/// host that cannot be reached, [`TaskError::TooLarge`] past the ceiling, and
-/// [`TaskError::NotFound`] for a refusal by the server.
+/// The same distinctions [`fetch`] makes, plus [`TaskError::Denied`] when a
+/// server tries to redirect a credentialed body.
 pub fn post(
     url: &str,
     body: &[u8],
@@ -727,46 +730,89 @@ pub fn post(
     headers: &[(&str, &str)],
     max_bytes: u32,
 ) -> Result<Vec<u8>, TaskError> {
-    // Header grammar is checked by the same maintained types used for URI
-    // syntax. This is the last gate before the socket, and both names and
-    // values may ultimately originate outside the runtime.
+    send_body_with(
+        url,
+        body,
+        content_type,
+        credential,
+        headers,
+        max_bytes,
+        BodyMethod::Post,
+        request,
+    )
+}
+
+/// Sends one PUT request and refuses every redirect.
+///
+/// Its arguments and error distinctions are the same as [`post`].
+pub fn put(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    credential: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    max_bytes: u32,
+) -> Result<Vec<u8>, TaskError> {
+    send_body_with(
+        url,
+        body,
+        content_type,
+        credential,
+        headers,
+        max_bytes,
+        BodyMethod::Put,
+        request,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum BodyMethod {
+    Post,
+    Put,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_body_with(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    credential: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    max_bytes: u32,
+    body_method: BodyMethod,
+    mut request_once: impl FnMut(&Address, &Method<'_>, u32) -> Result<Vec<u8>, TaskError>,
+) -> Result<Vec<u8>, TaskError> {
     let valid_header = |name: &str, value: &str| {
         name.parse::<http::HeaderName>().is_ok() && value.parse::<http::HeaderValue>().is_ok()
     };
-    if let Some((name, value)) = credential {
-        if !valid_header(name, value) {
-            return Err(TaskError::Denied);
-        }
-    }
-    if headers
-        .iter()
-        .any(|(name, value)| !valid_header(name, value))
+    if credential.is_some_and(|(name, value)| !valid_header(name, value))
+        || headers
+            .iter()
+            .any(|(name, value)| !valid_header(name, value))
+        || content_type.parse::<http::HeaderValue>().is_err()
     {
         return Err(TaskError::Denied);
     }
-    if content_type.parse::<http::HeaderValue>().is_err() {
-        return Err(TaskError::Denied);
-    }
     let address = parse(url)?;
-    let response = request(
-        &address,
-        &Method::Post {
+    let method = match body_method {
+        BodyMethod::Post => Method::Post {
             body,
             content_type,
             credential,
             headers,
         },
-        max_bytes,
-    )?;
+        BodyMethod::Put => Method::Put {
+            body,
+            content_type,
+            credential,
+            headers,
+        },
+    };
+    let response = request_once(&address, &method, max_bytes)?;
     match split_response(&response, max_bytes)? {
-        Response::Body(body) => {
-            if body.len() > max_bytes as usize {
-                Err(TaskError::TooLarge)
-            } else {
-                Ok(body.to_vec())
-            }
-        }
-        Response::Redirect(_) => Err(TaskError::NotFound),
+        Response::Body(body) if body.len() <= max_bytes as usize => Ok(body.to_vec()),
+        Response::Body(_) => Err(TaskError::TooLarge),
+        Response::Redirect(_) => Err(TaskError::Denied),
     }
 }
 
@@ -793,15 +839,15 @@ fn head(address: &Address, method: &Method<'_>, max_bytes: u32) -> String {
         Method::Get {
             offset: Some(_), ..
         } => "identity",
-        Method::Get { offset: None, .. } | Method::Post { .. } => "gzip",
+        Method::Get { offset: None, .. } | Method::Post { .. } | Method::Put { .. } => "gzip",
     };
-    // A POST hangs up after its answer; a GET does not. HTTP/1.1 is
+    // Body requests hang up after their answer; a GET does not. HTTP/1.1 is
     // persistent by default, so the difference is whether `close` is said at
     // all. Only a GET is ever replayed on a connection the far end had quietly
     // dropped, so only a GET is allowed to hold one open.
     let connection = match method {
         Method::Get { .. } => "keep-alive",
-        Method::Post { .. } => "close",
+        Method::Post { .. } | Method::Put { .. } => "close",
     };
     let mut head = format!(
         "{verb} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: {connection}\r\nAccept-Encoding: {encoding}\r\nUser-Agent: kobo-runtime\r\n"
@@ -832,6 +878,12 @@ fn head(address: &Address, method: &Method<'_>, max_bytes: u32) -> String {
             }
         }
         Method::Post {
+            body,
+            content_type,
+            credential,
+            headers,
+        }
+        | Method::Put {
             body,
             content_type,
             credential,
@@ -1133,7 +1185,7 @@ fn exchange(
     // own; the caller decides, knowing whether this socket was reused.
     tls.write_all(head(address, method, max_bytes).as_bytes())
         .map_err(|_| Failed::Stale)?;
-    if let Method::Post { body, .. } = method {
+    if let Method::Post { body, .. } | Method::Put { body, .. } = method {
         tls.write_all(body).map_err(|_| Failed::Stale)?;
     }
     tls.flush().map_err(|_| Failed::Stale)?;
@@ -1284,62 +1336,108 @@ mod tests {
     const CEILING: u32 = 64 * 1024;
 
     #[test]
-    fn bomtoon_credentials_are_bound_to_their_required_routes() {
+    fn bomtoon_session_is_denied_to_every_application_task() {
         use kobo_protocol::Credential;
 
-        let session = Credential::in_header("bomtoon-session", "Cookie");
+        for session in [
+            Credential::in_header("bomtoon-session", "Cookie"),
+            Credential::bearer("bomtoon-session"),
+        ] {
+            for method in [RequestMethod::Get, RequestMethod::Post] {
+                for url in [
+                    "https://www.bomtoon.tw/api/auth/session",
+                    "https://www.bomtoon.tw/detail/hunter_q",
+                    "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+                ] {
+                    assert!(!super::credential_allowed(
+                        "bomtoon", &session, method, url
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_next_data_and_detail_html_are_denied() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
         for url in [
             "https://www.bomtoon.tw/api/auth/session",
-            "https://www.bomtoon.tw/detail/365",
             "https://www.bomtoon.tw/detail/hunter_q",
+            "https://www.bomtoon.tw/_next/data/BUILD_ID/detail/hunter_q.json",
         ] {
-            assert!(super::credential_allowed(
+            assert!(!super::credential_allowed(
                 "bomtoon",
-                &session,
+                &access,
                 RequestMethod::Get,
                 url
             ));
         }
+    }
 
-        let access_token = Credential::bearer("bomtoon-access-token");
+    #[test]
+    fn content_json_requires_get_bearer_exact_alias_and_query() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let content = "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false";
         assert!(super::credential_allowed(
             "bomtoon",
-            &access_token,
+            &access,
             RequestMethod::Get,
-            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
+            content
         ));
-        assert!(super::credential_allowed(
-            "bomtoon",
-            &access_token,
-            RequestMethod::Get,
-            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
-        ));
-
+        for alias in ["365", "hunter_q", "title-Z"] {
+            assert!(super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                &format!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/{alias}?isNotLoginAdult=false&isPorch=false"
+                )
+            ));
+        }
         for url in [
-            "https://www.bomtoon.tw.attacker.invalid/detail/365",
-            "https://www.bomtoon.tw/detail/365/../../collect",
-            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=0&size=100&isIncludeAdult=true&contentsThumbnailType=SQUARE",
-            "https://attacker.invalid/collect",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/?isNotLoginAdult=false&isPorch=false",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter/q?isNotLoginAdult=false&isPorch=false",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isPorch=false&isNotLoginAdult=false",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false&extra=true",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false&isPorch=false",
+            "https://www.bomtoon.tw:444/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+            "https://attacker.invalid/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
         ] {
             assert!(!super::credential_allowed(
                 "bomtoon",
-                &session,
-                RequestMethod::Get,
-                url
-            ));
-            assert!(!super::credential_allowed(
-                "bomtoon",
-                &access_token,
+                &access,
                 RequestMethod::Get,
                 url
             ));
         }
         assert!(!super::credential_allowed(
             "bomtoon",
-            &access_token,
+            &access,
             RequestMethod::Post,
-            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
+            content
         ));
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &Credential::in_header("bomtoon-access-token", "Authorization"),
+            RequestMethod::Get,
+            content
+        ));
+        for url in [
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+        ] {
+            assert!(super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                url
+            ));
+        }
     }
 
     /// The policy is one function for both runtimes, so the tests that pin
@@ -1654,11 +1752,23 @@ mod tests {
             1024
         )
         .contains("Connection: close"));
+        let put = head(
+            &address,
+            &Method::Put {
+                body: b"{}",
+                content_type: "application/json",
+                credential: None,
+                headers: &[],
+            },
+            1024,
+        );
+        assert!(put.starts_with("PUT "));
+        assert!(put.contains("Connection: close"));
     }
 
     use super::{
-        fetch, get_with, head, message_end, parse, post, resolve_redirect, split_response,
-        stays_open, Address, Cow, Method, Response,
+        fetch, get_with, head, message_end, parse, post, resolve_redirect, send_body_with,
+        split_response, stays_open, Address, BodyMethod, Cow, Method, Response,
     };
     use kobo_protocol::TaskError;
 
@@ -1868,6 +1978,40 @@ mod tests {
 
             assert_eq!(result, Err(TaskError::Denied), "{location}");
             assert_eq!(attempted, vec![original], "{location}");
+        }
+    }
+
+    #[test]
+    fn credentialed_post_and_put_reject_redirects_without_a_second_request() {
+        let original = "https://a.test/session";
+        for body_method in [BodyMethod::Post, BodyMethod::Put] {
+            for location in ["next", "https://b.test/collect"] {
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                )
+                .into_bytes();
+                let mut attempted = Vec::new();
+                let result = send_body_with(
+                    original,
+                    br#"{"redacted":true}"#,
+                    "application/json",
+                    Some(("Authorization", "Bearer REDACTED")),
+                    &[("Cookie", "SESSION_REDACTED")],
+                    CEILING,
+                    body_method,
+                    |address, method, _| {
+                        attempted.push((
+                            method.verb(),
+                            format!("https://{}{}", address.authority, address.path),
+                        ));
+                        Ok(response.clone())
+                    },
+                );
+
+                assert_eq!(result, Err(TaskError::Denied), "{location}");
+                assert_eq!(attempted.len(), 1, "{location}");
+                assert_eq!(attempted[0].1, original, "{location}");
+            }
         }
     }
 

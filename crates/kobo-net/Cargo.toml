@@ -22,6 +22,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 kobo-protocol = { path = "../kobo-protocol" }
 kobo-policy = { path = "../kobo-policy" }
+kobo-json = { path = "../kobo-json" }
 
 [lints]
 workspace = true
