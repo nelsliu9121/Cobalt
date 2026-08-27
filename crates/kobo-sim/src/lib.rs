@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use kobo_policy::{shelf::Shelf, store::Store, DeviceServices, TaskRunner};
+use kobo_policy::{
+    shelf::Shelf, store::Store, DeviceServices, ManagedCredentials, TaskRunner,
+};
 use kobo_profile::{DeviceProfile, PanelPose, CLARA_BW_391};
 use kobo_protocol::{read_from, write_to, Frame, Lifecycle, Message};
 use kobo_ui::{
@@ -2060,10 +2063,56 @@ pub fn run_server_at(address: &str) -> io::Result<()> {
     Server::bind_address(address)?.serve()
 }
 
-/// Where the simulator looks for the named credentials an application asks
-/// for, mirroring the device directory without ever handing one to the
-/// application.
-const SIM_SECRETS: &str = "cobalt-sim-secrets";
+/// Durable locations used by simulator-managed authentication.
+///
+/// Public so simulator clients such as the CLI cannot drift to separate
+/// credential or provider-state directories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulatorAuthPaths {
+    pub secrets: PathBuf,
+    pub state: PathBuf,
+}
+
+/// Returns the simulator's shared authentication locations.
+#[must_use]
+pub fn simulator_auth_paths() -> SimulatorAuthPaths {
+    simulator_auth_paths_at(&std::env::temp_dir())
+}
+
+fn simulator_auth_paths_at(root: &Path) -> SimulatorAuthPaths {
+    SimulatorAuthPaths {
+        secrets: root.join("cobalt-sim-secrets"),
+        state: root.join("cobalt-sim-state"),
+    }
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn managed_credentials(
+    name: &str,
+    root: impl AsRef<Path>,
+) -> Option<Arc<ManagedCredentials>> {
+    if name != "bomtoon" {
+        return None;
+    }
+    let paths = simulator_auth_paths_at(root.as_ref());
+    Some(Arc::new(
+        ManagedCredentials::new(
+            &paths.secrets,
+            &paths.state,
+            Arc::new(epoch_millis),
+            Arc::new(kobo_net::bomtoon::Recipe::live()),
+        )
+        .expect("initialize BOMTOON managed credentials"),
+    ))
+}
 
 /// Set this to any value to make every network task fail.
 ///
@@ -2096,8 +2145,12 @@ fn simulated_tasks(name: &str) -> TaskRunner {
         );
         let _ = kobo_net::trust_owner_roots_from_dir(&directory);
     });
-    let runner = TaskRunner::simulated(std::env::temp_dir())
-        .with_secrets(std::env::temp_dir().join(SIM_SECRETS));
+    let root = std::env::temp_dir();
+    let paths = simulator_auth_paths();
+    let mut runner = TaskRunner::simulated(&root).with_secrets(paths.secrets);
+    if let Some(managed) = managed_credentials(name, root) {
+        runner = runner.with_managed_credentials(managed);
+    }
     if std::env::var_os(OFFLINE).is_some() {
         return runner;
     }
@@ -2716,6 +2769,20 @@ mod tests {
         });
         assert!(!denied, "the simulator denied a fetch on capability alone");
         online.shutdown();
+    }
+
+    #[test]
+    fn simulator_auth_paths_are_shared_and_stable() {
+        let root = private_temp_dir();
+        let paths = simulator_auth_paths_at(&root);
+        assert_eq!(paths.secrets, root.join("cobalt-sim-secrets"));
+        assert_eq!(paths.state, root.join("cobalt-sim-state"));
+    }
+
+    #[test]
+    fn only_bomtoon_receives_the_bomtoon_managed_provider() {
+        assert!(managed_credentials("bomtoon", private_temp_dir()).is_some());
+        assert!(managed_credentials("chat", private_temp_dir()).is_none());
     }
 
     fn private_temp_dir() -> PathBuf {

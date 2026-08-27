@@ -41,7 +41,9 @@ use kobo_hal::soc_watchdog::SocWatchdog;
 use kobo_hal::supervisor::Suspended;
 use kobo_hal::touch::TouchEvent;
 use kobo_hal::{Rect, RefreshIntent, RefreshPlan, RegionSnapshot};
-use kobo_policy::{Backends, Capability, Declared, DeviceServices, PowerPolicy, TaskRunner};
+use kobo_policy::{
+    Backends, Capability, Declared, DeviceServices, ManagedCredentials, PowerPolicy, TaskRunner,
+};
 use kobo_protocol::{Frame, Lifecycle, Message, TaskError, TaskOutcome};
 use kobo_ui::{
     render_all, ActionId, Chrome, FontHandle, FramePlanner, PanelWaveform, PictureCache, Screen,
@@ -56,7 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const COBALT_ROOT: &str = "/mnt/onboard/.adds/cobalt";
 /// Where named credentials live.
@@ -96,6 +98,29 @@ const MAX_APP_FONTS: usize = 16;
 
 /// Where each application's own keyed state lives, one directory per name.
 const STATE_ROOT: &str = "/mnt/onboard/.adds/cobalt/state";
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn managed_credentials(name: &str) -> Result<Option<Arc<ManagedCredentials>>, TaskError> {
+    if name != "bomtoon" {
+        return Ok(None);
+    }
+    ManagedCredentials::new(
+        SECRETS,
+        STATE_ROOT,
+        Arc::new(epoch_millis),
+        Arc::new(kobo_net::bomtoon::Recipe::live()),
+    )
+    .map(Arc::new)
+    .map(Some)
+}
 
 /// Where large application data lives.
 ///
@@ -2505,6 +2530,8 @@ fn start_application(
     } else {
         Declared::all()
     };
+    let managed = managed_credentials(&expected_name)
+        .map_err(|error| format!("initialize BOMTOON managed credentials: {error}"))?;
     let launch = AppLaunch::prepare(path, *next_id)?;
     let AppLaunch {
         listener,
@@ -2584,7 +2611,7 @@ fn start_application(
     }
     let waker = sender.clone();
     let credential_app = name.clone();
-    let tasks = TaskRunner::simulated(std::env::temp_dir())
+    let mut tasks = TaskRunner::simulated(std::env::temp_dir())
         .with_fetch(Arc::new(kobo_net::fetch_from))
         .with_post(Arc::new(kobo_net::post))
         .with_secrets(SECRETS)
@@ -2595,6 +2622,9 @@ fn start_application(
             let _ = waker.send(Event::TaskReady);
         }))
         .with_capabilities(declared.iter());
+    if let Some(managed) = managed {
+        tasks = tasks.with_managed_credentials(managed);
+    }
     let shelf_root = if name == "audiobook" {
         // `.mp3z` is the firmware's sideloaded-audiobook container. Keeping
         // this one privileged shelf in a visible directory means Nickel finds
