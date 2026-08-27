@@ -1314,11 +1314,11 @@ mod tests {
         assert_eq!(reason(&past_limit), Reason::TooDeep);
         // A value an application built by hand can be written out however
         // deep it is, because serialising does not recurse.
-        let mut deep = Value::Number(1.0);
+        let mut deep = Value::from(1_u32);
         for _ in 0..10_000 {
             deep = Value::Array(vec![deep]);
         }
-        assert_eq!(deep.to_json().len(), 20_001);
+        let written_len = deep.to_json().len();
         // Taking it apart again is done by hand because `Vec`'s drop glue is
         // recursive and is not this crate's to change: a value this deep can
         // only exist if an application built it, and the parser never will.
@@ -1326,6 +1326,9 @@ mod tests {
         while let Value::Array(mut items) = remaining {
             remaining = items.pop().unwrap_or(Value::Null);
         }
+        // Assert only after dismantling: an assertion failure must not ask
+        // recursive `Vec` drop glue to destroy the overdeep value.
+        assert_eq!(written_len, 20_001);
     }
 
     /// A response that arrives cut short (a dropped connection mid-body is the
