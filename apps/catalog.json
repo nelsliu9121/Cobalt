@@ -13,6 +13,17 @@
       "capabilities": ["network"]
     },
     {
+      "package": "kobo-bomtoon",
+      "id": "bomtoon",
+      "display_name": "BOMTOON",
+      "short_label": "BOMTOON",
+      "summary": "Check your BOMTOON library and episode purchase status on your Kobo.",
+      "version": "0.3.0",
+      "minimum_cobalt_version": "0.3.0",
+      "glyph": "book",
+      "capabilities": ["network"]
+    },
+    {
       "package": "kobo-audiobook",
       "id": "audiobook",
       "display_name": "Audiobook Studio",

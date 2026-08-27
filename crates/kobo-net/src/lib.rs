@@ -207,6 +207,21 @@ const AUDIOBOOK_VOICES: [&str; 6] = [
 /// hardware. That is the one thing this project is arranged to avoid.
 #[must_use]
 pub fn credential_allowed(app: &str, credential: &Credential, url: &str) -> bool {
+    if app == "bomtoon" {
+        return match (&*credential.secret, &credential.header) {
+            ("bomtoon-session", SecretHeader::Named(header)) => {
+                header.eq_ignore_ascii_case("cookie")
+                    && has_origin(url, "www.bomtoon.tw", 443)
+                    && (url == "https://www.bomtoon.tw/api/auth/session"
+                        || bomtoon_detail_url(url))
+            }
+            ("bomtoon-access-token", SecretHeader::Bearer) => {
+                has_origin(url, "www.bomtoon.tw", 443)
+                    && (bomtoon_library_url(url) || bomtoon_recent_url(url))
+            }
+            _ => false,
+        };
+    }
     if app == "audiobook" {
         return match (&*credential.secret, &credential.header) {
             ("exa", SecretHeader::Named(header)) => {
@@ -251,6 +266,38 @@ pub fn credential_allowed(app: &str, credential: &Credential, url: &str) -> bool
         }
         _ => false,
     }
+}
+
+fn bomtoon_detail_url(url: &str) -> bool {
+    url.strip_prefix("https://www.bomtoon.tw/detail/")
+        .is_some_and(|alias| {
+            !alias.is_empty()
+                && alias
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+fn bomtoon_library_url(url: &str) -> bool {
+    const PREFIX: &str =
+        "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=";
+    const SUFFIX: &str =
+        "&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
+
+    url.strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+        .is_some_and(|page| !page.is_empty() && page.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn bomtoon_recent_url(url: &str) -> bool {
+    const PREFIX: &str =
+        "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=";
+    const SUFFIX: &str =
+        "&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
+
+    url.strip_prefix(PREFIX)
+        .and_then(|rest| rest.strip_suffix(SUFFIX))
+        .is_some_and(|page| !page.is_empty() && page.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// What a server said, once the status line has been understood.
@@ -1183,6 +1230,42 @@ mod tests {
     /// A ceiling for tests that are about framing rather than size. Large
     /// enough that nothing in this module ever reaches it.
     const CEILING: u32 = 64 * 1024;
+
+    #[test]
+    fn bomtoon_credentials_are_bound_to_their_required_routes() {
+        use kobo_protocol::Credential;
+
+        let session = Credential::in_header("bomtoon-session", "Cookie");
+        for url in [
+            "https://www.bomtoon.tw/api/auth/session",
+            "https://www.bomtoon.tw/detail/365",
+            "https://www.bomtoon.tw/detail/hunter_q",
+        ] {
+            assert!(super::credential_allowed("bomtoon", &session, url));
+        }
+
+        let access_token = Credential::bearer("bomtoon-access-token");
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access_token,
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
+        ));
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access_token,
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
+        ));
+
+        for url in [
+            "https://www.bomtoon.tw.attacker.invalid/detail/365",
+            "https://www.bomtoon.tw/detail/365/../../collect",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=0&size=100&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://attacker.invalid/collect",
+        ] {
+            assert!(!super::credential_allowed("bomtoon", &session, url));
+            assert!(!super::credential_allowed("bomtoon", &access_token, url));
+        }
+    }
 
     /// The policy is one function for both runtimes, so the tests that pin
     /// it live beside it rather than in whichever runtime happened to own it

@@ -585,6 +585,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kobo-bomtoon"
+version = "0.3.0"
+dependencies = [
+ "kobo-json",
+ "kobo-sdk",
+]
+
+[[package]]
 name = "kobo-bookview"
 version = "0.3.0"
 dependencies = [
