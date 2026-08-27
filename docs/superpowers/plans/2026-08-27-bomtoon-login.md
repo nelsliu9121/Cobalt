@@ -19,7 +19,7 @@
 - Logout invalidates local credentials before remote network I/O. Remote failure leaves the account locally signed out.
 - Session tokens are `user.accessToken` and `user.refreshToken`; refresh tokens are `result.accessToken` and `result.refreshToken`. Their expiry fields are integer epoch milliseconds.
 - Content detail is bearer-only `GET /api/balcony-api-v2/contents/<alias>?isNotLoginAdult=false&isPorch=false`; its episodes are `data.episodes`, and `purchaseStatus` may be a string or `null`.
-- Credentialed POST and PUT requests never follow redirects.
+- Credentialed GET, POST, and PUT requests never follow redirects or forward credentials to a `Location`.
 - Secret values never enter app memory, protocol outcomes, logs, terminal output, process arguments, shell history, errors, screenshots, simulator traces, or snapshots.
 - Temporary Chrome profiles use mode `0700`; named credentials and managed state use mode `0600` with atomic replacement.
 - Unsafe Rust remains forbidden. Match rustfmt and the workspace's 100-column style.
@@ -29,12 +29,12 @@
 
 - Create `crates/kobo-policy/src/managed.rs`: generic managed token state, recipe interface, locking, expiry, atomic storage, cookie binding, and revocation ordering.
 - Modify `crates/kobo-policy/src/lib.rs`: export managed-credential types.
-- Modify `crates/kobo-policy/src/tasks.rs`: method-aware credential policy, managed resolution, one authentication retry, and revoke task execution.
+- Modify `crates/kobo-policy/src/tasks.rs`: method-aware credential policy, separate fetch credentials, managed resolution, one authentication retry, and revoke task execution.
 - Modify `crates/kobo-protocol/src/lib.rs`: revoke task and typed logout errors on the wire.
 - Modify `crates/kobo-sdk/src/lib.rs`: user-facing failure descriptions for the new task errors.
 - Modify `crates/kobod/src/app_link.rs`, `crates/kobod/src/app_store.rs`, `crates/kobod/src/device.rs`, and `crates/kobod/src/update.rs`: exhaustive mappings for the new task errors and device runtime provider wiring.
 - Create `crates/kobo-net/src/bomtoon.rs`: strict BOMTOON session, IP, refresh, and logout recipes.
-- Modify `crates/kobo-net/src/lib.rs`: PUT transport, method-aware allowlist, exact content URL validation, and broker export.
+- Modify `crates/kobo-net/src/lib.rs`: credential-separated GET transport, redirect refusal, PUT transport, method-aware allowlist, exact content URL validation, and broker export.
 - Modify `crates/kobo-net/Cargo.toml`: add path dependencies on `kobo-json` and `kobo-policy`.
 - Modify `crates/kobo-sim/src/lib.rs`: shared simulator auth paths and provider wiring.
 - Create `crates/kobo-cli/src/bomtoon.rs`: CLI parsing, Chrome discovery, CDP pipe, cookie selection, validation, target installation, and cleanup.
@@ -478,7 +478,7 @@ rtk git commit -m "feat(policy): manage runtime credentials"
 
 **Interfaces:**
 - Consumes: `Arc<ManagedCredentials>` and `Task::RevokeCredential` from Tasks 1 and 2.
-- Produces: method-aware `CredentialAuthorizer` and `TaskRunner::with_managed_credentials`.
+- Produces: method-aware `CredentialAuthorizer`, credential-separated `Fetcher`, and `TaskRunner::with_managed_credentials`.
 
 - [ ] **Step 1: Write failing runner tests**
 
@@ -487,6 +487,7 @@ Add these tests with a fake managed provider and fake fetch/post backends:
 Write separate tests named:
 
 - `credential_policy_receives_get_or_post_method`
+- `fetch_passes_the_runtime_credential_separately_from_app_headers`
 - `an_app_cannot_resolve_a_managed_credential_before_policy_allows_it`
 - `an_unauthorized_managed_fetch_renews_and_retries_once`
 - `a_second_unauthorized_result_is_returned_without_a_third_request`
@@ -521,6 +522,22 @@ pub type CredentialAuthorizer =
 
 Pass `RequestMethod::Get` for `Task::Fetch` and `RequestMethod::Post` for `Task::Post`. Policy authorization remains the first credential step, before managed or file-backed resolution.
 
+Keep application headers and runtime credentials distinct at the network boundary:
+
+```rust
+pub type Fetcher = dyn Fn(
+        &str,
+        u32,
+        u32,
+        Option<(&str, &str)>,
+        &[(&str, &str)],
+    ) -> Result<Vec<u8>, TaskError>
+    + Send
+    + Sync;
+```
+
+Never append a resolved credential to the application header vector.
+
 - [ ] **Step 4: Add provider wiring and managed-first resolution**
 
 Extend `TaskRunner` and `Backends` with `Option<Arc<ManagedCredentials>>`. Add:
@@ -543,7 +560,7 @@ struct ResolvedHeader {
 }
 ```
 
-After policy approval, call `managed.resolve(wanted)`. Use its result when it returns `Some`; otherwise use the current file-backed secret resolver unchanged.
+After policy approval, call `managed.resolve(wanted)`. Use its result when it returns `Some`; otherwise use the current file-backed secret resolver unchanged. Pass the resolved header through `Fetcher` or `Poster`'s separate credential argument. Application headers remain unchanged and non-secret.
 
 - [ ] **Step 5: Add one authentication retry**
 
@@ -634,6 +651,7 @@ Write separate tests named:
 - `partial_or_oversized_token_pairs_are_rejected`
 - `refresh_sends_cookie_ip_and_refresh_token_with_access_bearer`
 - `logout_sends_cookie_and_bearer_with_put_without_redirects`
+- `credentialed_get_rejects_relative_and_absolute_redirects_without_a_second_request`
 - `bomtoon_session_is_denied_to_every_application_task`
 - `authenticated_next_data_and_detail_html_are_denied`
 - `content_json_requires_get_bearer_exact_alias_and_query`
@@ -656,6 +674,7 @@ Extend the private HTTP method:
 enum Method<'a> {
     Get {
         offset: Option<u32>,
+        credential: Option<(&'a str, &'a str)>,
         headers: &'a [(&'a str, &'a str)],
     },
     Post {
@@ -673,7 +692,7 @@ enum Method<'a> {
 }
 ```
 
-`Method::verb` returns `PUT` for the new branch. Reuse one private body-sending function for POST and PUT; both issue one request and turn every redirect into `TaskError::NotFound`. Export `put` with the same parameters as `post`.
+`Method::verb` returns `PUT` for the new branch. Change `fetch_from` to accept the runtime credential separately from application headers. Uncredentialed GET retains bounded redirect behavior. A credentialed GET returns `TaskError::Denied` on the first relative or absolute redirect without issuing a request to the target. Reuse one private body-sending function for POST and PUT; both issue one request and reject every redirect with `TaskError::Denied`. Export `put` with the same parameters as `post`.
 
 - [ ] **Step 4: Add the broker contract**
 
@@ -692,6 +711,7 @@ pub trait Transport: Send + Sync {
     fn get(
         &self,
         url: &str,
+        credential: Option<(&str, &str)>,
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError>;
@@ -748,7 +768,7 @@ Logout produces exactly:
 {"refreshToken":"REFRESH_A"}
 ```
 
-`Recipe::binding_digest` delegates to `crate::sha256::hex_digest`. `bootstrap` uses the binding as its only credential. `refresh` fetches IP with the session cookie, then posts with both the session cookie and access bearer before parsing the rotated pair. `revoke` sends PUT with both credentials and accepts only a success response with a string `result` and object `data`. `validate_session_cookie` fetches the bounded session with only the supplied cookie, parses the same strict pair, returns SHA-256 over access token, one NUL byte, and refresh token, and drops the pair before returning.
+`Recipe::binding_digest` delegates to `crate::sha256::hex_digest`. `bootstrap` uses the binding as its only credential. `refresh` fetches IP with the session cookie, then posts with both the session cookie and access bearer before parsing the rotated pair. `revoke` sends PUT with both credentials and accepts only a success response with a string `result` and object `data`. `validate_session_cookie` fetches the bounded session with only the supplied cookie, parses the same strict pair, returns SHA-256 over access token, one NUL byte, and refresh token, and drops the pair before returning. Every broker GET supplies cookies through `Transport::get`'s credential argument; redirect tests prove the cookie or bearer never reaches a second request.
 
 - [ ] **Step 6: Tighten app credential policy**
 
@@ -892,7 +912,7 @@ Arc::new(
 )
 ```
 
-Attach it with `with_managed_credentials`. Other apps receive no managed provider. Update the policy closure to accept `(credential, method, url)`.
+Attach it with `with_managed_credentials`. Other apps receive no managed provider. Update the policy closure to accept `(credential, method, url)`. Update both `with_fetch` closures to forward the separate credential argument to `kobo_net::fetch_from`; never merge it into the application-header slice.
 
 On device, use existing `/mnt/onboard/.adds/cobalt/secrets` and add `/mnt/onboard/.adds/cobalt/state`. Return a startup error rather than panic if provider cleanup or initialization fails.
 

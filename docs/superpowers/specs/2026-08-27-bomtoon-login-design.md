@@ -159,7 +159,7 @@ Refresh follows BOMTOON's web client:
 
 Logout follows BOMTOON's web client. It sends a `PUT` to `/api/balcony-api/auth/logout` with the current session cookie, the access token as bearer authorization, and the refresh token in the bounded JSON body.
 
-Credentialed redirects are forbidden, and each response has a service-specific byte ceiling. Authentication bodies and headers are never logged.
+Credentialed GET, POST, and PUT requests reject every redirect before a second request, so no session cookie or bearer token reaches a `Location`. Uncredentialed GET redirect behavior remains unchanged. Each response has a service-specific byte ceiling. Authentication bodies and headers are never logged.
 
 ## Login Data Flow
 
