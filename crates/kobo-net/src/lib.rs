@@ -29,6 +29,7 @@ pub mod pem;
 pub mod serve;
 pub mod sha256;
 
+use kobo_policy::RequestMethod;
 use kobo_protocol::{Credential, SecretHeader, TaskError};
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -194,20 +195,26 @@ const AUDIOBOOK_VOICES: [&str; 6] = [
     "4VZIsMPtgggwNg7OXbPY", // James Gao, Chinese
 ];
 
-/// Whether a shipped application may attach one named secret to this URL.
+/// Whether a shipped application may attach one named secret to this request.
 ///
 /// The application selects a service, but the runtime independently binds the
-/// secret, header convention and HTTPS origin. A modified application can no
-/// longer turn a stored credential into a POST to an address it controls.
+/// secret, header convention, method and HTTPS origin. A modified application
+/// can no longer turn a stored credential into a request to an address it
+/// controls.
 ///
 /// It lives here, beside [`has_origin`], because both the device runtime and
-/// the simulator have to apply the same answer. They did not: the simulator
-/// installed no policy at all, so every credentialed request was refused off
-/// the device, and the two applications that need a key could only be run on
-/// hardware. That is the one thing this project is arranged to avoid.
+/// the simulator have to apply the same answer.
 #[must_use]
-pub fn credential_allowed(app: &str, credential: &Credential, url: &str) -> bool {
+pub fn credential_allowed(
+    app: &str,
+    credential: &Credential,
+    method: RequestMethod,
+    url: &str,
+) -> bool {
     if app == "bomtoon" {
+        if method != RequestMethod::Get {
+            return false;
+        }
         return match (&*credential.secret, &credential.header) {
             ("bomtoon-session", SecretHeader::Named(header)) => {
                 header.eq_ignore_ascii_case("cookie")
@@ -548,7 +555,7 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, TaskError> {
 /// past the ceiling is [`TaskError::TooLarge`], and a refusal by the server is
 /// [`TaskError::NotFound`].
 pub fn fetch(url: &str, max_bytes: u32) -> Result<Vec<u8>, TaskError> {
-    get(url, None, max_bytes, &[])
+    get(url, None, max_bytes, None, &[])
 }
 
 /// Fetches `url` starting `offset` bytes in, returning at most `max_bytes`.
@@ -567,11 +574,10 @@ pub fn fetch(url: &str, max_bytes: u32) -> Result<Vec<u8>, TaskError> {
 /// the ceiling then reports it as too large rather than handing back the
 /// beginning of the book labelled as the middle.
 ///
-/// `headers` are the non-secret headers the application asked for, already
-/// checked by the runtime against the ones it owns itself: an application
-/// cannot be one of these headers, because `offset` is the only thing
-/// permitted to become `Range`, so a `Fetch` could never ask for a piece
-/// other than the one the byte ceiling agreed to.
+/// `credential` is the runtime-resolved header and remains separate from
+/// `headers`, which are the non-secret headers requested by the application.
+/// A credentialed fetch refuses its first redirect so the credential can
+/// never be replayed to a server-selected target.
 ///
 /// # Errors
 ///
@@ -580,6 +586,7 @@ pub fn fetch_from(
     url: &str,
     offset: u32,
     max_bytes: u32,
+    credential: Option<(&str, &str)>,
     headers: &[(&str, &str)],
 ) -> Result<Vec<u8>, TaskError> {
     // The last gate before the socket, and the same one `post` applies to its
@@ -588,13 +595,14 @@ pub fn fetch_from(
     let valid_header = |name: &str, value: &str| {
         name.parse::<http::HeaderName>().is_ok() && value.parse::<http::HeaderValue>().is_ok()
     };
-    if headers
-        .iter()
-        .any(|(name, value)| !valid_header(name, value))
+    if credential.is_some_and(|(name, value)| !valid_header(name, value))
+        || headers
+            .iter()
+            .any(|(name, value)| !valid_header(name, value))
     {
         return Err(TaskError::Denied);
     }
-    get(url, Some(offset), max_bytes, headers)
+    get(url, Some(offset), max_bytes, credential, headers)
 }
 
 /// The one implementation behind [`fetch`] and [`fetch_from`].
@@ -602,12 +610,43 @@ fn get(
     url: &str,
     offset: Option<u32>,
     max_bytes: u32,
+    credential: Option<(&str, &str)>,
     headers: &[(&str, &str)],
+) -> Result<Vec<u8>, TaskError> {
+    get_with(
+        url,
+        offset,
+        max_bytes,
+        credential,
+        headers,
+        request,
+    )
+}
+
+fn get_with(
+    url: &str,
+    offset: Option<u32>,
+    max_bytes: u32,
+    credential: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    mut request_once: impl FnMut(
+        &Address,
+        &Method<'_>,
+        u32,
+    ) -> Result<Vec<u8>, TaskError>,
 ) -> Result<Vec<u8>, TaskError> {
     let mut target = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let address = parse(&target)?;
-        let response = request(&address, &Method::Get { offset, headers }, max_bytes)?;
+        let response = request_once(
+            &address,
+            &Method::Get {
+                offset,
+                credential,
+                headers,
+            },
+            max_bytes,
+        )?;
         match split_response(&response, max_bytes)? {
             Response::Body(body) => {
                 return if body.len() > max_bytes as usize {
@@ -616,7 +655,12 @@ fn get(
                     Ok(body.to_vec())
                 };
             }
-            Response::Redirect(location) => target = resolve_redirect(&address, &location)?,
+            Response::Redirect(location) => {
+                if credential.is_some() {
+                    return Err(TaskError::Denied);
+                }
+                target = resolve_redirect(&address, &location)?;
+            }
         }
     }
     Err(TaskError::Unreachable)
@@ -628,9 +672,11 @@ enum Method<'a> {
         /// Where to start reading, as a byte offset, or `None` to ask for the
         /// whole document with no range header at all.
         offset: Option<u32>,
+        /// The runtime-owned credential header, kept separate from application
+        /// headers so redirect policy can reason about its presence.
+        credential: Option<(&'a str, &'a str)>,
         /// Further headers the request needs, none of them secret and none of
-        /// them `Range`: that one is derived from `offset` alone, in [`head`],
-        /// so an application cannot widen or move the piece it was granted.
+        /// them `Range`: that one is derived from `offset` alone, in [`head`].
         headers: &'a [(&'a str, &'a str)],
     },
     Post {
@@ -761,7 +807,11 @@ fn head(address: &Address, method: &Method<'_>, max_bytes: u32) -> String {
         "{verb} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: {connection}\r\nAccept-Encoding: {encoding}\r\nUser-Agent: kobo-runtime\r\n"
     );
     match method {
-        Method::Get { offset, headers } => {
+        Method::Get {
+            offset,
+            credential,
+            headers,
+        } => {
             // Closed at both ends, because an open-ended range invites the
             // server to send the rest of a book that does not fit. Sent for
             // the first piece as well as later ones: a request for the opening
@@ -772,10 +822,11 @@ fn head(address: &Address, method: &Method<'_>, max_bytes: u32) -> String {
                 write!(head, "Range: bytes={start}-{last}\r\n")
                     .expect("writing to a String cannot fail");
             }
-            // Written after `Range`, and never able to replace it: `headers`
-            // here has already been through the same reserved-name gate
-            // `Post`'s headers pass through, so `Range` can never be one of
-            // these pairs in the first place.
+            if let Some((name, value)) = credential {
+                write!(head, "{name}: {value}\r\n").expect("writing to a String cannot fail");
+            }
+            // Written after runtime-owned headers, and never able to replace
+            // one: these pairs have already passed the reserved-name gate.
             for (name, value) in *headers {
                 write!(head, "{name}: {value}\r\n").expect("writing to a String cannot fail");
             }
@@ -1227,6 +1278,7 @@ fn stays_open(response: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use kobo_policy::RequestMethod;
     /// A ceiling for tests that are about framing rather than size. Large
     /// enough that nothing in this module ever reaches it.
     const CEILING: u32 = 64 * 1024;
@@ -1241,18 +1293,25 @@ mod tests {
             "https://www.bomtoon.tw/detail/365",
             "https://www.bomtoon.tw/detail/hunter_q",
         ] {
-            assert!(super::credential_allowed("bomtoon", &session, url));
+            assert!(super::credential_allowed(
+                "bomtoon",
+                &session,
+                RequestMethod::Get,
+                url
+            ));
         }
 
         let access_token = Credential::bearer("bomtoon-access-token");
         assert!(super::credential_allowed(
             "bomtoon",
             &access_token,
+            RequestMethod::Get,
             "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
         ));
         assert!(super::credential_allowed(
             "bomtoon",
             &access_token,
+            RequestMethod::Get,
             "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
         ));
 
@@ -1262,9 +1321,25 @@ mod tests {
             "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=0&size=100&isIncludeAdult=true&contentsThumbnailType=SQUARE",
             "https://attacker.invalid/collect",
         ] {
-            assert!(!super::credential_allowed("bomtoon", &session, url));
-            assert!(!super::credential_allowed("bomtoon", &access_token, url));
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &session,
+                RequestMethod::Get,
+                url
+            ));
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &access_token,
+                RequestMethod::Get,
+                url
+            ));
         }
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access_token,
+            RequestMethod::Post,
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE"
+        ));
     }
 
     /// The policy is one function for both runtimes, so the tests that pin
@@ -1278,6 +1353,7 @@ mod tests {
         assert!(super::credential_allowed(
             "chat",
             &openai,
+            RequestMethod::Get,
             "https://api.openai.com/v1/chat/completions"
         ));
         for (app, url) in [
@@ -1288,7 +1364,12 @@ mod tests {
             ),
             ("chat", "https://attacker.invalid/collect"),
         ] {
-            assert!(!super::credential_allowed(app, &openai, url));
+            assert!(!super::credential_allowed(
+                app,
+                &openai,
+                RequestMethod::Get,
+                url
+            ));
         }
     }
 
@@ -1315,11 +1396,22 @@ mod tests {
             )
         });
         for (credential, url) in requests.into_iter().chain(voices) {
-            assert!(super::credential_allowed("audiobook", &credential, &url));
-            assert!(!super::credential_allowed("chat", &credential, &url));
+            assert!(super::credential_allowed(
+                "audiobook",
+                &credential,
+                RequestMethod::Get,
+                &url
+            ));
+            assert!(!super::credential_allowed(
+                "chat",
+                &credential,
+                RequestMethod::Get,
+                &url
+            ));
             assert!(!super::credential_allowed(
                 "audiobook",
                 &credential,
+                RequestMethod::Get,
                 "https://attacker.invalid/collect"
             ));
         }
@@ -1331,7 +1423,12 @@ mod tests {
             "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=mp3_22050_32",
             "https://api.elevenlabs.io.attacker.invalid/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=mp3_44100_128",
         ] {
-            assert!(!super::credential_allowed("audiobook", &elevenlabs, url));
+            assert!(!super::credential_allowed(
+                "audiobook",
+                &elevenlabs,
+                RequestMethod::Get,
+                url
+            ));
         }
     }
 
@@ -1518,6 +1615,7 @@ mod tests {
             &address,
             &Method::Get {
                 offset: None,
+                credential: None,
                 headers: &[]
             },
             1024
@@ -1527,6 +1625,7 @@ mod tests {
             &address,
             &Method::Get {
                 offset: Some(1024),
+                credential: None,
                 headers: &[]
             },
             1024
@@ -1546,8 +1645,8 @@ mod tests {
     }
 
     use super::{
-        fetch, head, message_end, parse, post, resolve_redirect, split_response, stays_open,
-        Address, Cow, Method, Response,
+        fetch, get_with, head, message_end, parse, post, resolve_redirect, split_response,
+        stays_open, Address, Cow, Method, Response,
     };
     use kobo_protocol::TaskError;
 
@@ -1569,10 +1668,7 @@ mod tests {
         // device was a download that appeared to hang.
         let request = head(
             &book(),
-            &Method::Get {
-                offset: Some(0),
-                headers: &[],
-            },
+            &Method::Get { offset: Some(0), credential: None, headers: &[] },
             262_144,
         );
         assert!(
@@ -1585,10 +1681,7 @@ mod tests {
     fn a_later_piece_starts_where_the_last_one_ended() {
         let request = head(
             &book(),
-            &Method::Get {
-                offset: Some(262_144),
-                headers: &[],
-            },
+            &Method::Get { offset: Some(262_144), credential: None, headers: &[] },
             262_144,
         );
         assert!(
@@ -1603,10 +1696,7 @@ mod tests {
         // one is not shorter JSON, it is broken JSON.
         let request = head(
             &book(),
-            &Method::Get {
-                offset: None,
-                headers: &[],
-            },
+            &Method::Get { offset: None, credential: None, headers: &[] },
             262_144,
         );
         assert!(!request.contains("Range:"), "{request}");
@@ -1704,10 +1794,7 @@ mod tests {
         let address = parse("https://example.com:8443/path").expect("a URL");
         let request = head(
             &address,
-            &Method::Get {
-                offset: None,
-                headers: &[],
-            },
+            &Method::Get { offset: None, credential: None, headers: &[] },
             1024,
         );
         assert!(request.contains("Host: example.com:8443\r\n"), "{request}");
@@ -1744,6 +1831,59 @@ mod tests {
             Ok(Response::Redirect(
                 "https://elsewhere.test/book.epub".into()
             ))
+        );
+    }
+
+    #[test]
+    fn credentialed_get_rejects_relative_and_absolute_redirects_without_a_second_request() {
+        let original = "https://a.test/books/index.json";
+        for location in ["next.json", "https://b.test/collect"] {
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+                    .into_bytes();
+            let mut attempted = Vec::new();
+            let result = get_with(
+                original,
+                Some(0),
+                CEILING,
+                Some(("Authorization", "Bearer redacted-access")),
+                &[("Accept", "application/json")],
+                |address, _, _| {
+                    attempted.push(format!("https://{}{}", address.authority, address.path));
+                    Ok(response.clone())
+                },
+            );
+
+            assert_eq!(result, Err(TaskError::Denied), "{location}");
+            assert_eq!(attempted, vec![original], "{location}");
+        }
+    }
+
+    #[test]
+    fn an_uncredentialed_get_keeps_following_redirects() {
+        let original = "https://a.test/books/index.json";
+        let mut attempted = Vec::new();
+        let result = get_with(
+            original,
+            None,
+            CEILING,
+            None,
+            &[],
+            |address, _, _| {
+                attempted.push(format!("https://{}{}", address.authority, address.path));
+                if attempted.len() == 1 {
+                    Ok(b"HTTP/1.1 302 Found\r\nLocation: next.json\r\nContent-Length: 0\r\n\r\n"
+                        .to_vec())
+                } else {
+                    Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(b"ok".to_vec()));
+        assert_eq!(
+            attempted,
+            vec![original, "https://a.test/books/next.json"]
         );
     }
 
@@ -1844,10 +1984,7 @@ mod tests {
         let address = parse("https://feedsearch.dev/api/v1/search?url=nytimes.com").expect("a url");
         let request = head(
             &address,
-            &Method::Get {
-                offset: None,
-                headers: &[],
-            },
+            &Method::Get { offset: None, credential: None, headers: &[] },
             512 * 1024,
         );
         assert!(
@@ -1876,10 +2013,7 @@ mod tests {
         let address = parse("https://gutenberg.org/files/2701/2701-0.txt").expect("a url");
         let request = head(
             &address,
-            &Method::Get {
-                offset: Some(262_144),
-                headers: &[],
-            },
+            &Method::Get { offset: Some(262_144), credential: None, headers: &[] },
             262_144,
         );
         // A range names bytes the server sends. Compressed, those bytes are a

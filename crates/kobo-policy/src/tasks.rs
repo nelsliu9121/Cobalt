@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::Capability;
+use crate::{Capability, ManagedCredentials};
 
 /// The ceiling on tasks in flight for one application at once.
 ///
@@ -57,15 +57,29 @@ struct Running {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+/// The exact HTTP method a credential is authorized for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestMethod {
+    Get,
+    Post,
+}
+
 /// The host-provided network implementation a task's fetch runs through.
 ///
 /// It is a named type because the runtime, its builder and the worker all
 /// mention it, and spelling the whole signature in three places invites them
-/// to drift apart. The fourth argument is the non-secret headers the
-/// application asked for, already checked against the ones the runtime owns,
-/// the same guarantee `Poster` makes for `Post`.
-pub type Fetcher =
-    dyn Fn(&str, u32, u32, &[(&str, &str)]) -> Result<Vec<u8>, TaskError> + Send + Sync;
+/// to drift apart. The fourth argument is the resolved runtime credential,
+/// kept apart from the fifth argument containing the non-secret headers the
+/// application asked for.
+pub type Fetcher = dyn Fn(
+        &str,
+        u32,
+        u32,
+        Option<(&str, &str)>,
+        &[(&str, &str)],
+    ) -> Result<Vec<u8>, TaskError>
+    + Send
+    + Sync;
 
 /// The host-provided implementation a `Post` task runs through.
 ///
@@ -78,11 +92,12 @@ pub type Poster = dyn Fn(&str, &[u8], &str, Option<(&str, &str)>, &[(&str, &str)
     + Send
     + Sync;
 
-/// Decides whether one named credential may be sent to one URL.
+/// Decides whether one named credential may be sent with one method to one URL.
 ///
 /// Secret files alone are not authority: without this second decision an
 /// application could name a real key and an attacker-controlled destination.
-pub type CredentialAuthorizer = dyn Fn(&Credential, &str) -> bool + Send + Sync;
+pub type CredentialAuthorizer =
+    dyn Fn(&Credential, RequestMethod, &str) -> bool + Send + Sync;
 
 /// Headers an application may not set, because the runtime decides them.
 ///
@@ -107,31 +122,40 @@ pub fn header_is_the_applications_to_set(name: &str) -> bool {
     !RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// Checks a task's headers against the ones the runtime owns and, if none of
-/// them are reserved, hands back the pairs a network backend can use.
-///
-/// Shared by `Fetch` and `Post` rather than duplicated, because the two
-/// checks have to keep agreeing: `Range` is reserved for exactly the reason
-/// `Authorization` is, and a fork here is how one of them would quietly stop
-/// enforcing it.
+/// A credential resolved for one request without exposing its source.
+struct ResolvedHeader {
+    name: String,
+    value: String,
+    managed: bool,
+}
+
 /// Turns a named credential into the header it will be sent as.
 ///
-/// The one place that has both the naming convention and the value, so nothing
-/// downstream has to know that Bearer is spelled differently from an API key
-/// or that Basic is encoded at all. Shared by fetch and post: a catalogue
-/// behind a subscription is reached with a GET, and a credential that only
-/// worked on a POST would mean recognising a gated feed and never opening it.
+/// The policy check deliberately precedes both resolution mechanisms. A
+/// provider must never learn which managed credential an application is
+/// probing until the exact method and destination have been authorized.
 fn resolved_credential(
-    wanted: Option<&kobo_protocol::Credential>,
+    wanted: Option<&Credential>,
+    method: RequestMethod,
     url: &str,
     credentials: Option<&CredentialAuthorizer>,
+    managed: Option<&ManagedCredentials>,
     secrets: Option<&Path>,
-) -> Result<Option<(String, String)>, TaskError> {
+) -> Result<Option<ResolvedHeader>, TaskError> {
     let Some(wanted) = wanted else {
         return Ok(None);
     };
-    if credentials.is_none_or(|allows| !allows(wanted, url)) {
+    if credentials.is_none_or(|allows| !allows(wanted, method, url)) {
         return Err(TaskError::Denied);
+    }
+    if let Some(provider) = managed {
+        if let Some(resolved) = provider.resolve(wanted)? {
+            return Ok(Some(ResolvedHeader {
+                name: resolved.header_name,
+                value: resolved.header_value,
+                managed: true,
+            }));
+        }
     }
     // Not `Denied`. The application asked for a key it is allowed to ask for,
     // by the name the runtime publishes, and the check above already said so.
@@ -140,9 +164,9 @@ fn resolved_credential(
     let Some(value) = secret(secrets, &wanted.secret) else {
         return Err(TaskError::NoCredential);
     };
-    Ok(Some((
-        wanted.header_name().to_owned(),
-        match wanted.header {
+    Ok(Some(ResolvedHeader {
+        name: wanted.header_name().to_owned(),
+        value: match wanted.header {
             SecretHeader::Bearer => format!("Bearer {value}"),
             SecretHeader::Named(_) => value,
             // Encoded here rather than by the application, which is the whole
@@ -150,8 +174,38 @@ fn resolved_credential(
             // address or the password that make up the pair.
             SecretHeader::Basic => format!("Basic {}", base64(value.as_bytes())),
         },
-    )))
+        managed: false,
+    }))
 }
+
+/// Forces a provider-managed credential to rotate, then resolves the new
+/// header so an authentication retry cannot reuse the rejected value.
+fn renew_managed_credential(
+    wanted: &Credential,
+    managed: Option<&ManagedCredentials>,
+) -> Result<ResolvedHeader, TaskError> {
+    let Some(provider) = managed else {
+        return Err(TaskError::Denied);
+    };
+    if !provider.force_renew(wanted)? {
+        return Err(TaskError::Denied);
+    }
+    let Some(resolved) = provider.resolve(wanted)? else {
+        return Err(TaskError::Denied);
+    };
+    Ok(ResolvedHeader {
+        name: resolved.header_name,
+        value: resolved.header_value,
+        managed: true,
+    })
+}
+/// Checks a task's headers against the ones the runtime owns and, if none of
+/// them are reserved, hands back the pairs a network backend can use.
+///
+/// Shared by `Fetch` and `Post` rather than duplicated, because the two
+/// checks have to keep agreeing: `Range` is reserved for exactly the reason
+/// `Authorization` is, and a fork here is how one of them would quietly stop
+/// enforcing it.
 
 fn own_headers(headers: &[kobo_protocol::Header]) -> Result<Vec<(&str, &str)>, TaskError> {
     if headers
@@ -194,6 +248,8 @@ pub struct TaskRunner {
     secrets: Option<PathBuf>,
     /// Which secret and destination pairs this application is trusted to use.
     credentials: Option<Arc<CredentialAuthorizer>>,
+    /// Provider-backed credentials registered with this runtime.
+    managed: Option<Arc<ManagedCredentials>>,
     /// Called once, from the task's own thread, the moment a result is ready.
     ///
     /// A runtime that only looks for results when something else happens keeps
@@ -217,6 +273,7 @@ impl std::fmt::Debug for TaskRunner {
             .field("posts", &self.post.is_some())
             .field("secrets", &self.secrets.is_some())
             .field("credential_policy", &self.credentials.is_some())
+            .field("managed_credentials", &self.managed.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -240,6 +297,7 @@ impl TaskRunner {
             post: None,
             secrets: None,
             credentials: None,
+            managed: None,
             wake: None,
         }
     }
@@ -283,6 +341,13 @@ impl TaskRunner {
     #[must_use]
     pub fn with_credential_policy(mut self, policy: Arc<CredentialAuthorizer>) -> Self {
         self.credentials = Some(policy);
+        self
+    }
+
+    /// Supplies the provider used for registered managed credentials.
+    #[must_use]
+    pub fn with_managed_credentials(mut self, managed: Arc<ManagedCredentials>) -> Self {
+        self.managed = Some(managed);
         self
     }
 
@@ -349,6 +414,7 @@ impl TaskRunner {
         let post = self.post.clone();
         let secrets = self.secrets.clone();
         let credentials = self.credentials.clone();
+        let managed = self.managed.clone();
         let flag = Arc::clone(&cancel);
         let wake = self.wake.clone();
         let handle = thread::Builder::new()
@@ -362,6 +428,7 @@ impl TaskRunner {
                         post: post.as_deref(),
                         secrets: secrets.as_deref(),
                         credentials: credentials.as_deref(),
+                        managed: managed.as_deref(),
                     },
                     &flag,
                 );
@@ -458,6 +525,7 @@ struct Backends<'a> {
     post: Option<&'a Poster>,
     secrets: Option<&'a Path>,
     credentials: Option<&'a CredentialAuthorizer>,
+    managed: Option<&'a ManagedCredentials>,
 }
 
 /// Reads a named secret.
@@ -500,9 +568,17 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
         post,
         secrets,
         credentials,
+        managed,
     } = backends;
     match work {
-        Task::RevokeCredential { .. } => TaskOutcome::Failed(TaskError::Denied),
+        Task::RevokeCredential { credential } => match managed {
+            Some(provider) => match provider.revoke(credential) {
+                Ok(true) => TaskOutcome::Completed(Vec::new()),
+                Ok(false) => TaskOutcome::Failed(TaskError::Denied),
+                Err(error) => TaskOutcome::Failed(error),
+            },
+            None => TaskOutcome::Failed(TaskError::Denied),
+        },
         Task::Sleep { seconds } => {
             // Polled in short slices rather than slept in one call, so a
             // cancelled five minute sleep stops now instead of in five minutes.
@@ -543,36 +619,60 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             max_bytes,
             credential: wanted,
             headers,
-        } => match fetch {
-            None => TaskOutcome::Failed(TaskError::Denied),
-            // The same gate `Post` applies to its headers, and for `Fetch` it
-            // is load-bearing rather than tidy: `Range` is how `offset` is
-            // turned into the piece of the document actually asked for, and
-            // an application that could set `Range` itself could read past
-            // the piece the byte ceiling allowed.
-            Some(fetch) => {
-                let extra = match own_headers(headers) {
-                    Ok(extra) => extra,
+        } => {
+            let Some(fetch) = fetch else {
+                return TaskOutcome::Failed(TaskError::Denied);
+            };
+            let extra = match own_headers(headers) {
+                Ok(extra) => extra,
+                Err(error) => return TaskOutcome::Failed(error),
+            };
+            let credential = match resolved_credential(
+                wanted.as_ref(),
+                RequestMethod::Get,
+                url,
+                credentials,
+                managed,
+                secrets,
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return TaskOutcome::Failed(error),
+            };
+            let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+            let first = fetch(
+                url,
+                *offset,
+                ceiling,
+                credential
+                    .as_ref()
+                    .map(|header| (header.name.as_str(), header.value.as_str())),
+                &extra,
+            );
+            let result = if matches!(&first, Err(TaskError::Unauthorized))
+                && credential.as_ref().is_some_and(|header| header.managed)
+            {
+                let Some(wanted) = wanted.as_ref() else {
+                    return TaskOutcome::Failed(TaskError::Denied);
+                };
+                let renewed = match renew_managed_credential(wanted, managed) {
+                    Ok(renewed) => renewed,
                     Err(error) => return TaskOutcome::Failed(error),
                 };
-                // Appended after the gate above rather than before it: the
-                // credential is the runtime's own header, and an application
-                // is refused for setting one by hand.
-                let credential =
-                    match resolved_credential(wanted.as_ref(), url, credentials, secrets) {
-                        Ok(credential) => credential,
-                        Err(error) => return TaskOutcome::Failed(error),
-                    };
-                let mut extra = extra;
-                if let Some((name, value)) = &credential {
-                    extra.push((name.as_str(), value.as_str()));
-                }
-                match fetch(url, *offset, (*max_bytes).min(MAX_TASK_BYTES_U32), &extra) {
-                    Ok(bytes) => TaskOutcome::Completed(bytes),
-                    Err(error) => TaskOutcome::Failed(error),
-                }
+                fetch(
+                    url,
+                    *offset,
+                    ceiling,
+                    Some((renewed.name.as_str(), renewed.value.as_str())),
+                    &extra,
+                )
+            } else {
+                first
+            };
+            match result {
+                Ok(bytes) => TaskOutcome::Completed(bytes),
+                Err(error) => TaskOutcome::Failed(error),
             }
-        },
+        }
         Task::Post {
             url,
             body,
@@ -584,32 +684,54 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             let Some(post) = post else {
                 return TaskOutcome::Failed(TaskError::Denied);
             };
-            // Refused rather than quietly dropped. A request that loses a
-            // header the runtime happens to own would fail at the far end with
-            // an error the author cannot connect to anything they wrote.
             let extra = match own_headers(headers) {
                 Ok(extra) => extra,
                 Err(error) => return TaskOutcome::Failed(error),
             };
-            // A task that names a credential the runtime does not hold is
-            // refused rather than sent without one. Sending it anyway would
-            // reach the server as an unauthenticated request, and the
-            // application would report whatever the server said about that
-            // instead of the real problem.
-            let credential = match resolved_credential(wanted.as_ref(), url, credentials, secrets) {
+            let credential = match resolved_credential(
+                wanted.as_ref(),
+                RequestMethod::Post,
+                url,
+                credentials,
+                managed,
+                secrets,
+            ) {
                 Ok(credential) => credential,
                 Err(error) => return TaskOutcome::Failed(error),
             };
-            match post(
+            let ceiling = (*max_bytes).min(MAX_TASK_BYTES_U32);
+            let first = post(
                 url,
                 body.as_bytes(),
                 content_type,
                 credential
                     .as_ref()
-                    .map(|(name, value)| (name.as_str(), value.as_str())),
+                    .map(|header| (header.name.as_str(), header.value.as_str())),
                 &extra,
-                (*max_bytes).min(MAX_TASK_BYTES_U32),
-            ) {
+                ceiling,
+            );
+            let result = if matches!(&first, Err(TaskError::Unauthorized))
+                && credential.as_ref().is_some_and(|header| header.managed)
+            {
+                let Some(wanted) = wanted.as_ref() else {
+                    return TaskOutcome::Failed(TaskError::Denied);
+                };
+                let renewed = match renew_managed_credential(wanted, managed) {
+                    Ok(renewed) => renewed,
+                    Err(error) => return TaskOutcome::Failed(error),
+                };
+                post(
+                    url,
+                    body.as_bytes(),
+                    content_type,
+                    Some((renewed.name.as_str(), renewed.value.as_str())),
+                    &extra,
+                    ceiling,
+                )
+            } else {
+                first
+            };
+            match result {
                 Ok(bytes) => TaskOutcome::Completed(bytes),
                 Err(error) => TaskOutcome::Failed(error),
             }
@@ -673,8 +795,10 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ManagedCredentialRecipe, ManagedTokenPair};
     use kobo_protocol::{Credential, Header};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     fn temp_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("kobo-tasks-{name}-{}", std::process::id()));
@@ -908,7 +1032,7 @@ mod tests {
     fn a_granted_fetch_reaches_the_backend() {
         let mut runner = TaskRunner::simulated(temp_root("fetch"))
             .with_capabilities([Capability::Network])
-            .with_fetch(Arc::new(|url: &str, _, _, _| Ok(url.as_bytes().to_vec())));
+            .with_fetch(Arc::new(|url: &str, _, _, _, _| Ok(url.as_bytes().to_vec())));
         runner
             .submit(
                 TaskId(1),
@@ -932,7 +1056,7 @@ mod tests {
     fn a_fetch_header_reaches_the_backend_the_application_asked_for_it_by() {
         let mut runner = TaskRunner::simulated(temp_root("fetch-headers"))
             .with_capabilities([Capability::Network])
-            .with_fetch(Arc::new(|_, _, _, headers: &[(&str, &str)]| {
+            .with_fetch(Arc::new(|_, _, _, _, headers: &[(&str, &str)]| {
                 Ok(headers
                     .iter()
                     .map(|(name, value)| format!("{name}: {value}"))
@@ -967,7 +1091,7 @@ mod tests {
         // outright rather than sent with two.
         let mut runner = TaskRunner::simulated(temp_root("fetch-range"))
             .with_capabilities([Capability::Network])
-            .with_fetch(Arc::new(|_, _, _, _| Ok(b"should not run".to_vec())));
+            .with_fetch(Arc::new(|_, _, _, _, _| Ok(b"should not run".to_vec())));
         runner
             .submit(
                 TaskId(1),
@@ -1043,7 +1167,7 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("nosecret"))
             .with_capabilities([Capability::Network])
             .with_secrets(temp_root("nosecret-empty"))
-            .with_credential_policy(Arc::new(|_, _| true))
+            .with_credential_policy(Arc::new(|_, _, _| true))
             .with_post(Arc::new(move |_, _, _, _, _, _| {
                 observed.store(true, Ordering::SeqCst);
                 Ok(Vec::new())
@@ -1080,8 +1204,10 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("resolved-root"))
             .with_capabilities([Capability::Network])
             .with_secrets(directory)
-            .with_credential_policy(Arc::new(|credential, url| {
-                credential.secret == "openai" && url == "https://example.invalid/"
+            .with_credential_policy(Arc::new(|credential, method, url| {
+                credential.secret == "openai"
+                    && method == RequestMethod::Post
+                    && url == "https://example.invalid/"
             }))
             .with_post(Arc::new(|_, _, _, credential, _, _| {
                 assert_eq!(credential, Some(("Authorization", "Bearer not-a-real-key")));
@@ -1117,8 +1243,10 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("wrong-destination-root"))
             .with_capabilities([Capability::Network])
             .with_secrets(directory)
-            .with_credential_policy(Arc::new(|credential, url| {
-                credential.secret == "openai" && url == "https://api.openai.com/v1/chat/completions"
+            .with_credential_policy(Arc::new(|credential, method, url| {
+                credential.secret == "openai"
+                    && method == RequestMethod::Post
+                    && url == "https://api.openai.com/v1/chat/completions"
             }))
             .with_post(Arc::new(move |_, _, _, _, _, _| {
                 observed.store(true, Ordering::SeqCst);
@@ -1167,6 +1295,373 @@ mod tests {
             TaskOutcome::Failed(TaskError::Denied)
         );
     }
+    #[derive(Default)]
+    struct FakeManagedRecipe {
+        bootstraps: AtomicUsize,
+        refreshes: AtomicUsize,
+        revokes: AtomicUsize,
+    }
+
+    impl ManagedCredentialRecipe for FakeManagedRecipe {
+        fn credential_name(&self) -> &'static str {
+            "managed-token"
+        }
+
+        fn binding_secret_name(&self) -> &'static str {
+            "managed-cookie"
+        }
+
+        fn binding_digest(&self, _secret: &str) -> String {
+            "redacted-binding-digest".to_owned()
+        }
+
+        fn bootstrap(&self, _binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
+            let call = self.bootstraps.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(managed_pair(&format!("redacted-access-{call}")))
+        }
+
+        fn refresh(
+            &self,
+            _binding_secret: &str,
+            _pair: &ManagedTokenPair,
+        ) -> Result<ManagedTokenPair, TaskError> {
+            let call = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(managed_pair(&format!("redacted-renewed-{call}")))
+        }
+
+        fn revoke(
+            &self,
+            _binding_secret: &str,
+            _pair: &ManagedTokenPair,
+        ) -> Result<(), TaskError> {
+            self.revokes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn managed_pair(access_token: &str) -> ManagedTokenPair {
+        ManagedTokenPair {
+            access_token: access_token.to_owned(),
+            access_expires_at_ms: 10_000_000,
+            refresh_token: "redacted-refresh".to_owned(),
+            refresh_expires_at_ms: 20_000_000,
+        }
+    }
+
+    fn managed_provider(name: &str) -> (Arc<ManagedCredentials>, Arc<FakeManagedRecipe>) {
+        let root = temp_root(&format!("managed-{name}"));
+        let secrets = root.join("secrets");
+        let state = root.join("state");
+        std::fs::create_dir_all(&secrets).expect("create managed secrets");
+        std::fs::create_dir_all(&state).expect("create managed state");
+        std::fs::write(secrets.join("managed-cookie"), "redacted-cookie")
+            .expect("write managed binding");
+        let recipe = Arc::new(FakeManagedRecipe::default());
+        let managed = ManagedCredentials::new(
+            secrets,
+            state,
+            Arc::new(|| 0),
+            recipe.clone(),
+        )
+        .expect("construct managed provider");
+        (Arc::new(managed), recipe)
+    }
+
+    fn managed_fetch(url: &str) -> Task {
+        Task::Fetch {
+            url: url.to_owned(),
+            offset: 0,
+            max_bytes: 1024,
+            credential: Some(Credential::bearer("managed-token")),
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn credential_policy_receives_get_or_post_method() {
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&methods);
+        let mut runner = TaskRunner::simulated(temp_root("credential-method"))
+            .with_capabilities([Capability::Network])
+            .with_secrets(secret_dir("credential-method"))
+            .with_credential_policy(Arc::new(move |_, method, url| {
+                observed
+                    .lock()
+                    .expect("method observations")
+                    .push((method, url.to_owned()));
+                true
+            }))
+            .with_fetch(Arc::new(|_, _, _, _, _| Ok(Vec::new())))
+            .with_post(Arc::new(|_, _, _, _, _, _| Ok(Vec::new())));
+
+        runner
+            .submit(
+                TaskId(1),
+                Task::Fetch {
+                    url: "https://example.test/catalog".to_owned(),
+                    offset: 0,
+                    max_bytes: 1024,
+                    credential: Some(Credential::bearer("openai")),
+                    headers: Vec::new(),
+                },
+            )
+            .expect("submit GET");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(Vec::new())
+        );
+        runner
+            .submit(
+                TaskId(2),
+                Task::Post {
+                    url: "https://example.test/action".to_owned(),
+                    body: "{}".to_owned(),
+                    content_type: "application/json".to_owned(),
+                    credential: Some(Credential::bearer("openai")),
+                    headers: Vec::new(),
+                    max_bytes: 1024,
+                },
+            )
+            .expect("submit POST");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(Vec::new())
+        );
+        assert_eq!(
+            *methods.lock().expect("method observations"),
+            vec![
+                (
+                    RequestMethod::Get,
+                    "https://example.test/catalog".to_owned()
+                ),
+                (
+                    RequestMethod::Post,
+                    "https://example.test/action".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_passes_the_runtime_credential_separately_from_app_headers() {
+        type ObservedRequest = (Option<(String, String)>, Vec<(String, String)>);
+        let request = Arc::new(Mutex::new(None::<ObservedRequest>));
+        let observed = Arc::clone(&request);
+        let mut runner = TaskRunner::simulated(temp_root("separate-fetch-credential"))
+            .with_capabilities([Capability::Network])
+            .with_secrets(secret_dir("separate-fetch-credential"))
+            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Get))
+            .with_fetch(Arc::new(move |_, _, _, credential, headers| {
+                *observed.lock().expect("fetch observation") = Some((
+                    credential.map(|(name, value)| (name.to_owned(), value.to_owned())),
+                    headers
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect(),
+                ));
+                Ok(Vec::new())
+            }));
+        runner
+            .submit(
+                TaskId(1),
+                Task::Fetch {
+                    url: "https://example.test/catalog".to_owned(),
+                    offset: 0,
+                    max_bytes: 1024,
+                    credential: Some(Credential::bearer("openai")),
+                    headers: vec![Header::new("Accept", "application/json")],
+                },
+            )
+            .expect("submit fetch");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(Vec::new())
+        );
+        assert_eq!(
+            *request.lock().expect("fetch observation"),
+            Some((
+                Some((
+                    "Authorization".to_owned(),
+                    "Bearer not-a-real-key".to_owned()
+                )),
+                vec![("Accept".to_owned(), "application/json".to_owned())],
+            ))
+        );
+    }
+
+    #[test]
+    fn an_app_cannot_resolve_a_managed_credential_before_policy_allows_it() {
+        let (managed, recipe) = managed_provider("policy-before-resolution");
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let mut runner = TaskRunner::simulated(temp_root("policy-before-resolution-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, _, _| false))
+            .with_fetch(Arc::new(move |_, _, _, _, _| {
+                observed.store(true, Ordering::SeqCst);
+                Ok(Vec::new())
+            }));
+        runner
+            .submit(
+                TaskId(1),
+                managed_fetch("https://example.test/catalog"),
+            )
+            .expect("submit denied managed fetch");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+        assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 0);
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_unauthorized_managed_fetch_renews_and_retries_once() {
+        let (managed, recipe) = managed_provider("renew-once");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credentials = Arc::new(Mutex::new(Vec::new()));
+        let call_counter = Arc::clone(&calls);
+        let observed = Arc::clone(&credentials);
+        let mut runner = TaskRunner::simulated(temp_root("renew-once-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, _, _| true))
+            .with_fetch(Arc::new(move |_, _, _, credential, _| {
+                observed.lock().expect("credential observations").push(
+                    credential
+                        .map(|(_, value)| value.to_owned())
+                        .expect("managed credential"),
+                );
+                if call_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(TaskError::Unauthorized)
+                } else {
+                    Ok(b"accepted".to_vec())
+                }
+            }));
+        runner
+            .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
+            .expect("submit managed fetch");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(b"accepted".to_vec())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recipe.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *credentials.lock().expect("credential observations"),
+            vec![
+                "Bearer redacted-access-1".to_owned(),
+                "Bearer redacted-renewed-1".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_unauthorized_result_is_returned_without_a_third_request() {
+        let (managed, recipe) = managed_provider("second-unauthorized");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let mut runner = TaskRunner::simulated(temp_root("second-unauthorized-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, _, _| true))
+            .with_fetch(Arc::new(move |_, _, _, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(TaskError::Unauthorized)
+            }));
+        runner
+            .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
+            .expect("submit managed fetch");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Unauthorized)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recipe.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn network_and_not_found_errors_do_not_renew_managed_credentials() {
+        for (name, error) in [
+            ("network", TaskError::Unreachable),
+            ("not-found", TaskError::NotFound),
+        ] {
+            let (managed, recipe) = managed_provider(name);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let expected = error.clone();
+            let mut runner = TaskRunner::simulated(temp_root(&format!("{name}-root")))
+                .with_capabilities([Capability::Network])
+                .with_managed_credentials(managed)
+                .with_credential_policy(Arc::new(|_, _, _| true))
+                .with_fetch(Arc::new(move |_, _, _, _, _| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(error.clone())
+                }));
+            runner
+                .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
+                .expect("submit managed fetch");
+
+            assert_eq!(
+                collect(&mut runner, 1)[0].outcome,
+                TaskOutcome::Failed(expected)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(recipe.refreshes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn revoke_rejects_an_unregistered_managed_credential() {
+        let (managed, recipe) = managed_provider("unregistered-revoke");
+        let mut runner = TaskRunner::simulated(temp_root("unregistered-revoke-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::RevokeCredential {
+                    credential: "other-token".to_owned(),
+                },
+            )
+            .expect("submit revoke");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+        assert_eq!(recipe.revokes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revoke_returns_only_an_empty_completion_body() {
+        let (managed, recipe) = managed_provider("registered-revoke");
+        managed
+            .resolve(&Credential::bearer("managed-token"))
+            .expect("prepare managed token");
+        let mut runner = TaskRunner::simulated(temp_root("registered-revoke-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::RevokeCredential {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit revoke");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(Vec::new())
+        );
+        assert_eq!(recipe.revokes.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_basic_credential_is_encoded_by_the_runtime_rather_than_the_application() {
         // The pairs from RFC 4648, plus the shape Standard Ebooks asks for:
