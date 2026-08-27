@@ -1377,6 +1377,27 @@ mod tests {
         }
     }
 
+    fn managed_post() -> Task {
+        Task::Post {
+            url: "https://example.test/action".to_owned(),
+            body: r#"{"value":"redacted"}"#.to_owned(),
+            content_type: "application/json".to_owned(),
+            credential: Some(Credential::bearer("managed-token")),
+            headers: vec![Header::new("X-App-Trace", "redacted-app-header")],
+            max_bytes: 777,
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ObservedPost {
+        url: String,
+        body: Vec<u8>,
+        content_type: String,
+        credential: Option<(String, String)>,
+        headers: Vec<(String, String)>,
+        max_bytes: u32,
+    }
+
     #[test]
     fn credential_policy_receives_get_or_post_method() {
         let methods = Arc::new(Mutex::new(Vec::new()));
@@ -1575,6 +1596,111 @@ mod tests {
         runner
             .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
             .expect("submit managed fetch");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Unauthorized)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recipe.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_unauthorized_managed_post_retries_the_original_request_once() {
+        let (managed, recipe) = managed_provider("post-renew-once");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let call_counter = Arc::clone(&calls);
+        let observed = Arc::clone(&requests);
+        let mut runner = TaskRunner::simulated(temp_root("post-renew-once-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Post))
+            .with_post(Arc::new(
+                move |url, body, content_type, credential, headers, max_bytes| {
+                    observed
+                        .lock()
+                        .expect("POST request observations")
+                        .push(ObservedPost {
+                            url: url.to_owned(),
+                            body: body.to_vec(),
+                            content_type: content_type.to_owned(),
+                            credential: credential
+                                .map(|(name, value)| (name.to_owned(), value.to_owned())),
+                            headers: headers
+                                .iter()
+                                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                                .collect(),
+                            max_bytes,
+                        });
+                    if call_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(TaskError::Unauthorized)
+                    } else {
+                        Ok(b"accepted".to_vec())
+                    }
+                },
+            ));
+        runner
+            .submit(TaskId(1), managed_post())
+            .expect("submit managed POST");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(b"accepted".to_vec())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recipe.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *requests.lock().expect("POST request observations"),
+            vec![
+                ObservedPost {
+                    url: "https://example.test/action".to_owned(),
+                    body: br#"{"value":"redacted"}"#.to_vec(),
+                    content_type: "application/json".to_owned(),
+                    credential: Some((
+                        "Authorization".to_owned(),
+                        "Bearer redacted-access-1".to_owned(),
+                    )),
+                    headers: vec![(
+                        "X-App-Trace".to_owned(),
+                        "redacted-app-header".to_owned(),
+                    )],
+                    max_bytes: 777,
+                },
+                ObservedPost {
+                    url: "https://example.test/action".to_owned(),
+                    body: br#"{"value":"redacted"}"#.to_vec(),
+                    content_type: "application/json".to_owned(),
+                    credential: Some((
+                        "Authorization".to_owned(),
+                        "Bearer redacted-renewed-1".to_owned(),
+                    )),
+                    headers: vec![(
+                        "X-App-Trace".to_owned(),
+                        "redacted-app-header".to_owned(),
+                    )],
+                    max_bytes: 777,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_unauthorized_managed_post_stops_without_a_third_request() {
+        let (managed, recipe) = managed_provider("post-second-unauthorized");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let mut runner = TaskRunner::simulated(temp_root("post-second-unauthorized-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Post))
+            .with_post(Arc::new(move |_, _, _, _, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(TaskError::Unauthorized)
+            }));
+        runner
+            .submit(TaskId(1), managed_post())
+            .expect("submit managed POST");
 
         assert_eq!(
             collect(&mut runner, 1)[0].outcome,

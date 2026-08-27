@@ -1356,6 +1356,12 @@ mod tests {
             RequestMethod::Get,
             "https://api.openai.com/v1/chat/completions"
         ));
+        assert!(super::credential_allowed(
+            "chat",
+            &openai,
+            RequestMethod::Post,
+            "https://api.openai.com/v1/chat/completions"
+        ));
         for (app, url) in [
             ("other", "https://api.openai.com/v1/chat/completions"),
             (
@@ -1400,6 +1406,12 @@ mod tests {
                 "audiobook",
                 &credential,
                 RequestMethod::Get,
+                &url
+            ));
+            assert!(super::credential_allowed(
+                "audiobook",
+                &credential,
+                RequestMethod::Post,
                 &url
             ));
             assert!(!super::credential_allowed(
