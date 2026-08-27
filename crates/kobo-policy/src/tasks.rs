@@ -115,11 +115,10 @@ pub fn header_is_the_applications_to_set(name: &str) -> bool {
     !RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// A credential resolved for one request without exposing its source.
+/// A file-backed credential resolved for one request without exposing its source.
 struct ResolvedHeader {
     name: String,
     value: String,
-    managed: bool,
 }
 
 /// Turns a named credential into the header it will be sent as.
@@ -132,7 +131,6 @@ fn resolved_credential(
     method: RequestMethod,
     url: &str,
     credentials: Option<&CredentialAuthorizer>,
-    managed: Option<&ManagedCredentials>,
     secrets: Option<&Path>,
 ) -> Result<Option<ResolvedHeader>, TaskError> {
     let Some(wanted) = wanted else {
@@ -140,15 +138,6 @@ fn resolved_credential(
     };
     if credentials.is_none_or(|allows| !allows(wanted, method, url)) {
         return Err(TaskError::Denied);
-    }
-    if let Some(provider) = managed {
-        if let Some(resolved) = provider.resolve(wanted)? {
-            return Ok(Some(ResolvedHeader {
-                name: resolved.header_name,
-                value: resolved.header_value,
-                managed: true,
-            }));
-        }
     }
     // Not `Denied`. The application asked for a key it is allowed to ask for,
     // by the name the runtime publishes, and the check above already said so.
@@ -167,30 +156,36 @@ fn resolved_credential(
             // address or the password that make up the pair.
             SecretHeader::Basic => format!("Basic {}", base64(value.as_bytes())),
         },
-        managed: false,
     }))
 }
 
-/// Forces a provider-managed credential to rotate, then resolves the new
-/// header so an authentication retry cannot reuse the rejected value.
-fn renew_managed_credential(
-    wanted: &Credential,
-    managed: Option<&ManagedCredentials>,
-) -> Result<ResolvedHeader, TaskError> {
-    let Some(provider) = managed else {
-        return Err(TaskError::Denied);
+/// Runs one backend dispatch while a matching managed credential generation
+/// remains leased against refresh, revocation, and attended replacement.
+fn with_managed_credential<T>(
+    wanted: Option<&Credential>,
+    method: RequestMethod,
+    url: &str,
+    backends: &Backends<'_>,
+    force_renewal: bool,
+    operation: impl FnOnce(&crate::ResolvedCredential) -> T,
+) -> Result<Option<T>, TaskError> {
+    let Some(wanted) = wanted else {
+        return Ok(None);
     };
-    if !provider.force_renew(wanted)? {
+    if backends
+        .credentials
+        .is_none_or(|allows| !allows(wanted, method, url))
+    {
         return Err(TaskError::Denied);
     }
-    let Some(resolved) = provider.resolve(wanted)? else {
-        return Err(TaskError::Denied);
+    let Some(provider) = backends.managed else {
+        return Ok(None);
     };
-    Ok(ResolvedHeader {
-        name: resolved.header_name,
-        value: resolved.header_value,
-        managed: true,
-    })
+    if force_renewal {
+        provider.with_forced_renewal(wanted, operation)
+    } else {
+        provider.with_resolved(wanted, operation)
+    }
 }
 /// Checks a task's headers against the ones the runtime owns and, if none of
 /// them are reserved, hands back the pairs a network backend can use.
@@ -569,44 +564,78 @@ fn run_fetch(
         Ok(extra) => extra,
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let credential = match resolved_credential(
+    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
+    let managed_first = with_managed_credential(
         wanted,
         RequestMethod::Get,
         url,
-        backends.credentials,
-        backends.managed,
-        backends.secrets,
-    ) {
-        Ok(credential) => credential,
+        backends,
+        false,
+        |credential| {
+            fetch(
+                url,
+                offset,
+                ceiling,
+                Some((
+                    credential.header_name.as_str(),
+                    credential.header_value.as_str(),
+                )),
+                &extra,
+            )
+        },
+    );
+    let (first, used_managed) = match managed_first {
+        Ok(Some(result)) => (result, true),
+        Ok(None) => {
+            let credential = match resolved_credential(
+                wanted,
+                RequestMethod::Get,
+                url,
+                backends.credentials,
+                backends.secrets,
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return TaskOutcome::Failed(error),
+            };
+            (
+                fetch(
+                    url,
+                    offset,
+                    ceiling,
+                    credential
+                        .as_ref()
+                        .map(|header| (header.name.as_str(), header.value.as_str())),
+                    &extra,
+                ),
+                false,
+            )
+        }
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
-    let first = fetch(
-        url,
-        offset,
-        ceiling,
-        credential
-            .as_ref()
-            .map(|header| (header.name.as_str(), header.value.as_str())),
-        &extra,
-    );
-    let result = if matches!(&first, Err(TaskError::Unauthorized))
-        && credential.as_ref().is_some_and(|header| header.managed)
-    {
-        let Some(wanted) = wanted else {
-            return TaskOutcome::Failed(TaskError::Denied);
-        };
-        let renewed = match renew_managed_credential(wanted, backends.managed) {
-            Ok(renewed) => renewed,
-            Err(error) => return TaskOutcome::Failed(error),
-        };
-        fetch(
+    let result = if matches!(&first, Err(TaskError::Unauthorized)) && used_managed {
+        match with_managed_credential(
+            wanted,
+            RequestMethod::Get,
             url,
-            offset,
-            ceiling,
-            Some((renewed.name.as_str(), renewed.value.as_str())),
-            &extra,
-        )
+            backends,
+            true,
+            |credential| {
+                fetch(
+                    url,
+                    offset,
+                    ceiling,
+                    Some((
+                        credential.header_name.as_str(),
+                        credential.header_value.as_str(),
+                    )),
+                    &extra,
+                )
+            },
+        ) {
+            Ok(Some(result)) => result,
+            Ok(None) => return TaskOutcome::Failed(TaskError::Denied),
+            Err(error) => return TaskOutcome::Failed(error),
+        }
     } else {
         first
     };
@@ -632,46 +661,75 @@ fn run_post(
         Ok(extra) => extra,
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let credential = match resolved_credential(
+    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
+    let managed_first = with_managed_credential(
         wanted,
         RequestMethod::Post,
         url,
-        backends.credentials,
-        backends.managed,
-        backends.secrets,
-    ) {
-        Ok(credential) => credential,
+        backends,
+        false,
+        |credential| {
+            post(
+                url,
+                body.as_bytes(),
+                content_type,
+                Some((credential.header_name.as_str(), credential.header_value.as_str())),
+                &extra,
+                ceiling,
+            )
+        },
+    );
+    let (first, used_managed) = match managed_first {
+        Ok(Some(result)) => (result, true),
+        Ok(None) => {
+            let credential = match resolved_credential(
+                wanted,
+                RequestMethod::Post,
+                url,
+                backends.credentials,
+                backends.secrets,
+            ) {
+                Ok(credential) => credential,
+                Err(error) => return TaskOutcome::Failed(error),
+            };
+            (
+                post(
+                    url,
+                    body.as_bytes(),
+                    content_type,
+                    credential
+                        .as_ref()
+                        .map(|header| (header.name.as_str(), header.value.as_str())),
+                    &extra,
+                    ceiling,
+                ),
+                false,
+            )
+        }
         Err(error) => return TaskOutcome::Failed(error),
     };
-    let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
-    let first = post(
-        url,
-        body.as_bytes(),
-        content_type,
-        credential
-            .as_ref()
-            .map(|header| (header.name.as_str(), header.value.as_str())),
-        &extra,
-        ceiling,
-    );
-    let result = if matches!(&first, Err(TaskError::Unauthorized))
-        && credential.as_ref().is_some_and(|header| header.managed)
-    {
-        let Some(wanted) = wanted else {
-            return TaskOutcome::Failed(TaskError::Denied);
-        };
-        let renewed = match renew_managed_credential(wanted, backends.managed) {
-            Ok(renewed) => renewed,
-            Err(error) => return TaskOutcome::Failed(error),
-        };
-        post(
+    let result = if matches!(&first, Err(TaskError::Unauthorized)) && used_managed {
+        match with_managed_credential(
+            wanted,
+            RequestMethod::Post,
             url,
-            body.as_bytes(),
-            content_type,
-            Some((renewed.name.as_str(), renewed.value.as_str())),
-            &extra,
-            ceiling,
-        )
+            backends,
+            true,
+            |credential| {
+                post(
+                    url,
+                    body.as_bytes(),
+                    content_type,
+                    Some((credential.header_name.as_str(), credential.header_value.as_str())),
+                    &extra,
+                    ceiling,
+                )
+            },
+        ) {
+            Ok(Some(result)) => result,
+            Ok(None) => return TaskOutcome::Failed(TaskError::Denied),
+            Err(error) => return TaskOutcome::Failed(error),
+        }
     } else {
         first
     };
@@ -706,24 +764,21 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             }
             TaskOutcome::Completed(Vec::new())
         }
-        Task::ReadFile { path } => match resolve(root, path) {
-            None => TaskOutcome::Failed(TaskError::Denied),
-            Some(path) => match std::fs::File::open(&path) {
-                Err(_) => TaskOutcome::Failed(TaskError::NotFound),
-                Ok(file) => {
-                    let mut bytes = Vec::new();
-                    // Bounded by one more byte than the ceiling, so a file
-                    // exactly at the limit is accepted and one over is
-                    // reported rather than silently truncated.
-                    match file.take(MAX_TASK_BYTES as u64 + 1).read_to_end(&mut bytes) {
-                        Err(_) => TaskOutcome::Failed(TaskError::NotFound),
-                        Ok(_) if bytes.len() > MAX_TASK_BYTES => {
-                            TaskOutcome::Failed(TaskError::TooLarge)
-                        }
-                        Ok(_) => TaskOutcome::Completed(bytes),
+        Task::ReadFile { path } => match open_task_file(root, path) {
+            Err(error) => TaskOutcome::Failed(error),
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                // Bounded by one more byte than the ceiling, so a file
+                // exactly at the limit is accepted and one over is
+                // reported rather than silently truncated.
+                match file.take(MAX_TASK_BYTES as u64 + 1).read_to_end(&mut bytes) {
+                    Err(_) => TaskOutcome::Failed(TaskError::NotFound),
+                    Ok(_) if bytes.len() > MAX_TASK_BYTES => {
+                        TaskOutcome::Failed(TaskError::TooLarge)
                     }
+                    Ok(_) => TaskOutcome::Completed(bytes),
                 }
-            },
+            }
         },
         Task::Fetch {
             url,
@@ -784,6 +839,31 @@ fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Opens one sandbox file while refusing every symbolic-link component.
+///
+/// Applications cannot mutate files through this API, so walking the owner-
+/// controlled tree before opening also preserves confinement on filesystems
+/// where canonical path comparisons are not case-safe.
+fn open_task_file(root: &Path, path: &str) -> Result<std::fs::File, TaskError> {
+    let resolved = resolve(root, path).ok_or(TaskError::Denied)?;
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|_| TaskError::NotFound)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(TaskError::Denied);
+    }
+    let mut current = root.to_path_buf();
+    for component in Path::new(path).components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| TaskError::NotFound)?;
+        if metadata.file_type().is_symlink() {
+            return Err(TaskError::Denied);
+        }
+    }
+    std::fs::File::open(resolved).map_err(|_| TaskError::NotFound)
+}
+
 /// Standard base64, which is how a Basic credential is spelled on the wire.
 ///
 /// Written out rather than taken from a crate: it is twenty lines, it runs on
@@ -815,6 +895,7 @@ fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::{ManagedCredentialRecipe, ManagedTokenPair};
+    use fs4::FileExt;
     use kobo_protocol::{Credential, Header};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
@@ -1006,6 +1087,28 @@ mod tests {
         assert_eq!(
             finished[0].outcome,
             TaskOutcome::Completed(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_symbolic_link_cannot_escape_the_file_sandbox() {
+        let root = temp_root("symlink-sandbox");
+        let outside = temp_root("symlink-outside").join("credential-state");
+        std::fs::write(&outside, b"redacted-sensitive-state").expect("outside file");
+        std::os::unix::fs::symlink(&outside, root.join("linked"))
+            .expect("create escaping symlink");
+        let mut runner = TaskRunner::simulated(root);
+        runner
+            .submit(
+                TaskId(1),
+                Task::ReadFile {
+                    path: "linked".into(),
+                },
+            )
+            .expect("submitted");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
         );
     }
 
@@ -1545,6 +1648,64 @@ mod tests {
         );
         assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 0);
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn managed_fetch_holds_the_generation_lease_through_backend_dispatch() {
+        let root = temp_root("generation-lease");
+        let secrets = root.join("secrets");
+        let state = root.join("state");
+        std::fs::create_dir_all(&secrets).expect("create managed secrets");
+        std::fs::create_dir_all(&state).expect("create managed state");
+        std::fs::write(secrets.join("managed-cookie"), "redacted-cookie")
+            .expect("write managed binding");
+        let recipe = Arc::new(FakeManagedRecipe::default());
+        let managed = Arc::new(
+            ManagedCredentials::new(
+                secrets,
+                &state,
+                Arc::new(|| 0),
+                recipe,
+            )
+            .expect("construct managed provider"),
+        );
+        let lease_was_held = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&lease_was_held);
+        let lock_path = state.join(".managed-token.lock");
+        let mut runner = TaskRunner::simulated(temp_root("generation-lease-files"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed)
+            .with_credential_policy(Arc::new(|_, _, _| true))
+            .with_fetch(Arc::new(move |_, _, _, _, _| {
+                let competing = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .expect("open competing lease");
+                observed.store(
+                    matches!(
+                        FileExt::try_lock(&competing),
+                        Err(fs4::TryLockError::WouldBlock)
+                    ),
+                    Ordering::SeqCst,
+                );
+                Ok(b"current-generation".to_vec())
+            }));
+        runner
+            .submit(TaskId(1), managed_fetch("https://example.test/catalog"))
+            .expect("submit managed fetch");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(b"current-generation".to_vec())
+        );
+        assert!(lease_was_held.load(Ordering::SeqCst));
+        let released = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.join(".managed-token.lock"))
+            .expect("open released lease");
+        FileExt::try_lock(&released).expect("request released generation lease");
     }
 
     #[test]

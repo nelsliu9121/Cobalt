@@ -2,7 +2,7 @@ use kobo_json::{ObjectBuilder, Value};
 use kobo_sim::SimulatorAuthPaths;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -30,11 +30,49 @@ const INSECURE_COOKIE: &str = "next-auth.session-token";
 const SESSION_SECRET: &str = "bomtoon-session";
 const MANAGED_STATE: &str = "bomtoon-access-token.state";
 
-const CHROME_LAUNCH_PROGRAM: &str = r#"exec 3<&0
+const CHROME_LAUNCH_PROGRAM: &str = r#"set -u
+owner=$1
+browser=$2
+profile=$3
+shift 3
+browser_pid=
+stop_browser() {
+    if [ -n "$browser_pid" ] && kill -0 "$browser_pid" 2>/dev/null; then
+        kill -TERM "$browser_pid" 2>/dev/null || true
+        attempt=0
+        while kill -0 "$browser_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        if kill -0 "$browser_pid" 2>/dev/null; then
+            kill -KILL "$browser_pid" 2>/dev/null || true
+        fi
+    fi
+    if [ -n "$browser_pid" ]; then
+        wait "$browser_pid" 2>/dev/null || true
+    fi
+}
+cleanup() {
+    trap '' HUP INT TERM
+    stop_browser
+    rm -rf -- "$profile"
+    exit 0
+}
+trap cleanup HUP INT TERM
+exec 3<&0
 exec 4>&1
-browser=$1
-shift
-exec "$browser" "$@"
+"$browser" "$@" &
+browser_pid=$!
+exec 0<&-
+while kill -0 "$browser_pid" 2>/dev/null; do
+    parent=$(ps -o ppid= -p $$ 2>/dev/null) || cleanup
+    [ "$parent" -eq "$owner" ] || cleanup
+    sleep 0.1
+done
+wait "$browser_pid"
+status=$?
+rm -rf -- "$profile"
+exit "$status"
 "#;
 
 const DEVICE_INSTALL_PROGRAM: &str = r#"set -eu
@@ -43,57 +81,135 @@ secrets=/mnt/onboard/.adds/cobalt/secrets
 state=/mnt/onboard/.adds/cobalt/state
 cookie="$secrets/bomtoon-session"
 managed="$state/bomtoon-access-token.state"
-temporary="$secrets/.bomtoon-session.login.$$"
-backup="$secrets/.bomtoon-session.backup.$$"
-state_backup="$state/.bomtoon-access-token.state.backup.$$"
+temporary="$secrets/.bomtoon-session.login"
+backup="$secrets/.bomtoon-session.backup"
+state_backup="$state/.bomtoon-access-token.state.backup"
+marker="$state/.bomtoon-login.transaction"
+marker_new="$state/.bomtoon-login.transaction.new"
+lock="$state/.bomtoon-access-token.lock"
 had_cookie=0
 had_state=0
-installed=0
-complete=0
+committed=0
+stage=
+rank=0
+durable() {
+    sync
+}
+stage_rank() {
+    case "$stage" in
+        prepared) rank=0 ;;
+        cookie-backed-up) rank=1 ;;
+        cookie-installed) rank=2 ;;
+        state-backed-up) rank=3 ;;
+        committed) rank=4 ;;
+        *) return 1 ;;
+    esac
+}
+write_marker() {
+    stage=$1
+    printf 'cobalt-bomtoon-install-v1\n%s\n%s\n%s\n' \
+        "$stage" "$had_cookie" "$had_state" > "$marker_new"
+    chmod 600 "$marker_new"
+    durable
+    mv "$marker_new" "$marker"
+    durable
+}
+read_marker() {
+    {
+        IFS= read -r version
+        IFS= read -r stage
+        IFS= read -r had_cookie
+        IFS= read -r had_state
+    } < "$marker"
+    [ "$version" = cobalt-bomtoon-install-v1 ]
+    case "$had_cookie:$had_state" in
+        0:0|0:1|1:0|1:1) ;;
+        *) return 1 ;;
+    esac
+    stage_rank
+}
+cleanup_committed() {
+    rm -f "$temporary" "$backup" "$state_backup" "$marker_new"
+    durable
+    rm -f "$marker"
+    durable
+}
+recover() {
+    if [ ! -e "$marker" ]; then
+        [ ! -e "$backup" ] && [ ! -e "$state_backup" ] || return 1
+        rm -f "$temporary" "$marker_new"
+        durable
+        return 0
+    fi
+    read_marker
+    if [ "$stage" = committed ]; then
+        cleanup_committed
+        return 0
+    fi
+    rm -f "$temporary" "$marker_new"
+    durable
+    if [ -e "$state_backup" ]; then
+        rm -f "$managed"
+        mv "$state_backup" "$managed"
+        durable
+    elif [ "$had_state" -eq 1 ] && [ "$rank" -ge 3 ]; then
+        return 1
+    fi
+    if [ -e "$backup" ]; then
+        rm -f "$cookie"
+        mv "$backup" "$cookie"
+        durable
+    elif [ "$had_cookie" -eq 1 ] && [ "$rank" -ge 1 ]; then
+        return 1
+    elif [ "$had_cookie" -eq 0 ] && [ "$rank" -ge 1 ]; then
+        rm -f "$cookie"
+        durable
+    fi
+    rm -f "$marker"
+    durable
+}
 rollback() {
     status=$?
-    set +e
     trap - EXIT HUP INT TERM
-    if [ "$complete" -ne 1 ]; then
-        rm -f "$temporary"
-        if [ "$had_state" -eq 1 ] && [ -e "$state_backup" ]; then
-            rm -f "$managed"
-            mv "$state_backup" "$managed" || true
-        fi
-        if [ "$installed" -eq 1 ]; then
-            rm -f "$cookie"
-        fi
-        if [ "$had_cookie" -eq 1 ] && [ -e "$backup" ]; then
-            mv "$backup" "$cookie" || true
-        fi
+    set +e
+    if [ "$committed" -ne 1 ]; then
+        recover
     fi
     exit "$status"
 }
-trap rollback EXIT HUP INT TERM
 mkdir -p "$secrets" "$state"
 chmod 700 "$secrets" "$state"
+command -v flock >/dev/null 2>&1 || exit 1
+exec 9>"$lock"
+chmod 600 "$lock"
+flock -w 5 9 || exit 1
+recover
 set -C
 : > "$temporary"
 set +C
 chmod 600 "$temporary"
 cat > "$temporary"
-if [ -e "$cookie" ]; then
-    mv "$cookie" "$backup"
-    had_cookie=1
-fi
-mv "$temporary" "$cookie"
-installed=1
-if [ -e "$managed" ]; then
-    mv "$managed" "$state_backup"
-    had_state=1
-fi
-complete=1
+durable
+[ -e "$cookie" ] && had_cookie=1
+[ -e "$managed" ] && had_state=1
+write_marker prepared
+trap rollback EXIT HUP INT TERM
 if [ "$had_cookie" -eq 1 ]; then
-    rm -f "$backup"
+    mv "$cookie" "$backup"
+    durable
 fi
+write_marker cookie-backed-up
+mv "$temporary" "$cookie"
+durable
+write_marker cookie-installed
 if [ "$had_state" -eq 1 ]; then
-    rm -f "$state_backup"
+    mv "$managed" "$state_backup"
+    durable
 fi
+write_marker state-backed-up
+write_marker committed
+committed=1
+cleanup_committed
 trap - EXIT HUP INT TERM
 exit 0
 "#;
@@ -290,7 +406,9 @@ fn launch_chrome(browser: &Path, profile: &Path) -> Result<Child, ()> {
     let profile_argument = format!("--user-data-dir={}", profile.display());
     Command::new("/bin/sh")
         .args(["-c", CHROME_LAUNCH_PROGRAM, "kobo-chrome"])
+        .arg(std::process::id().to_string())
         .arg(browser)
+        .arg(profile)
         .args([
             "--remote-debugging-pipe",
             profile_argument.as_str(),
@@ -312,10 +430,13 @@ trait BrowserProcess {
 
 impl BrowserProcess for Child {
     fn stop(&mut self) -> io::Result<()> {
-        match self.kill() {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
-            Err(error) => Err(error),
+        let status = Command::new("/bin/kill")
+            .args(["-TERM", &self.id().to_string()])
+            .status()?;
+        if status.success() || self.try_wait()?.is_some() {
+            Ok(())
+        } else {
+            Err(io::Error::other("browser supervisor did not stop"))
         }
     }
 
@@ -1016,10 +1137,81 @@ enum InstallPoint {
     StateDetached,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransactionStatus {
-    Active,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum InstallStage {
+    Prepared,
+    CookieBackedUp,
+    CookieInstalled,
+    StateBackedUp,
     Committed,
+}
+
+impl InstallStage {
+    fn encoded(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::CookieBackedUp => "cookie-backed-up",
+            Self::CookieInstalled => "cookie-installed",
+            Self::StateBackedUp => "state-backed-up",
+            Self::Committed => "committed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prepared" => Some(Self::Prepared),
+            "cookie-backed-up" => Some(Self::CookieBackedUp),
+            "cookie-installed" => Some(Self::CookieInstalled),
+            "state-backed-up" => Some(Self::StateBackedUp),
+            "committed" => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InstallRecord {
+    stage: InstallStage,
+    had_cookie: bool,
+    had_state: bool,
+}
+
+impl InstallRecord {
+    fn encode(self) -> String {
+        format!(
+            "cobalt-bomtoon-install-v1\n{}\n{}\n{}",
+            self.stage.encoded(),
+            u8::from(self.had_cookie),
+            u8::from(self.had_state)
+        )
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let mut lines = value.split('\n');
+        if lines.next()? != "cobalt-bomtoon-install-v1" {
+            return None;
+        }
+        let stage = InstallStage::parse(lines.next()?)?;
+        let had_cookie = match lines.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let had_state = match lines.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let trailing = lines.next();
+        if !matches!(trailing, None | Some("")) || lines.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            stage,
+            had_cookie,
+            had_state,
+        })
+    }
 }
 
 struct SimulatorTransaction {
@@ -1028,103 +1220,127 @@ struct SimulatorTransaction {
     temporary: PathBuf,
     state: PathBuf,
     state_backup: PathBuf,
-    cookie_moved: bool,
-    cookie_installed: bool,
-    state_moved: bool,
-    status: TransactionStatus,
+    marker: PathBuf,
+    marker_temporary: PathBuf,
 }
 
 impl SimulatorTransaction {
     fn new(paths: &SimulatorAuthPaths) -> Self {
-        let cookie = paths.secrets.join(SESSION_SECRET);
-        let state = paths.state.join(MANAGED_STATE);
         Self {
-            cookie_backup: paths.secrets.join(private_name(".bomtoon-session.backup")),
-            temporary: paths.secrets.join(private_name(".bomtoon-session.login")),
+            cookie: paths.secrets.join(SESSION_SECRET),
+            cookie_backup: paths.secrets.join(".bomtoon-session.backup"),
+            temporary: paths.secrets.join(".bomtoon-session.login"),
+            state: paths.state.join(MANAGED_STATE),
             state_backup: paths
                 .state
-                .join(private_name(".bomtoon-access-token.state.backup")),
-            cookie,
-            state,
-            cookie_moved: false,
-            cookie_installed: false,
-            state_moved: false,
-            status: TransactionStatus::Active,
+                .join(".bomtoon-access-token.state.backup"),
+            marker: paths.state.join(".bomtoon-login.transaction"),
+            marker_temporary: paths.state.join(".bomtoon-login.transaction.new"),
         }
     }
 
-    fn rollback(&mut self) -> io::Result<()> {
-        let mut failed = remove_file_if_exists(&self.temporary).is_err();
-        if self.state_moved {
-            if remove_file_if_exists(&self.state).is_err() {
-                failed = true;
-            } else {
-                match fs::rename(&self.state_backup, &self.state) {
-                    Ok(()) => self.state_moved = false,
-                    Err(_) => failed = true,
-                }
-            }
-        }
-        if self.cookie_installed {
-            match remove_file_if_exists(&self.cookie) {
-                Ok(()) => self.cookie_installed = false,
-                Err(_) => failed = true,
-            }
-        }
-        if self.cookie_moved && !self.cookie_installed {
-            match fs::rename(&self.cookie_backup, &self.cookie) {
-                Ok(()) => self.cookie_moved = false,
-                Err(_) => failed = true,
-            }
-        }
-        if failed {
-            Err(io::Error::other("simulator rollback failed"))
-        } else {
-            Ok(())
-        }
+    fn write_record(&self, record: InstallRecord) -> io::Result<()> {
+        remove_file_synced(&self.marker_temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.marker_temporary)?;
+        file.write_all(record.encode().as_bytes())?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.sync_all()?;
+        drop(file);
+        rename_synced(&self.marker_temporary, &self.marker)
     }
 
-    fn cleanup_committed(&mut self) -> io::Result<()> {
-        let mut failed = remove_file_if_exists(&self.temporary).is_err();
-        if self.cookie_moved {
-            match remove_file_if_exists(&self.cookie_backup) {
-                Ok(()) => self.cookie_moved = false,
-                Err(_) => failed = true,
+    fn read_record(&self) -> io::Result<Option<InstallRecord>> {
+        let file = match File::open(&self.marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut encoded = String::new();
+        file.take(257).read_to_string(&mut encoded)?;
+        if encoded.len() > 256 {
+            return Err(io::Error::other("invalid simulator transaction"));
+        }
+        InstallRecord::parse(&encoded)
+            .ok_or_else(|| io::Error::other("invalid simulator transaction"))
+            .map(Some)
+    }
+
+    fn recover(&self) -> io::Result<()> {
+        let Some(record) = self.read_record()? else {
+            if path_exists(&self.cookie_backup)? || path_exists(&self.state_backup)? {
+                return Err(io::Error::other("orphaned simulator transaction"));
             }
+            remove_file_synced(&self.temporary)?;
+            remove_file_synced(&self.marker_temporary)?;
+            return Ok(());
+        };
+        if record.stage == InstallStage::Committed {
+            return self.cleanup_committed();
         }
-        if self.state_moved {
-            match remove_file_if_exists(&self.state_backup) {
-                Ok(()) => self.state_moved = false,
-                Err(_) => failed = true,
-            }
+
+        remove_file_synced(&self.marker_temporary)?;
+        remove_file_synced(&self.temporary)?;
+        if path_exists(&self.state_backup)? {
+            remove_file_synced(&self.state)?;
+            rename_synced(&self.state_backup, &self.state)?;
+        } else if record.had_state && record.stage >= InstallStage::StateBackedUp {
+            return Err(io::Error::other("missing simulator state backup"));
         }
-        if failed {
-            Err(io::Error::other("simulator commit cleanup failed"))
-        } else {
-            Ok(())
+
+        if path_exists(&self.cookie_backup)? {
+            remove_file_synced(&self.cookie)?;
+            rename_synced(&self.cookie_backup, &self.cookie)?;
+        } else if record.had_cookie && record.stage >= InstallStage::CookieBackedUp {
+            return Err(io::Error::other("missing simulator cookie backup"));
+        } else if !record.had_cookie && record.stage >= InstallStage::CookieBackedUp {
+            remove_file_synced(&self.cookie)?;
         }
+        remove_file_synced(&self.marker)
+    }
+
+    fn cleanup_committed(&self) -> io::Result<()> {
+        remove_file_synced(&self.temporary)?;
+        remove_file_synced(&self.cookie_backup)?;
+        remove_file_synced(&self.state_backup)?;
+        remove_file_synced(&self.marker_temporary)?;
+        remove_file_synced(&self.marker)
     }
 }
 
-impl Drop for SimulatorTransaction {
-    fn drop(&mut self) {
-        match self.status {
-            TransactionStatus::Committed => {
-                let _ = self.cleanup_committed();
-            }
-            TransactionStatus::Active => {
-                let _ = self.rollback();
-            }
-        }
-    }
+fn path_exists(path: &Path) -> io::Result<bool> {
+    path.try_exists()
 }
 
-fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| io::Error::other("path has no parent"))?,
+    )
+}
+
+fn remove_file_synced(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn rename_synced(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)?;
+    sync_parent(source)?;
+    if source.parent() != destination.parent() {
+        sync_parent(destination)?;
+    }
+    Ok(())
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
@@ -1139,8 +1355,17 @@ fn install_simulator_at_with(
 ) -> io::Result<()> {
     ensure_private_directory(&paths.secrets)?;
     ensure_private_directory(&paths.state)?;
-    let mut transaction = SimulatorTransaction::new(paths);
+    let _lease = kobo_sim::acquire_simulator_auth_lease(paths)
+        .map_err(|_| io::Error::other("simulator credential lease unavailable"))?;
+    let transaction = SimulatorTransaction::new(paths);
+    transaction.recover()?;
+    let mut record = InstallRecord {
+        stage: InstallStage::Prepared,
+        had_cookie: path_exists(&transaction.cookie)?,
+        had_state: path_exists(&transaction.state)?,
+    };
     let operation = (|| -> io::Result<()> {
+        transaction.write_record(record)?;
         let mut temporary = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1151,30 +1376,36 @@ fn install_simulator_at_with(
         temporary.sync_all()?;
         drop(temporary);
 
-        if transaction.cookie.exists() {
-            fs::rename(&transaction.cookie, &transaction.cookie_backup)?;
-            transaction.cookie_moved = true;
+        if record.had_cookie {
+            rename_synced(&transaction.cookie, &transaction.cookie_backup)?;
         }
-        fs::rename(&transaction.temporary, &transaction.cookie)?;
-        transaction.cookie_installed = true;
+        record.stage = InstallStage::CookieBackedUp;
+        transaction.write_record(record)?;
+
+        rename_synced(&transaction.temporary, &transaction.cookie)?;
+        record.stage = InstallStage::CookieInstalled;
+        transaction.write_record(record)?;
         checkpoint(InstallPoint::CookieInstalled)?;
 
-        if transaction.state.exists() {
-            fs::rename(&transaction.state, &transaction.state_backup)?;
-            transaction.state_moved = true;
+        if record.had_state {
+            rename_synced(&transaction.state, &transaction.state_backup)?;
         }
+        record.stage = InstallStage::StateBackedUp;
+        transaction.write_record(record)?;
         checkpoint(InstallPoint::StateDetached)?;
-        Ok(())
-    })();
 
+        record.stage = InstallStage::Committed;
+        transaction.write_record(record)
+    })();
     if operation.is_err() {
-        return match transaction.rollback() {
+        return match transaction.recover() {
             Ok(()) => Err(io::Error::other("simulator installation failed")),
             Err(_) => Err(io::Error::other("simulator rollback failed")),
         };
     }
-    transaction.status = TransactionStatus::Committed;
-    transaction.cleanup_committed()
+    transaction
+        .cleanup_committed()
+        .map_err(|_| io::Error::other("simulator commit cleanup failed"))
 }
 
 fn install_simulator_at(cookie: &str, paths: &SimulatorAuthPaths) -> io::Result<()> {
@@ -1217,9 +1448,11 @@ mod tests {
     impl TestDirectories {
         fn new() -> Self {
             let root = create_private_profile_at(&std::env::temp_dir()).expect("test root");
+            let state = root.join("state");
             let paths = SimulatorAuthPaths {
                 secrets: root.join("secrets"),
-                state: root.join("state"),
+                lock: state.join(".bomtoon-access-token.lock"),
+                state,
             };
             Self { root, paths }
         }
@@ -1581,19 +1814,32 @@ mod tests {
                 Some(DEVICE_INSTALL_PROGRAM)
             );
             assert!(arguments.iter().all(|argument| !argument.contains(&cookie)));
-            assert!(DEVICE_INSTALL_PROGRAM.contains("trap rollback EXIT HUP INT TERM"));
-            assert!(DEVICE_INSTALL_PROGRAM.contains("mv \"$backup\" \"$cookie\" || true"));
-            assert!(DEVICE_INSTALL_PROGRAM.contains("mv \"$state_backup\" \"$managed\" || true"));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("flock -w 5 9 || exit 1"));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("read_marker"));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("recover"));
+            assert!(DEVICE_INSTALL_PROGRAM.contains(
+                "marker=\"$state/.bomtoon-login.transaction\""
+            ));
+            assert!(DEVICE_INSTALL_PROGRAM.contains(
+                "backup=\"$secrets/.bomtoon-session.backup\""
+            ));
+            assert!(DEVICE_INSTALL_PROGRAM.contains(
+                "state_backup=\"$state/.bomtoon-access-token.state.backup\""
+            ));
+            assert!(!DEVICE_INSTALL_PROGRAM.contains("backup.$$"));
+            let recovered = DEVICE_INSTALL_PROGRAM
+                .find("\nrecover\nset -C")
+                .expect("startup recovery");
+            let mutation = DEVICE_INSTALL_PROGRAM
+                .find("mv \"$cookie\" \"$backup\"")
+                .expect("cookie backup");
             let committed = DEVICE_INSTALL_PROGRAM
-                .find("\ncomplete=1\n")
-                .expect("commit marker");
-            let cookie_cleanup = DEVICE_INSTALL_PROGRAM
-                .rfind("rm -f \"$backup\"")
-                .expect("cookie backup cleanup");
-            let state_cleanup = DEVICE_INSTALL_PROGRAM
-                .rfind("rm -f \"$state_backup\"")
-                .expect("state backup cleanup");
-            assert!(committed < cookie_cleanup && committed < state_cleanup);
+                .rfind("write_marker committed")
+                .expect("durable commit marker");
+            let cleanup = DEVICE_INSTALL_PROGRAM
+                .rfind("cleanup_committed")
+                .expect("commit cleanup");
+            assert!(recovered < mutation && mutation < committed && committed < cleanup);
             Err(())
         });
         let error = result.map_err(|()| TARGET_INSTALLATION_FAILED.to_owned());
@@ -1683,9 +1929,16 @@ mod tests {
                         .into_owned()
                 })
                 .collect::<Vec<_>>();
-            assert!(names
-                .iter()
-                .all(|name| !name.contains(".login-") && !name.contains(".backup-")));
+            assert!(names.iter().all(|name| {
+                !matches!(
+                    name.as_str(),
+                    ".bomtoon-session.login"
+                        | ".bomtoon-session.backup"
+                        | ".bomtoon-access-token.state.backup"
+                        | ".bomtoon-login.transaction"
+                        | ".bomtoon-login.transaction.new"
+                )
+            }));
         }
 
         fs::write(&cookie_path, "rollback-cookie").expect("rollback cookie");
@@ -1706,6 +1959,52 @@ mod tests {
             fs::read_to_string(&state_path).expect("restored state"),
             "rollback-state"
         );
+    }
+
+    #[test]
+    fn simulator_startup_recovers_fixed_backups_after_an_interrupted_install() {
+        let directories = TestDirectories::new();
+        ensure_private_directory(&directories.paths.secrets).expect("secrets");
+        ensure_private_directory(&directories.paths.state).expect("state");
+        let transaction = SimulatorTransaction::new(&directories.paths);
+        fs::write(&transaction.cookie, "prior-cookie").expect("old cookie");
+        fs::write(&transaction.state, "prior-state").expect("old state");
+        fs::write(&transaction.temporary, "replacement-cookie").expect("replacement");
+        transaction
+            .write_record(InstallRecord {
+                stage: InstallStage::Prepared,
+                had_cookie: true,
+                had_state: true,
+            })
+            .expect("prepared marker");
+        rename_synced(&transaction.cookie, &transaction.cookie_backup)
+            .expect("durable cookie backup");
+        transaction
+            .write_record(InstallRecord {
+                stage: InstallStage::CookieBackedUp,
+                had_cookie: true,
+                had_state: true,
+            })
+            .expect("cookie backup marker");
+        rename_synced(&transaction.temporary, &transaction.cookie)
+            .expect("durable replacement");
+        rename_synced(&transaction.state, &transaction.state_backup)
+            .expect("crash-window state backup");
+
+        SimulatorTransaction::new(&directories.paths)
+            .recover()
+            .expect("startup recovery");
+        assert_eq!(
+            fs::read_to_string(&transaction.cookie).expect("restored cookie"),
+            "prior-cookie"
+        );
+        assert_eq!(
+            fs::read_to_string(&transaction.state).expect("restored state"),
+            "prior-state"
+        );
+        assert!(!transaction.marker.exists());
+        assert!(!transaction.cookie_backup.exists());
+        assert!(!transaction.state_backup.exists());
     }
 
     #[test]
@@ -1734,19 +2033,19 @@ mod tests {
             fs::read_to_string(&state_path).expect("state restored"),
             "recoverable-old-state"
         );
-        let cookie_backup = fs::read_dir(&directories.paths.secrets)
-            .expect("secret entries")
-            .map(|entry| entry.expect("secret entry").path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".bomtoon-session.backup-"))
-            })
-            .expect("recoverable cookie backup");
+        let cookie_backup = directories
+            .paths
+            .secrets
+            .join(".bomtoon-session.backup");
         assert_eq!(
             fs::read_to_string(cookie_backup).expect("backup contents"),
             "recoverable-old-cookie"
         );
+        assert!(directories
+            .paths
+            .state
+            .join(".bomtoon-login.transaction")
+            .exists());
     }
 
     #[derive(Clone)]
@@ -1774,6 +2073,7 @@ mod tests {
                 Err(io::Error::other("injected wait failure"))
             } else {
                 Ok(())
+
             }
         }
     }
@@ -1793,6 +2093,36 @@ mod tests {
                 Ok(())
             }
         }
+    }
+    #[test]
+    fn chrome_supervisor_stops_waits_and_removes_profile_after_owner_exit() {
+        let profile =
+            create_private_profile_at(&std::env::temp_dir()).expect("supervised profile");
+        let mut supervisor = Command::new("/bin/sh")
+            .args(["-c", CHROME_LAUNCH_PROGRAM, "test-supervisor"])
+            .arg("0")
+            .arg("/bin/sh")
+            .arg(&profile)
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn supervisor");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = supervisor.try_wait().expect("poll supervisor") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = supervisor.kill();
+                let _ = supervisor.wait();
+                panic!("supervisor did not react to owner exit");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        assert!(!profile.exists());
     }
 
     #[test]

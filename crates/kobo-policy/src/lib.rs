@@ -16,7 +16,8 @@ pub mod store;
 pub mod tasks;
 
 pub use managed::{
-    managed_state_path, Clock, ManagedCredentialRecipe, ManagedCredentials, ManagedTokenPair,
+    acquire_managed_credential_lease, managed_lock_path, managed_state_path, Clock,
+    ManagedCredentialLease, ManagedCredentialRecipe, ManagedCredentials, ManagedTokenPair,
     ResolvedCredential, REFRESH_WINDOW_MS,
 };
 pub use services::{request_capability, Backends, DeviceServices, DeviceState};

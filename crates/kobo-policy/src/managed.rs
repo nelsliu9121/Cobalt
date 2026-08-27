@@ -1,12 +1,15 @@
 use crate::tasks::MAX_SECRET_BYTES;
+use fs4::{FileExt, TryLockError};
 use kobo_protocol::{Credential, SecretHeader, TaskError};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Access tokens at or inside this window are renewed before use.
 pub const REFRESH_WINDOW_MS: u64 = 5 * 60 * 1000;
@@ -15,6 +18,8 @@ pub type Clock = dyn Fn() -> u64 + Send + Sync;
 
 const STATE_VERSION: &str = "cobalt-managed-v1";
 const MAX_STATE_BYTES: usize = 2 * MAX_SECRET_BYTES + 1024;
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -127,16 +132,92 @@ struct ProviderState {
     cached: Option<BoundPair>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct BoundPair {
     cookie_digest: String,
     pair: ManagedTokenPair,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum InstallStage {
+    Prepared,
+    CookieBackedUp,
+    CookieInstalled,
+    StateBackedUp,
+    Committed,
+}
+
+impl InstallStage {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prepared" => Some(Self::Prepared),
+            "cookie-backed-up" => Some(Self::CookieBackedUp),
+            "cookie-installed" => Some(Self::CookieInstalled),
+            "state-backed-up" => Some(Self::StateBackedUp),
+            "committed" => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+struct InstallRecord {
+    stage: InstallStage,
+    had_cookie: bool,
+    had_state: bool,
+}
+
+impl InstallRecord {
+    fn parse(value: &str) -> Option<Self> {
+        let mut lines = value.split('\n');
+        if lines.next()? != "cobalt-bomtoon-install-v1" {
+            return None;
+        }
+        let stage = InstallStage::parse(lines.next()?)?;
+        let had_cookie = match lines.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let had_state = match lines.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let trailing = lines.next();
+        if !matches!(trailing, None | Some("")) || lines.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            stage,
+            had_cookie,
+            had_state,
+        })
+    }
 }
 
 /// Returns the durable state path for a managed credential.
 #[must_use]
 pub fn managed_state_path(root: &Path, credential: &str) -> PathBuf {
     root.join(format!("{credential}.state"))
+}
+
+/// Returns the crash-released lease path for a managed credential.
+#[must_use]
+pub fn managed_lock_path(root: &Path, credential: &str) -> PathBuf {
+    root.join(format!(".{credential}.lock"))
+}
+
+/// Acquires the bounded, crash-released lease for a managed credential.
+///
+/// # Errors
+///
+/// Returns [`TaskError::LocalStorage`] when the lock file cannot be opened or
+/// another owner does not release the lease within the bounded wait.
+pub fn acquire_managed_credential_lease(
+    state: &Path,
+    credential: &str,
+) -> Result<ManagedCredentialLease, TaskError> {
+    acquire_credential_lease_with_wait(state, credential, LOCK_WAIT)
 }
 
 impl ManagedCredentials {
@@ -159,7 +240,11 @@ impl ManagedCredentials {
             recipe,
             inner: Mutex::new(ProviderState::default()),
         };
+        ensure_private_directory(&provider.state)?;
+        let lease = provider.acquire_lease()?;
+        provider.recover_interrupted_install()?;
         provider.remove_stale_detached()?;
+        drop(lease);
         Ok(provider)
     }
 
@@ -174,24 +259,7 @@ impl ManagedCredentials {
     /// token, or an error reported by the provider while issuing or rotating
     /// the token pair.
     pub fn resolve(&self, wanted: &Credential) -> Result<Option<ResolvedCredential>, TaskError> {
-        if wanted.secret != self.recipe.credential_name() {
-            return Ok(None);
-        }
-        if !matches!(&wanted.header, SecretHeader::Bearer) {
-            return Err(TaskError::Denied);
-        }
-
-        let mut inner = self.lock_inner()?;
-        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
-        let digest = self.checked_digest(&cookie)?;
-        let pair = self.obtain_pair(&mut inner, &cookie, &digest, false)?;
-        if pair.access_expires_at_ms <= (self.clock)() {
-            return Err(TaskError::Unreachable);
-        }
-        Ok(Some(ResolvedCredential {
-            header_name: "Authorization".to_owned(),
-            header_value: format!("Bearer {}", pair.access_token),
-        }))
+        self.with_resolved(wanted, Clone::clone)
     }
 
     /// Renews a matching managed bearer credential regardless of its expiry.
@@ -204,18 +272,7 @@ impl ManagedCredentials {
     /// or updated, or an error reported by the provider while issuing or
     /// rotating the token pair.
     pub fn force_renew(&self, wanted: &Credential) -> Result<bool, TaskError> {
-        if wanted.secret != self.recipe.credential_name() {
-            return Ok(false);
-        }
-        if !matches!(&wanted.header, SecretHeader::Bearer) {
-            return Err(TaskError::Denied);
-        }
-
-        let mut inner = self.lock_inner()?;
-        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
-        let digest = self.checked_digest(&cookie)?;
-        self.obtain_pair(&mut inner, &cookie, &digest, true)?;
-        Ok(true)
+        self.with_forced_renewal(wanted, |_| ()).map(|result| result.is_some())
     }
 
     /// Removes local credentials before attempting provider revocation.
@@ -231,23 +288,91 @@ impl ManagedCredentials {
         }
 
         let mut inner = self.lock_inner()?;
+        let lease = self.acquire_lease()?;
         let cookie = self.read_binding_secret()?;
+        let had_cookie = cookie.is_some();
         let remote = if let Some(cookie) = cookie {
             let digest = self.checked_digest(&cookie)?;
-            self.pair_for_revoke(&inner, &digest)?
+            self.bind_cached_or_durable(&mut inner, &digest)?;
+            self.pair_for_revoke(&inner, &digest)
                 .map(|pair| (cookie, pair))
         } else {
             None
         };
         self.detach_and_clear(&mut inner)?;
+        drop(lease);
         drop(inner);
 
-        let remote_result = remote
-            .as_ref()
-            .map_or(Ok(()), |(cookie, pair)| self.recipe.revoke(cookie, pair));
+        let remote_result = match remote.as_ref() {
+            Some((cookie, pair)) => self.recipe.revoke(cookie, pair),
+            None if had_cookie => Err(TaskError::RevocationUnconfirmed),
+            None => Ok(()),
+        };
         drop(remote);
         remote_result.map_err(|_| TaskError::RevocationUnconfirmed)?;
         Ok(true)
+    }
+
+    /// Resolves a managed credential and keeps its generation leased while
+    /// `operation` dispatches the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same credential, storage, and provider errors as
+    /// [`Self::resolve`]. The lease wait is bounded and reports
+    /// [`TaskError::LocalStorage`] when another owner does not finish in time.
+    pub fn with_resolved<T>(
+        &self,
+        wanted: &Credential,
+        operation: impl FnOnce(&ResolvedCredential) -> T,
+    ) -> Result<Option<T>, TaskError> {
+        self.with_credential(wanted, false, operation)
+    }
+
+    /// Forces renewal and keeps the resulting generation leased while
+    /// `operation` dispatches the one allowed authentication retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same credential, storage, and provider errors as
+    /// [`Self::force_renew`].
+    pub fn with_forced_renewal<T>(
+        &self,
+        wanted: &Credential,
+        operation: impl FnOnce(&ResolvedCredential) -> T,
+    ) -> Result<Option<T>, TaskError> {
+        self.with_credential(wanted, true, operation)
+    }
+
+    fn with_credential<T>(
+        &self,
+        wanted: &Credential,
+        force_refresh: bool,
+        operation: impl FnOnce(&ResolvedCredential) -> T,
+    ) -> Result<Option<T>, TaskError> {
+        if wanted.secret != self.recipe.credential_name() {
+            return Ok(None);
+        }
+        if !matches!(&wanted.header, SecretHeader::Bearer) {
+            return Err(TaskError::Denied);
+        }
+
+        let mut inner = self.lock_inner()?;
+        let lease = self.acquire_lease()?;
+        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
+        let digest = self.checked_digest(&cookie)?;
+        let pair = self.obtain_pair(&mut inner, &cookie, &digest, force_refresh)?;
+        if pair.access_expires_at_ms <= (self.clock)() {
+            return Err(TaskError::Unreachable);
+        }
+        let resolved = ResolvedCredential {
+            header_name: "Authorization".to_owned(),
+            header_value: format!("Bearer {}", pair.access_token),
+        };
+        let result = operation(&resolved);
+        drop(lease);
+        drop(inner);
+        Ok(Some(result))
     }
 
     fn obtain_pair(
@@ -284,24 +409,13 @@ impl ManagedCredentials {
         inner: &mut ProviderState,
         digest: &str,
     ) -> Result<(), TaskError> {
-        if inner
-            .cached
-            .as_ref()
-            .is_some_and(|bound| bound.cookie_digest != digest)
-        {
-            inner.cached = None;
-            remove_file_synced(&self.state_path())?;
-        }
-        if inner.cached.is_some() {
-            return Ok(());
-        }
-
         match read_bound_pair(&self.state_path())? {
             Some(bound) if bound.cookie_digest == digest => inner.cached = Some(bound),
             Some(_) => {
+                inner.cached = None;
                 remove_file_synced(&self.state_path())?;
             }
-            None => {}
+            None => inner.cached = None,
         }
         Ok(())
     }
@@ -358,17 +472,12 @@ impl ManagedCredentials {
         }
     }
 
-    fn pair_for_revoke(
-        &self,
-        inner: &ProviderState,
-        digest: &str,
-    ) -> Result<Option<ManagedTokenPair>, TaskError> {
-        if let Some(bound) = &inner.cached {
-            return Ok((bound.cookie_digest == digest).then(|| bound.pair.clone()));
-        }
-        Ok(read_bound_pair(&self.state_path())?
+    fn pair_for_revoke(&self, inner: &ProviderState, digest: &str) -> Option<ManagedTokenPair> {
+        inner
+            .cached
+            .as_ref()
             .filter(|bound| bound.cookie_digest == digest)
-            .map(|bound| bound.pair))
+            .map(|bound| bound.pair.clone())
     }
 
     fn detach_and_clear(&self, inner: &mut ProviderState) -> Result<(), TaskError> {
@@ -407,6 +516,59 @@ impl ManagedCredentials {
             remove_file_synced(&detached)?;
         }
         Ok(())
+    }
+
+    fn recover_interrupted_install(&self) -> Result<(), TaskError> {
+        let marker = self.state.join(".bomtoon-login.transaction");
+        if self.recipe.credential_name() != "bomtoon-access-token"
+            || self.recipe.binding_secret_name() != "bomtoon-session"
+        {
+            return Ok(());
+        }
+        let marker_temporary = self.state.join(".bomtoon-login.transaction.new");
+        let cookie_backup = self
+            .secrets
+            .join(format!(".{}.backup", self.recipe.binding_secret_name()));
+        let cookie_temporary = self
+            .secrets
+            .join(format!(".{}.login", self.recipe.binding_secret_name()));
+        let state_backup = self
+            .state
+            .join(format!(".{}.state.backup", self.recipe.credential_name()));
+        let Some(record) = read_install_record(&marker)? else {
+            if path_exists(&cookie_backup)? || path_exists(&state_backup)? {
+                return Err(TaskError::LocalStorage);
+            }
+            remove_file_synced(&cookie_temporary)?;
+            remove_file_synced(&marker_temporary)?;
+            return Ok(());
+        };
+        if record.stage == InstallStage::Committed {
+            remove_file_synced(&cookie_temporary)?;
+            remove_file_synced(&cookie_backup)?;
+            remove_file_synced(&state_backup)?;
+            remove_file_synced(&marker_temporary)?;
+            remove_file_synced(&marker)?;
+            return Ok(());
+        }
+
+        remove_file_synced(&cookie_temporary)?;
+        remove_file_synced(&marker_temporary)?;
+        if path_exists(&state_backup)? {
+            remove_file_synced(&self.state_path())?;
+            rename_synced(&state_backup, &self.state_path())?;
+        } else if record.had_state && record.stage >= InstallStage::StateBackedUp {
+            return Err(TaskError::LocalStorage);
+        }
+        if path_exists(&cookie_backup)? {
+            remove_file_synced(&self.cookie_path())?;
+            rename_synced(&cookie_backup, &self.cookie_path())?;
+        } else if record.had_cookie && record.stage >= InstallStage::CookieBackedUp {
+            return Err(TaskError::LocalStorage);
+        } else if !record.had_cookie && record.stage >= InstallStage::CookieBackedUp {
+            remove_file_synced(&self.cookie_path())?;
+        }
+        remove_file_synced(&marker)
     }
 
     fn remove_stale_detached(&self) -> Result<(), TaskError> {
@@ -454,9 +616,85 @@ impl ManagedCredentials {
         managed_state_path(&self.state, self.recipe.credential_name())
     }
 
+    fn acquire_lease(&self) -> Result<ManagedCredentialLease, TaskError> {
+        acquire_managed_credential_lease(&self.state, self.recipe.credential_name())
+    }
+
     fn lock_inner(&self) -> Result<MutexGuard<'_, ProviderState>, TaskError> {
         self.inner.lock().map_err(|_| TaskError::LocalStorage)
     }
+}
+
+/// An exclusive managed-credential lease released by close or process exit.
+pub struct ManagedCredentialLease {
+    _file: File,
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), TaskError> {
+    fs::create_dir_all(path).map_err(|_| TaskError::LocalStorage)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| TaskError::LocalStorage)
+}
+
+fn acquire_credential_lease_with_wait(
+    state: &Path,
+    credential: &str,
+    wait: Duration,
+) -> Result<ManagedCredentialLease, TaskError> {
+    ensure_private_directory(state)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(managed_lock_path(state, credential))
+        .map_err(|_| TaskError::LocalStorage)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| TaskError::LocalStorage)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match FileExt::try_lock(&file) {
+            Ok(()) => return Ok(ManagedCredentialLease { _file: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(LOCK_RETRY.min(remaining));
+            }
+            Err(TryLockError::WouldBlock | TryLockError::Error(_)) => {
+                return Err(TaskError::LocalStorage);
+            }
+        }
+    }
+}
+
+fn read_install_record(path: &Path) -> Result<Option<InstallRecord>, TaskError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(TaskError::LocalStorage),
+    };
+    let mut encoded = String::new();
+    file.take(257)
+        .read_to_string(&mut encoded)
+        .map_err(|_| TaskError::LocalStorage)?;
+    if encoded.len() > 256 {
+        return Err(TaskError::LocalStorage);
+    }
+    InstallRecord::parse(&encoded)
+        .ok_or(TaskError::LocalStorage)
+        .map(Some)
+}
+
+fn path_exists(path: &Path) -> Result<bool, TaskError> {
+    path.try_exists().map_err(|_| TaskError::LocalStorage)
+}
+
+fn rename_synced(source: &Path, destination: &Path) -> Result<(), TaskError> {
+    fs::rename(source, destination).map_err(|_| TaskError::LocalStorage)?;
+    sync_parent(source)?;
+    if source.parent() != destination.parent() {
+        sync_parent(destination)?;
+    }
+    Ok(())
 }
 
 fn valid_secret_field(value: &str) -> bool {
@@ -997,6 +1235,192 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn separate_provider_instances_rotate_one_durable_refresh_token_once() {
+        let directories = TestDirectories::new("cross-instance-refresh");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let initial_recipe = Arc::new(FakeRecipe::default());
+        initial_recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000)));
+        provider(
+            &directories,
+            Arc::new(|| 1),
+            Arc::clone(&initial_recipe),
+        )
+        .resolve(&Credential::bearer("bomtoon-access-token"))
+        .expect("initial resolution");
+
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Ok(token_pair("b", 2_000_000)));
+        let clock: Arc<Clock> = Arc::new(|| 800_000);
+        let first = provider(&directories, Arc::clone(&clock), Arc::clone(&recipe));
+        let second = provider(&directories, clock, Arc::clone(&recipe));
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = [first, second].map(|managed| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                managed.resolve(&Credential::bearer("bomtoon-access-token"))
+            })
+        });
+        barrier.wait();
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("provider thread"),
+                Ok(Some(ResolvedCredential {
+                    header_name: "Authorization".to_owned(),
+                    header_value: "Bearer access-b".to_owned(),
+                }))
+            );
+        }
+        assert_eq!(
+            recipe
+                .calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|call| **call == "refresh")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_lease_is_bounded_and_released_when_its_owner_drops() {
+        let directories = TestDirectories::new("crash-released-lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(managed_lock_path(
+                &directories.state,
+                "bomtoon-access-token",
+            ))
+            .expect("lock file");
+        FileExt::try_lock(&lock).expect("take external lease");
+        assert!(matches!(
+            acquire_credential_lease_with_wait(
+                &directories.state,
+                "bomtoon-access-token",
+                Duration::ZERO,
+            ),
+            Err(TaskError::LocalStorage)
+        ));
+        drop(lock);
+        assert!(acquire_credential_lease_with_wait(
+            &directories.state,
+            "bomtoon-access-token",
+            Duration::ZERO,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn provider_startup_rolls_back_an_interrupted_login_install() {
+        let directories = TestDirectories::new("install-rollback-recovery");
+        fs::write(directories.cookie(), "replacement-cookie").expect("replacement cookie");
+        fs::write(
+            directories.secrets.join(".bomtoon-session.backup"),
+            "prior-cookie",
+        )
+        .expect("cookie backup");
+        fs::write(
+            directories
+                .state
+                .join(".bomtoon-access-token.state.backup"),
+            "prior-state",
+        )
+        .expect("state backup");
+        fs::write(
+            directories.state.join(".bomtoon-login.transaction"),
+            "cobalt-bomtoon-install-v1\nstate-backed-up\n1\n1",
+        )
+        .expect("transaction marker");
+
+        let _managed = provider(
+            &directories,
+            Arc::new(|| 1),
+            Arc::new(FakeRecipe::default()),
+        );
+        assert_eq!(
+            fs::read_to_string(directories.cookie()).expect("restored cookie"),
+            "prior-cookie"
+        );
+        assert_eq!(
+            fs::read_to_string(directories.managed_state()).expect("restored state"),
+            "prior-state"
+        );
+        assert!(!directories
+            .state
+            .join(".bomtoon-login.transaction")
+            .exists());
+    }
+
+    #[test]
+    fn provider_startup_finishes_cleanup_after_a_durable_commit() {
+        let directories = TestDirectories::new("install-commit-recovery");
+        fs::write(directories.cookie(), "replacement-cookie").expect("replacement cookie");
+        fs::write(
+            directories.secrets.join(".bomtoon-session.backup"),
+            "prior-cookie",
+        )
+        .expect("cookie backup");
+        fs::write(
+            directories
+                .state
+                .join(".bomtoon-access-token.state.backup"),
+            "prior-state",
+        )
+        .expect("state backup");
+        fs::write(
+            directories.state.join(".bomtoon-login.transaction"),
+            "cobalt-bomtoon-install-v1\ncommitted\n1\n1",
+        )
+        .expect("transaction marker");
+
+        let _managed = provider(
+            &directories,
+            Arc::new(|| 1),
+            Arc::new(FakeRecipe::default()),
+        );
+        assert_eq!(
+            fs::read_to_string(directories.cookie()).expect("installed cookie"),
+            "replacement-cookie"
+        );
+        assert!(!directories.managed_state().exists());
+        assert!(!directories
+            .secrets
+            .join(".bomtoon-session.backup")
+            .exists());
+        assert!(!directories
+            .state
+            .join(".bomtoon-login.transaction")
+            .exists());
+    }
+
+    #[test]
+    fn cookie_without_a_matching_pair_revokes_locally_but_fails_closed() {
+        let directories = TestDirectories::new("unmatched-revoke");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let recipe = Arc::new(FakeRecipe::default());
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
+
+        assert_eq!(
+            managed.revoke("bomtoon-access-token"),
+            Err(TaskError::RevocationUnconfirmed)
+        );
+        assert!(!directories.cookie().exists());
+        assert!(!directories.managed_state().exists());
+        assert!(recipe.calls.lock().expect("calls").is_empty());
     }
 
     #[test]

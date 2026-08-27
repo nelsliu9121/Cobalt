@@ -2,6 +2,7 @@
 
 //! Localhost-only browser simulator for Kobo grayscale screens.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -9,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2069,6 +2070,7 @@ pub fn run_server_at(address: &str) -> io::Result<()> {
 pub struct SimulatorAuthPaths {
     pub secrets: PathBuf,
     pub state: PathBuf,
+    pub lock: PathBuf,
 }
 
 /// Returns the simulator's shared authentication locations.
@@ -2078,10 +2080,39 @@ pub fn simulator_auth_paths() -> SimulatorAuthPaths {
 }
 
 fn simulator_auth_paths_at(root: &Path) -> SimulatorAuthPaths {
+    let state = root.join("cobalt-sim-state");
     SimulatorAuthPaths {
         secrets: root.join("cobalt-sim-secrets"),
-        state: root.join("cobalt-sim-state"),
+        lock: kobo_policy::managed_lock_path(&state, "bomtoon-access-token"),
+        state,
     }
+}
+
+/// Acquires the simulator lease shared by login installation and runtime use.
+///
+/// # Errors
+///
+/// Returns an error when the lease file cannot be opened or another process
+/// does not release it within the bounded wait.
+pub fn acquire_simulator_auth_lease(
+    paths: &SimulatorAuthPaths,
+) -> io::Result<impl Send> {
+    kobo_policy::acquire_managed_credential_lease(&paths.state, "bomtoon-access-token")
+        .map_err(|_| io::Error::other("simulator authentication lease unavailable"))
+}
+
+fn simulator_task_root_at(root: &Path, name: &str) -> PathBuf {
+    let component = if !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        name
+    } else {
+        ".denied"
+    };
+    root.join("cobalt-sim-app-files").join(component)
 }
 
 fn epoch_millis() -> u64 {
@@ -2097,8 +2128,14 @@ fn managed_credentials(name: &str, root: impl AsRef<Path>) -> Option<Arc<Managed
     if name != "bomtoon" {
         return None;
     }
+    static PROVIDERS: LazyLock<Mutex<HashMap<PathBuf, Weak<ManagedCredentials>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     let paths = simulator_auth_paths_at(root.as_ref());
-    Some(Arc::new(
+    let mut providers = PROVIDERS.lock().expect("simulator provider cache");
+    if let Some(provider) = providers.get(&paths.state).and_then(Weak::upgrade) {
+        return Some(provider);
+    }
+    let provider = Arc::new(
         ManagedCredentials::new(
             &paths.secrets,
             &paths.state,
@@ -2106,7 +2143,9 @@ fn managed_credentials(name: &str, root: impl AsRef<Path>) -> Option<Arc<Managed
             Arc::new(kobo_net::bomtoon::Recipe::live()),
         )
         .expect("initialize BOMTOON managed credentials"),
-    ))
+    );
+    providers.insert(paths.state, Arc::downgrade(&provider));
+    Some(provider)
 }
 
 /// Set this to any value to make every network task fail.
@@ -2141,9 +2180,13 @@ fn simulated_tasks(name: &str) -> TaskRunner {
         let _ = kobo_net::trust_owner_roots_from_dir(&directory);
     });
     let root = std::env::temp_dir();
-    let paths = simulator_auth_paths();
-    let mut runner = TaskRunner::simulated(&root).with_secrets(paths.secrets);
-    if let Some(managed) = managed_credentials(name, root) {
+    let paths = simulator_auth_paths_at(&root);
+    let task_root = simulator_task_root_at(&root, name);
+    if fs::create_dir_all(&task_root).is_ok() {
+        let _ = fs::set_permissions(&task_root, fs::Permissions::from_mode(0o700));
+    }
+    let mut runner = TaskRunner::simulated(task_root).with_secrets(paths.secrets);
+    if let Some(managed) = managed_credentials(name, &root) {
         runner = runner.with_managed_credentials(managed);
     }
     if std::env::var_os(OFFLINE).is_some() {
@@ -2772,12 +2815,71 @@ mod tests {
         let paths = simulator_auth_paths_at(&root);
         assert_eq!(paths.secrets, root.join("cobalt-sim-secrets"));
         assert_eq!(paths.state, root.join("cobalt-sim-state"));
+        assert_eq!(
+            paths.lock,
+            root.join("cobalt-sim-state/.bomtoon-access-token.lock")
+        );
+        assert_ne!(simulator_task_root_at(&root, "bomtoon"), paths.secrets);
+        assert_ne!(simulator_task_root_at(&root, "bomtoon"), paths.state);
     }
 
     #[test]
     fn only_bomtoon_receives_the_bomtoon_managed_provider() {
         assert!(managed_credentials("bomtoon", private_temp_dir()).is_some());
         assert!(managed_credentials("chat", private_temp_dir()).is_none());
+    }
+
+    #[test]
+    fn simulator_reuses_one_managed_provider_for_each_auth_root() {
+        let root = private_temp_dir();
+        let first = managed_credentials("bomtoon", &root).expect("first provider");
+        let second = managed_credentials("bomtoon", &root).expect("second provider");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn ordinary_app_files_cannot_address_simulator_authentication_roots() {
+        let root = private_temp_dir();
+        let paths = simulator_auth_paths_at(&root);
+        fs::create_dir_all(&paths.secrets).expect("secret directory");
+        fs::write(
+            paths.secrets.join("bomtoon-session"),
+            b"redacted-session-material",
+        )
+        .expect("session fixture");
+        let task_root = simulator_task_root_at(&root, "bomtoon");
+        fs::create_dir_all(&task_root).expect("app file directory");
+        let mut runner = TaskRunner::simulated(task_root);
+        runner
+            .submit(
+                kobo_protocol::TaskId(1),
+                kobo_protocol::Task::ReadFile {
+                    path: "cobalt-sim-secrets/bomtoon-session".to_owned(),
+                },
+            )
+            .expect("submit ordinary file read");
+        assert_eq!(
+            runner
+                .wait(Duration::from_secs(1))
+                .expect("file outcome")
+                .outcome,
+            kobo_protocol::TaskOutcome::Failed(kobo_protocol::TaskError::NotFound)
+        );
+        runner
+            .submit(
+                kobo_protocol::TaskId(2),
+                kobo_protocol::Task::ReadFile {
+                    path: "../../cobalt-sim-secrets/bomtoon-session".to_owned(),
+                },
+            )
+            .expect("submit escaping file read");
+        assert_eq!(
+            runner
+                .wait(Duration::from_secs(1))
+                .expect("escape outcome")
+                .outcome,
+            kobo_protocol::TaskOutcome::Failed(kobo_protocol::TaskError::Denied)
+        );
     }
 
     fn private_temp_dir() -> PathBuf {
