@@ -730,14 +730,13 @@ pub fn post(
     headers: &[(&str, &str)],
     max_bytes: u32,
 ) -> Result<Vec<u8>, TaskError> {
-    send_body_with(
+    post_with(
         url,
         body,
         content_type,
         credential,
         headers,
         max_bytes,
-        BodyMethod::Post,
         request,
     )
 }
@@ -753,6 +752,49 @@ pub fn put(
     headers: &[(&str, &str)],
     max_bytes: u32,
 ) -> Result<Vec<u8>, TaskError> {
+    put_with(
+        url,
+        body,
+        content_type,
+        credential,
+        headers,
+        max_bytes,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_with(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    credential: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    max_bytes: u32,
+    request_once: impl FnMut(&Address, &Method<'_>, u32) -> Result<Vec<u8>, TaskError>,
+) -> Result<Vec<u8>, TaskError> {
+    send_body_with(
+        url,
+        body,
+        content_type,
+        credential,
+        headers,
+        max_bytes,
+        BodyMethod::Post,
+        request_once,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_with(
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+    credential: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    max_bytes: u32,
+    request_once: impl FnMut(&Address, &Method<'_>, u32) -> Result<Vec<u8>, TaskError>,
+) -> Result<Vec<u8>, TaskError> {
     send_body_with(
         url,
         body,
@@ -761,7 +803,7 @@ pub fn put(
         headers,
         max_bytes,
         BodyMethod::Put,
-        request,
+        request_once,
     )
 }
 
@@ -1440,6 +1482,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn library_json_rejects_every_query_and_origin_mutation() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let exact = "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Get,
+            exact
+        ));
+        for url in [
+            "https://www.bomtoon.tw/api/balcony-api-v2/library",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=one&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?page=1&sort=CREATE&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=31&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=false&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=RECTANGLE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE&extra=true",
+            "https://www.bomtoon.tw:444/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://attacker.invalid/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "http://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+        ] {
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                url
+            ));
+        }
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Post,
+            exact
+        ));
+    }
+
+    #[test]
+    fn recent_json_rejects_every_query_and_origin_mutation() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let exact = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Get,
+            exact
+        ));
+        for url in [
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=one&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?page=0&sort=CREATE&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&size=30&contentsOrderNo=0&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=31&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=false&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=RECTANGLE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE&extra=true",
+            "https://www.bomtoon.tw:444/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "https://attacker.invalid/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+            "http://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+        ] {
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                url
+            ));
+        }
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Post,
+            exact
+        ));
+    }
+
     /// The policy is one function for both runtimes, so the tests that pin
     /// it live beside it rather than in whichever runtime happened to own it
     /// first. In the device runtime they only ran under a feature flag.
@@ -1767,8 +1899,8 @@ mod tests {
     }
 
     use super::{
-        fetch, get_with, head, message_end, parse, post, resolve_redirect, send_body_with,
-        split_response, stays_open, Address, BodyMethod, Cow, Method, Response,
+        fetch, get_with, head, message_end, parse, post, post_with, put_with, resolve_redirect,
+        split_response, stays_open, Address, Cow, Method, Response,
     };
     use kobo_protocol::TaskError;
 
@@ -1984,34 +2116,54 @@ mod tests {
     #[test]
     fn credentialed_post_and_put_reject_redirects_without_a_second_request() {
         let original = "https://a.test/session";
-        for body_method in [BodyMethod::Post, BodyMethod::Put] {
-            for location in ["next", "https://b.test/collect"] {
-                let response = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
-                )
-                .into_bytes();
-                let mut attempted = Vec::new();
-                let result = send_body_with(
-                    original,
-                    br#"{"redacted":true}"#,
-                    "application/json",
-                    Some(("Authorization", "Bearer REDACTED")),
-                    &[("Cookie", "SESSION_REDACTED")],
-                    CEILING,
-                    body_method,
-                    |address, method, _| {
-                        attempted.push((
-                            method.verb(),
-                            format!("https://{}{}", address.authority, address.path),
-                        ));
-                        Ok(response.clone())
-                    },
-                );
+        for location in ["next", "https://b.test/collect"] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes();
+            let mut attempted = Vec::new();
+            let result = post_with(
+                original,
+                br#"{"redacted":true}"#,
+                "application/json",
+                Some(("Authorization", "Bearer REDACTED")),
+                &[("Cookie", "SESSION_REDACTED")],
+                CEILING,
+                |address, method, _| {
+                    attempted.push((
+                        method.verb(),
+                        format!("https://{}{}", address.authority, address.path),
+                    ));
+                    Ok(response.clone())
+                },
+            );
+            assert_eq!(result, Err(TaskError::Denied), "{location}");
+            assert_eq!(attempted, vec![("POST", original.to_owned())], "{location}");
+        }
 
-                assert_eq!(result, Err(TaskError::Denied), "{location}");
-                assert_eq!(attempted.len(), 1, "{location}");
-                assert_eq!(attempted[0].1, original, "{location}");
-            }
+        for location in ["next", "https://b.test/collect"] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes();
+            let mut attempted = Vec::new();
+            let result = put_with(
+                original,
+                br#"{"redacted":true}"#,
+                "application/json",
+                Some(("Authorization", "Bearer REDACTED")),
+                &[("Cookie", "SESSION_REDACTED")],
+                CEILING,
+                |address, method, _| {
+                    attempted.push((
+                        method.verb(),
+                        format!("https://{}{}", address.authority, address.path),
+                    ));
+                    Ok(response.clone())
+                },
+            );
+            assert_eq!(result, Err(TaskError::Denied), "{location}");
+            assert_eq!(attempted, vec![("PUT", original.to_owned())], "{location}");
         }
     }
 

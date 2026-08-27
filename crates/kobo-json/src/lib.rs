@@ -70,6 +70,16 @@ use std::fmt;
 /// kilobytes of stack.
 pub const MAX_DEPTH: usize = 64;
 
+/// A JSON integer together with the exact lexeme that was parsed.
+///
+/// Keeping the text avoids silently changing integers beyond `f64`'s exact
+/// range while still letting [`Value::as_f64`] preserve its existing behavior.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Integer {
+    lexeme: String,
+    number: f64,
+}
+
 /// A parsed JSON value.
 ///
 /// Objects are a `Vec` of pairs rather than a map. That keeps the crate free
@@ -81,6 +91,7 @@ pub enum Value {
     Null,
     Bool(bool),
     Number(f64),
+    Integer(Integer),
     String(String),
     Array(Vec<Value>),
     /// Insertion-ordered fields. Duplicate keys are kept as sent; [`get`]
@@ -125,17 +136,28 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Number(number) => Some(*number),
+            Self::Integer(integer) => Some(integer.number),
+            _ => None,
+        }
+    }
+
+    /// The exact source lexeme when this value was parsed as a JSON integer.
+    ///
+    /// Decimal fractions and exponent forms are numbers, but not integer
+    /// lexemes, even when their `f64` value is mathematically integral.
+    #[must_use]
+    pub fn as_integer_str(&self) -> Option<&str> {
+        match self {
+            Self::Integer(integer) => Some(&integer.lexeme),
             _ => None,
         }
     }
 
     /// The number as an `i64`, but only when it is exactly an integer that
-    /// fits.
+    /// fits the historical `f64` representation.
     ///
-    /// A JSON number is a `f64` here, so `1e30` and `1.5` are perfectly good
-    /// numbers that are not identifiers or counts. Returning `None` rather
-    /// than a rounded or saturated answer means a caller asking for a book id
-    /// never silently receives a different book.
+    /// Use [`Value::as_integer_str`] when the source integer lexeme itself is
+    /// load-bearing and must not pass through `f64`.
     #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         // `i64::MAX` is not representable as f64, so the upper bound is the
@@ -210,6 +232,7 @@ impl Value {
                         out.push_str("null");
                     }
                 }
+                Step::Value(Self::Integer(integer)) => out.push_str(&integer.lexeme),
                 Step::Value(Self::String(text)) => escape_into(text, out),
                 Step::Value(Self::Array(items)) => {
                     out.push('[');
@@ -862,11 +885,14 @@ impl Parser<'_> {
             Some(b'1'..=b'9') => self.digits(start)?,
             _ => return Err(error_at(start, Reason::InvalidNumber)),
         }
+        let mut integer = true;
         if self.peek() == Some(b'.') {
+            integer = false;
             self.bump();
             self.digits(start)?;
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
+            integer = false;
             self.bump();
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.bump();
@@ -882,10 +908,16 @@ impl Parser<'_> {
             .map_err(|_| error_at(start, Reason::InvalidNumber))?;
         // `1e400` parses to infinity, which has no JSON spelling and would not
         // survive being written back out.
-        if number.is_finite() {
-            Ok(Value::Number(number))
+        if !number.is_finite() {
+            return Err(error_at(start, Reason::NumberOutOfRange));
+        }
+        if integer {
+            Ok(Value::Integer(Integer {
+                lexeme: text.to_owned(),
+                number,
+            }))
         } else {
-            Err(error_at(start, Reason::NumberOutOfRange))
+            Ok(Value::Number(number))
         }
     }
 
@@ -1109,6 +1141,28 @@ mod tests {
                 "{rejected} is not a JSON number but was accepted"
             );
         }
+    }
+
+    #[test]
+    fn parsed_integer_lexemes_remain_exact_beyond_double_precision() {
+        for integer in [
+            "0",
+            "-0",
+            "9007199254740993",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let value = parsed(integer);
+            assert_eq!(value.as_integer_str(), Some(integer));
+            assert_eq!(value.to_json(), integer);
+        }
+        for number in ["1.0", "1.0000000000000001", "1e0", "1E+3"] {
+            assert_eq!(parsed(number).as_integer_str(), None);
+        }
+        assert_eq!(
+            parsed("9007199254740993").as_i64(),
+            Some(9_007_199_254_740_992)
+        );
     }
 
     /// An overflowing exponent parses to infinity, which cannot be written

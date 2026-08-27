@@ -73,15 +73,7 @@ impl Transport for LiveTransport {
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError> {
-        let authorization = format!("Bearer {bearer}");
-        crate::post(
-            url,
-            body,
-            JSON_CONTENT_TYPE,
-            Some(("Authorization", &authorization)),
-            headers,
-            max_bytes,
-        )
+        send_json_with_bearer(url, body, bearer, headers, max_bytes, crate::post)
     }
 
     fn put_json(
@@ -92,16 +84,34 @@ impl Transport for LiveTransport {
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError> {
-        let authorization = format!("Bearer {bearer}");
-        crate::put(
-            url,
-            body,
-            JSON_CONTENT_TYPE,
-            Some(("Authorization", &authorization)),
-            headers,
-            max_bytes,
-        )
+        send_json_with_bearer(url, body, bearer, headers, max_bytes, crate::put)
     }
+}
+
+fn send_json_with_bearer(
+    url: &str,
+    body: &[u8],
+    bearer: &str,
+    headers: &[(&str, &str)],
+    max_bytes: u32,
+    send: impl FnOnce(
+        &str,
+        &[u8],
+        &str,
+        Option<(&str, &str)>,
+        &[(&str, &str)],
+        u32,
+    ) -> Result<Vec<u8>, TaskError>,
+) -> Result<Vec<u8>, TaskError> {
+    let authorization = format!("Bearer {bearer}");
+    send(
+        url,
+        body,
+        JSON_CONTENT_TYPE,
+        Some(("Authorization", authorization.as_str())),
+        headers,
+        max_bytes,
+    )
 }
 
 /// BOMTOON's cookie-bound access-token lifecycle.
@@ -289,8 +299,8 @@ fn parse_token(container: &Value, name: &str) -> Result<(String, u64), TaskError
 
 fn epoch_milliseconds(value: &Value) -> Result<u64, TaskError> {
     value
-        .as_i64()
-        .and_then(|number| u64::try_from(number).ok())
+        .as_integer_str()
+        .and_then(|lexeme| lexeme.parse().ok())
         .ok_or(TaskError::Unreachable)
 }
 
@@ -497,11 +507,12 @@ mod tests {
         }
     }
 
-    fn assert_common_headers(headers: &[(String, String)]) {
-        assert!(headers.iter().any(|header| header == &("Accept".to_owned(), "application/json".to_owned())));
-        assert!(headers.iter().any(|header| header == &("x-balcony-id".to_owned(), "BOMTOON_TW".to_owned())));
-        assert!(headers.iter().any(|header| header == &("x-balcony-timezone".to_owned(), "Asia/Taipei".to_owned())));
-        assert!(headers.iter().any(|header| header == &("x-platform".to_owned(), "MOBILE_IOS".to_owned())));
+    fn common_headers() -> Vec<(String, String)> {
+        owned_headers(&BOMTOON_HEADERS)
+    }
+
+    fn cookie_headers(cookie: &str) -> Vec<(String, String)> {
+        owned_headers(&headers_with_cookie(cookie))
     }
 
     #[test]
@@ -566,6 +577,40 @@ mod tests {
     }
 
     #[test]
+    fn epoch_milliseconds_require_exact_non_overflowing_integer_lexemes() {
+        for malformed in [
+            SESSION.replace("604801000", "604801000.0000000000000001"),
+            SESSION.replace("604801000", "604801000e0"),
+            SESSION.replace("604801000", "18446744073709551616"),
+            SESSION.replace("1000", "-1"),
+        ] {
+            assert!(matches!(
+                parse_session_tokens(malformed.as_bytes()),
+                Err(TaskError::Unreachable)
+            ));
+        }
+
+        let beyond_double_precision = br#"{
+          "user": {
+            "accessToken": {
+              "token":"ACCESS_A",
+              "createdAt":9007199254740993,
+              "expiredAt":9007199254740994
+            },
+            "refreshToken": {
+              "token":"REFRESH_A",
+              "createdAt":9007199254740993,
+              "expiredAt":9007199254740995
+            }
+          }
+        }"#;
+        let pair =
+            parse_session_tokens(beyond_double_precision).expect("exact integer lexemes");
+        assert_eq!(pair.access_expires_at_ms, 9_007_199_254_740_994);
+        assert_eq!(pair.refresh_expires_at_ms, 9_007_199_254_740_995);
+    }
+
+    #[test]
     fn refresh_sends_cookie_ip_and_refresh_token_with_access_bearer() {
         let transport = Arc::new(FakeTransport::new([
             Ok(br#"{"ipAddress":"203.0.113.1"}"#.to_vec()),
@@ -590,8 +635,7 @@ mod tests {
                 assert_eq!(url, IP_URL);
                 assert_eq!(credential.as_ref().map(|value| (value.0.as_str(), value.1.as_str())), Some(("Cookie", "SESSION_COOKIE_A")));
                 assert_eq!(*max_bytes, IP_RESPONSE_MAX_BYTES);
-                assert_common_headers(headers);
-                assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")));
+                assert_eq!(headers, &common_headers());
             }
             _ => panic!("expected IP GET"),
         }
@@ -607,8 +651,7 @@ mod tests {
                 assert_eq!(body, br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#);
                 assert_eq!(bearer, "ACCESS_A");
                 assert_eq!(*max_bytes, REFRESH_RESPONSE_MAX_BYTES);
-                assert!(headers.iter().any(|header| header == &("Cookie".to_owned(), "SESSION_COOKIE_A".to_owned())));
-                assert_common_headers(headers);
+                assert_eq!(headers, &cookie_headers("SESSION_COOKIE_A"));
             }
             _ => panic!("expected refresh POST"),
         }
@@ -637,8 +680,7 @@ mod tests {
                 assert_eq!(body, br#"{"refreshToken":"REFRESH_A"}"#);
                 assert_eq!(bearer, "ACCESS_A");
                 assert_eq!(*max_bytes, LOGOUT_RESPONSE_MAX_BYTES);
-                assert!(headers.iter().any(|header| header == &("Cookie".to_owned(), "SESSION_COOKIE_A".to_owned())));
-                assert_common_headers(headers);
+                assert_eq!(headers, &cookie_headers("SESSION_COOKIE_A"));
             }
             _ => panic!("expected logout PUT"),
         }
@@ -687,9 +729,7 @@ mod tests {
             assert_eq!(url, SESSION_URL);
             assert_eq!(credential.as_ref().map(|value| (value.0.as_str(), value.1.as_str())), Some(("Cookie", "SESSION_COOKIE_A")));
             assert_eq!(*max_bytes, SESSION_RESPONSE_MAX_BYTES);
-            assert_eq!(headers.len(), BOMTOON_HEADERS.len());
-            assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")));
-            assert_common_headers(headers);
+            assert_eq!(headers, &common_headers());
         }
     }
 
@@ -739,6 +779,37 @@ mod tests {
             Err(TaskError::TooLarge)
         );
         assert!(invalid.calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn live_body_adapter_maps_bearer_to_exact_authorization_credential() {
+        let headers = headers_with_cookie("SESSION_COOKIE_A");
+        let mut called = false;
+        let response = send_json_with_bearer(
+            REFRESH_URL,
+            br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#,
+            "ACCESS_A",
+            &headers,
+            REFRESH_RESPONSE_MAX_BYTES,
+            |url, body, content_type, credential, sent_headers, max_bytes| {
+                called = true;
+                assert_eq!(url, REFRESH_URL);
+                assert_eq!(
+                    body,
+                    br#"{"refreshToken":"REFRESH_A","clientIp":"203.0.113.1"}"#
+                );
+                assert_eq!(content_type, "application/json");
+                assert_eq!(
+                    credential,
+                    Some(("Authorization", "Bearer ACCESS_A"))
+                );
+                assert_eq!(sent_headers, &headers);
+                assert_eq!(max_bytes, REFRESH_RESPONSE_MAX_BYTES);
+                Ok(b"ok".to_vec())
+            },
+        );
+        assert!(called);
+        assert_eq!(response, Ok(b"ok".to_vec()));
     }
 
     #[test]
