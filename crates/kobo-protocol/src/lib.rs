@@ -394,6 +394,9 @@ pub enum Task {
         headers: Vec<Header>,
         max_bytes: u32,
     },
+    /// Removes a named credential from managed local storage and asks the
+    /// provider to revoke it. The value itself never crosses this boundary.
+    RevokeCredential { credential: String },
     /// Reads a file from the application's own directory.
     ReadFile { path: String },
     /// Waits, without holding a wake lock.
@@ -434,6 +437,13 @@ impl Task {
                     && headers.len() <= MAX_HEADERS
                     && headers.iter().all(Header::is_well_formed)
                     && credential.as_ref().is_none_or(Credential::is_well_formed)
+            }
+            Self::RevokeCredential { credential } => {
+                !credential.is_empty()
+                    && credential.len() <= MAX_HEADER_NAME
+                    && credential
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             }
             Self::ReadFile { path } => path.len() <= MAX_STRING_LEN,
             Self::Sleep { .. } => true,
@@ -498,6 +508,10 @@ pub enum TaskError {
     /// Kept apart from [`TaskError::NoCredential`] as well: that one is the
     /// device having no key, this one is the host refusing the request.
     Unauthorized,
+    /// The runtime could not update its managed local credential storage.
+    LocalStorage,
+    /// Local sign-out completed, but the provider did not confirm revocation.
+    RevocationUnconfirmed,
 }
 
 impl TaskError {
@@ -530,6 +544,10 @@ impl fmt::Display for TaskError {
             Self::TimedOut => "the task ran out of time",
             Self::NotFound => "not found",
             Self::Unauthorized => "the host will not answer without a credential",
+            Self::LocalStorage => "the runtime could not update local credential storage",
+            Self::RevocationUnconfirmed => {
+                "the account is signed out locally but remote revocation was not confirmed"
+            }
         })
     }
 }
@@ -1744,6 +1762,10 @@ fn encode_task_message(payload: &mut Vec<u8>, message: &Message) -> Result<(), P
                     }
                     push_u32(payload, *max_bytes);
                 }
+                Task::RevokeCredential { credential } => {
+                    payload.push(4);
+                    push_string(payload, credential)?;
+                }
             }
         }
         Message::Cancel { task } => push_u32(payload, task.0),
@@ -2080,6 +2102,9 @@ fn encoded_task_len(work: &Task) -> Result<usize, ProtocolError> {
                 add_encoded_len(&mut length, encoded_string_len(&header.name)?)?;
                 add_encoded_len(&mut length, encoded_string_len(&header.value)?)?;
             }
+        }
+        Task::RevokeCredential { credential } => {
+            add_encoded_len(&mut length, encoded_string_len(credential)?)?;
         }
     }
     Ok(length)
@@ -3737,6 +3762,9 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
                         max_bytes: min(reader.u32()?, MAX_TASK_BYTES_U32),
                     }
                 }
+                4 => Task::RevokeCredential {
+                    credential: reader.string()?,
+                },
                 _ => return Err(ProtocolError::InvalidValue("task kind")),
             };
             Message::Spawn { task, work }
@@ -7865,6 +7893,30 @@ mod store_tests {
     }
 
     #[test]
+    fn managed_credential_revocation_round_trips() {
+        let message = Message::Spawn {
+            task: TaskId(41),
+            work: Task::RevokeCredential {
+                credential: "bomtoon-access-token".to_owned(),
+            },
+        };
+        let encoded = encode(&Frame {
+            request_id: 9,
+            message: message.clone(),
+        })
+        .expect("encode revoke");
+        assert_eq!(decode(&encoded).expect("decode revoke").message, message);
+    }
+
+    #[test]
+    fn revoke_refuses_an_invalid_credential_name() {
+        let work = Task::RevokeCredential {
+            credential: "bad credential".to_owned(),
+        };
+        assert!(!work.is_sendable());
+    }
+
+    #[test]
     fn a_fetch_that_carries_headers_survives_an_encode_decode_round_trip() {
         let message = Message::Spawn {
             task: TaskId(20),
@@ -8178,6 +8230,8 @@ const fn encode_task_error(error: TaskError) -> u8 {
         TaskError::Offline => 5,
         TaskError::NoCredential => 6,
         TaskError::Unauthorized => 7,
+        TaskError::LocalStorage => 8,
+        TaskError::RevocationUnconfirmed => 9,
     }
 }
 
@@ -8191,6 +8245,8 @@ const fn decode_task_error(tag: u8) -> Result<TaskError, ProtocolError> {
         5 => TaskError::Offline,
         6 => TaskError::NoCredential,
         7 => TaskError::Unauthorized,
+        8 => TaskError::LocalStorage,
+        9 => TaskError::RevocationUnconfirmed,
         _ => return Err(ProtocolError::InvalidValue("task error")),
     })
 }
@@ -8208,6 +8264,9 @@ mod task_error_tests {
         TaskError::TooLarge,
         TaskError::TimedOut,
         TaskError::NotFound,
+        TaskError::Unauthorized,
+        TaskError::LocalStorage,
+        TaskError::RevocationUnconfirmed,
     ];
 
     #[test]
@@ -8241,6 +8300,18 @@ mod task_error_tests {
         assert_eq!(encode_task_error(TaskError::NotFound), 4);
         assert_eq!(encode_task_error(TaskError::Offline), 5);
         assert_eq!(encode_task_error(TaskError::NoCredential), 6);
+        assert_eq!(encode_task_error(TaskError::Unauthorized), 7);
+    }
+
+    #[test]
+    fn logout_errors_keep_append_only_wire_tags() {
+        assert_eq!(encode_task_error(TaskError::LocalStorage), 8);
+        assert_eq!(encode_task_error(TaskError::RevocationUnconfirmed), 9);
+        assert_eq!(decode_task_error(8), Ok(TaskError::LocalStorage));
+        assert_eq!(
+            decode_task_error(9),
+            Ok(TaskError::RevocationUnconfirmed)
+        );
     }
 
     /// The two refusals have to stay distinguishable in words as well as on
@@ -8258,7 +8329,7 @@ mod task_error_tests {
     #[test]
     fn a_tag_from_the_future_is_refused_rather_than_guessed() {
         assert_eq!(
-            decode_task_error(8),
+            decode_task_error(10),
             Err(ProtocolError::InvalidValue("task error"))
         );
         assert_eq!(

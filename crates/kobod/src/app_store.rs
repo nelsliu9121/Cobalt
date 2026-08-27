@@ -876,9 +876,9 @@ fn builtin_binary(root: &Path, id: &str) -> PathBuf {
 
 fn network_error(error: kobo_protocol::TaskError) -> DeviceError {
     match error {
-        kobo_protocol::TaskError::Offline | kobo_protocol::TaskError::Unreachable => {
-            DeviceError::Unreachable
-        }
+        kobo_protocol::TaskError::Offline
+        | kobo_protocol::TaskError::Unreachable
+        | kobo_protocol::TaskError::RevocationUnconfirmed => DeviceError::Unreachable,
         kobo_protocol::TaskError::TimedOut => DeviceError::TimedOut,
         kobo_protocol::TaskError::NotFound => DeviceError::NotFound,
         kobo_protocol::TaskError::TooLarge | kobo_protocol::TaskError::Denied => {
@@ -887,6 +887,7 @@ fn network_error(error: kobo_protocol::TaskError) -> DeviceError {
         kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
             DeviceError::Authentication
         }
+        kobo_protocol::TaskError::LocalStorage => DeviceError::Backend,
     }
 }
 

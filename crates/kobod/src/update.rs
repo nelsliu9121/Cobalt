@@ -48,9 +48,9 @@ const BLOCK: usize = 512;
 #[cfg(feature = "device-write")]
 pub fn apply(url: &str, sha256: &str) -> Result<(), DeviceError> {
     let archive = kobo_net::fetch(url, ARCHIVE_LIMIT).map_err(|error| match error {
-        kobo_protocol::TaskError::Offline | kobo_protocol::TaskError::Unreachable => {
-            DeviceError::Unreachable
-        }
+        kobo_protocol::TaskError::Offline
+        | kobo_protocol::TaskError::Unreachable
+        | kobo_protocol::TaskError::RevocationUnconfirmed => DeviceError::Unreachable,
         kobo_protocol::TaskError::TimedOut => DeviceError::TimedOut,
         kobo_protocol::TaskError::NotFound => DeviceError::NotFound,
         kobo_protocol::TaskError::TooLarge | kobo_protocol::TaskError::Denied => {
@@ -59,6 +59,7 @@ pub fn apply(url: &str, sha256: &str) -> Result<(), DeviceError> {
         kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
             DeviceError::Authentication
         }
+        kobo_protocol::TaskError::LocalStorage => DeviceError::Backend,
     })?;
     install(&archive, sha256, Path::new(ADDS))
 }

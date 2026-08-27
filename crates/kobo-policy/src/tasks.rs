@@ -324,7 +324,9 @@ impl TaskRunner {
         }
 
         let required = match &work {
-            Task::Fetch { .. } | Task::Post { .. } => Some(Capability::Network),
+            Task::Fetch { .. } | Task::Post { .. } | Task::RevokeCredential { .. } => {
+                Some(Capability::Network)
+            }
             Task::ReadFile { .. } | Task::Sleep { .. } => None,
         };
         if let Some(capability) = required {
@@ -500,6 +502,7 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
         credentials,
     } = backends;
     match work {
+        Task::RevokeCredential { .. } => TaskOutcome::Failed(TaskError::Denied),
         Task::Sleep { seconds } => {
             // Polled in short slices rather than slept in one call, so a
             // cancelled five minute sleep stops now instead of in five minutes.
@@ -712,6 +715,24 @@ mod tests {
                 task: TaskId(1),
                 outcome: TaskOutcome::Failed(TaskError::Denied),
             }]
+        );
+    }
+
+    #[test]
+    fn revoke_is_fail_closed_before_the_managed_provider_exists() {
+        let mut runner = TaskRunner::simulated(temp_root("revoke-closed"))
+            .with_capabilities([Capability::Network]);
+        runner
+            .submit(
+                TaskId(1),
+                Task::RevokeCredential {
+                    credential: "bomtoon-access-token".to_owned(),
+                },
+            )
+            .expect("admit revoke");
+        assert_eq!(
+            runner.wait(Duration::from_secs(1)).unwrap().outcome,
+            TaskOutcome::Failed(TaskError::Denied)
         );
     }
 

@@ -1162,7 +1162,9 @@ fn host_applications(
             // different things everywhere else, but `DeviceError` is the radio
             // vocabulary and has one word for both. Unreachable is the honest
             // one: from the player's point of view the bytes cannot be got.
-            kobo_protocol::TaskError::Offline | kobo_protocol::TaskError::Unreachable => {
+            kobo_protocol::TaskError::Offline
+            | kobo_protocol::TaskError::Unreachable
+            | kobo_protocol::TaskError::RevocationUnconfirmed => {
                 kobo_protocol::DeviceError::Unreachable
             }
             kobo_protocol::TaskError::TimedOut => kobo_protocol::DeviceError::TimedOut,
@@ -1180,6 +1182,7 @@ fn host_applications(
             kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
                 kobo_protocol::DeviceError::Authentication
             }
+            kobo_protocol::TaskError::LocalStorage => kobo_protocol::DeviceError::Backend,
         })
     });
     let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher));

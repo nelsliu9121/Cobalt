@@ -325,6 +325,16 @@ impl Failure {
                 advice: "The service had nothing to return.",
                 retryable: false,
             },
+            TaskError::LocalStorage => Self {
+                state: StandardState::Error,
+                advice: "This reader could not remove the local sign-in data.",
+                retryable: false,
+            },
+            TaskError::RevocationUnconfirmed => Self {
+                state: StandardState::Error,
+                advice: "Signed out here, but BOMTOON did not confirm remote sign-out.",
+                retryable: false,
+            },
         }
     }
 

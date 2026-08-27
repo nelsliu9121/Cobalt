@@ -232,11 +232,13 @@ fn network_error(error: kobo_protocol::TaskError) -> DeviceError {
         kobo_protocol::TaskError::Unauthorized => DeviceError::Authentication,
         kobo_protocol::TaskError::Offline
         | kobo_protocol::TaskError::Unreachable
-        | kobo_protocol::TaskError::TimedOut => DeviceError::Unreachable,
+        | kobo_protocol::TaskError::TimedOut
+        | kobo_protocol::TaskError::RevocationUnconfirmed => DeviceError::Unreachable,
         kobo_protocol::TaskError::NotFound => DeviceError::NotFound,
         kobo_protocol::TaskError::TooLarge
         | kobo_protocol::TaskError::Denied
-        | kobo_protocol::TaskError::NoCredential => DeviceError::Backend,
+        | kobo_protocol::TaskError::NoCredential
+        | kobo_protocol::TaskError::LocalStorage => DeviceError::Backend,
     }
 }
 
