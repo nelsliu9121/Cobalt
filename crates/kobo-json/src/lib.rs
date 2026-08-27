@@ -141,10 +141,11 @@ impl Value {
         }
     }
 
-    /// The exact source lexeme when this value was parsed as a JSON integer.
+    /// The exact lexeme carried by a JSON integer.
     ///
-    /// Decimal fractions and exponent forms are numbers, but not integer
-    /// lexemes, even when their `f64` value is mathematically integral.
+    /// Parsed values preserve their source bytes; typed integer conversions
+    /// use their canonical decimal spelling. Decimal fractions and exponent
+    /// forms remain numbers even when mathematically integral.
     #[must_use]
     pub fn as_integer_str(&self) -> Option<&str> {
         match self {
@@ -224,10 +225,20 @@ impl Value {
                 }
                 Step::Value(Self::Number(number)) => {
                     if number.is_finite() {
-                        // Rust's `Display` for f64 is the shortest form that
-                        // reads back as the same bits, which is exactly the
-                        // round-trip property wanted here.
-                        out.push_str(&number.to_string());
+                        // An integral f64 still needs numeric punctuation.
+                        // Without it, `4E0` would be written as `4` and parse
+                        // back as an exact Integer rather than a Number.
+                        let mut text = number.to_string();
+                        if number.fract() == 0.0 {
+                            if let Some(exponent) =
+                                text.find('e').or_else(|| text.find('E'))
+                            {
+                                text.insert_str(exponent, ".0");
+                            } else {
+                                text.push_str(".0");
+                            }
+                        }
+                        out.push_str(&text);
                     } else {
                         out.push_str("null");
                     }
@@ -382,13 +393,19 @@ impl From<f64> for Value {
 
 impl From<u32> for Value {
     fn from(value: u32) -> Self {
-        Self::Number(f64::from(value))
+        Self::Integer(Integer {
+            lexeme: value.to_string(),
+            number: f64::from(value),
+        })
     }
 }
 
 impl From<i32> for Value {
     fn from(value: i32) -> Self {
-        Self::Number(f64::from(value))
+        Self::Integer(Integer {
+            lexeme: value.to_string(),
+            number: f64::from(value),
+        })
     }
 }
 
@@ -1501,9 +1518,10 @@ mod tests {
     }
 
     #[test]
-    fn numbers_are_written_in_the_shortest_form_that_reads_back_the_same() {
+    fn numbers_are_written_to_preserve_value_and_number_kind() {
         for original in [
             0.0,
+            -0.0,
             -0.5,
             1.0,
             1e21,
@@ -1513,14 +1531,25 @@ mod tests {
             -1e308,
         ] {
             let written = Value::Number(original).to_json();
+            let reparsed = parsed(&written);
             assert_eq!(
-                parsed(&written).as_f64(),
+                reparsed.as_f64(),
                 Some(original),
                 "{original} did not survive as {written}"
             );
+            assert_eq!(
+                reparsed.as_integer_str(),
+                None,
+                "{original} changed from Number to Integer as {written}"
+            );
         }
-        assert_eq!(Value::Number(1.0).to_json(), "1");
+        assert_eq!(Value::Number(1.0).to_json(), "1.0");
+        assert_eq!(Value::Number(-0.0).to_json(), "-0.0");
         assert_eq!(Value::Number(0.1).to_json(), "0.1");
+        assert_eq!(parsed("4E0").to_json(), "4.0");
+        assert_eq!(parsed("4").to_json(), "4");
+        assert_eq!(Value::from(512_u32).to_json(), "512");
+        assert_eq!(Value::from(-7_i32).to_json(), "-7");
     }
 
     #[test]
