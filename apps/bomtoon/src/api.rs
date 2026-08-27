@@ -1,24 +1,11 @@
 use kobo_sdk::{Credential, Header, Task};
 
-const SESSION_URL: &str = "https://www.bomtoon.tw/api/auth/session";
-const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
 const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
-const SESSION_BYTES: u32 = 128 * 1024;
 const CONTENT_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
-const DETAIL_BYTES: u32 = 4 * 1024 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
-
-pub fn session() -> Task {
-    fetch(
-        SESSION_URL.to_owned(),
-        SESSION_BYTES,
-        Credential::in_header("bomtoon-session", "Cookie"),
-        response_headers("*/*"),
-    )
-}
 
 pub fn library(page: usize) -> Task {
     fetch(
@@ -60,17 +47,6 @@ pub fn logout() -> Task {
     Task::RevokeCredential {
         credential: "bomtoon-access-token".to_owned(),
     }
-}
-
-pub fn detail(alias: &str) -> Task {
-    fetch(
-        format!("{DETAIL_URL}{alias}"),
-        DETAIL_BYTES,
-        Credential::in_header("bomtoon-session", "Cookie"),
-        response_headers(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ),
-    )
 }
 
 fn response_headers(accept: &str) -> Vec<Header> {
@@ -132,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn content_request_contains_no_cookie_or_html_accept_header() {
+    fn content_request_uses_managed_bearer_and_json_headers() {
         let Task::Fetch {
             credential,
             headers,
@@ -153,7 +129,6 @@ mod tests {
         assert!(headers.iter().all(|header| {
             !header.name.eq_ignore_ascii_case("cookie")
                 && !header.name.eq_ignore_ascii_case("authorization")
-                && !header.value.to_ascii_lowercase().contains("text/html")
         }));
     }
 

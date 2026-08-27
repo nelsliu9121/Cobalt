@@ -49,11 +49,6 @@ pub struct RecentPage {
     pub total_items: usize,
 }
 
-pub fn session_is_authenticated(bytes: &[u8]) -> Result<bool, ParseError> {
-    let root = parse_json(bytes)?;
-    Ok(matches!(root.get("user"), Some(Value::Object(_))))
-}
-
 pub fn library(bytes: &[u8]) -> Result<LibraryPage, ParseError> {
     let root = parse_json(bytes)?;
     if string(&root, "result", "result")? != "SUCCESS" {
@@ -249,12 +244,6 @@ mod tests {
         let parsed = episodes(body).expect("optional paid values");
         assert_eq!(parsed[0].purchase, PurchaseState::NotOwned);
         assert_eq!(parsed[1].purchase, PurchaseState::NotOwned);
-    }
-
-    #[test]
-    fn next_data_html_is_rejected_as_json() {
-        let html = br#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"ssrDetail":{"episodes":[]}}}}</script></html>"#;
-        assert!(matches!(episodes(html), Err(ParseError::Json(_))));
     }
 
     #[test]

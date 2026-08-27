@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 const TITLE: &str = "BOMTOON";
 const RETRY: &str = "retry";
+const SIGN_OUT: &str = "sign-out";
 const PREVIOUS: &str = "previous";
 const NEXT: &str = "next";
 const LIBRARY_SHELF: &str = "library-shelf";
@@ -34,14 +35,24 @@ enum Shelf {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pending {
-    Session,
     Library(usize),
     Recent(usize),
-    Detail(usize),
+    Content(usize),
+    Logout,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AccountState {
+    #[default]
+    Active,
+    SignedOut,
+    Expired,
+    RevocationUnconfirmed,
 }
 
 #[derive(Default)]
 struct Bomtoon {
+    account: AccountState,
     view: View,
     pending: Option<Pending>,
     task: Option<TaskId>,
@@ -64,17 +75,20 @@ struct Bomtoon {
 
 impl Bomtoon {
     fn show(&self, context: &mut Context) {
-        let owns_back = self.view == View::Episodes && self.pending.is_none();
+        let owns_back = self.account == AccountState::Active
+            && self.problem.is_none()
+            && self.view == View::Episodes
+            && self.pending.is_none();
         context.set_screen(self.screen().with_own_back(owns_back));
     }
 
     fn screen(&self) -> Screen {
         if let Some(pending) = self.pending {
             let message = match pending {
-                Pending::Session => "Checking the stored session",
                 Pending::Library(_) => "Loading your library",
                 Pending::Recent(_) => "Loading recent reading",
-                Pending::Detail(_) => "Loading episode purchase status",
+                Pending::Content(_) => "Loading episode purchase status",
+                Pending::Logout => "Signing out",
             };
             return ScreenBuilder::new("bomtoon-loading")
                 .top_bar(TITLE)
@@ -88,6 +102,9 @@ impl Bomtoon {
                 .primary_button(RETRY, "Try again")
                 .build();
         }
+        if self.account != AccountState::Active {
+            return self.signed_out_screen();
+        }
         match self.view {
             View::Status => ScreenBuilder::new("bomtoon-status")
                 .top_bar(TITLE)
@@ -97,6 +114,23 @@ impl Bomtoon {
             View::Library => self.library_screen(),
             View::Episodes => self.episode_screen(),
         }
+    }
+    fn signed_out_screen(&self) -> Screen {
+        let mut screen = ScreenBuilder::new("bomtoon-signed-out").top_bar(TITLE);
+        screen = match self.account {
+            AccountState::Expired => {
+                screen.banner(BannerLevel::Attention, "Your BOMTOON sign-in has expired.")
+            }
+            AccountState::RevocationUnconfirmed => screen.banner(
+                BannerLevel::Attention,
+                Failure::of(TaskError::RevocationUnconfirmed).advice,
+            ),
+            AccountState::SignedOut | AccountState::Active => screen,
+        };
+        screen
+            .text("Run this on your Mac:\nkobo bomtoon login --device <Kobo IP>")
+            .primary_button(RETRY, "Try again")
+            .build()
     }
 
     fn library_screen(&self) -> Screen {
@@ -162,7 +196,7 @@ impl Bomtoon {
         ) {
             screen = screen.button(NEXT, "Next page");
         }
-        screen.build()
+        screen.button(SIGN_OUT, "Sign out").build()
     }
 
     fn shelf_len(&self) -> usize {
@@ -238,11 +272,11 @@ impl Bomtoon {
         page_controls(screen, self.page, self.episodes.len())
     }
 
-    fn restart(&mut self, context: &mut Context) {
-        self.problem = None;
+    fn clear_account_data(&mut self) {
         self.comics.clear();
         self.recent.clear();
         self.episodes.clear();
+        self.selected_title.clear();
         self.page = 0;
         self.library_view_page = 0;
         self.recent_view_page = 0;
@@ -252,9 +286,15 @@ impl Bomtoon {
         self.total_recent_titles = 0;
         self.library_loaded = false;
         self.recent_loaded = false;
+    }
+
+    fn restart(&mut self, context: &mut Context) {
+        self.problem = None;
+        self.account = AccountState::Active;
+        self.clear_account_data();
         self.shelf = Shelf::Library;
         self.view = View::Status;
-        self.spawn(context, Pending::Session, api::session());
+        self.spawn(context, Pending::Library(0), api::library(0));
     }
 
     fn spawn(&mut self, context: &mut Context, pending: Pending, work: kobo_sdk::Task) {
@@ -269,13 +309,15 @@ impl Bomtoon {
 
     fn accept(&mut self, context: &mut Context, pending: Pending, bytes: &[u8]) {
         match pending {
-            Pending::Session => match parse::session_is_authenticated(bytes) {
-                Ok(true) => self.spawn(context, Pending::Library(0), api::library(0)),
-                Ok(false) => {
-                    self.problem = Some("The stored BOMTOON session is not signed in.".to_owned());
+            Pending::Logout => {
+                if bytes.is_empty() {
+                    self.clear_account_data();
+                    self.account = AccountState::SignedOut;
+                } else {
+                    self.problem =
+                        Some("BOMTOON returned unexpected sign-out data.".to_owned());
                 }
-                Err(error) => self.problem = Some(error.to_string()),
-            },
+            }
             Pending::Library(expected) => match parse::library(bytes) {
                 Ok(page) if page.number == expected => {
                     let first_page = !self.library_loaded;
@@ -315,7 +357,7 @@ impl Bomtoon {
                 Ok(_) => self.problem = Some("BOMTOON returned a different recent page.".to_owned()),
                 Err(error) => self.problem = Some(error.to_string()),
             },
-            Pending::Detail(_index) => match parse::episodes(bytes) {
+            Pending::Content(_index) => match parse::episodes(bytes) {
                 Ok(episodes) => {
                     self.episodes = episodes;
                     self.page = 0;
@@ -342,7 +384,7 @@ impl Bomtoon {
         self.remember_shelf_page();
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
-        self.spawn(context, Pending::Detail(index), api::detail(&alias));
+        self.spawn(context, Pending::Content(index), api::content(&alias));
         self.show(context);
     }
 }
@@ -354,7 +396,10 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
-        if action == ActionId::BACK && self.view == View::Episodes {
+        let ready = self.account == AccountState::Active
+            && self.problem.is_none()
+            && self.pending.is_none();
+        if action == ActionId::BACK && ready && self.view == View::Episodes {
             self.view = View::Library;
             self.page = match self.shelf {
                 Shelf::Library => self.library_view_page,
@@ -363,8 +408,13 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        if action == action_id(RETRY) {
+        if action == action_id(RETRY) && self.pending.is_none() {
             self.restart(context);
+        } else if !ready {
+            self.show(context);
+            return;
+        } else if self.view == View::Library && action == action_id(SIGN_OUT) {
+            self.spawn(context, Pending::Logout, api::logout());
         } else if self.view == View::Library && action == action_id(LIBRARY_SHELF) {
             self.switch_shelf(context, Shelf::Library);
         } else if self.view == View::Library && action == action_id(RECENT_SHELF) {
@@ -410,19 +460,42 @@ impl KoboApp for Bomtoon {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        match outcome {
-            TaskOutcome::Completed(bytes) => self.accept(context, pending, &bytes),
-            TaskOutcome::Failed(TaskError::NoCredential) => {
-                let name = match pending {
-                    Pending::Library(_) | Pending::Recent(_) => "bomtoon-access-token",
-                    Pending::Session | Pending::Detail(_) => "bomtoon-session",
-                };
-                self.problem = Some(format!("Stored credential '{name}' is missing."));
+        match (pending, outcome) {
+            (pending, TaskOutcome::Completed(bytes)) => {
+                self.accept(context, pending, &bytes);
             }
-            TaskOutcome::Failed(error) => {
+            (
+                Pending::Logout,
+                TaskOutcome::Failed(TaskError::RevocationUnconfirmed),
+            ) => {
+                self.clear_account_data();
+                self.account = AccountState::RevocationUnconfirmed;
+                self.problem = None;
+            }
+            (Pending::Logout, TaskOutcome::Failed(TaskError::LocalStorage)) => {
+                self.problem =
+                    Some("Could not remove the local BOMTOON sign-in data.".to_owned());
+            }
+            (
+                Pending::Library(_) | Pending::Recent(_) | Pending::Content(_),
+                TaskOutcome::Failed(TaskError::NoCredential),
+            ) => {
+                self.account = AccountState::SignedOut;
+                self.problem = None;
+            }
+            (
+                Pending::Library(_) | Pending::Recent(_) | Pending::Content(_),
+                TaskOutcome::Failed(TaskError::Unauthorized),
+            ) => {
+                self.account = AccountState::Expired;
+                self.problem = None;
+            }
+            (_, TaskOutcome::Failed(error)) => {
                 self.problem = Some(Failure::of(error).advice.to_owned());
             }
-            TaskOutcome::Cancelled => self.problem = Some("The request was cancelled.".to_owned()),
+            (_, TaskOutcome::Cancelled) => {
+                self.problem = Some("The request was cancelled.".to_owned());
+            }
         }
         self.show(context);
     }
@@ -463,7 +536,404 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{library_has_next_page, should_load_recent};
+    use super::*;
+    use kobo_sdk::{
+        AppRunner, Chrome, Command, Credential, SecretHeader, Task, CLARA_BW_METRICS,
+    };
+
+    const LIBRARY_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{
+            "content":[{
+                "alias":"hunter_q",
+                "title":"Hunter Q",
+                "collectionCount":1,
+                "episodeCount":2
+            }],
+            "number":0,
+            "totalPages":1,
+            "totalElements":1
+        }
+    }"#;
+    const CONTENT_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{"episodes":[{
+            "alias":"ep-1",
+            "title":"Episode One",
+            "isSample":false,
+            "purchaseStatus":"POSSESSION"
+        }]}
+    }"#;
+
+    fn started() -> (AppRunner<Bomtoon>, Vec<Command>) {
+        let mut runner = AppRunner::with_metrics(Bomtoon::default(), CLARA_BW_METRICS);
+        let commands = runner.start();
+        (runner, commands)
+    }
+
+    fn only_spawn(commands: &[Command]) -> (TaskId, Task) {
+        let mut spawned = commands.iter().filter_map(|command| match command {
+            Command::Spawn { task, work } => Some((*task, work.clone())),
+            _ => None,
+        });
+        let first = spawned.next().expect("one spawned task");
+        assert!(spawned.next().is_none(), "more than one task was spawned");
+        first
+    }
+
+    fn last_screen(commands: &[Command]) -> Screen {
+        commands
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::SetScreen(screen) => Some(screen.clone()),
+                _ => None,
+            })
+            .expect("a screen command")
+    }
+
+    fn assert_fits(screen: &Screen) {
+        let issues = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+        assert!(
+            !issues.has_errors(),
+            "screen does not fit Clara BW: {issues:?}"
+        );
+    }
+
+    fn assert_login_instructions(screen: &Screen) {
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains("Run this on your Mac:"),
+            "missing operator preface: {drawn}"
+        );
+        assert!(
+            drawn.contains("kobo bomtoon login --device <Kobo IP>"),
+            "missing exact login command: {drawn}"
+        );
+        assert!(drawn.contains("Try again"), "missing retry action: {drawn}");
+        assert_fits(screen);
+    }
+
+    fn loaded_library() -> (AppRunner<Bomtoon>, Vec<Command>) {
+        let (mut runner, commands) = started();
+        let (task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
+        assert_eq!(runner.app().view, View::Library);
+        (runner, commands)
+    }
+
+    fn seed_all_account_data(runner: &mut AppRunner<Bomtoon>) {
+        let app = runner.app_mut();
+        app.recent.push(RecentEntry {
+            content_alias: "hunter_q".to_owned(),
+            content_title: "Hunter Q".to_owned(),
+            episode_alias: "ep-1".to_owned(),
+            episode_title: "Episode One".to_owned(),
+        });
+        app.episodes.push(Episode {
+            alias: "ep-1".to_owned(),
+            title: "Episode One".to_owned(),
+            purchase: model::PurchaseState::Owned,
+        });
+        app.selected_title = "Hunter Q".to_owned();
+        app.page = 3;
+        app.library_view_page = 2;
+        app.recent_view_page = 1;
+        app.next_library_page = Some(4);
+        app.next_recent_page = Some(5);
+        app.total_library_titles = 91;
+        app.total_recent_titles = 62;
+        app.library_loaded = true;
+        app.recent_loaded = true;
+    }
+
+    fn assert_all_account_data_cleared(app: &Bomtoon) {
+        assert!(app.comics.is_empty());
+        assert!(app.recent.is_empty());
+        assert!(app.episodes.is_empty());
+        assert!(app.selected_title.is_empty());
+        assert_eq!(app.page, 0);
+        assert_eq!(app.library_view_page, 0);
+        assert_eq!(app.recent_view_page, 0);
+        assert_eq!(app.next_library_page, None);
+        assert_eq!(app.next_recent_page, None);
+        assert_eq!(app.total_library_titles, 0);
+        assert_eq!(app.total_recent_titles, 0);
+        assert!(!app.library_loaded);
+        assert!(!app.recent_loaded);
+    }
+
+    fn assert_seeded_account_data_is_kept(app: &Bomtoon) {
+        assert_eq!(app.comics.len(), 1);
+        assert_eq!(app.recent.len(), 1);
+        assert_eq!(app.episodes.len(), 1);
+        assert_eq!(app.selected_title, "Hunter Q");
+        assert_eq!(app.page, 3);
+        assert_eq!(app.library_view_page, 2);
+        assert_eq!(app.recent_view_page, 1);
+        assert_eq!(app.next_library_page, Some(4));
+        assert_eq!(app.next_recent_page, Some(5));
+        assert_eq!(app.total_library_titles, 91);
+        assert_eq!(app.total_recent_titles, 62);
+        assert!(app.library_loaded);
+        assert!(app.recent_loaded);
+    }
+
+    fn begin_logout(runner: &mut AppRunner<Bomtoon>) -> TaskId {
+        let commands = runner.action(action_id(SIGN_OUT));
+        let (task, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            Task::RevokeCredential {
+                credential: "bomtoon-access-token".to_owned(),
+            }
+        );
+        task
+    }
+
+    fn failed_start(error: TaskError) -> (AppRunner<Bomtoon>, Vec<Command>) {
+        let (mut runner, commands) = started();
+        let (task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
+        (runner, commands)
+    }
+
+    fn failed_library_action(
+        action: &str,
+        error: TaskError,
+    ) -> (AppRunner<Bomtoon>, Vec<Command>) {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id(action));
+        let (task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
+        (runner, commands)
+    }
+
+    #[test]
+    fn startup_requests_library_without_a_session_task() {
+        let (_, commands) = started();
+        let (_, work) = only_spawn(&commands);
+        let Task::Fetch {
+            url, credential, ..
+        } = work
+        else {
+            panic!("startup did not request the library");
+        };
+        assert!(url.starts_with("https://www.bomtoon.tw/api/balcony-api-v2/library?"));
+        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+    }
+
+    #[test]
+    fn missing_credentials_show_login_instructions_and_try_again() {
+        let (mut runner, commands) = started();
+        let (task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Failed(TaskError::NoCredential),
+        );
+
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_login_instructions(&last_screen(&commands));
+
+        let commands = runner.action(action_id(RETRY));
+        let (_, work) = only_spawn(&commands);
+        assert!(matches!(work, Task::Fetch { .. }));
+        assert_eq!(runner.app().account, AccountState::Active);
+    }
+
+    #[test]
+    fn a_loaded_library_shows_sign_out() {
+        let (mut runner, _) = loaded_library();
+        for index in 1..ITEMS_PER_PAGE {
+            runner.app_mut().comics.push(Comic {
+                alias: format!("comic-{index}"),
+                title: format!("Comic {index}"),
+                owned_episodes: index,
+                total_episodes: ITEMS_PER_PAGE,
+            });
+        }
+        runner.app_mut().total_library_titles = 30;
+        runner.app_mut().next_library_page = Some(1);
+        let commands = runner.action(action_id("refresh-layout"));
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Sign out"), "missing sign-out action: {drawn}");
+        assert_fits(&screen);
+
+        let _ = begin_logout(&mut runner);
+        assert_eq!(runner.app().pending, Some(Pending::Logout));
+        let commands = runner.action(action_id(SIGN_OUT));
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, Command::Spawn { .. })),
+            "a stale sign-out action started overlapping work"
+        );
+    }
+
+    #[test]
+    fn successful_logout_clears_every_account_collection() {
+        let (mut runner, _) = loaded_library();
+        seed_all_account_data(&mut runner);
+        let task = begin_logout(&mut runner);
+        let commands = runner.task_outcome(task, TaskOutcome::Completed(Vec::new()));
+
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_all_account_data_cleared(runner.app());
+        assert_login_instructions(&last_screen(&commands));
+    }
+
+    #[test]
+    fn unconfirmed_remote_logout_is_signed_out_with_a_warning() {
+        let (mut runner, _) = loaded_library();
+        seed_all_account_data(&mut runner);
+        let task = begin_logout(&mut runner);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Failed(TaskError::RevocationUnconfirmed),
+        );
+
+        assert_eq!(
+            runner.app().account,
+            AccountState::RevocationUnconfirmed
+        );
+        assert_all_account_data_cleared(runner.app());
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains("Signed out here, but BOMTOON did not confirm remote sign-out."),
+            "missing remote-revocation warning: {drawn}"
+        );
+        assert_login_instructions(&screen);
+    }
+
+    #[test]
+    fn local_storage_logout_failure_keeps_loaded_account_data() {
+        let (mut runner, _) = loaded_library();
+        seed_all_account_data(&mut runner);
+        let task = begin_logout(&mut runner);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Failed(TaskError::LocalStorage),
+        );
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_seeded_account_data_is_kept(runner.app());
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains("Could not remove the local BOMTOON sign-in data."),
+            "missing local-storage failure: {drawn}"
+        );
+        assert_fits(&screen);
+
+        let commands = runner.action(action_id(RETRY));
+        let (_, work) = only_spawn(&commands);
+        assert!(matches!(work, Task::Fetch { .. }));
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_all_account_data_cleared(runner.app());
+    }
+
+    #[test]
+    fn expired_session_returns_to_login_instructions() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (task, work) = only_spawn(&commands);
+        let Task::Fetch {
+            url, credential, ..
+        } = work
+        else {
+            panic!("opening a comic did not request content");
+        };
+        assert!(url.contains("/api/balcony-api-v2/contents/hunter_q?"));
+        assert!(matches!(
+            credential,
+            Some(value)
+                if value.secret == "bomtoon-access-token"
+                    && value.header == SecretHeader::Bearer
+        ));
+
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        assert_eq!(runner.app().account, AccountState::Expired);
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains("BOMTOON sign-in has expired"),
+            "missing expiration warning: {drawn}"
+        );
+        assert_login_instructions(&screen);
+    }
+
+    #[test]
+    fn library_recent_and_content_credential_errors_show_account_states() {
+        for (error, expected) in [
+            (TaskError::NoCredential, AccountState::SignedOut),
+            (TaskError::Unauthorized, AccountState::Expired),
+        ] {
+            for (runner, commands) in [
+                failed_start(error),
+                failed_library_action(RECENT_SHELF, error),
+                failed_library_action("comic-0", error),
+            ] {
+                assert_eq!(runner.app().account, expected);
+                assert_login_instructions(&last_screen(&commands));
+            }
+        }
+    }
+
+    #[test]
+    fn comic_selection_uses_json_content_and_back_returns_to_the_library() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (task, work) = only_spawn(&commands);
+        assert!(matches!(
+            work,
+            Task::Fetch { ref url, .. }
+                if url.contains("/api/balcony-api-v2/contents/hunter_q?")
+        ));
+
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let screen = last_screen(&commands);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(screen.owns_back);
+        assert_fits(&screen);
+
+        let commands = runner.action(ActionId::BACK);
+        let screen = last_screen(&commands);
+        assert_eq!(runner.app().view, View::Library);
+        assert!(!screen.owns_back);
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn logout_rejects_a_nonempty_completion_and_keeps_account_data() {
+        let (mut runner, _) = loaded_library();
+        seed_all_account_data(&mut runner);
+        let task = begin_logout(&mut runner);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Completed(b"unexpected".to_vec()),
+        );
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_seeded_account_data_is_kept(runner.app());
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains("BOMTOON returned unexpected sign-out data."),
+            "missing strict revoke-result failure: {drawn}"
+        );
+        assert_fits(&screen);
+    }
 
     #[test]
     fn a_remote_library_page_is_loaded_only_at_the_local_boundary() {
