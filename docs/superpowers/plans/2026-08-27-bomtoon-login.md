@@ -52,6 +52,7 @@
 - Modify: `crates/kobo-protocol/src/lib.rs:341-540,1690-1760,2000-2090,3680-3760,8168-8205`
 - Modify: `crates/kobo-sdk/src/lib.rs:270-335`
 - Modify: `crates/kobod/src/app_link.rs:230-241`
+- Modify: `crates/kobo-policy/src/tasks.rs:318-365,495-615`
 - Modify: `crates/kobod/src/app_store.rs:877-890`
 - Modify: `crates/kobod/src/device.rs:1159-1183`
 - Modify: `crates/kobod/src/update.rs:49-61`
@@ -89,12 +90,35 @@ fn revoke_refuses_an_invalid_credential_name() {
     assert!(!work.is_sendable());
 }
 
+
 #[test]
 fn logout_errors_keep_append_only_wire_tags() {
     assert_eq!(encode_task_error(TaskError::LocalStorage), 8);
     assert_eq!(encode_task_error(TaskError::RevocationUnconfirmed), 9);
     assert_eq!(decode_task_error(8), Ok(TaskError::LocalStorage));
     assert_eq!(decode_task_error(9), Ok(TaskError::RevocationUnconfirmed));
+}
+```
+
+Add this policy test beside the existing runner tests:
+
+```rust
+#[test]
+fn revoke_is_fail_closed_before_the_managed_provider_exists() {
+    let mut runner = TaskRunner::simulated(temp_root("revoke-closed"))
+        .with_capabilities([Capability::Network]);
+    runner
+        .submit(
+            TaskId(1),
+            Task::RevokeCredential {
+                credential: "bomtoon-access-token".to_owned(),
+            },
+        )
+        .expect("admit revoke");
+    assert_eq!(
+        runner.wait_for(Duration::from_secs(1)).unwrap().outcome,
+        TaskOutcome::Failed(TaskError::Denied)
+    );
 }
 ```
 
@@ -180,6 +204,25 @@ Self::RevocationUnconfirmed => "the account is signed out locally but remote rev
 
 Neither new error is retryable in `TaskError::worth_retrying`.
 
+Keep `kobo-policy` exhaustive and fail closed until Task 3 installs the managed provider:
+
+```rust
+let required = match &work {
+    Task::Fetch { .. } | Task::Post { .. } | Task::RevokeCredential { .. } => {
+        Some(Capability::Network)
+    }
+    Task::ReadFile { .. } | Task::Sleep { .. } => None,
+};
+```
+
+Add this temporary execution arm:
+
+```rust
+Task::RevokeCredential { .. } => TaskOutcome::Failed(TaskError::Denied),
+```
+
+Task 3 replaces that arm with provider-backed revocation.
+
 - [ ] **Step 4: Update exhaustive application-facing mappings**
 
 Add SDK failures:
@@ -199,21 +242,23 @@ TaskError::RevocationUnconfirmed => Self {
 
 In non-BOMTOON `DeviceError` conversions, map `LocalStorage` to the existing backend or invalid-input category and `RevocationUnconfirmed` to the existing unreachable category. Use explicit arms rather than wildcards so future `TaskError` additions remain compiler-visible.
 
-- [ ] **Step 5: Run protocol and SDK tests**
+- [ ] **Step 5: Run protocol, SDK, policy, and workspace checks**
 
 Run:
 
 ```bash
 rtk cargo test -p kobo-protocol
 rtk cargo test -p kobo-sdk
+rtk cargo test -p kobo-policy revoke_is_fail_closed_before_the_managed_provider_exists
+rtk cargo check --workspace --all-targets
 ```
 
-Expected: both packages pass, including revoke round-trip, error tags, sendability, and failure wording.
+Expected: protocol, SDK, and fail-closed policy tests pass. The workspace check has no errors; pre-existing warnings remain.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-rtk git add crates/kobo-protocol/src/lib.rs crates/kobo-sdk/src/lib.rs crates/kobod/src/app_link.rs crates/kobod/src/app_store.rs crates/kobod/src/device.rs crates/kobod/src/update.rs
+rtk git add crates/kobo-protocol/src/lib.rs crates/kobo-sdk/src/lib.rs crates/kobo-policy/src/tasks.rs crates/kobod/src/app_link.rs crates/kobod/src/app_store.rs crates/kobod/src/device.rs crates/kobod/src/update.rs
 rtk git commit -m "feat(protocol): add credential revocation task"
 ```
 
@@ -1077,7 +1122,7 @@ Add `mod bomtoon;`, dispatch:
 "bomtoon" => bomtoon::command(&arguments[1..]),
 ```
 
-Add both command forms to `print_help`.
+Add both command forms to `print_help`. Add `"kobo-bomtoon"` to `STORE_PACKAGES` so the checked-in simulator registry matches the workspace's published apps.
 
 - [ ] **Step 9: Run CLI tests**
 
@@ -1085,9 +1130,10 @@ Run:
 
 ```bash
 rtk cargo test -p kobo-cli bomtoon::tests
+rtk cargo test -p kobo-cli checked_in_registry_contains_every_store_application
 ```
 
-Expected: parsing, Chrome discovery, cookie families, CDP framing, secret non-disclosure, transactional device command construction, simulator installation, and cleanup tests pass without opening Chrome or contacting hardware.
+Expected: parsing, Chrome discovery, cookie families, CDP framing, secret non-disclosure, transactional device command construction, simulator installation, cleanup, and registry tests pass without opening Chrome or contacting hardware.
 
 - [ ] **Step 10: Commit**
 
