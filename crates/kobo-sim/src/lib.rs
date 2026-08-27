@@ -2094,9 +2094,7 @@ fn simulator_auth_paths_at(root: &Path) -> SimulatorAuthPaths {
 ///
 /// Returns an error when the lease file cannot be opened or another process
 /// does not release it within the bounded wait.
-pub fn acquire_simulator_auth_lease(
-    paths: &SimulatorAuthPaths,
-) -> io::Result<impl Send> {
+pub fn acquire_simulator_auth_lease(paths: &SimulatorAuthPaths) -> io::Result<impl Send> {
     kobo_policy::acquire_managed_credential_lease(&paths.state, "bomtoon-access-token")
         .map_err(|_| io::Error::other("simulator authentication lease unavailable"))
 }
@@ -2125,11 +2123,11 @@ fn epoch_millis() -> u64 {
 }
 
 fn managed_credentials(name: &str, root: impl AsRef<Path>) -> Option<Arc<ManagedCredentials>> {
+    static PROVIDERS: LazyLock<Mutex<HashMap<PathBuf, Weak<ManagedCredentials>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     if name != "bomtoon" {
         return None;
     }
-    static PROVIDERS: LazyLock<Mutex<HashMap<PathBuf, Weak<ManagedCredentials>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
     let paths = simulator_auth_paths_at(root.as_ref());
     let mut providers = PROVIDERS.lock().expect("simulator provider cache");
     if let Some(provider) = providers.get(&paths.state).and_then(Weak::upgrade) {

@@ -1231,9 +1231,7 @@ impl SimulatorTransaction {
             cookie_backup: paths.secrets.join(".bomtoon-session.backup"),
             temporary: paths.secrets.join(".bomtoon-session.login"),
             state: paths.state.join(MANAGED_STATE),
-            state_backup: paths
-                .state
-                .join(".bomtoon-access-token.state.backup"),
+            state_backup: paths.state.join(".bomtoon-access-token.state.backup"),
             marker: paths.state.join(".bomtoon-login.transaction"),
             marker_temporary: paths.state.join(".bomtoon-login.transaction.new"),
         }
@@ -1817,15 +1815,10 @@ mod tests {
             assert!(DEVICE_INSTALL_PROGRAM.contains("flock -w 5 9 || exit 1"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("read_marker"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("recover"));
-            assert!(DEVICE_INSTALL_PROGRAM.contains(
-                "marker=\"$state/.bomtoon-login.transaction\""
-            ));
-            assert!(DEVICE_INSTALL_PROGRAM.contains(
-                "backup=\"$secrets/.bomtoon-session.backup\""
-            ));
-            assert!(DEVICE_INSTALL_PROGRAM.contains(
-                "state_backup=\"$state/.bomtoon-access-token.state.backup\""
-            ));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("marker=\"$state/.bomtoon-login.transaction\""));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("backup=\"$secrets/.bomtoon-session.backup\""));
+            assert!(DEVICE_INSTALL_PROGRAM
+                .contains("state_backup=\"$state/.bomtoon-access-token.state.backup\""));
             assert!(!DEVICE_INSTALL_PROGRAM.contains("backup.$$"));
             let recovered = DEVICE_INSTALL_PROGRAM
                 .find("\nrecover\nset -C")
@@ -1986,8 +1979,7 @@ mod tests {
                 had_state: true,
             })
             .expect("cookie backup marker");
-        rename_synced(&transaction.temporary, &transaction.cookie)
-            .expect("durable replacement");
+        rename_synced(&transaction.temporary, &transaction.cookie).expect("durable replacement");
         rename_synced(&transaction.state, &transaction.state_backup)
             .expect("crash-window state backup");
 
@@ -2033,10 +2025,7 @@ mod tests {
             fs::read_to_string(&state_path).expect("state restored"),
             "recoverable-old-state"
         );
-        let cookie_backup = directories
-            .paths
-            .secrets
-            .join(".bomtoon-session.backup");
+        let cookie_backup = directories.paths.secrets.join(".bomtoon-session.backup");
         assert_eq!(
             fs::read_to_string(cookie_backup).expect("backup contents"),
             "recoverable-old-cookie"
@@ -2073,7 +2062,6 @@ mod tests {
                 Err(io::Error::other("injected wait failure"))
             } else {
                 Ok(())
-
             }
         }
     }
@@ -2096,8 +2084,7 @@ mod tests {
     }
     #[test]
     fn chrome_supervisor_stops_waits_and_removes_profile_after_owner_exit() {
-        let profile =
-            create_private_profile_at(&std::env::temp_dir()).expect("supervised profile");
+        let profile = create_private_profile_at(&std::env::temp_dir()).expect("supervised profile");
         let mut supervisor = Command::new("/bin/sh")
             .args(["-c", CHROME_LAUNCH_PROGRAM, "test-supervisor"])
             .arg("0")

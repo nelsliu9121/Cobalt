@@ -172,15 +172,18 @@ fn with_managed_credential<T>(
     let Some(wanted) = wanted else {
         return Ok(None);
     };
+    let Some(provider) = backends.managed else {
+        return Ok(None);
+    };
+    if !provider.manages(wanted) {
+        return Ok(None);
+    }
     if backends
         .credentials
         .is_none_or(|allows| !allows(wanted, method, url))
     {
         return Err(TaskError::Denied);
     }
-    let Some(provider) = backends.managed else {
-        return Ok(None);
-    };
     if force_renewal {
         provider.with_forced_renewal(wanted, operation)
     } else {
@@ -673,7 +676,10 @@ fn run_post(
                 url,
                 body.as_bytes(),
                 content_type,
-                Some((credential.header_name.as_str(), credential.header_value.as_str())),
+                Some((
+                    credential.header_name.as_str(),
+                    credential.header_value.as_str(),
+                )),
                 &extra,
                 ceiling,
             )
@@ -720,7 +726,10 @@ fn run_post(
                     url,
                     body.as_bytes(),
                     content_type,
-                    Some((credential.header_name.as_str(), credential.header_value.as_str())),
+                    Some((
+                        credential.header_name.as_str(),
+                        credential.header_value.as_str(),
+                    )),
                     &extra,
                     ceiling,
                 )
@@ -1095,8 +1104,7 @@ mod tests {
         let root = temp_root("symlink-sandbox");
         let outside = temp_root("symlink-outside").join("credential-state");
         std::fs::write(&outside, b"redacted-sensitive-state").expect("outside file");
-        std::os::unix::fs::symlink(&outside, root.join("linked"))
-            .expect("create escaping symlink");
+        std::os::unix::fs::symlink(&outside, root.join("linked")).expect("create escaping symlink");
         let mut runner = TaskRunner::simulated(root);
         runner
             .submit(
@@ -1661,13 +1669,8 @@ mod tests {
             .expect("write managed binding");
         let recipe = Arc::new(FakeManagedRecipe::default());
         let managed = Arc::new(
-            ManagedCredentials::new(
-                secrets,
-                &state,
-                Arc::new(|| 0),
-                recipe,
-            )
-            .expect("construct managed provider"),
+            ManagedCredentials::new(secrets, &state, Arc::new(|| 0), recipe)
+                .expect("construct managed provider"),
         );
         let lease_was_held = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&lease_was_held);

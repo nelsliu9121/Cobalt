@@ -272,7 +272,8 @@ impl ManagedCredentials {
     /// or updated, or an error reported by the provider while issuing or
     /// rotating the token pair.
     pub fn force_renew(&self, wanted: &Credential) -> Result<bool, TaskError> {
-        self.with_forced_renewal(wanted, |_| ()).map(|result| result.is_some())
+        self.with_forced_renewal(wanted, |_| ())
+            .map(|result| result.is_some())
     }
 
     /// Removes local credentials before attempting provider revocation.
@@ -294,8 +295,7 @@ impl ManagedCredentials {
         let remote = if let Some(cookie) = cookie {
             let digest = self.checked_digest(&cookie)?;
             self.bind_cached_or_durable(&mut inner, &digest)?;
-            self.pair_for_revoke(&inner, &digest)
-                .map(|pair| (cookie, pair))
+            Self::pair_for_revoke(&inner, &digest).map(|pair| (cookie, pair))
         } else {
             None
         };
@@ -311,6 +311,12 @@ impl ManagedCredentials {
         drop(remote);
         remote_result.map_err(|_| TaskError::RevocationUnconfirmed)?;
         Ok(true)
+    }
+
+    /// Returns whether this provider owns the requested credential name.
+    #[must_use]
+    pub fn manages(&self, wanted: &Credential) -> bool {
+        wanted.secret == self.recipe.credential_name()
     }
 
     /// Resolves a managed credential and keeps its generation leased while
@@ -472,7 +478,7 @@ impl ManagedCredentials {
         }
     }
 
-    fn pair_for_revoke(&self, inner: &ProviderState, digest: &str) -> Option<ManagedTokenPair> {
+    fn pair_for_revoke(inner: &ProviderState, digest: &str) -> Option<ManagedTokenPair> {
         inner
             .cached
             .as_ref()
@@ -568,7 +574,7 @@ impl ManagedCredentials {
         } else if !record.had_cookie && record.stage >= InstallStage::CookieBackedUp {
             remove_file_synced(&self.cookie_path())?;
         }
-        remove_file_synced(&marker)
+        remove_file_synced(&marker).map(|_| ())
     }
 
     fn remove_stale_detached(&self) -> Result<(), TaskError> {
@@ -646,6 +652,7 @@ fn acquire_credential_lease_with_wait(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(managed_lock_path(state, credential))
         .map_err(|_| TaskError::LocalStorage)?;
@@ -1247,13 +1254,9 @@ mod tests {
             .lock()
             .expect("bootstrap queue")
             .push_back(Ok(token_pair("a", 1_000_000)));
-        provider(
-            &directories,
-            Arc::new(|| 1),
-            Arc::clone(&initial_recipe),
-        )
-        .resolve(&Credential::bearer("bomtoon-access-token"))
-        .expect("initial resolution");
+        provider(&directories, Arc::new(|| 1), Arc::clone(&initial_recipe))
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("initial resolution");
 
         let recipe = Arc::new(FakeRecipe::default());
         recipe
@@ -1301,6 +1304,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(managed_lock_path(
                 &directories.state,
                 "bomtoon-access-token",
@@ -1334,9 +1338,7 @@ mod tests {
         )
         .expect("cookie backup");
         fs::write(
-            directories
-                .state
-                .join(".bomtoon-access-token.state.backup"),
+            directories.state.join(".bomtoon-access-token.state.backup"),
             "prior-state",
         )
         .expect("state backup");
@@ -1375,9 +1377,7 @@ mod tests {
         )
         .expect("cookie backup");
         fs::write(
-            directories
-                .state
-                .join(".bomtoon-access-token.state.backup"),
+            directories.state.join(".bomtoon-access-token.state.backup"),
             "prior-state",
         )
         .expect("state backup");
@@ -1397,10 +1397,7 @@ mod tests {
             "replacement-cookie"
         );
         assert!(!directories.managed_state().exists());
-        assert!(!directories
-            .secrets
-            .join(".bomtoon-session.backup")
-            .exists());
+        assert!(!directories.secrets.join(".bomtoon-session.backup").exists());
         assert!(!directories
             .state
             .join(".bomtoon-login.transaction")
