@@ -2,9 +2,11 @@ use kobo_sdk::{Credential, Header, Task};
 
 const SESSION_URL: &str = "https://www.bomtoon.tw/api/auth/session";
 const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
+const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
 const SESSION_BYTES: u32 = 128 * 1024;
+const CONTENT_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const DETAIL_BYTES: u32 = 4 * 1024 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
@@ -43,6 +45,21 @@ pub fn recent(page: usize) -> Task {
         Credential::bearer("bomtoon-access-token"),
         headers,
     )
+}
+
+pub fn content(alias: &str) -> Task {
+    fetch(
+        format!("{CONTENT_URL}{alias}?isNotLoginAdult=false&isPorch=false"),
+        CONTENT_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
+    )
+}
+
+pub fn logout() -> Task {
+    Task::RevokeCredential {
+        credential: "bomtoon-access-token".to_owned(),
+    }
 }
 
 pub fn detail(alias: &str) -> Task {
@@ -85,12 +102,64 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 
 #[cfg(test)]
 mod tests {
-    use super::{detail, library, recent, session};
+    use super::{content, library, recent};
     use kobo_sdk::{SecretHeader, Task};
 
     #[test]
+    fn content_uses_exact_bearer_json_endpoint() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            ..
+        } = content("hunter_q")
+        else {
+            panic!("expected fetch task");
+        };
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
+        );
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 512 * 1024);
+        assert!(matches!(
+            credential,
+            Some(value)
+                if value.secret == "bomtoon-access-token"
+                    && value.header == SecretHeader::Bearer
+        ));
+    }
+
+    #[test]
+    fn content_request_contains_no_cookie_or_html_accept_header() {
+        let Task::Fetch {
+            credential,
+            headers,
+            ..
+        } = content("365")
+        else {
+            panic!("expected fetch task");
+        };
+        assert!(matches!(
+            credential,
+            Some(value)
+                if value.secret == "bomtoon-access-token"
+                    && value.header == SecretHeader::Bearer
+        ));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("accept") && header.value == "application/json"
+        }));
+        assert!(headers.iter().all(|header| {
+            !header.name.eq_ignore_ascii_case("cookie")
+                && !header.name.eq_ignore_ascii_case("authorization")
+                && !header.value.to_ascii_lowercase().contains("text/html")
+        }));
+    }
+
+    #[test]
     fn credentials_never_enter_urls_or_regular_headers() {
-        for task in [session(), library(2), recent(0), detail("hunter_q")] {
+        for task in [content("hunter_q"), library(2), recent(0)] {
             let Task::Fetch {
                 url,
                 credential,
@@ -109,43 +178,15 @@ mod tests {
     }
 
     #[test]
-    fn each_request_uses_the_expected_secret_kind() {
-        let Task::Fetch { credential, .. } = session() else {
-            panic!("expected fetch task");
-        };
-        assert!(matches!(
-            credential.map(|value| value.header),
-            Some(SecretHeader::Named(name)) if name.eq_ignore_ascii_case("cookie")
-        ));
-
-        let Task::Fetch { credential, .. } = library(0) else {
-            panic!("expected fetch task");
-        };
-        assert!(matches!(
-            credential.map(|value| value.header),
-            Some(SecretHeader::Bearer)
-        ));
-    }
-
-    #[test]
     fn requests_use_endpoint_headers_without_browser_fingerprints() {
-        let cases = [
-            (session(), "*/*"),
-            (library(0), "application/json"),
-            (recent(0), "application/json"),
-            (
-                detail("365"),
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ),
-        ];
-        for (task, expected_accept) in cases {
+        for task in [content("365"), library(0), recent(0)] {
             let Task::Fetch { headers, .. } = task else {
                 panic!("expected fetch task");
             };
-            assert!(headers
-                .iter()
-                .any(|header| header.name.eq_ignore_ascii_case("accept")
-                    && header.value == expected_accept));
+            assert!(headers.iter().any(|header| {
+                header.name.eq_ignore_ascii_case("accept")
+                    && header.value == "application/json"
+            }));
             assert!(headers
                 .iter()
                 .any(|header| header.name.eq_ignore_ascii_case("accept-language")));

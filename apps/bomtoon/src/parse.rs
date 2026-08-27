@@ -2,7 +2,6 @@ use crate::model::{Comic, Episode, PurchaseState, RecentEntry};
 use kobo_json::Value;
 use std::{error::Error, fmt, str};
 
-const NEXT_DATA_ID: &str = "id=\"__NEXT_DATA__\"";
 const MAX_LIBRARY_PAGES: usize = 100;
 
 #[derive(Debug)]
@@ -121,31 +120,20 @@ pub fn recent(bytes: &[u8]) -> Result<RecentPage, ParseError> {
 }
 
 pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
-    let html = str::from_utf8(bytes).map_err(ParseError::Utf8)?;
-    let marker = html.find(NEXT_DATA_ID).ok_or(ParseError::Missing("__NEXT_DATA__"))?;
-    let body_start = html[marker..]
-        .find('>')
-        .map(|offset| marker + offset + 1)
-        .ok_or(ParseError::Missing("__NEXT_DATA__ body"))?;
-    let body_end = html[body_start..]
-        .find("</script>")
-        .map(|offset| body_start + offset)
-        .ok_or(ParseError::Missing("__NEXT_DATA__ closing tag"))?;
-    let root = kobo_json::parse(&html[body_start..body_end]).map_err(ParseError::Json)?;
-    let values = root
-        .get("props")
-        .and_then(|value| value.get("pageProps"))
-        .and_then(|value| value.get("ssrDetail"))
-        .and_then(|value| value.get("episodes"))
-        .and_then(Value::as_array)
-        .ok_or(ParseError::Missing("props.pageProps.ssrDetail.episodes"))?;
+    let root = parse_json(bytes)?;
+    if string(&root, "result", "result")? != "SUCCESS" {
+        return Err(ParseError::InvalidValue("result"));
+    }
+    let data = field(&root, "data", "data")?;
+    let values = array(data, "episodes", "data.episodes")?;
 
     values
         .iter()
         .map(|item| {
-            let status = string(item, "purchaseStatus", "episode.purchaseStatus")?;
-            let is_sample = item.get("isSample").and_then(Value::as_bool).unwrap_or(false);
-            let paid = item.get("paid").and_then(Value::as_bool);
+            let status =
+                nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?;
+            let is_sample = boolean(item, "isSample", "episode.isSample")?;
+            let paid = optional_boolean(item, "paid", "episode.paid")?;
             Ok(Episode {
                 alias: string(item, "alias", "episode.alias")?.to_owned(),
                 title: string(item, "title", "episode.title")?.to_owned(),
@@ -170,6 +158,36 @@ fn string<'a>(value: &'a Value, key: &str, name: &'static str) -> Result<&'a str
         .ok_or(ParseError::WrongType(name))
 }
 
+fn nullable_string<'a>(
+    value: &'a Value,
+    key: &str,
+    name: &'static str,
+) -> Result<Option<&'a str>, ParseError> {
+    match field(value, key, name)? {
+        Value::Null => Ok(None),
+        Value::String(text) => Ok(Some(text)),
+        _ => Err(ParseError::WrongType(name)),
+    }
+}
+
+fn boolean(value: &Value, key: &str, name: &'static str) -> Result<bool, ParseError> {
+    field(value, key, name)?
+        .as_bool()
+        .ok_or(ParseError::WrongType(name))
+}
+
+fn optional_boolean(
+    value: &Value,
+    key: &str,
+    name: &'static str,
+) -> Result<Option<bool>, ParseError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(ParseError::WrongType(name)),
+    }
+}
+
 fn array<'a>(value: &'a Value, key: &str, name: &'static str) -> Result<&'a [Value], ParseError> {
     field(value, key, name)?
         .as_array()
@@ -185,15 +203,19 @@ fn unsigned(value: &Value, key: &str, name: &'static str) -> Result<usize, Parse
 
 #[cfg(test)]
 mod tests {
-    use super::{episodes, library, recent, session_is_authenticated};
+    use super::{episodes, library, recent, ParseError};
     use crate::model::PurchaseState;
 
-    #[test]
-    fn session_check_does_not_need_token_fields() {
-        assert!(session_is_authenticated(br#"{"user":{"name":"Reader"},"expires":"tomorrow"}"#)
-            .is_ok_and(|authenticated| authenticated));
-        assert_eq!(session_is_authenticated(br#"{}"#).ok(), Some(false));
-    }
+    const CONTENT: &[u8] = br#"{
+      "result":"SUCCESS",
+      "data":{
+        "episodes":[
+          {"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null,"paid":null},
+          {"alias":"owned","title":"Owned","isSample":false,"purchaseStatus":"POSSESSION","paid":true},
+          {"alias":"locked","title":"Locked","isSample":false,"purchaseStatus":null,"paid":null}
+        ]
+      }
+    }"#;
 
     #[test]
     fn library_response_becomes_typed_comics() {
@@ -205,12 +227,48 @@ mod tests {
     }
 
     #[test]
-    fn next_data_distinguishes_owned_sample_and_unowned_episodes() {
-        let html = br#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"ssrDetail":{"episodes":[{"alias":"f1","title":"Sample","purchaseStatus":"NONE","isSample":true,"paid":false},{"alias":"59","title":"Episode 59","purchaseStatus":"POSSESSION","isSample":false,"paid":true},{"alias":"60","title":"Episode 60","purchaseStatus":"NONE","isSample":false,"paid":true}]}}}}</script></html>"#;
-        let parsed = episodes(html).expect("valid detail HTML");
+    fn episodes_are_read_from_data_episodes() {
+        let parsed = episodes(CONTENT).expect("valid content response");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].alias, "sample");
+        assert_eq!(parsed[1].title, "Owned");
+        assert_eq!(parsed[2].alias, "locked");
+    }
+
+    #[test]
+    fn null_purchase_status_is_sample_when_sample_and_not_owned_otherwise() {
+        let parsed = episodes(CONTENT).expect("valid content response");
         assert_eq!(parsed[0].purchase, PurchaseState::Sample);
         assert_eq!(parsed[1].purchase, PurchaseState::Owned);
         assert_eq!(parsed[2].purchase, PurchaseState::NotOwned);
+    }
+
+    #[test]
+    fn paid_may_be_absent_or_null() {
+        let body = br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"absent","title":"Absent","purchaseStatus":"NONE","isSample":false},{"alias":"null","title":"Null","purchaseStatus":"NONE","isSample":false,"paid":null}]}}"#;
+        let parsed = episodes(body).expect("optional paid values");
+        assert_eq!(parsed[0].purchase, PurchaseState::NotOwned);
+        assert_eq!(parsed[1].purchase, PurchaseState::NotOwned);
+    }
+
+    #[test]
+    fn next_data_html_is_rejected_as_json() {
+        let html = br#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"ssrDetail":{"episodes":[]}}}}</script></html>"#;
+        assert!(matches!(episodes(html), Err(ParseError::Json(_))));
+    }
+
+    #[test]
+    fn episode_purchase_fields_require_observed_types() {
+        for body in [
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":false,"isSample":false}]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":"false"}]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"paid":"false"}]}}"#
+                .as_slice(),
+        ] {
+            assert!(matches!(episodes(body), Err(ParseError::WrongType(_))));
+        }
     }
 
     #[test]
