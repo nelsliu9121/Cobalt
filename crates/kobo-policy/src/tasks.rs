@@ -731,14 +731,7 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             max_bytes,
             credential,
             headers,
-        } => run_fetch(
-            url,
-            offset,
-            max_bytes,
-            credential,
-            headers,
-            &backends,
-        ),
+        } => run_fetch(url, offset, max_bytes, credential, headers, &backends),
         Task::Post {
             url,
             body,
