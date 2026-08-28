@@ -1378,7 +1378,10 @@ mod tests {
         let root = create_private_directory_at(&std::env::temp_dir()).expect("test root");
         let home = root.join("home");
         let destination = extension_directory(&home);
-        let cobalt_root = destination.parent().expect("extension parent").to_path_buf();
+        let cobalt_root = destination
+            .parent()
+            .expect("extension parent")
+            .to_path_buf();
         ensure_private_directory(&cobalt_root).expect("extension parent");
         let lock_drops = Rc::new(Cell::new(0));
         let acquired_lock_drops = Rc::clone(&lock_drops);
