@@ -2,11 +2,12 @@
 
 ## Status
 
-Approved design. Implementation has not started.
+Design sections approved. Written specification awaits final approval; implementation has not started.
 
 ## Goal
 
-Make a plain BOMTOON episode behave as one continuous vertical strip while keeping the reader responsive on Kobo-class hardware.
+Make a plain BOMTOON episode paginate over one logical continuous vertical strip while keeping the reader responsive on Kobo-class hardware.
+“Continuous” describes how source rows are packed into discrete display pages. It does not introduce scrolling, a scroll position, or scroll gestures.
 
 The first page should appear without preparing the entire episode. Once it is visible, the reader prepares up to three following pages so ordinary forward page turns, including turns across source-image boundaries, do not show a loading screen.
 
@@ -21,6 +22,7 @@ Loading is also serialized around source boundaries. `turn_reader` drops the sca
 ## Requirements
 
 - Treat all plain manifest images as one ordered vertical strip.
+- Keep the existing discrete Previous/Next page-turn controls and interaction zones.
 - Let a display page contain the end of one source and the beginning of the next.
 - Add white rows only below the episode's final content row.
 - Display page 1 before preparing lookahead pages.
@@ -35,7 +37,7 @@ Loading is also serialized around source boundaries. `turn_reader` drops the sca
 - Downloading, decoding, stitching, or uploading a whole episode eagerly.
 - Persisting comic images or rendered pages across reader sessions.
 - Making backward navigation as aggressively prefetched as forward navigation.
-- Changing the reusable reading-surface layout or its interaction zones.
+- Changing the reusable reading-surface layout, its interaction zones, or its paginated control model.
 - Adding a user-facing cache or prefetch setting.
 - Hiding a foreground failure when the requested page cannot be rendered.
 
@@ -145,7 +147,7 @@ A foreground manifest, fetch, decode, dimension, scale, render, or upload failur
 
 ## Navigation and lifecycle
 
-Reader position becomes a zero-based global page index. Page-position chrome continues to expose one-based current and total values. Previous and Next remain bounded no-ops at episode ends and successful turns hide overlay chrome.
+Reader position becomes a zero-based global page index, not a scroll offset. Page-position chrome continues to expose one-based current and total values. Previous and Next retain the existing tap interactions, remain bounded no-ops at episode ends, and hide overlay chrome after successful turns.
 
 Back cancels every active reader task, clears task registry entries for the reader generation, drops the displayed picture handle, releases rendered pages and decoded sources, removes signed URLs, and returns to the same episode list state. Late outcomes from cancelled or prior-generation tasks cannot repopulate caches or change the screen.
 
