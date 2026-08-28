@@ -2,11 +2,12 @@ mod api;
 mod model;
 mod parse;
 
+use kobo_image::{Picture, PANEL_GREYS};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, Screen, ScreenBuilder, TaskError,
-    TaskId, TaskOutcome,
+    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, ReadingChrome,
+    Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
 };
-use model::{display_text, Comic, Episode, RecentEntry};
+use model::{display_text, Comic, Episode, EpisodeImage, RecentEntry};
 use std::process::ExitCode;
 
 const TITLE: &str = "BOMTOON";
@@ -18,6 +19,9 @@ const LIBRARY_SHELF: &str = "library-shelf";
 const RECENT_SHELF: &str = "recent-shelf";
 const LIBRARY_ITEMS_PER_PAGE: usize = 3;
 const EPISODE_ITEMS_PER_PAGE: usize = 6;
+const READER_PREVIOUS: &str = "reader-previous";
+const READER_NEXT: &str = "reader-next";
+const READER_CHROME: &str = "reader-chrome";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum View {
@@ -25,6 +29,7 @@ enum View {
     Status,
     Library,
     Episodes,
+    Reader,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,6 +44,9 @@ enum Pending {
     Library(usize),
     Recent(usize),
     Content(usize),
+    Manifest,
+    ManifestRefresh(PageLocation),
+    Image(PageLocation),
     Logout,
 }
 
@@ -50,6 +58,46 @@ enum AccountState {
     Expired,
     RevocationUnconfirmed,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageLocation {
+    source: usize,
+    slice: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Retry {
+    #[default]
+    Restart,
+    Manifest,
+    Image(PageLocation),
+    Slice,
+}
+
+struct EpisodeSelection {
+    content_alias: String,
+    episode_alias: String,
+    title: String,
+}
+
+struct ReaderState {
+    images: Vec<EpisodeImage>,
+    pages_per_source: Vec<usize>,
+    location: PageLocation,
+    total_pages: u16,
+    source: Option<Picture>,
+    picture: Option<TilePicture>,
+    chrome_visible: bool,
+    refreshed_current_image: bool,
+}
+
+impl ReaderState {
+    fn global_page(&self) -> u16 {
+        let before = self.pages_per_source[..self.location.source]
+            .iter()
+            .sum::<usize>();
+        u16::try_from(before + self.location.slice + 1).unwrap_or(self.total_pages)
+    }
+}
 
 #[derive(Default)]
 struct Bomtoon {
@@ -60,7 +108,12 @@ struct Bomtoon {
     comics: Vec<Comic>,
     recent: Vec<RecentEntry>,
     episodes: Vec<Episode>,
+    selected_content_alias: String,
     selected_title: String,
+    reader_selection: Option<EpisodeSelection>,
+    reader: Option<ReaderState>,
+    retry: Retry,
+    next_picture_handle: u32,
     page: usize,
     library_view_page: usize,
     recent_view_page: usize,
@@ -77,28 +130,40 @@ struct Bomtoon {
 impl Bomtoon {
     fn show(&self, context: &mut Context) {
         let owns_back = self.account == AccountState::Active
-            && self.problem.is_none()
-            && self.view == View::Episodes
-            && self.pending.is_none();
+            && self.pending.is_none()
+            && match self.view {
+                View::Episodes => self.problem.is_none(),
+                View::Reader => true,
+                View::Status | View::Library => false,
+            };
         context.set_screen(self.screen().with_own_back(owns_back));
     }
 
     fn screen(&self) -> Screen {
         if let Some(pending) = self.pending {
-            let message = match pending {
-                Pending::Library(_) => "Loading your library",
-                Pending::Recent(_) => "Loading recent reading",
-                Pending::Content(_) => "Loading episode purchase status",
-                Pending::Logout => "Signing out",
+            let (title, message) = match pending {
+                Pending::Library(_) => (TITLE, "Loading your library"),
+                Pending::Recent(_) => (TITLE, "Loading recent reading"),
+                Pending::Content(_) => (TITLE, "Loading episode purchase status"),
+                Pending::Manifest | Pending::ManifestRefresh(_) => {
+                    (self.reader_title(), "Loading comic pages")
+                }
+                Pending::Image(_) => (self.reader_title(), "Loading comic image"),
+                Pending::Logout => (TITLE, "Signing out"),
             };
             return ScreenBuilder::new("bomtoon-loading")
-                .top_bar(TITLE)
+                .top_bar(title)
                 .activity(message, None)
                 .build();
         }
         if let Some(problem) = &self.problem {
+            let title = if self.view == View::Reader {
+                self.reader_title()
+            } else {
+                TITLE
+            };
             return ScreenBuilder::new("bomtoon-error")
-                .top_bar(TITLE)
+                .top_bar(title)
                 .banner(BannerLevel::Attention, problem.clone())
                 .primary_button(RETRY, "Try again")
                 .build();
@@ -114,8 +179,16 @@ impl Bomtoon {
                 .build(),
             View::Library => self.library_screen(),
             View::Episodes => self.episode_screen(),
+            View::Reader => self.reader_screen(),
         }
     }
+
+    fn reader_title(&self) -> &str {
+        self.reader_selection
+            .as_ref()
+            .map_or(TITLE, |selection| selection.title.as_str())
+    }
+
     fn signed_out_screen(&self) -> Screen {
         let mut screen = ScreenBuilder::new("bomtoon-signed-out").top_bar(TITLE);
         screen = match self.account {
@@ -256,24 +329,61 @@ impl Bomtoon {
             .top_bar(self.selected_title.clone())
             .text(format!("{} episodes", self.episodes.len()));
         let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
-        for episode in &self.episodes[start..end] {
+        for (index, episode) in self.episodes[start..end].iter().enumerate() {
+            let index = start + index;
             let title_fallback = format!("Episode {}", episode.alias);
             let status = display_text(episode.purchase.label(), "Other status");
-            screen = screen.text(format!(
+            let label = format!(
                 "{} [{}] - {}",
                 display_text(&episode.title, &title_fallback),
                 episode.alias,
                 status
-            ));
+            );
+            if episode.purchase.is_readable() {
+                screen = screen.button(format!("episode-{index}"), label);
+            } else {
+                screen = screen.text(label);
+            }
         }
         page_controls(screen, self.page, self.episodes.len())
     }
 
-    fn clear_account_data(&mut self) {
+    fn reader_screen(&self) -> Screen {
+        let selection = self
+            .reader_selection
+            .as_ref()
+            .expect("reader view without episode selection");
+        let reader = self.reader.as_ref().expect("reader view without reader state");
+        let picture = reader.picture.expect("reader view without uploaded slice");
+        ScreenBuilder::new("bomtoon-reader")
+            .top_bar(selection.title.clone())
+            .reading_surface(
+                picture,
+                if reader.chrome_visible {
+                    ReadingChrome::Overlay
+                } else {
+                    ReadingChrome::Hidden
+                },
+            )
+            .page_turns(READER_PREVIOUS, READER_NEXT)
+            .reading_menu(READER_CHROME)
+            .page_position(reader.global_page(), reader.total_pages)
+            .build()
+    }
+
+    fn clear_account_data(&mut self, context: &mut Context) {
+        let picture = self
+            .reader
+            .take()
+            .and_then(|reader| reader.picture)
+            .map(|picture| picture.handle);
         self.comics.clear();
         self.recent.clear();
         self.episodes.clear();
+        self.selected_content_alias.clear();
         self.selected_title.clear();
+        self.reader_selection = None;
+        self.retry = Retry::Restart;
         self.page = 0;
         self.library_view_page = 0;
         self.recent_view_page = 0;
@@ -283,12 +393,15 @@ impl Bomtoon {
         self.total_recent_titles = 0;
         self.library_loaded = false;
         self.recent_loaded = false;
+        if let Some(handle) = picture {
+            context.drop_picture(handle);
+        }
     }
 
     fn restart(&mut self, context: &mut Context) {
         self.problem = None;
         self.account = AccountState::Active;
-        self.clear_account_data();
+        self.clear_account_data(context);
         self.shelf = Shelf::Library;
         self.view = View::Status;
         self.spawn(context, Pending::Library(0), api::library(0));
@@ -304,11 +417,124 @@ impl Bomtoon {
         }
     }
 
-    fn accept(&mut self, context: &mut Context, pending: Pending, bytes: &[u8]) {
+    fn start_manifest(&mut self, context: &mut Context) {
+        let Some((content, episode)) = self.reader_selection.as_ref().map(|selection| {
+            (
+                selection.content_alias.clone(),
+                selection.episode_alias.clone(),
+            )
+        }) else {
+            self.problem = Some("The selected episode is no longer available.".to_owned());
+            self.retry = Retry::Restart;
+            return;
+        };
+        self.retry = Retry::Manifest;
+        self.spawn(context, Pending::Manifest, api::images(&content, &episode));
+    }
+
+    fn start_manifest_refresh(&mut self, context: &mut Context, target: PageLocation) {
+        let Some((content, episode)) = self.reader_selection.as_ref().map(|selection| {
+            (
+                selection.content_alias.clone(),
+                selection.episode_alias.clone(),
+            )
+        }) else {
+            self.fail_reader(
+                Retry::Image(target),
+                "The selected episode is no longer available.",
+            );
+            return;
+        };
+        self.retry = Retry::Image(target);
+        self.spawn(
+            context,
+            Pending::ManifestRefresh(target),
+            api::images(&content, &episode),
+        );
+    }
+
+    fn start_image(&mut self, context: &mut Context, target: PageLocation, reset_refresh: bool) {
+        let Some(url) = self
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.images.get(target.source))
+            .map(|image| image.url.clone())
+        else {
+            self.fail_reader(
+                Retry::Manifest,
+                "The selected comic image is no longer available.",
+            );
+            return;
+        };
+        if reset_refresh {
+            if let Some(reader) = self.reader.as_mut() {
+                reader.refreshed_current_image = false;
+            }
+        }
+        self.retry = Retry::Image(target);
+        self.spawn(context, Pending::Image(target), api::image(&url));
+    }
+
+    fn fail_reader(&mut self, retry: Retry, message: impl Into<String>) {
+        self.problem = Some(message.into());
+        self.retry = retry;
+    }
+
+    fn next_handle(&mut self) -> Result<PictureHandle, String> {
+        let handle = PictureHandle(self.next_picture_handle);
+        self.next_picture_handle = self
+            .next_picture_handle
+            .checked_add(1)
+            .ok_or_else(|| "The picture handle limit was reached.".to_owned())?;
+        Ok(handle)
+    }
+
+    fn install_slice(
+        &mut self,
+        context: &mut Context,
+        target: PageLocation,
+    ) -> Result<(), String> {
+        let panel_height = u32::try_from(context.metrics().height)
+            .map_err(|_| "The panel height is not supported.".to_owned())?;
+        let slice = {
+            let reader = self
+                .reader
+                .as_ref()
+                .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
+            let source = reader
+                .source
+                .as_ref()
+                .ok_or_else(|| "The comic image needs to be loaded again.".to_owned())?;
+            slice_rows(source, target.slice, panel_height)?
+        };
+        let handle = self.next_handle()?;
+        let width = slice.width();
+        let height = slice.height();
+        let picture = context
+            .put_picture(handle, width, height, slice.into_grey())
+            .ok_or_else(|| "The comic slice could not be uploaded.".to_owned())?;
+        let old = {
+            let reader = self
+                .reader
+                .as_mut()
+                .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
+            reader.location = target;
+            reader.chrome_visible = false;
+            reader.picture.replace(picture)
+        };
+        self.problem = None;
+        self.show(context);
+        if let Some(old) = old {
+            context.drop_picture(old.handle);
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, context: &mut Context, pending: Pending, bytes: &[u8]) -> bool {
         match pending {
             Pending::Logout => {
                 if bytes.is_empty() {
-                    self.clear_account_data();
+                    self.clear_account_data(context);
                     self.account = AccountState::SignedOut;
                 } else {
                     self.problem = Some("BOMTOON returned unexpected sign-out data.".to_owned());
@@ -365,7 +591,113 @@ impl Bomtoon {
                 }
                 Err(error) => self.problem = Some(error.to_string()),
             },
+            Pending::Manifest => {
+                let panel_width = u32::try_from(context.metrics().width);
+                let panel_height = u32::try_from(context.metrics().height);
+                let planned = match (panel_width, panel_height) {
+                    (Ok(width), Ok(height)) => parse::images(bytes)
+                        .map_err(|error| error.to_string())
+                        .and_then(|images| {
+                            page_plan(&images, width, height)
+                                .map(|(pages_per_source, total_pages)| {
+                                    (images, pages_per_source, total_pages)
+                                })
+                        }),
+                    _ => Err("The panel dimensions are not supported.".to_owned()),
+                };
+                match planned {
+                    Ok((images, pages_per_source, total_pages)) => {
+                        let target = PageLocation {
+                            source: 0,
+                            slice: 0,
+                        };
+                        self.reader = Some(ReaderState {
+                            images,
+                            pages_per_source,
+                            location: target,
+                            total_pages,
+                            source: None,
+                            picture: None,
+                            chrome_visible: false,
+                            refreshed_current_image: false,
+                        });
+                        self.start_image(context, target, true);
+                    }
+                    Err(error) => self.fail_reader(Retry::Manifest, error),
+                }
+            }
+            Pending::ManifestRefresh(target) => match parse::images(bytes) {
+                Ok(refreshed)
+                    if self
+                        .reader
+                        .as_ref()
+                        .is_some_and(|reader| same_assets(&reader.images, &refreshed)) =>
+                {
+                    if let Some(reader) = self.reader.as_mut() {
+                        for (current, replacement) in
+                            reader.images.iter_mut().zip(refreshed.into_iter())
+                        {
+                            current.url = replacement.url;
+                        }
+                    }
+                    self.start_image(context, target, false);
+                }
+                Ok(_) => self.fail_reader(
+                    Retry::Image(target),
+                    "BOMTOON returned different comic image metadata.",
+                ),
+                Err(error) => self.fail_reader(Retry::Image(target), error.to_string()),
+            },
+            Pending::Image(target) => {
+                let panel_width = match u32::try_from(context.metrics().width) {
+                    Ok(width) => width,
+                    Err(_) => {
+                        self.fail_reader(
+                            Retry::Image(target),
+                            "The panel width is not supported.",
+                        );
+                        return false;
+                    }
+                };
+                let scaled = (|| {
+                    let expected = self
+                        .reader
+                        .as_ref()
+                        .and_then(|reader| reader.images.get(target.source))
+                        .ok_or_else(|| {
+                            "The selected comic image is no longer available.".to_owned()
+                        })?;
+                    let decoded =
+                        kobo_image::decode(bytes).map_err(|error| error.to_string())?;
+                    if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
+                        return Err(
+                            "BOMTOON returned different comic image dimensions.".to_owned()
+                        );
+                    }
+                    let mut scaled = decoded
+                        .scale_to_width(panel_width)
+                        .map_err(|error| error.to_string())?;
+                    scaled.dither(PANEL_GREYS);
+                    Ok(scaled)
+                })();
+                match scaled {
+                    Ok(source) => {
+                        if let Some(reader) = self.reader.as_mut() {
+                            reader.source = Some(source);
+                            reader.location = target;
+                            reader.chrome_visible = false;
+                        }
+                        self.retry = Retry::Slice;
+                        match self.install_slice(context, target) {
+                            Ok(()) => return true,
+                            Err(error) => self.fail_reader(Retry::Slice, error),
+                        }
+                    }
+                    Err(error) => self.fail_reader(Retry::Image(target), error),
+                }
+            }
         }
+        false
     }
 
     fn open_comic(&mut self, context: &mut Context, index: usize) {
@@ -383,10 +715,188 @@ impl Bomtoon {
             return;
         };
         self.remember_shelf_page();
+        self.selected_content_alias = alias.clone();
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
+        self.retry = Retry::Restart;
         self.spawn(context, Pending::Content(index), api::content(&alias));
         self.show(context);
+    }
+
+    fn open_episode(&mut self, context: &mut Context, index: usize) {
+        let Some((episode_alias, title)) = self.episodes.get(index).and_then(|episode| {
+            episode.purchase.is_readable().then(|| {
+                (
+                    episode.alias.clone(),
+                    display_text(
+                        &episode.title,
+                        &format!("Episode {}", episode.alias),
+                    ),
+                )
+            })
+        }) else {
+            return;
+        };
+        self.reader_selection = Some(EpisodeSelection {
+            content_alias: self.selected_content_alias.clone(),
+            episode_alias,
+            title,
+        });
+        self.reader = None;
+        self.problem = None;
+        self.view = View::Reader;
+        self.start_manifest(context);
+    }
+
+    fn leave_reader(&mut self, context: &mut Context) {
+        let old = self
+            .reader
+            .take()
+            .and_then(|reader| reader.picture)
+            .map(|picture| picture.handle);
+        self.reader_selection = None;
+        self.problem = None;
+        self.retry = Retry::Restart;
+        self.view = View::Episodes;
+        self.show(context);
+        if let Some(handle) = old {
+            context.drop_picture(handle);
+        }
+    }
+
+    fn turn_reader(&mut self, context: &mut Context, target: PageLocation) {
+        let same_source = self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.location.source == target.source);
+        if let Some(reader) = self.reader.as_mut() {
+            reader.location = target;
+            reader.chrome_visible = false;
+            if !same_source {
+                reader.source = None;
+                reader.refreshed_current_image = false;
+            }
+        }
+        if same_source {
+            self.retry = Retry::Slice;
+            if let Err(error) = self.install_slice(context, target) {
+                self.fail_reader(Retry::Slice, error);
+                self.show(context);
+            }
+        } else {
+            self.start_image(context, target, true);
+            self.show(context);
+        }
+    }
+
+    fn retry(&mut self, context: &mut Context) -> bool {
+        let retry = self.retry;
+        self.problem = None;
+        match retry {
+            Retry::Restart => self.restart(context),
+            Retry::Manifest => self.start_manifest(context),
+            Retry::Image(target) => {
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.location = target;
+                    reader.source = None;
+                    reader.refreshed_current_image = false;
+                }
+                self.start_image(context, target, true);
+            }
+            Retry::Slice => {
+                let Some(target) = self.reader.as_ref().map(|reader| reader.location) else {
+                    self.fail_reader(
+                        Retry::Restart,
+                        "The selected episode is no longer available.",
+                    );
+                    return false;
+                };
+                match self.install_slice(context, target) {
+                    Ok(()) => return true,
+                    Err(error) => self.fail_reader(Retry::Slice, error),
+                }
+            }
+        }
+        false
+    }
+
+    fn fail_task(&mut self, context: &mut Context, pending: Pending, error: TaskError) {
+        match (pending, error) {
+            (Pending::Logout, TaskError::RevocationUnconfirmed) => {
+                self.clear_account_data(context);
+                self.account = AccountState::RevocationUnconfirmed;
+                self.problem = None;
+            }
+            (Pending::Logout, TaskError::LocalStorage) => {
+                self.problem = Some("Could not remove the local BOMTOON sign-in data.".to_owned());
+            }
+            (
+                Pending::Library(_)
+                | Pending::Recent(_)
+                | Pending::Content(_)
+                | Pending::Manifest
+                | Pending::ManifestRefresh(_),
+                TaskError::NoCredential,
+            ) => {
+                self.clear_account_data(context);
+                self.account = AccountState::SignedOut;
+                self.problem = None;
+            }
+            (
+                Pending::Library(_)
+                | Pending::Recent(_)
+                | Pending::Content(_)
+                | Pending::Manifest
+                | Pending::ManifestRefresh(_),
+                TaskError::Unauthorized,
+            ) => {
+                self.clear_account_data(context);
+                self.account = AccountState::Expired;
+                self.problem = None;
+            }
+            (Pending::Image(target), TaskError::Unauthorized) => {
+                let can_refresh = self
+                    .reader
+                    .as_ref()
+                    .is_some_and(|reader| !reader.refreshed_current_image);
+                if can_refresh {
+                    if let Some(reader) = self.reader.as_mut() {
+                        reader.refreshed_current_image = true;
+                    }
+                    self.start_manifest_refresh(context, target);
+                } else {
+                    self.fail_reader(
+                        Retry::Image(target),
+                        "BOMTOON did not authorize the selected comic image.",
+                    );
+                }
+            }
+            (Pending::Image(target) | Pending::ManifestRefresh(target), error) => {
+                self.fail_reader(Retry::Image(target), Failure::of(error).advice);
+            }
+            (Pending::Manifest, error) => {
+                self.fail_reader(Retry::Manifest, Failure::of(error).advice);
+            }
+            (_, error) => {
+                self.problem = Some(Failure::of(error).advice.to_owned());
+                self.retry = Retry::Restart;
+            }
+        }
+    }
+
+    fn cancel_task(&mut self, pending: Pending) {
+        match pending {
+            Pending::Manifest => {
+                self.fail_reader(Retry::Manifest, "The request was cancelled.");
+            }
+            Pending::ManifestRefresh(target) | Pending::Image(target) => {
+                self.fail_reader(Retry::Image(target), "The request was cancelled.");
+            }
+            _ => {
+                self.problem = Some("The request was cancelled.".to_owned());
+                self.retry = Retry::Restart;
+            }
+        }
     }
 }
 
@@ -397,12 +907,15 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
+        let can_go_back =
+            self.account == AccountState::Active && self.pending.is_none();
+        if action == ActionId::BACK && can_go_back && self.view == View::Reader {
+            self.leave_reader(context);
+            return;
+        }
         let ready = self.account == AccountState::Active
             && self.problem.is_none()
             && self.pending.is_none();
-        let retry_visible = self.problem.is_some()
-            || self.account != AccountState::Active
-            || self.view == View::Status;
         if action == ActionId::BACK && ready && self.view == View::Episodes {
             self.view = View::Library;
             self.page = match self.shelf {
@@ -412,12 +925,46 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
+        let retry_visible = self.problem.is_some()
+            || self.account != AccountState::Active
+            || self.view == View::Status;
         if action == action_id(RETRY) && self.pending.is_none() && retry_visible {
-            self.restart(context);
-        } else if !ready {
+            if !self.retry(context) {
+                self.show(context);
+            }
+            return;
+        }
+        if !ready {
             self.show(context);
             return;
-        } else if self.view == View::Library && action == action_id(SIGN_OUT) {
+        }
+        if self.view == View::Reader {
+            if action == action_id(READER_CHROME) {
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.chrome_visible = !reader.chrome_visible;
+                }
+                self.show(context);
+                return;
+            }
+            let target = self.reader.as_ref().and_then(|reader| {
+                if action == action_id(READER_PREVIOUS) {
+                    previous_location(&reader.pages_per_source, reader.location)
+                } else if action == action_id(READER_NEXT) {
+                    next_location(&reader.pages_per_source, reader.location)
+                } else {
+                    None
+                }
+            });
+            if let Some(target) = target {
+                self.turn_reader(context, target);
+            } else if action != action_id(READER_PREVIOUS)
+                && action != action_id(READER_NEXT)
+            {
+                self.show(context);
+            }
+            return;
+        }
+        if self.view == View::Library && action == action_id(SIGN_OUT) {
             self.spawn(context, Pending::Logout, api::logout());
         } else if self.view == View::Library && action == action_id(LIBRARY_SHELF) {
             self.switch_shelf(context, Shelf::Library);
@@ -431,7 +978,10 @@ impl KoboApp for Bomtoon {
             } else {
                 EPISODE_ITEMS_PER_PAGE
             };
-            let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
+            let next_start = self
+                .page
+                .saturating_add(1)
+                .saturating_mul(items_per_page);
             if self.view != View::Library || next_start < self.shelf_len() {
                 self.page = self.page.saturating_add(1);
             } else if let Some(next) = self.shelf_next_page() {
@@ -454,6 +1004,14 @@ impl KoboApp for Bomtoon {
                     return;
                 }
             }
+        } else if self.view == View::Episodes {
+            for index in 0..self.episodes.len() {
+                if action == action_id(&format!("episode-{index}")) {
+                    self.open_episode(context, index);
+                    self.show(context);
+                    return;
+                }
+            }
         }
         self.show(context);
     }
@@ -466,41 +1024,130 @@ impl KoboApp for Bomtoon {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        match (pending, outcome) {
-            (pending, TaskOutcome::Completed(bytes)) => {
-                self.accept(context, pending, &bytes);
+        let shown = match outcome {
+            TaskOutcome::Completed(bytes) => self.accept(context, pending, &bytes),
+            TaskOutcome::Failed(error) => {
+                self.fail_task(context, pending, error);
+                false
             }
-            (Pending::Logout, TaskOutcome::Failed(TaskError::RevocationUnconfirmed)) => {
-                self.clear_account_data();
-                self.account = AccountState::RevocationUnconfirmed;
-                self.problem = None;
+            TaskOutcome::Cancelled => {
+                self.cancel_task(pending);
+                false
             }
-            (Pending::Logout, TaskOutcome::Failed(TaskError::LocalStorage)) => {
-                self.problem = Some("Could not remove the local BOMTOON sign-in data.".to_owned());
-            }
-            (
-                Pending::Library(_) | Pending::Recent(_) | Pending::Content(_),
-                TaskOutcome::Failed(TaskError::NoCredential),
-            ) => {
-                self.account = AccountState::SignedOut;
-                self.problem = None;
-            }
-            (
-                Pending::Library(_) | Pending::Recent(_) | Pending::Content(_),
-                TaskOutcome::Failed(TaskError::Unauthorized),
-            ) => {
-                self.account = AccountState::Expired;
-                self.problem = None;
-            }
-            (_, TaskOutcome::Failed(error)) => {
-                self.problem = Some(Failure::of(error).advice.to_owned());
-            }
-            (_, TaskOutcome::Cancelled) => {
-                self.problem = Some("The request was cancelled.".to_owned());
-            }
+        };
+        if !shown {
+            self.show(context);
         }
-        self.show(context);
     }
+}
+
+fn slices_for(height: u32, panel_height: u32) -> Option<usize> {
+    if height == 0 || panel_height == 0 {
+        return None;
+    }
+    let height = usize::try_from(height).ok()?;
+    let panel = usize::try_from(panel_height).ok()?;
+    Some(height.div_ceil(panel))
+}
+
+fn page_plan(
+    images: &[EpisodeImage],
+    panel_width: u32,
+    panel_height: u32,
+) -> Result<(Vec<usize>, u16), String> {
+    let mut pages = Vec::with_capacity(images.len());
+    let mut total = 0_usize;
+    for image in images {
+        let (_, scaled_height) =
+            kobo_image::width_scaled_size((image.width, image.height), panel_width)
+                .map_err(|error| error.to_string())?;
+        let count = slices_for(scaled_height, panel_height)
+            .ok_or_else(|| "The comic page dimensions are not supported.".to_owned())?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| "The comic has too many pages.".to_owned())?;
+        pages.push(count);
+    }
+    let total =
+        u16::try_from(total).map_err(|_| "The comic has too many pages.".to_owned())?;
+    Ok((pages, total))
+}
+
+fn previous_location(pages: &[usize], current: PageLocation) -> Option<PageLocation> {
+    if current.slice > 0 {
+        return Some(PageLocation {
+            source: current.source,
+            slice: current.slice - 1,
+        });
+    }
+    let source = current.source.checked_sub(1)?;
+    Some(PageLocation {
+        source,
+        slice: pages.get(source)?.checked_sub(1)?,
+    })
+}
+
+fn next_location(pages: &[usize], current: PageLocation) -> Option<PageLocation> {
+    let count = *pages.get(current.source)?;
+    let slice = current.slice.checked_add(1)?;
+    if slice < count {
+        return Some(PageLocation {
+            source: current.source,
+            slice,
+        });
+    }
+    let source = current.source.checked_add(1)?;
+    pages
+        .get(source)
+        .map(|_| PageLocation { source, slice: 0 })
+}
+
+fn slice_rows(source: &Picture, slice: usize, panel_height: u32) -> Result<Picture, String> {
+    let width = usize::try_from(source.width())
+        .map_err(|_| "The comic width is not supported.".to_owned())?;
+    let panel = usize::try_from(panel_height)
+        .map_err(|_| "The panel height is not supported.".to_owned())?;
+    if panel == 0 {
+        return Err("The panel height is not supported.".to_owned());
+    }
+    let start_row = slice
+        .checked_mul(panel)
+        .ok_or_else(|| "The comic page offset is too large.".to_owned())?;
+    let source_height = usize::try_from(source.height())
+        .map_err(|_| "The comic height is not supported.".to_owned())?;
+    if start_row >= source_height {
+        return Err("The comic page offset is outside the image.".to_owned());
+    }
+    let copied_rows = (source_height - start_row).min(panel);
+    let output_len = width
+        .checked_mul(panel)
+        .ok_or_else(|| "The comic slice is too large.".to_owned())?;
+    let copied_len = width
+        .checked_mul(copied_rows)
+        .ok_or_else(|| "The comic slice is too large.".to_owned())?;
+    let source_start = width
+        .checked_mul(start_row)
+        .ok_or_else(|| "The comic page offset is too large.".to_owned())?;
+    let source_end = source_start
+        .checked_add(copied_len)
+        .ok_or_else(|| "The comic page offset is too large.".to_owned())?;
+    let source_rows = source
+        .grey()
+        .get(source_start..source_end)
+        .ok_or_else(|| "The comic pixels do not match their dimensions.".to_owned())?;
+    let mut grey = vec![255; output_len];
+    grey[..copied_len].copy_from_slice(source_rows);
+    Picture::from_grey(source.width(), panel_height, grey).map_err(|error| error.to_string())
+}
+
+fn same_assets(current: &[EpisodeImage], refreshed: &[EpisodeImage]) -> bool {
+    current.len() == refreshed.len()
+        && current.iter().zip(refreshed).all(|(old, new)| {
+            old.order == new.order
+                && old.width == new.width
+                && old.height == new.height
+                && old.path == new.path
+        })
 }
 
 fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usize) {
@@ -546,7 +1193,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kobo_sdk::{AppRunner, Chrome, Command, Credential, SecretHeader, Task, CLARA_BW_METRICS};
+    use kobo_sdk::{
+        AppRunner, Chrome, Command, Credential, Node, PictureHandle, ReadingChrome, SecretHeader,
+        Task, TilePicture, CLARA_BW_METRICS,
+    };
 
     const LIBRARY_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
@@ -579,13 +1229,24 @@ mod tests {
     const REMOTE_LIBRARY_PAGE_SIZE: usize = 30;
     const CONTENT_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
-        "data":{"episodes":[{
-            "alias":"ep-1",
-            "title":"Episode One",
-            "isSample":false,
-            "purchaseStatus":"POSSESSION"
-        }]}
+        "data":{"episodes":[
+            {"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
+            {"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
+            {"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
+            {"alias":"locked","title":"Locked","isSample":false,"purchaseStatus":null,"paid":true}
+        ]}
     }"#;
+    const TINY_WEBP: &[u8] = &[
+        82, 73, 70, 70, 36, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 24, 0, 0, 0, 48, 1, 0,
+        157, 1, 42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
+    ];
+
+    fn image_manifest(path: &str, policy: &str) -> Vec<u8> {
+        format!(
+            "{{\"result\":\"SUCCESS\",\"data\":[{{\"orderNo\":1,\"width\":1,\"height\":1,\"imagePath\":\"https://image.balcony.studio{path}?Policy={policy}&Signature=s&Key-Pair-Id=k\",\"line\":null,\"point\":null}}]}}"
+        )
+        .into_bytes()
+    }
 
     fn started() -> (AppRunner<Bomtoon>, Vec<Command>) {
         let mut runner = AppRunner::with_metrics(Bomtoon::default(), CLARA_BW_METRICS);
@@ -642,6 +1303,83 @@ mod tests {
         let commands = runner.task_outcome(task, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         assert_eq!(runner.app().view, View::Library);
         (runner, commands)
+    }
+
+    fn reader_waiting_for_manifest() -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let commands = runner.action(action_id("episode-0"));
+        let (manifest_task, _) = only_spawn(&commands);
+        (runner, manifest_task)
+    }
+
+    fn reader_waiting_for_first_image() -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, manifest_task) = reader_waiting_for_manifest();
+        let commands = runner.task_outcome(
+            manifest_task,
+            TaskOutcome::Completed(image_manifest("/tw/ep/one.webp", "p1")),
+        );
+        let (image_task, _) = only_spawn(&commands);
+        (runner, image_task)
+    }
+
+    fn seeded_reader(
+        pages_per_source: Vec<usize>,
+        location: PageLocation,
+        chrome_visible: bool,
+    ) -> AppRunner<Bomtoon> {
+        let width = CLARA_BW_METRICS.width as u32;
+        let panel_height = CLARA_BW_METRICS.height as u32;
+        let source_height = panel_height * pages_per_source[location.source] as u32;
+        let images = pages_per_source
+            .iter()
+            .enumerate()
+            .map(|(index, pages)| EpisodeImage {
+                order: index + 1,
+                width,
+                height: panel_height * *pages as u32,
+                path: format!("/tw/ep/{index}.webp"),
+                url: format!(
+                    "https://image.balcony.studio/tw/ep/{index}.webp?Policy=p&Signature=s&Key-Pair-Id=k"
+                ),
+            })
+            .collect();
+        let total_pages = pages_per_source.iter().sum::<usize>() as u16;
+        AppRunner::with_metrics(
+            Bomtoon {
+                view: View::Reader,
+                selected_content_alias: "hunter_q".to_owned(),
+                reader_selection: Some(EpisodeSelection {
+                    content_alias: "hunter_q".to_owned(),
+                    episode_alias: "ep-1".to_owned(),
+                    title: "Episode One".to_owned(),
+                }),
+                reader: Some(ReaderState {
+                    images,
+                    pages_per_source,
+                    location,
+                    total_pages,
+                    source: Some(
+                        Picture::from_grey(
+                            width,
+                            source_height,
+                            vec![127; width as usize * source_height as usize],
+                        )
+                        .expect("scaled source"),
+                    ),
+                    picture: Some(TilePicture::new(PictureHandle(7), width, panel_height)),
+                    chrome_visible,
+                    refreshed_current_image: false,
+                }),
+                ..Bomtoon::default()
+            },
+            CLARA_BW_METRICS,
+        )
     }
 
     fn seed_all_account_data(runner: &mut AppRunner<Bomtoon>) {
@@ -726,6 +1464,342 @@ mod tests {
         let (task, _) = only_spawn(&commands);
         let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
         (runner, commands)
+    }
+
+    #[test]
+    fn only_owned_and_free_episode_rows_are_actions() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let screen = last_screen(&commands);
+        let actions = screen
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Button { action, .. } => Some(*action),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&action_id("episode-0")));
+        assert!(actions.contains(&action_id("episode-1")));
+        assert!(!actions.contains(&action_id("episode-2")));
+        assert!(!actions.contains(&action_id("episode-3")));
+    }
+
+    #[test]
+    fn owned_episode_opens_full_screen_reader_with_hidden_chrome() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let episode_screen = last_screen(&commands);
+        assert!(format!("{episode_screen:?}").contains("Episode One"));
+
+        let commands = runner.action(action_id("episode-0"));
+        let (manifest_task, manifest_work) = only_spawn(&commands);
+        assert_eq!(manifest_work, api::images("hunter_q", "ep-1"));
+        let commands = runner.task_outcome(
+            manifest_task,
+            TaskOutcome::Completed(image_manifest("/tw/ep/one.webp", "p1")),
+        );
+        let (image_task, image_work) = only_spawn(&commands);
+        assert!(matches!(
+            image_work,
+            Task::Fetch {
+                credential: None,
+                ..
+            }
+        ));
+
+        let commands =
+            runner.task_outcome(image_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let screen = last_screen(&commands);
+        let surface = screen.reading_surface.expect("reading surface");
+        assert_eq!(surface.chrome, ReadingChrome::Hidden);
+        assert_eq!(surface.picture.source, (1072, 1448));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::PutPicture { .. })));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn cdn_unauthorized_refreshes_once_without_expiring_account() {
+        let (mut runner, image_task) = reader_waiting_for_first_image();
+        let commands =
+            runner.task_outcome(image_task, TaskOutcome::Failed(TaskError::Unauthorized));
+        assert_eq!(runner.app().account, AccountState::Active);
+        let (refresh_task, refresh_work) = only_spawn(&commands);
+        assert_eq!(refresh_work, api::images("hunter_q", "ep-1"));
+
+        let commands = runner.task_outcome(
+            refresh_task,
+            TaskOutcome::Completed(image_manifest("/tw/ep/one.webp", "p2")),
+        );
+        let (retry_task, retry_work) = only_spawn(&commands);
+        let Task::Fetch {
+            url, credential, ..
+        } = retry_work
+        else {
+            panic!("expected image retry");
+        };
+        assert!(url.contains("Policy=p2"));
+        assert_eq!(credential, None);
+
+        let commands =
+            runner.task_outcome(retry_task, TaskOutcome::Failed(TaskError::Unauthorized));
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, Command::Spawn { .. })));
+    }
+
+    #[test]
+    fn row_slices_cover_source_once_and_pad_only_the_final_page() {
+        let source = Picture::from_grey(2, 5, (0..10).collect()).expect("source");
+        let first = slice_rows(&source, 0, 3).expect("first");
+        let second = slice_rows(&source, 1, 3).expect("second");
+        assert_eq!(first.grey(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(second.grey(), &[6, 7, 8, 9, 255, 255]);
+    }
+
+    #[test]
+    fn center_toggles_chrome_and_boundary_noop_preserves_it() {
+        let mut runner = seeded_reader(
+            vec![1],
+            PageLocation {
+                source: 0,
+                slice: 0,
+            },
+            false,
+        );
+        let commands = runner.action(action_id(READER_CHROME));
+        assert_eq!(
+            last_screen(&commands)
+                .reading_surface
+                .expect("surface")
+                .chrome,
+            ReadingChrome::Overlay
+        );
+        runner.action(action_id(READER_NEXT));
+        assert!(runner
+            .app()
+            .reader
+            .as_ref()
+            .expect("reader")
+            .chrome_visible);
+        let commands = runner.action(action_id(READER_CHROME));
+        assert_eq!(
+            last_screen(&commands)
+                .reading_surface
+                .expect("surface")
+                .chrome,
+            ReadingChrome::Hidden
+        );
+    }
+
+    #[test]
+    fn successful_page_turn_hides_chrome_and_replaces_handle_in_order() {
+        let mut runner = seeded_reader(
+            vec![2],
+            PageLocation {
+                source: 0,
+                slice: 0,
+            },
+            true,
+        );
+        let commands = runner.action(action_id(READER_NEXT));
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(
+            reader.location,
+            PageLocation {
+                source: 0,
+                slice: 1
+            }
+        );
+        assert!(!reader.chrome_visible);
+        let put = commands
+            .iter()
+            .position(|command| matches!(command, Command::PutPicture { .. }))
+            .expect("PutPicture");
+        let set = commands
+            .iter()
+            .position(|command| matches!(command, Command::SetScreen(_)))
+            .expect("SetScreen");
+        let drop = commands
+            .iter()
+            .position(|command| matches!(command, Command::DropPicture(_)))
+            .expect("DropPicture");
+        assert!(put < set && set < drop);
+    }
+
+    #[test]
+    fn source_boundary_targets_are_exact_and_reversible() {
+        let pages = [2, 3];
+        assert_eq!(
+            next_location(
+                &pages,
+                PageLocation {
+                    source: 0,
+                    slice: 1
+                }
+            ),
+            Some(PageLocation {
+                source: 1,
+                slice: 0
+            })
+        );
+        assert_eq!(
+            previous_location(
+                &pages,
+                PageLocation {
+                    source: 1,
+                    slice: 0
+                }
+            ),
+            Some(PageLocation {
+                source: 0,
+                slice: 1
+            })
+        );
+        assert_eq!(
+            previous_location(
+                &pages,
+                PageLocation {
+                    source: 0,
+                    slice: 0
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            next_location(
+                &pages,
+                PageLocation {
+                    source: 1,
+                    slice: 2
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn refreshed_manifest_rejects_changed_asset_identity() {
+        for refreshed in [
+            image_manifest("/tw/ep/different.webp", "p2"),
+            String::from_utf8(image_manifest("/tw/ep/one.webp", "p2"))
+                .expect("JSON")
+                .replace("\"height\":1", "\"height\":2")
+                .into_bytes(),
+        ] {
+            let (mut runner, image_task) = reader_waiting_for_first_image();
+            let commands =
+                runner.task_outcome(image_task, TaskOutcome::Failed(TaskError::Unauthorized));
+            let (refresh_task, _) = only_spawn(&commands);
+            let commands =
+                runner.task_outcome(refresh_task, TaskOutcome::Completed(refreshed));
+            assert!(runner.app().problem.is_some());
+            assert!(commands
+                .iter()
+                .all(|command| !matches!(command, Command::Spawn { .. })));
+        }
+    }
+
+    #[test]
+    fn manifest_credentials_alone_change_account_state() {
+        for (error, expected) in [
+            (TaskError::NoCredential, AccountState::SignedOut),
+            (TaskError::Unauthorized, AccountState::Expired),
+        ] {
+            let (mut runner, manifest_task) = reader_waiting_for_manifest();
+            runner.task_outcome(manifest_task, TaskOutcome::Failed(error));
+            assert_eq!(runner.app().account, expected);
+        }
+    }
+
+    #[test]
+    fn stale_image_outcome_cannot_mutate_reader() {
+        let (mut runner, image_task) = reader_waiting_for_first_image();
+        let before = runner.app().pending;
+        let commands = runner.task_outcome(
+            TaskId(image_task.0 + 1),
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        assert!(commands.is_empty());
+        assert_eq!(runner.app().pending, before);
+    }
+
+    #[test]
+    fn back_and_logout_release_reader_state_and_picture() {
+        let mut runner = seeded_reader(
+            vec![1],
+            PageLocation {
+                source: 0,
+                slice: 0,
+            },
+            true,
+        );
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(runner.app().reader.is_none());
+        let set = commands
+            .iter()
+            .position(|command| matches!(command, Command::SetScreen(_)))
+            .expect("SetScreen");
+        let drop = commands
+            .iter()
+            .position(|command| matches!(command, Command::DropPicture(_)))
+            .expect("DropPicture");
+        assert!(set < drop);
+
+        let mut runner = seeded_reader(
+            vec![1],
+            PageLocation {
+                source: 0,
+                slice: 0,
+            },
+            false,
+        );
+        runner.app_mut().pending = Some(Pending::Logout);
+        runner.app_mut().task = Some(TaskId(77));
+        let commands = runner.task_outcome(TaskId(77), TaskOutcome::Completed(Vec::new()));
+        assert!(runner.app().reader.is_none());
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::DropPicture(_))));
+    }
+
+    #[test]
+    fn image_failure_retry_stays_on_selected_episode() {
+        let (mut runner, image_task) = reader_waiting_for_first_image();
+        runner.task_outcome(
+            image_task,
+            TaskOutcome::Completed(vec![0, 1, 2, 3]),
+        );
+        let commands = runner.action(action_id(RETRY));
+        let (_, work) = only_spawn(&commands);
+        assert!(matches!(
+            work,
+            Task::Fetch {
+                credential: None,
+                ..
+            }
+        ));
+        let selection = runner
+            .app()
+            .reader_selection
+            .as_ref()
+            .expect("selection");
+        assert_eq!(selection.content_alias, "hunter_q");
+        assert_eq!(selection.episode_alias, "ep-1");
     }
 
     #[test]
