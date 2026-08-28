@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: kobo bomtoon login (--device IP | --sim)";
+const USAGE: &str = "usage: kobo bomtoon (login (--device IP | --sim) | extension install)";
 const LOGIN_URL: &str = "https://www.bomtoon.tw/user/login";
 const COOKIE_URL: &str = "https://www.bomtoon.tw/";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -29,6 +29,32 @@ const SECURE_COOKIE: &str = "__Secure-next-auth.session-token";
 const INSECURE_COOKIE: &str = "next-auth.session-token";
 const SESSION_SECRET: &str = "bomtoon-session";
 const MANAGED_STATE: &str = "bomtoon-access-token.state";
+const EXTENSION_FILES: &[(&str, &[u8])] = &[
+    (
+        "manifest.json",
+        include_bytes!("../bomtoon-extension/manifest.json"),
+    ),
+    (
+        "protocol.js",
+        include_bytes!("../bomtoon-extension/protocol.js"),
+    ),
+    (
+        "background.js",
+        include_bytes!("../bomtoon-extension/background.js"),
+    ),
+    (
+        "content.js",
+        include_bytes!("../bomtoon-extension/content.js"),
+    ),
+    (
+        "popup.html",
+        include_bytes!("../bomtoon-extension/popup.html"),
+    ),
+    (
+        "popup.js",
+        include_bytes!("../bomtoon-extension/popup.js"),
+    ),
+];
 
 const CHROME_LAUNCH_PROGRAM: &str = r#"set -u
 owner=$1
@@ -263,33 +289,74 @@ enum LoginTarget {
     Simulator,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Action {
+    Login(LoginTarget),
+    InstallExtension,
+}
+
 pub fn command(arguments: &[String]) -> Result<(), String> {
-    let target = parse_target(arguments)?;
+    let action = parse_action(arguments)?;
     if !cfg!(target_os = "macos") {
         return Err(UNSUPPORTED_HOST.to_owned());
     }
 
     #[cfg(target_os = "macos")]
     {
-        login(&target)
+        match action {
+            Action::Login(target) => login(&target),
+            Action::InstallExtension => install_extension(),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = target;
+        let _ = action;
         Err(UNSUPPORTED_HOST.to_owned())
     }
 }
 
-fn parse_target(arguments: &[String]) -> Result<LoginTarget, String> {
+fn parse_action(arguments: &[String]) -> Result<Action, String> {
     match arguments {
+        [verb, subcommand] if verb == "extension" && subcommand == "install" => {
+            Ok(Action::InstallExtension)
+        }
         [verb, flag, host]
             if verb == "login" && flag == "--device" && super::valid_device_host(host) =>
         {
-            Ok(LoginTarget::Device(host.clone()))
+            Ok(Action::Login(LoginTarget::Device(host.clone())))
         }
-        [verb, flag] if verb == "login" && flag == "--sim" => Ok(LoginTarget::Simulator),
+        [verb, flag] if verb == "login" && flag == "--sim" => {
+            Ok(Action::Login(LoginTarget::Simulator))
+        }
         _ => Err(USAGE.to_owned()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn install_extension() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())?;
+    let destination = extension_directory(&home);
+    let replacing = destination
+        .try_exists()
+        .map_err(|_| "extension installation failed".to_owned())?;
+    let cobalt_root = destination
+        .parent()
+        .ok_or_else(|| "extension installation failed".to_owned())?;
+    let installed = materialize_extension_at(cobalt_root)
+        .map_err(|_| "extension installation failed".to_owned())?;
+
+    println!("{}", installed.display());
+    println!("1. Open chrome://extensions.");
+    println!("2. Enable Developer mode.");
+    println!("3. Choose Load unpacked.");
+    println!("4. Select the printed directory.");
+    println!("5. Pin the Cobalt BOMTOON Login extension if desired.");
+    if replacing {
+        println!("Reload Cobalt BOMTOON Login on chrome://extensions.");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -398,6 +465,29 @@ fn create_private_profile_at(root: &Path) -> io::Result<PathBuf> {
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "temporary profile collision",
+    ))
+}
+
+fn create_private_directory_at(root: &Path) -> io::Result<PathBuf> {
+    for _ in 0..128 {
+        let path = root.join(private_name("kobo-bomtoon-extension"));
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => {
+                if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
+                    let _ = fs::remove_dir_all(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "temporary extension directory collision",
     ))
 }
 
@@ -1346,6 +1436,161 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+fn extension_directory(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/Cobalt/bomtoon-login-extension")
+}
+
+fn remove_extension_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn record_extension_cleanup(
+    result: io::Result<()>,
+    first_error: &mut Option<io::Error>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+            false
+        }
+    }
+}
+
+fn rollback_extension_materialization(
+    cobalt_root: &Path,
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    backup_active: bool,
+    installed: bool,
+) -> io::Result<()> {
+    let mut first_error = None;
+    record_extension_cleanup(remove_extension_path(staging), &mut first_error);
+
+    if backup_active {
+        let destination_exists = match path_exists(destination) {
+            Ok(exists) => exists,
+            Err(error) => {
+                record_extension_cleanup(Err(error), &mut first_error);
+                false
+            }
+        };
+        let destination_removed = if installed || destination_exists {
+            record_extension_cleanup(remove_extension_path(destination), &mut first_error)
+        } else {
+            true
+        };
+        if destination_removed {
+            record_extension_cleanup(fs::rename(backup, destination), &mut first_error);
+        }
+    } else if installed {
+        record_extension_cleanup(remove_extension_path(destination), &mut first_error);
+    }
+
+    record_extension_cleanup(sync_directory(cobalt_root), &mut first_error);
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn cleanup_committed_extension(
+    cobalt_root: &Path,
+    staging: &Path,
+    backup: &Path,
+    backup_active: bool,
+) -> io::Result<()> {
+    let mut first_error = None;
+    record_extension_cleanup(remove_extension_path(staging), &mut first_error);
+    if backup_active {
+        record_extension_cleanup(remove_extension_path(backup), &mut first_error);
+    }
+    record_extension_cleanup(sync_directory(cobalt_root), &mut first_error);
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn materialize_extension_at_with(
+    cobalt_root: &Path,
+    before_destination_rename: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    ensure_private_directory(cobalt_root)?;
+    let destination = cobalt_root.join("bomtoon-login-extension");
+    let staging = create_private_directory_at(cobalt_root)?;
+    let backup = cobalt_root.join(private_name("bomtoon-login-extension.backup"));
+    let mut backup_active = false;
+    let mut installed = false;
+    let mut committed = false;
+
+    let operation = (|| -> io::Result<()> {
+        for (name, contents) in EXTENSION_FILES {
+            let path = staging.join(name);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(contents)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+        }
+        sync_directory(&staging)?;
+
+        if path_exists(&destination)? {
+            fs::rename(&destination, &backup)?;
+            backup_active = true;
+            sync_directory(cobalt_root)?;
+        }
+        before_destination_rename(&staging)?;
+        fs::rename(&staging, &destination)?;
+        installed = true;
+        sync_directory(cobalt_root)?;
+        committed = true;
+
+        if backup_active {
+            remove_extension_path(&backup)?;
+            backup_active = false;
+            sync_directory(cobalt_root)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = operation {
+        let cleanup = if committed {
+            cleanup_committed_extension(cobalt_root, &staging, &backup, backup_active)
+        } else {
+            rollback_extension_materialization(
+                cobalt_root,
+                &staging,
+                &destination,
+                &backup,
+                backup_active,
+                installed,
+            )
+        };
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(_) => Err(io::Error::other("extension materialization cleanup failed")),
+        };
+    }
+
+    Ok(destination)
+}
+
+fn materialize_extension_at(cobalt_root: &Path) -> io::Result<PathBuf> {
+    materialize_extension_at_with(cobalt_root, |_| Ok(()))
+}
+
 fn install_simulator_at_with(
     cookie: &str,
     paths: &SimulatorAuthPaths,
@@ -1418,6 +1663,7 @@ fn install_simulator(cookie: &str) -> Result<(), ()> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -1477,12 +1723,12 @@ mod tests {
     #[test]
     fn login_requires_exactly_one_device_or_simulator_target() {
         assert_eq!(
-            parse_target(&argument_list(&["login", "--device", "192.0.2.1"])),
-            Ok(LoginTarget::Device("192.0.2.1".to_owned()))
+            parse_action(&argument_list(&["login", "--device", "192.0.2.1"])),
+            Ok(Action::Login(LoginTarget::Device("192.0.2.1".to_owned())))
         );
         assert_eq!(
-            parse_target(&argument_list(&["login", "--sim"])),
-            Ok(LoginTarget::Simulator)
+            parse_action(&argument_list(&["login", "--sim"])),
+            Ok(Action::Login(LoginTarget::Simulator))
         );
         for rejected in [
             argument_list(&[]),
@@ -1494,8 +1740,161 @@ mod tests {
             argument_list(&["login", "--device", "192.0.2.1", "--sim"]),
             argument_list(&["login", "--sim", "extra"]),
         ] {
-            assert_eq!(parse_target(&rejected), Err(USAGE.to_owned()));
+            assert_eq!(parse_action(&rejected), Err(USAGE.to_owned()));
         }
+    }
+
+    #[test]
+    fn extension_install_is_an_exact_command() {
+        assert_eq!(
+            parse_action(&argument_list(&["extension", "install"])),
+            Ok(Action::InstallExtension)
+        );
+        for rejected in [
+            argument_list(&["extension"]),
+            argument_list(&["extension", "install", "extra"]),
+            argument_list(&["extension", "remove"]),
+        ] {
+            assert_eq!(parse_action(&rejected), Err(USAGE.to_owned()));
+        }
+    }
+
+    #[test]
+    fn extension_manifest_has_only_the_approved_surface() {
+        fn collect_strings<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
+            match value {
+                Value::String(value) => strings.push(value),
+                Value::Array(values) => {
+                    for value in values {
+                        collect_strings(value, strings);
+                    }
+                }
+                Value::Object(fields) => {
+                    for (name, value) in fields {
+                        strings.push(name);
+                        collect_strings(value, strings);
+                    }
+                }
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::Integer(_) => {}
+            }
+        }
+
+        let manifest_bytes = EXTENSION_FILES
+            .iter()
+            .find_map(|(name, bytes)| (*name == "manifest.json").then_some(*bytes))
+            .expect("embedded manifest");
+        let manifest = kobo_json::parse(
+            std::str::from_utf8(manifest_bytes).expect("manifest is valid UTF-8"),
+        )
+        .expect("manifest is valid JSON");
+        let permissions = manifest
+            .get("permissions")
+            .and_then(Value::as_array)
+            .expect("permissions")
+            .iter()
+            .map(|value| value.as_str().expect("string permission"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            permissions,
+            BTreeSet::from(["activeTab", "cookies", "storage"])
+        );
+        let host_permissions = manifest
+            .get("host_permissions")
+            .and_then(Value::as_array)
+            .expect("host permissions")
+            .iter()
+            .map(|value| value.as_str().expect("string host permission"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            host_permissions,
+            BTreeSet::from([
+                "http://127.0.0.1/*",
+                "https://*.bomtoon.tw/*",
+                "https://www.bomtoon.tw/*",
+            ])
+        );
+        let mut strings = Vec::new();
+        collect_strings(&manifest, &mut strings);
+        for forbidden in ["google", "<all_urls>", "http://*/*", "https://*/*"] {
+            assert!(
+                strings.iter().all(|value| !value.contains(forbidden)),
+                "manifest contains forbidden string {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_materialization_is_exact_private_and_replaceable() {
+        assert_eq!(
+            extension_directory(Path::new("/Users/cobalt")),
+            PathBuf::from(
+                "/Users/cobalt/Library/Application Support/Cobalt/bomtoon-login-extension"
+            )
+        );
+        let root = create_private_directory_at(&std::env::temp_dir()).expect("test root");
+        let installed = materialize_extension_at(&root).expect("first install");
+        assert_eq!(installed, root.join("bomtoon-login-extension"));
+        assert_eq!(
+            fs::metadata(&installed)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let names = fs::read_dir(&installed)
+            .expect("extension files")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            EXTENSION_FILES
+                .iter()
+                .map(|(name, _)| (*name).into())
+                .collect()
+        );
+        for (name, contents) in EXTENSION_FILES {
+            let path = installed.join(name);
+            assert_eq!(fs::read(&path).expect("materialized file"), *contents);
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::write(installed.join("stale.js"), "stale").expect("stale file");
+        materialize_extension_at(&root).expect("replacement");
+        assert!(!installed.join("stale.js").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn extension_replacement_rolls_back_when_installation_fails() {
+        let root = create_private_directory_at(&std::env::temp_dir()).expect("test root");
+        let installed = materialize_extension_at(&root).expect("first install");
+        let sentinel = installed.join("existing-install");
+        fs::write(&sentinel, "preserve me").expect("sentinel");
+
+        let result = materialize_extension_at_with(&root, |staging| {
+            fs::remove_dir_all(staging)?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(sentinel).expect("restored install"),
+            "preserve me"
+        );
+        let transient_names = fs::read_dir(&root)
+            .expect("root entries")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name != "bomtoon-login-extension")
+            .collect::<Vec<_>>();
+        assert!(transient_names.is_empty(), "{transient_names:?}");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
