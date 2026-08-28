@@ -7,9 +7,10 @@ use std::io::{self, Read, Write};
 
 use kobo_ui::{
     ActionId, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, ControlState,
-    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle, Row,
-    RowLead, RowState, Screen, Space, TextScale, Tile, TilePicture, TileShape, TileState, TopBar,
-    TransferFailure, MAX_BAR_ACTIONS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
+    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle,
+    ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale, Tile,
+    TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
     MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
@@ -44,8 +45,8 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// would have been misread from that point on rather than refused. Version 9
 /// adds bounded rich EPUB text and runtime-held publisher-font handles.
 /// Version 10 adds exact text-hold coordinates and typed offline dictionary
-/// requests/results.
-pub const VERSION: u8 = 10;
+/// requests/results. Version 11 adds the runtime-owned reading surface.
+pub const VERSION: u8 = 11;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -3221,6 +3222,11 @@ fn encoded_screen_len(
     if screen.reading_font.is_some() {
         add_encoded_len(&mut length, 4)?;
     }
+    // One flag byte, plus the reading surface's four u32 values when present.
+    add_encoded_len(&mut length, 1)?;
+    if screen.reading_surface.is_some() {
+        add_encoded_len(&mut length, 16)?;
+    }
     if let Some(nav_bar) = &screen.nav_bar {
         if nav_bar.destinations.len() > u8::MAX as usize {
             return Err(ProtocolError::TooManyNodes);
@@ -4191,6 +4197,19 @@ fn encode_screen(
             push_u32(output, handle.0);
         }
     }
+    match screen.reading_surface {
+        None => output.push(0),
+        Some(surface) => {
+            output.push(match surface.chrome {
+                ReadingChrome::Hidden => 1,
+                ReadingChrome::Overlay => 2,
+            });
+            push_u32(output, surface.id.0);
+            push_u32(output, surface.picture.handle.0);
+            push_u32(output, surface.picture.source.0);
+            push_u32(output, surface.picture.source.1);
+        }
+    }
     push_u16(
         output,
         u16::try_from(screen.nodes.len()).map_err(|_| ProtocolError::TooManyNodes)?,
@@ -5100,6 +5119,28 @@ const fn decode_glyph(tag: u8) -> Option<Glyph> {
     })
 }
 
+fn decode_reading_surface(
+    reader: &mut Reader<'_>,
+) -> Result<Option<ReadingSurface>, ProtocolError> {
+    Ok(match reader.u8()? {
+        0 => None,
+        mode @ (1 | 2) => Some(ReadingSurface::new(
+            NodeId(reader.u32()?),
+            TilePicture::new(
+                PictureHandle(reader.u32()?),
+                reader.u32()?,
+                reader.u32()?,
+            ),
+            if mode == 1 {
+                ReadingChrome::Hidden
+            } else {
+                ReadingChrome::Overlay
+            },
+        )),
+        _ => return Err(ProtocolError::InvalidValue("reading surface flag")),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn decode_screen(
     reader: &mut Reader<'_>,
@@ -5218,6 +5259,7 @@ fn decode_screen(
         1 => Some(FontHandle(reader.u32()?)),
         _ => return Err(ProtocolError::InvalidValue("reading font flag")),
     };
+    let reading_surface = decode_reading_surface(reader)?;
     let count_nodes = usize::from(reader.u16()?);
     if count_nodes > MAX_NODES {
         return Err(ProtocolError::TooManyNodes);
@@ -5271,6 +5313,7 @@ fn decode_screen(
     screen.text_scale = text_scale;
     screen.reading = reading;
     screen.reading_font = reading_font;
+    screen.reading_surface = reading_surface;
     Ok(screen)
 }
 
@@ -6937,7 +6980,7 @@ mod tests {
 #[cfg(test)]
 mod node_coverage_tests {
     use super::*;
-    use kobo_ui::{BandAlign, BandSlot, Chip};
+    use kobo_ui::{BandAlign, BandSlot, Chip, ReadingChrome, ReadingSurface};
 
     /// Every node kind, so the precomputed frame layout is checked against the
     /// real encoder for all of them.
@@ -7287,6 +7330,29 @@ mod node_coverage_tests {
             Message::SetScreen(screen) => screen,
             other => panic!("expected a screen, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn screen_round_trip_preserves_reading_surface_and_chrome() {
+        for chrome in [ReadingChrome::Hidden, ReadingChrome::Overlay] {
+            let screen = Screen::new(17, Vec::new()).with_reading_surface(Some(
+                ReadingSurface::new(
+                    NodeId(9),
+                    TilePicture::new(PictureHandle(42), 1072, 1448),
+                    chrome,
+                ),
+            ));
+            assert_eq!(round_trip(screen.clone()), screen);
+        }
+    }
+
+    #[test]
+    fn screen_rejects_unknown_reading_surface_flag() {
+        let mut reader = Reader::new(&[3]);
+        assert_eq!(
+            decode_reading_surface(&mut reader),
+            Err(ProtocolError::InvalidValue("reading surface flag"))
+        );
     }
 
     #[test]
