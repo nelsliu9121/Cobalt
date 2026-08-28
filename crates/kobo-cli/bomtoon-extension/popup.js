@@ -17,6 +17,11 @@
     status.textContent = message;
   }
 
+  function challengeExpired(value) {
+    return !value || !Number.isFinite(value.expiresAt)
+      || value.expiresAt <= Date.now();
+  }
+
   async function clearChallenge() {
     await chrome.storage.session.remove("bomtoonChallenge");
     challenge = null;
@@ -25,8 +30,7 @@
   async function initialize() {
     const stored = await chrome.storage.session.get("bomtoonChallenge");
     const candidate = stored.bomtoonChallenge;
-    if (!candidate || !Number.isFinite(candidate.expiresAt)
-      || candidate.expiresAt <= Date.now()) {
+    if (challengeExpired(candidate)) {
       await clearChallenge();
       sendButton.disabled = true;
       show("Run kobo bomtoon login first.");
@@ -50,8 +54,7 @@
   async function sendHandoff() {
     await ready;
     if (!challenge || sending) return;
-    if (!Number.isFinite(challenge.expiresAt)
-      || challenge.expiresAt <= Date.now()) {
+    if (challengeExpired(challenge)) {
       await clearChallenge();
       sendButton.disabled = true;
       show("Run kobo bomtoon login first.");
@@ -96,6 +99,12 @@
         url: "https://www.bomtoon.tw/",
         storeId: store.id,
       });
+      if (challengeExpired(challenge)) {
+        await clearChallenge();
+        sendButton.disabled = true;
+        show("Run kobo bomtoon login first.");
+        return;
+      }
       const cookies = filterSessionCookies(allCookies);
       const body = payload(session.fingerprint, cookies);
       const response = await fetch(endpoint(challenge), {

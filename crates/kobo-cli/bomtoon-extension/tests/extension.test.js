@@ -435,6 +435,26 @@ test("popup revalidates expiry before starting credential work", async () => {
   assert.deepEqual(harness.fetches, []);
 });
 
+test("popup revalidates expiry after awaited credential work", async () => {
+  const cookies = deferred();
+  const harness = popupHarness({
+    now: 1000,
+    challenge: { version: 1, port: 43125, nonce, expiresAt: 2000 },
+    cookies: cookies.promise,
+  });
+  await tick();
+  const handoff = harness.handlers["send:click"]();
+  await tick();
+  assert.equal(harness.cookieReads.length, 1);
+  harness.advanceTo(2001);
+  cookies.resolve([]);
+  await handoff;
+  assert.deepEqual(harness.removals, ["bomtoonChallenge"]);
+  assert.equal(harness.elements.send.disabled, true);
+  assert.equal(harness.elements.status.textContent, "Run kobo bomtoon login first.");
+  assert.deepEqual(harness.fetches, []);
+});
+
 test("popup keeps the challenge after a failed POST and allows retry", async () => {
   let attempts = 0;
   const harness = popupHarness({
