@@ -91,7 +91,7 @@ Rendering a page may require one or more manifest sources. Source bodies are fet
 The implementation enforces these independent bounds:
 
 - one uploaded runtime picture handle for the displayed page
-- three application-side rendered lookahead pages
+- three application-side lookahead page buffers, whether complete or in progress
 - at most two decoded or panel-width-scaled source pictures at once
 - at most two image fetches at once
 - one transient compressed response per completed task callback
