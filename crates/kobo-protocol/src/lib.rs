@@ -10,8 +10,7 @@ use kobo_ui::{
     FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle,
     ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale, Tile,
     TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
-    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
-    MIN_NAV_DESTINATIONS,
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
 
@@ -5126,11 +5125,7 @@ fn decode_reading_surface(
         0 => None,
         mode @ (1 | 2) => Some(ReadingSurface::new(
             NodeId(reader.u32()?),
-            TilePicture::new(
-                PictureHandle(reader.u32()?),
-                reader.u32()?,
-                reader.u32()?,
-            ),
+            TilePicture::new(PictureHandle(reader.u32()?), reader.u32()?, reader.u32()?),
             if mode == 1 {
                 ReadingChrome::Hidden
             } else {
@@ -7335,13 +7330,12 @@ mod node_coverage_tests {
     #[test]
     fn screen_round_trip_preserves_reading_surface_and_chrome() {
         for chrome in [ReadingChrome::Hidden, ReadingChrome::Overlay] {
-            let screen = Screen::new(17, Vec::new()).with_reading_surface(Some(
-                ReadingSurface::new(
+            let screen =
+                Screen::new(17, Vec::new()).with_reading_surface(Some(ReadingSurface::new(
                     NodeId(9),
                     TilePicture::new(PictureHandle(42), 1072, 1448),
                     chrome,
-                ),
-            ));
+                )));
             assert_eq!(round_trip(screen.clone()), screen);
         }
     }

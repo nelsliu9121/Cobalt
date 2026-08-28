@@ -286,8 +286,7 @@ fn bomtoon_content_url(url: &str) -> bool {
 }
 
 fn bomtoon_images_url(url: &str) -> bool {
-    const PREFIX: &str =
-        "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
+    const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
     const SUFFIX: &str = "?imageWidth=1080";
 
     url.strip_prefix(PREFIX)

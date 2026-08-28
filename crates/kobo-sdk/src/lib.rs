@@ -25,9 +25,9 @@ pub use kobo_ui::{
     ParagraphPresentation, Percent, PictureHandle, ProseArea, ReadingChrome, ReadingSurface,
     RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space, TextHit, TextPresentation,
     TextSelection, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
-    CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS,
-    MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS,
-    MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
+    CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS,
+    MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS,
+    MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
 use std::collections::BTreeMap;
 use std::collections::VecDeque;

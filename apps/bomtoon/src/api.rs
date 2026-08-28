@@ -1,8 +1,7 @@
 use kobo_sdk::{Credential, Header, Task};
 
 const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
-const IMAGES_URL: &str =
-    "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
+const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
 const CONTENT_BYTES: u32 = 512 * 1024;
@@ -241,10 +240,7 @@ mod tests {
         );
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 512 * 1024);
-        assert_eq!(
-            credential,
-            Some(Credential::bearer("bomtoon-access-token"))
-        );
+        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
         assert_eq!(
             headers,
             vec![
@@ -253,10 +249,7 @@ mod tests {
                 Header::new("x-balcony-id", "BOMTOON_TW"),
                 Header::new("x-balcony-timezone", "Asia/Taipei"),
                 Header::new("x-platform", "MOBILE_IOS"),
-                Header::new(
-                    "x-referer",
-                    "https://www.bomtoon.tw/viewer/hunter_q/ep-1"
-                ),
+                Header::new("x-referer", "https://www.bomtoon.tw/viewer/hunter_q/ep-1"),
             ]
         );
     }
@@ -287,5 +280,4 @@ mod tests {
             ]
         );
     }
-
 }

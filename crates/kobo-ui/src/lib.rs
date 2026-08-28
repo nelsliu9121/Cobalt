@@ -13591,17 +13591,13 @@ mod page_turn_tests {
             screen.page_turns = screen
                 .page_turns
                 .map(|turns| turns.with_menu(ActionId(12)).with_position(4, 12));
-            screen.with_reading_surface(Some(ReadingSurface::new(
-                NodeId(2),
-                picture,
-                chrome,
-            )))
+            screen.with_reading_surface(Some(ReadingSurface::new(NodeId(2), picture, chrome)))
         };
 
-        let hidden = screen(ReadingChrome::Hidden)
-            .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
-        let overlay = screen(ReadingChrome::Overlay)
-            .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
+        let hidden =
+            screen(ReadingChrome::Hidden).layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
+        let overlay =
+            screen(ReadingChrome::Overlay).layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
         let full_panel = Rect {
             x: 0,
             y: 0,
@@ -13648,37 +13644,29 @@ mod page_turn_tests {
             Some(ActionId::BACK)
         );
         assert_eq!(
-            overlay.hit_test(
-                CLARA_BW_METRICS.width / 2,
-                CLARA_BW_METRICS.height / 2
-            ),
+            overlay.hit_test(CLARA_BW_METRICS.width / 2, CLARA_BW_METRICS.height / 2),
             Some(ActionId(12))
         );
     }
 
     #[test]
     fn reading_surface_reports_wrong_panel_dimensions() {
-        let screen = Screen::new(8, Vec::new()).with_reading_surface(Some(
-            ReadingSurface::new(
-                NodeId(1),
-                TilePicture::new(PictureHandle(2), 100, 200),
-                ReadingChrome::Hidden,
-            ),
-        ));
-        assert!(
-            screen
-                .validate(&CLARA_BW_METRICS)
-                .iter()
-                .any(|issue| matches!(
-                    issue.kind,
-                    LayoutIssueKind::ReadingSurfaceSize {
-                        actual: (100, 200),
-                        ..
-                    }
-                ))
-        );
+        let screen = Screen::new(8, Vec::new()).with_reading_surface(Some(ReadingSurface::new(
+            NodeId(1),
+            TilePicture::new(PictureHandle(2), 100, 200),
+            ReadingChrome::Hidden,
+        )));
+        assert!(screen
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| matches!(
+                issue.kind,
+                LayoutIssueKind::ReadingSurfaceSize {
+                    actual: (100, 200),
+                    ..
+                }
+            )));
     }
-
 }
 
 #[cfg(test)]

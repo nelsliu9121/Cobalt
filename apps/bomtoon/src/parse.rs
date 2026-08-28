@@ -289,9 +289,7 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
         return Err(ParseError::InvalidValue("image URL"));
     }
 
-    let query = uri
-        .query()
-        .ok_or(ParseError::InvalidValue("image URL"))?;
+    let query = uri.query().ok_or(ParseError::InvalidValue("image URL"))?;
     let mut policy = None;
     let mut signature = None;
     let mut key_pair_id = None;
@@ -342,7 +340,11 @@ mod tests {
     }
 
     fn manifest(entries: &[String]) -> Vec<u8> {
-        format!("{{\"result\":\"SUCCESS\",\"data\":[{}]}}", entries.join(",")).into_bytes()
+        format!(
+            "{{\"result\":\"SUCCESS\",\"data\":[{}]}}",
+            entries.join(",")
+        )
+        .into_bytes()
     }
 
     fn image(order: usize, width: u32, height: u32, url: &str) -> String {
@@ -364,18 +366,8 @@ mod tests {
     #[test]
     fn plain_manifest_requires_contiguous_order_and_exact_signed_urls() {
         let bytes = manifest(&[
-            image(
-                1,
-                1280,
-                5000,
-                &signed("/tw/ep/one.webp", "p1", "s1", "k1"),
-            ),
-            image(
-                2,
-                1280,
-                5120,
-                &signed("/tw/ep/two.webp", "p2", "s2", "k2"),
-            ),
+            image(1, 1280, 5000, &signed("/tw/ep/one.webp", "p1", "s1", "k1")),
+            image(2, 1280, 5120, &signed("/tw/ep/two.webp", "p2", "s2", "k2")),
         ]);
         let parsed = images(&bytes).expect("plain manifest");
         assert_eq!(parsed.len(), 2);
@@ -405,14 +397,7 @@ mod tests {
     fn manifest_count_and_url_length_are_bounded() {
         assert!(images(&manifest(&[])).is_err());
         let too_many = (1..=257)
-            .map(|order| {
-                image(
-                    order,
-                    1,
-                    1,
-                    &signed("/tw/ep/one.webp", "p", "s", "k"),
-                )
-            })
+            .map(|order| image(order, 1, 1, &signed("/tw/ep/one.webp", "p", "s", "k")))
             .collect::<Vec<_>>();
         assert!(images(&manifest(&too_many)).is_err());
         assert!(images(&manifest(&[image(1, 1, 1, &signed_of_len(1024))])).is_ok());

@@ -353,7 +353,10 @@ impl Bomtoon {
             .reader_selection
             .as_ref()
             .expect("reader view without episode selection");
-        let reader = self.reader.as_ref().expect("reader view without reader state");
+        let reader = self
+            .reader
+            .as_ref()
+            .expect("reader view without reader state");
         let picture = reader.picture.expect("reader view without uploaded slice");
         ScreenBuilder::new("bomtoon-reader")
             .top_bar(selection.title.clone())
@@ -489,11 +492,7 @@ impl Bomtoon {
         Ok(handle)
     }
 
-    fn install_slice(
-        &mut self,
-        context: &mut Context,
-        target: PageLocation,
-    ) -> Result<(), String> {
+    fn install_slice(&mut self, context: &mut Context, target: PageLocation) -> Result<(), String> {
         let panel_height = u32::try_from(context.metrics().height)
             .map_err(|_| "The panel height is not supported.".to_owned())?;
         let slice = {
@@ -598,10 +597,11 @@ impl Bomtoon {
                     (Ok(width), Ok(height)) => parse::images(bytes)
                         .map_err(|error| error.to_string())
                         .and_then(|images| {
-                            page_plan(&images, width, height)
-                                .map(|(pages_per_source, total_pages)| {
+                            page_plan(&images, width, height).map(
+                                |(pages_per_source, total_pages)| {
                                     (images, pages_per_source, total_pages)
-                                })
+                                },
+                            )
                         }),
                     _ => Err("The panel dimensions are not supported.".to_owned()),
                 };
@@ -652,10 +652,7 @@ impl Bomtoon {
                 let panel_width = match u32::try_from(context.metrics().width) {
                     Ok(width) => width,
                     Err(_) => {
-                        self.fail_reader(
-                            Retry::Image(target),
-                            "The panel width is not supported.",
-                        );
+                        self.fail_reader(Retry::Image(target), "The panel width is not supported.");
                         return false;
                     }
                 };
@@ -667,12 +664,9 @@ impl Bomtoon {
                         .ok_or_else(|| {
                             "The selected comic image is no longer available.".to_owned()
                         })?;
-                    let decoded =
-                        kobo_image::decode(bytes).map_err(|error| error.to_string())?;
+                    let decoded = kobo_image::decode(bytes).map_err(|error| error.to_string())?;
                     if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
-                        return Err(
-                            "BOMTOON returned different comic image dimensions.".to_owned()
-                        );
+                        return Err("BOMTOON returned different comic image dimensions.".to_owned());
                     }
                     let mut scaled = decoded
                         .scale_to_width(panel_width)
@@ -728,10 +722,7 @@ impl Bomtoon {
             episode.purchase.is_readable().then(|| {
                 (
                     episode.alias.clone(),
-                    display_text(
-                        &episode.title,
-                        &format!("Episode {}", episode.alias),
-                    ),
+                    display_text(&episode.title, &format!("Episode {}", episode.alias)),
                 )
             })
         }) else {
@@ -907,8 +898,7 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
-        let can_go_back =
-            self.account == AccountState::Active && self.pending.is_none();
+        let can_go_back = self.account == AccountState::Active && self.pending.is_none();
         if action == ActionId::BACK && can_go_back && self.view == View::Reader {
             self.leave_reader(context);
             return;
@@ -957,9 +947,7 @@ impl KoboApp for Bomtoon {
             });
             if let Some(target) = target {
                 self.turn_reader(context, target);
-            } else if action != action_id(READER_PREVIOUS)
-                && action != action_id(READER_NEXT)
-            {
+            } else if action != action_id(READER_PREVIOUS) && action != action_id(READER_NEXT) {
                 self.show(context);
             }
             return;
@@ -978,10 +966,7 @@ impl KoboApp for Bomtoon {
             } else {
                 EPISODE_ITEMS_PER_PAGE
             };
-            let next_start = self
-                .page
-                .saturating_add(1)
-                .saturating_mul(items_per_page);
+            let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
             if self.view != View::Library || next_start < self.shelf_len() {
                 self.page = self.page.saturating_add(1);
             } else if let Some(next) = self.shelf_next_page() {
@@ -1068,8 +1053,7 @@ fn page_plan(
             .ok_or_else(|| "The comic has too many pages.".to_owned())?;
         pages.push(count);
     }
-    let total =
-        u16::try_from(total).map_err(|_| "The comic has too many pages.".to_owned())?;
+    let total = u16::try_from(total).map_err(|_| "The comic has too many pages.".to_owned())?;
     Ok((pages, total))
 }
 
@@ -1097,9 +1081,7 @@ fn next_location(pages: &[usize], current: PageLocation) -> Option<PageLocation>
         });
     }
     let source = current.source.checked_add(1)?;
-    pages
-        .get(source)
-        .map(|_| PageLocation { source, slice: 0 })
+    pages.get(source).map(|_| PageLocation { source, slice: 0 })
 }
 
 fn slice_rows(source: &Picture, slice: usize, panel_height: u32) -> Result<Picture, String> {
@@ -1237,8 +1219,8 @@ mod tests {
         ]}
     }"#;
     const TINY_WEBP: &[u8] = &[
-        82, 73, 70, 70, 36, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 24, 0, 0, 0, 48, 1, 0,
-        157, 1, 42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
+        82, 73, 70, 70, 36, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 24, 0, 0, 0, 48, 1, 0, 157, 1,
+        42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
     ];
 
     fn image_manifest(path: &str, policy: &str) -> Vec<u8> {
@@ -1518,8 +1500,7 @@ mod tests {
             }
         ));
 
-        let commands =
-            runner.task_outcome(image_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let commands = runner.task_outcome(image_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let screen = last_screen(&commands);
         let surface = screen.reading_surface.expect("reading surface");
         assert_eq!(surface.chrome, ReadingChrome::Hidden);
@@ -1589,12 +1570,7 @@ mod tests {
             ReadingChrome::Overlay
         );
         runner.action(action_id(READER_NEXT));
-        assert!(runner
-            .app()
-            .reader
-            .as_ref()
-            .expect("reader")
-            .chrome_visible);
+        assert!(runner.app().reader.as_ref().expect("reader").chrome_visible);
         let commands = runner.action(action_id(READER_CHROME));
         assert_eq!(
             last_screen(&commands)
@@ -1704,8 +1680,7 @@ mod tests {
             let commands =
                 runner.task_outcome(image_task, TaskOutcome::Failed(TaskError::Unauthorized));
             let (refresh_task, _) = only_spawn(&commands);
-            let commands =
-                runner.task_outcome(refresh_task, TaskOutcome::Completed(refreshed));
+            let commands = runner.task_outcome(refresh_task, TaskOutcome::Completed(refreshed));
             assert!(runner.app().problem.is_some());
             assert!(commands
                 .iter()
@@ -1780,10 +1755,7 @@ mod tests {
     #[test]
     fn image_failure_retry_stays_on_selected_episode() {
         let (mut runner, image_task) = reader_waiting_for_first_image();
-        runner.task_outcome(
-            image_task,
-            TaskOutcome::Completed(vec![0, 1, 2, 3]),
-        );
+        runner.task_outcome(image_task, TaskOutcome::Completed(vec![0, 1, 2, 3]));
         let commands = runner.action(action_id(RETRY));
         let (_, work) = only_spawn(&commands);
         assert!(matches!(
@@ -1793,11 +1765,7 @@ mod tests {
                 ..
             }
         ));
-        let selection = runner
-            .app()
-            .reader_selection
-            .as_ref()
-            .expect("selection");
+        let selection = runner.app().reader_selection.as_ref().expect("selection");
         assert_eq!(selection.content_alias, "hunter_q");
         assert_eq!(selection.episode_alias, "ep-1");
     }

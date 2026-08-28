@@ -515,18 +515,14 @@ pub fn fitted_size(source: (u32, u32), width: u32, height: u32) -> (u32, u32) {
 /// Returns [`ImageError::EmptyBox`] for a zero source dimension or target
 /// width, and [`ImageError::TooManyPixels`] when the result exceeds
 /// [`MAX_PIXELS`].
-pub fn width_scaled_size(
-    source: (u32, u32),
-    target_width: u32,
-) -> Result<(u32, u32), ImageError> {
+pub fn width_scaled_size(source: (u32, u32), target_width: u32) -> Result<(u32, u32), ImageError> {
     if source.0 == 0 || source.1 == 0 || target_width == 0 {
         return Err(ImageError::EmptyBox);
     }
-    let target_height = u32::try_from(
-        (u64::from(target_width) * u64::from(source.1)) / u64::from(source.0),
-    )
-    .unwrap_or(u32::MAX)
-    .max(1);
+    let target_height =
+        u32::try_from((u64::from(target_width) * u64::from(source.1)) / u64::from(source.0))
+            .unwrap_or(u32::MAX)
+            .max(1);
     checked_pixels(target_width, target_height)?;
     Ok((target_width, target_height))
 }
