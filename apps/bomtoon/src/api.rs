@@ -63,7 +63,8 @@ pub fn image(url: &str) -> Task {
     Task::Fetch {
         url: url.to_owned(),
         offset: 0,
-        max_bytes: kobo_image::MAX_SOURCE_BYTES as u32,
+        max_bytes: u32::try_from(kobo_image::MAX_SOURCE_BYTES)
+            .expect("the image source byte limit must fit in u32"),
         credential: None,
         headers: response_headers("image/webp"),
     }
@@ -270,7 +271,11 @@ mod tests {
         };
         assert!(url == signed_url, "image URL mismatch");
         assert_eq!(offset, 0);
-        assert_eq!(max_bytes, kobo_image::MAX_SOURCE_BYTES as u32);
+        assert_eq!(
+            max_bytes,
+            u32::try_from(kobo_image::MAX_SOURCE_BYTES)
+                .expect("the test image source byte limit must fit in u32")
+        );
         assert_eq!(credential, None);
         assert_eq!(
             headers,

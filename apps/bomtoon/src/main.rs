@@ -421,27 +421,35 @@ impl Bomtoon {
     }
 
     fn start_manifest(&mut self, context: &mut Context) {
-        let Some((content, episode)) = self.reader_selection.as_ref().map(|selection| {
-            (
-                selection.content_alias.clone(),
-                selection.episode_alias.clone(),
-            )
-        }) else {
+        let Some((content_alias, episode_alias)) =
+            self.reader_selection.as_ref().map(|selection| {
+                (
+                    selection.content_alias.clone(),
+                    selection.episode_alias.clone(),
+                )
+            })
+        else {
             self.problem = Some("The selected episode is no longer available.".to_owned());
             self.retry = Retry::Restart;
             return;
         };
         self.retry = Retry::Manifest;
-        self.spawn(context, Pending::Manifest, api::images(&content, &episode));
+        self.spawn(
+            context,
+            Pending::Manifest,
+            api::images(&content_alias, &episode_alias),
+        );
     }
 
     fn start_manifest_refresh(&mut self, context: &mut Context, target: PageLocation) {
-        let Some((content, episode)) = self.reader_selection.as_ref().map(|selection| {
-            (
-                selection.content_alias.clone(),
-                selection.episode_alias.clone(),
-            )
-        }) else {
+        let Some((content_alias, episode_alias)) =
+            self.reader_selection.as_ref().map(|selection| {
+                (
+                    selection.content_alias.clone(),
+                    selection.episode_alias.clone(),
+                )
+            })
+        else {
             self.fail_reader(
                 Retry::Image(target),
                 "The selected episode is no longer available.",
@@ -452,7 +460,7 @@ impl Bomtoon {
         self.spawn(
             context,
             Pending::ManifestRefresh(target),
-            api::images(&content, &episode),
+            api::images(&content_alias, &episode_alias),
         );
     }
 
@@ -529,6 +537,108 @@ impl Bomtoon {
         Ok(())
     }
 
+    fn accept_manifest(&mut self, context: &mut Context, bytes: &[u8]) {
+        let panel_width = u32::try_from(context.metrics().width);
+        let panel_height = u32::try_from(context.metrics().height);
+        let planned = match (panel_width, panel_height) {
+            (Ok(width), Ok(height)) => parse::images(bytes)
+                .map_err(|error| error.to_string())
+                .and_then(|images| {
+                    page_plan(&images, width, height).map(|(pages_per_source, total_pages)| {
+                        (images, pages_per_source, total_pages)
+                    })
+                }),
+            _ => Err("The panel dimensions are not supported.".to_owned()),
+        };
+        match planned {
+            Ok((images, pages_per_source, total_pages)) => {
+                let target = PageLocation {
+                    source: 0,
+                    slice: 0,
+                };
+                self.reader = Some(ReaderState {
+                    images,
+                    pages_per_source,
+                    location: target,
+                    total_pages,
+                    source: None,
+                    picture: None,
+                    chrome_visible: false,
+                    refreshed_current_image: false,
+                });
+                self.start_image(context, target, true);
+            }
+            Err(error) => self.fail_reader(Retry::Manifest, error),
+        }
+    }
+
+    fn accept_manifest_refresh(
+        &mut self,
+        context: &mut Context,
+        target: PageLocation,
+        bytes: &[u8],
+    ) {
+        match parse::images(bytes) {
+            Ok(refreshed)
+                if self
+                    .reader
+                    .as_ref()
+                    .is_some_and(|reader| same_assets(&reader.images, &refreshed)) =>
+            {
+                if let Some(reader) = self.reader.as_mut() {
+                    for (current, replacement) in reader.images.iter_mut().zip(refreshed) {
+                        current.url = replacement.url;
+                    }
+                }
+                self.start_image(context, target, false);
+            }
+            Ok(_) => self.fail_reader(
+                Retry::Image(target),
+                "BOMTOON returned different comic image metadata.",
+            ),
+            Err(error) => self.fail_reader(Retry::Image(target), error.to_string()),
+        }
+    }
+
+    fn accept_image(&mut self, context: &mut Context, target: PageLocation, bytes: &[u8]) -> bool {
+        let Ok(panel_width) = u32::try_from(context.metrics().width) else {
+            self.fail_reader(Retry::Image(target), "The panel width is not supported.");
+            return false;
+        };
+        let scaled = (|| {
+            let expected = self
+                .reader
+                .as_ref()
+                .and_then(|reader| reader.images.get(target.source))
+                .ok_or_else(|| "The selected comic image is no longer available.".to_owned())?;
+            let decoded = kobo_image::decode(bytes).map_err(|error| error.to_string())?;
+            if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
+                return Err("BOMTOON returned different comic image dimensions.".to_owned());
+            }
+            let mut scaled = decoded
+                .scale_to_width(panel_width)
+                .map_err(|error| error.to_string())?;
+            scaled.dither(PANEL_GREYS);
+            Ok(scaled)
+        })();
+        match scaled {
+            Ok(source) => {
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.source = Some(source);
+                    reader.location = target;
+                    reader.chrome_visible = false;
+                }
+                self.retry = Retry::Slice;
+                match self.install_slice(context, target) {
+                    Ok(()) => return true,
+                    Err(error) => self.fail_reader(Retry::Slice, error),
+                }
+            }
+            Err(error) => self.fail_reader(Retry::Image(target), error),
+        }
+        false
+    }
+
     fn accept(&mut self, context: &mut Context, pending: Pending, bytes: &[u8]) -> bool {
         match pending {
             Pending::Logout => {
@@ -590,106 +700,11 @@ impl Bomtoon {
                 }
                 Err(error) => self.problem = Some(error.to_string()),
             },
-            Pending::Manifest => {
-                let panel_width = u32::try_from(context.metrics().width);
-                let panel_height = u32::try_from(context.metrics().height);
-                let planned = match (panel_width, panel_height) {
-                    (Ok(width), Ok(height)) => parse::images(bytes)
-                        .map_err(|error| error.to_string())
-                        .and_then(|images| {
-                            page_plan(&images, width, height).map(
-                                |(pages_per_source, total_pages)| {
-                                    (images, pages_per_source, total_pages)
-                                },
-                            )
-                        }),
-                    _ => Err("The panel dimensions are not supported.".to_owned()),
-                };
-                match planned {
-                    Ok((images, pages_per_source, total_pages)) => {
-                        let target = PageLocation {
-                            source: 0,
-                            slice: 0,
-                        };
-                        self.reader = Some(ReaderState {
-                            images,
-                            pages_per_source,
-                            location: target,
-                            total_pages,
-                            source: None,
-                            picture: None,
-                            chrome_visible: false,
-                            refreshed_current_image: false,
-                        });
-                        self.start_image(context, target, true);
-                    }
-                    Err(error) => self.fail_reader(Retry::Manifest, error),
-                }
+            Pending::Manifest => self.accept_manifest(context, bytes),
+            Pending::ManifestRefresh(target) => {
+                self.accept_manifest_refresh(context, target, bytes);
             }
-            Pending::ManifestRefresh(target) => match parse::images(bytes) {
-                Ok(refreshed)
-                    if self
-                        .reader
-                        .as_ref()
-                        .is_some_and(|reader| same_assets(&reader.images, &refreshed)) =>
-                {
-                    if let Some(reader) = self.reader.as_mut() {
-                        for (current, replacement) in
-                            reader.images.iter_mut().zip(refreshed.into_iter())
-                        {
-                            current.url = replacement.url;
-                        }
-                    }
-                    self.start_image(context, target, false);
-                }
-                Ok(_) => self.fail_reader(
-                    Retry::Image(target),
-                    "BOMTOON returned different comic image metadata.",
-                ),
-                Err(error) => self.fail_reader(Retry::Image(target), error.to_string()),
-            },
-            Pending::Image(target) => {
-                let panel_width = match u32::try_from(context.metrics().width) {
-                    Ok(width) => width,
-                    Err(_) => {
-                        self.fail_reader(Retry::Image(target), "The panel width is not supported.");
-                        return false;
-                    }
-                };
-                let scaled = (|| {
-                    let expected = self
-                        .reader
-                        .as_ref()
-                        .and_then(|reader| reader.images.get(target.source))
-                        .ok_or_else(|| {
-                            "The selected comic image is no longer available.".to_owned()
-                        })?;
-                    let decoded = kobo_image::decode(bytes).map_err(|error| error.to_string())?;
-                    if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
-                        return Err("BOMTOON returned different comic image dimensions.".to_owned());
-                    }
-                    let mut scaled = decoded
-                        .scale_to_width(panel_width)
-                        .map_err(|error| error.to_string())?;
-                    scaled.dither(PANEL_GREYS);
-                    Ok(scaled)
-                })();
-                match scaled {
-                    Ok(source) => {
-                        if let Some(reader) = self.reader.as_mut() {
-                            reader.source = Some(source);
-                            reader.location = target;
-                            reader.chrome_visible = false;
-                        }
-                        self.retry = Retry::Slice;
-                        match self.install_slice(context, target) {
-                            Ok(()) => return true,
-                            Err(error) => self.fail_reader(Retry::Slice, error),
-                        }
-                    }
-                    Err(error) => self.fail_reader(Retry::Image(target), error),
-                }
-            }
+            Pending::Image(target) => return self.accept_image(context, target, bytes),
         }
         false
     }
@@ -709,7 +724,7 @@ impl Bomtoon {
             return;
         };
         self.remember_shelf_page();
-        self.selected_content_alias = alias.clone();
+        self.selected_content_alias.clone_from(&alias);
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
         self.retry = Retry::Restart;
@@ -875,6 +890,30 @@ impl Bomtoon {
         }
     }
 
+    fn handle_reader_action(&mut self, context: &mut Context, action: ActionId) {
+        if action == action_id(READER_CHROME) {
+            if let Some(reader) = self.reader.as_mut() {
+                reader.chrome_visible = !reader.chrome_visible;
+            }
+            self.show(context);
+            return;
+        }
+        let target = self.reader.as_ref().and_then(|reader| {
+            if action == action_id(READER_PREVIOUS) {
+                previous_location(&reader.pages_per_source, reader.location)
+            } else if action == action_id(READER_NEXT) {
+                next_location(&reader.pages_per_source, reader.location)
+            } else {
+                None
+            }
+        });
+        if let Some(target) = target {
+            self.turn_reader(context, target);
+        } else if action != action_id(READER_PREVIOUS) && action != action_id(READER_NEXT) {
+            self.show(context);
+        }
+    }
+
     fn cancel_task(&mut self, pending: Pending) {
         match pending {
             Pending::Manifest => {
@@ -929,27 +968,7 @@ impl KoboApp for Bomtoon {
             return;
         }
         if self.view == View::Reader {
-            if action == action_id(READER_CHROME) {
-                if let Some(reader) = self.reader.as_mut() {
-                    reader.chrome_visible = !reader.chrome_visible;
-                }
-                self.show(context);
-                return;
-            }
-            let target = self.reader.as_ref().and_then(|reader| {
-                if action == action_id(READER_PREVIOUS) {
-                    previous_location(&reader.pages_per_source, reader.location)
-                } else if action == action_id(READER_NEXT) {
-                    next_location(&reader.pages_per_source, reader.location)
-                } else {
-                    None
-                }
-            });
-            if let Some(target) = target {
-                self.turn_reader(context, target);
-            } else if action != action_id(READER_PREVIOUS) && action != action_id(READER_NEXT) {
-                self.show(context);
-            }
+            self.handle_reader_action(context, action);
             return;
         }
         if self.view == View::Library && action == action_id(SIGN_OUT) {
@@ -1317,21 +1336,26 @@ mod tests {
     ) -> AppRunner<Bomtoon> {
         let width = CLARA_BW_METRICS.width as u32;
         let panel_height = CLARA_BW_METRICS.height as u32;
-        let source_height = panel_height * pages_per_source[location.source] as u32;
+        let source_pages = u32::try_from(pages_per_source[location.source])
+            .expect("seeded reader source page count must fit in u32");
+        let source_height = panel_height * source_pages;
         let images = pages_per_source
             .iter()
             .enumerate()
             .map(|(index, pages)| EpisodeImage {
                 order: index + 1,
                 width,
-                height: panel_height * *pages as u32,
+                height: panel_height
+                    * u32::try_from(*pages)
+                        .expect("seeded reader image page count must fit in u32"),
                 path: format!("/tw/ep/{index}.webp"),
                 url: format!(
                     "https://image.balcony.studio/tw/ep/{index}.webp?Policy=p&Signature=s&Key-Pair-Id=k"
                 ),
             })
             .collect();
-        let total_pages = pages_per_source.iter().sum::<usize>() as u16;
+        let total_pages = u16::try_from(pages_per_source.iter().sum::<usize>())
+            .expect("seeded reader total page count must fit in u16");
         AppRunner::with_metrics(
             Bomtoon {
                 view: View::Reader,

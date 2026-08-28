@@ -285,7 +285,7 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
         return Err(ParseError::InvalidValue("image URL"));
     }
     let path = uri.path();
-    if !path.starts_with("/tw/ep/") || !path.ends_with(".webp") {
+    if !path.starts_with("/tw/ep/") || !path.as_bytes().ends_with(b".webp") {
         return Err(ParseError::InvalidValue("image URL"));
     }
 
