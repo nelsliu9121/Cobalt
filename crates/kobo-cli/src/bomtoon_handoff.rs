@@ -1,14 +1,9 @@
 use kobo_json::Value;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{
     Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
 };
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,9 +11,9 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_COOKIES: usize = 16;
 pub const MAX_REJECTED_REQUESTS: usize = 32;
 pub const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(2);
+pub const HOST_LOCK_PORT: u16 = 53_941;
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-const LOCK_NAME: &str = ".bomtoon-login.lock";
 const BAD_REQUEST_RESPONSE: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 const SUCCESS_RESPONSE: &[u8] =
@@ -59,12 +54,7 @@ pub enum HandoffError {
 }
 
 pub struct HostLock {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-    _listener: UnixListener,
-    stop_drainer: Arc<AtomicBool>,
-    drainer: Option<thread::JoinHandle<()>>,
+    _listener: TcpListener,
 }
 
 impl Challenge {
@@ -98,97 +88,15 @@ impl PendingHandoff {
 }
 
 impl HostLock {
-    pub fn acquire(cobalt_root: &Path) -> io::Result<Self> {
-        let path = cobalt_root.join(LOCK_NAME);
-        match UnixListener::bind(&path) {
-            Ok(listener) => Self::from_listener(path, listener),
-            Err(bind_error) if bind_error.kind() == io::ErrorKind::AddrInUse => {
-                let stale = socket_metadata(&path).map_err(|_| bind_error)?;
-                match UnixStream::connect(&path) {
-                    Ok(_) => {
-                        thread::sleep(Duration::from_millis(1));
-                        Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "BOMTOON login already active",
-                        ))
-                    }
-                    Err(connect_error)
-                        if connect_error.kind() == io::ErrorKind::ConnectionRefused =>
-                    {
-                        let current = socket_metadata(&path)?;
-                        if current.dev() != stale.dev() || current.ino() != stale.ino() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AddrInUse,
-                                "BOMTOON login lock changed during recovery",
-                            ));
-                        }
-                        fs::remove_file(&path)?;
-                        let listener = UnixListener::bind(&path)?;
-                        Self::from_listener(path, listener)
-                    }
-                    Err(connect_error) => Err(connect_error),
-                }
-            }
-            Err(bind_error) => Err(bind_error),
-        }
+    pub fn acquire() -> io::Result<Self> {
+        Self::acquire_at(HOST_LOCK_PORT)
     }
 
-    fn from_listener(path: PathBuf, listener: UnixListener) -> io::Result<Self> {
-        let metadata = socket_metadata(&path)?;
-        listener.set_nonblocking(true)?;
-        let drain_listener = listener.try_clone()?;
-        let stop_drainer = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stop_drainer);
-        let drainer = thread::Builder::new()
-            .name("bomtoon-lock".to_owned())
-            .spawn(move || drain_lock_probes(&drain_listener, &stop))?;
+    fn acquire_at(port: u16) -> io::Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         Ok(Self {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
             _listener: listener,
-            stop_drainer,
-            drainer: Some(drainer),
         })
-    }
-}
-
-fn drain_lock_probes(listener: &UnixListener, stop: &AtomicBool) {
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((_stream, _peer)) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
-    }
-}
-
-impl Drop for HostLock {
-    fn drop(&mut self) {
-        self.stop_drainer.store(true, Ordering::Relaxed);
-        if let Some(drainer) = self.drainer.take() {
-            let _ = drainer.join();
-        }
-        if let Ok(metadata) = socket_metadata(&self.path) {
-            if metadata.dev() == self.device && metadata.ino() == self.inode {
-                let _ = fs::remove_file(&self.path);
-            }
-        }
-    }
-}
-
-fn socket_metadata(path: &Path) -> io::Result<fs::Metadata> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_socket() {
-        Ok(metadata)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "BOMTOON login lock is not a socket",
-        ))
     }
 }
 
@@ -588,13 +496,8 @@ fn finish_response(mut stream: TcpStream, response: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Cursor;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::net::UnixListener;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -700,32 +603,12 @@ mod tests {
         }
     }
 
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    struct TempRoot(PathBuf);
-
-    impl TempRoot {
-        fn new() -> Self {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = Path::new("/tmp").join(format!(
-                "cob-handoff-{}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).expect("create temporary root");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .expect("secure temporary root");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempRoot {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    fn unused_loopback_port() -> u16 {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("select unused lock port");
+        let port = listener.local_addr().expect("lock address").port();
+        drop(listener);
+        port
     }
 
     #[test]
@@ -958,37 +841,31 @@ mod tests {
     }
 
     #[test]
-    fn host_lock_excludes_recovers_and_releases() {
-        let root = TempRoot::new();
-        let first = HostLock::acquire(root.path()).expect("first lock");
+    fn production_host_lock_port_is_fixed() {
+        assert_eq!(HOST_LOCK_PORT, 53_941);
+    }
+
+    #[test]
+    fn host_lock_excludes_repeated_attempts_and_releases_on_drop() {
+        let port = unused_loopback_port();
+        let first = HostLock::acquire_at(port).expect("first lock");
         for probe in 0..256 {
             assert!(
-                HostLock::acquire(root.path()).is_err(),
+                HostLock::acquire_at(port).is_err(),
                 "probe {probe} bypassed active lock"
             );
         }
         drop(first);
-        let second = HostLock::acquire(root.path()).expect("reacquire after drop");
+        let second = HostLock::acquire_at(port).expect("reacquire after drop");
         drop(second);
-
-        let path = root.path().join(".bomtoon-login.lock");
-        let stale = UnixListener::bind(&path).expect("stale socket");
-        drop(stale);
-        let recovered = HostLock::acquire(root.path()).expect("recover stale socket");
-        drop(recovered);
     }
 
     #[test]
-    fn host_lock_drop_does_not_remove_a_replacement_inode() {
-        let root = TempRoot::new();
-        let path = root.path().join(".bomtoon-login.lock");
-        let lock = HostLock::acquire(root.path()).expect("host lock");
-        fs::remove_file(&path).expect("unlink acquired socket");
-        let replacement = UnixListener::bind(&path).expect("replacement socket");
-        drop(lock);
-        assert!(path.exists());
-        drop(replacement);
-        fs::remove_file(path).expect("remove replacement");
+    fn host_lock_fails_closed_when_the_port_is_prebound() {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("prebind lock port");
+        let port = listener.local_addr().expect("lock address").port();
+        assert!(HostLock::acquire_at(port).is_err());
     }
 
     #[test]
