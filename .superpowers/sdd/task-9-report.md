@@ -32,8 +32,9 @@ Parent validation:
 - `rtk cargo run -p kobo-cli -- run --sim --app bomtoon`: exited 0, connected `bomtoon`, and rendered the direct `Loading your library` screen. No session-check screen appeared.
 - The simulator terminal output contained no credential, token response, email, user ID, IP address, or CDP payload. No physical Kobo, SSH, or device-discovery command ran.
 
-Attended evidence still requiring the operator's BOMTOON credentials:
-- Complete `kobo bomtoon login --sim` in the temporary Chrome profile.
-- Exercise authenticated library, recent, episode, Sign out, and re-login behavior.
+Attended login result:
+- `kobo bomtoon login --sim` launched the isolated Chrome profile, but the operator could not complete sign-in because Chrome reported it was controlled by automated software.
+- The blocked login process was stopped. It exited 1; no `kobo-bomtoon-chrome-*` profile directory or matching Chrome process remained.
+- Authenticated library, recent, episode, Sign out, and re-login behavior therefore was not manually exercised. Deterministic app, broker, install, supervisor, and state-machine tests are the evidence for those paths.
 
 Formal final re-review: approved; all seven security findings are resolved.
