@@ -1249,6 +1249,30 @@ impl NavBar {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadingChrome {
+    Hidden,
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadingSurface {
+    pub id: NodeId,
+    pub picture: TilePicture,
+    pub chrome: ReadingChrome,
+}
+
+impl ReadingSurface {
+    #[must_use]
+    pub const fn new(id: NodeId, picture: TilePicture, chrome: ReadingChrome) -> Self {
+        Self {
+            id,
+            picture,
+            chrome,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Screen {
     pub id: u32,
@@ -1256,6 +1280,7 @@ pub struct Screen {
     /// cannot carry two of them, bury one inside a card, or place one halfway
     /// down the page.
     pub top_bar: Option<TopBar>,
+    pub reading_surface: Option<ReadingSurface>,
     pub nodes: Vec<Node>,
     /// Optional fixed bottom bar, pinned to the panel rather than the flow.
     pub nav_bar: Option<NavBar>,
@@ -1463,12 +1488,53 @@ const BACK_ZONE: i32 = 3;
 /// screen a reader has no other reason to touch.
 const MENU_COLUMNS: i32 = 3;
 
+fn layout_page_position(
+    turns: PageTurns,
+    page: u16,
+    of: u16,
+    band: Rect,
+    metrics: &DisplayMetrics,
+    layout: &mut Layout,
+) {
+    layout.nodes.push(LayoutNode {
+        id: NodeId(0),
+        rect: band,
+        kind: LayoutKind::PagePosition,
+        text_lines: vec![format!("{page} of {of}")],
+    });
+    let side = min(metrics.touch_target_default(), band.width / 3);
+    if page > 1 {
+        layout.nodes.push(LayoutNode {
+            id: NodeId(0),
+            rect: Rect {
+                width: side,
+                ..band
+            },
+            kind: LayoutKind::PagePrevious(turns.previous),
+            text_lines: Vec::new(),
+        });
+    }
+    if page < of {
+        layout.nodes.push(LayoutNode {
+            id: NodeId(0),
+            rect: Rect {
+                x: band.x + band.width - side,
+                width: side,
+                ..band
+            },
+            kind: LayoutKind::PageNext(turns.next),
+            text_lines: Vec::new(),
+        });
+    }
+}
+
 impl Screen {
     #[must_use]
     pub fn new(id: u32, nodes: Vec<Node>) -> Self {
         Self {
             id,
             top_bar: None,
+            reading_surface: None,
             nodes,
             nav_bar: None,
             bottom_action: None,
@@ -1486,6 +1552,12 @@ impl Screen {
     #[must_use]
     pub const fn with_hold(mut self, action: ActionId) -> Self {
         self.hold = Some(action);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_reading_surface(mut self, surface: Option<ReadingSurface>) -> Self {
+        self.reading_surface = surface;
         self
     }
 
@@ -1586,6 +1658,9 @@ impl Screen {
         } else {
             Face::Text
         };
+        if let Some(surface) = self.reading_surface {
+            return self.layout_reading_surface(surface, metrics, chrome, prose);
+        }
         let mut layout = Layout {
             prose_face: prose,
             ..Layout::default()
@@ -1717,40 +1792,7 @@ impl Screen {
                 width: metrics.width - 2 * margin,
                 height: position_band,
             };
-            layout.nodes.push(LayoutNode {
-                id: NodeId(0),
-                rect: band,
-                kind: LayoutKind::PagePosition,
-                text_lines: vec![format!("{page} of {of}")],
-            });
-            // Each chevron is offered only where there is a page on that side.
-            // A control that promises a page which does not exist is worse
-            // than no control: it answers a tap by doing nothing, and the
-            // reader concludes the screen is stuck rather than finished.
-            let side = min(metrics.touch_target_default(), band.width / 3);
-            if page > 1 {
-                layout.nodes.push(LayoutNode {
-                    id: NodeId(0),
-                    rect: Rect {
-                        width: side,
-                        ..band
-                    },
-                    kind: LayoutKind::PagePrevious(turns.previous),
-                    text_lines: Vec::new(),
-                });
-            }
-            if page < of {
-                layout.nodes.push(LayoutNode {
-                    id: NodeId(0),
-                    rect: Rect {
-                        x: band.x + band.width - side,
-                        width: side,
-                        ..band
-                    },
-                    kind: LayoutKind::PageNext(turns.next),
-                    text_lines: Vec::new(),
-                });
-            }
+            layout_page_position(turns, page, of, band, metrics, &mut layout);
         }
         layout.content = Rect {
             x: 0,
@@ -1767,6 +1809,68 @@ impl Screen {
             // left of the content area, and "left over" must not include the
             // thing drawn over it. Said as suppression rather than absence, so
             // that whatever reads this can tell "covered" from "never asked".
+            layout.page_turns = PagingState::SuppressedByOverlay;
+            layout.hold = None;
+        }
+        layout
+    }
+
+    fn layout_reading_surface(
+        &self,
+        surface: ReadingSurface,
+        metrics: &DisplayMetrics,
+        chrome: &Chrome,
+        prose: Face,
+    ) -> Layout {
+        let panel = Rect {
+            x: 0,
+            y: 0,
+            width: metrics.width,
+            height: metrics.height,
+        };
+        let mut layout = Layout {
+            prose_face: prose,
+            content: panel,
+            page_turns: self
+                .page_turns
+                .map_or(PagingState::None, PagingState::Declared),
+            hold: self.hold,
+            ..Layout::default()
+        };
+        layout.nodes.push(LayoutNode {
+            id: surface.id,
+            rect: panel,
+            kind: LayoutKind::Picture(surface.picture.handle),
+            text_lines: Vec::new(),
+        });
+
+        if surface.chrome == ReadingChrome::Overlay {
+            if let Some(top_bar) = &self.top_bar {
+                layout_top_bar(top_bar, chrome, metrics, 0, &mut layout);
+            }
+            if let Some((turns, (page, of))) = self
+                .page_turns
+                .and_then(|turns| turns.drawable_position().map(|position| (turns, position)))
+            {
+                let height = metrics.page_position_band();
+                let band = Rect {
+                    x: 0,
+                    y: metrics.height - height,
+                    width: metrics.width,
+                    height,
+                };
+                layout.nodes.push(LayoutNode {
+                    id: NodeId(0),
+                    rect: band,
+                    kind: LayoutKind::ReadingFooter,
+                    text_lines: Vec::new(),
+                });
+                layout_page_position(turns, page, of, band, metrics, &mut layout);
+            }
+        }
+
+        if let Some(overlay) = &self.overlay {
+            layout_overlay(overlay, metrics, prose, &mut layout);
             layout.page_turns = PagingState::SuppressedByOverlay;
             layout.hold = None;
         }
@@ -4008,6 +4112,7 @@ pub enum LayoutKind {
     /// "4 of 12", centred under the content. Muted: it answers a question the
     /// reader only asks occasionally and must not compete with the page.
     PagePosition,
+    ReadingFooter,
     /// The chevrons either side of the position, and the only visible sign a
     /// screen turns at all.
     ///
@@ -4227,6 +4332,10 @@ pub enum LayoutIssueKind {
     },
     EmptyChoice,
     InvalidPictureSource,
+    ReadingSurfaceSize {
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
     /// A bar of destinations with nothing marked as current.
     ///
     /// A warning rather than an error, and deliberately so. `selected: None`
@@ -4335,6 +4444,11 @@ impl std::fmt::Display for LayoutIssue {
             LayoutIssueKind::InvalidPictureSource => {
                 write!(formatter, "{node}: picture source has no area")
             }
+            LayoutIssueKind::ReadingSurfaceSize { expected, actual } => write!(
+                formatter,
+                "{node}: reading surface is {} by {}, expected {} by {}",
+                actual.0, actual.1, expected.0, expected.1
+            ),
             LayoutIssueKind::NavBarWithoutSelection => write!(
                 formatter,
                 "{node}: a bar of destinations marks none of them as current; \
@@ -9250,6 +9364,42 @@ fn diagnose_screen(
         check_identifier(bottom.id, &mut identifiers, &mut issues);
         check_text_coverage(bottom.id, &bottom.action.label, Face::Text, &mut issues);
     }
+    if let Some(surface) = screen.reading_surface {
+        check_identifier(surface.id, &mut identifiers, &mut issues);
+        match pictures {
+            Some(pictures) => check_picture(
+                surface.id,
+                surface.picture.handle,
+                surface.picture.source,
+                pictures,
+                &mut issues,
+            ),
+            None if surface.picture.source.0 == 0 || surface.picture.source.1 == 0 => {
+                issues.push(LayoutIssue {
+                    severity: DiagnosticSeverity::Error,
+                    node: Some(surface.id),
+                    kind: LayoutIssueKind::InvalidPictureSource,
+                    rect: None,
+                });
+            }
+            None => {}
+        }
+        let expected = (
+            u32::try_from(metrics.width).unwrap_or(0),
+            u32::try_from(metrics.height).unwrap_or(0),
+        );
+        if surface.picture.source != expected {
+            issues.push(LayoutIssue {
+                severity: DiagnosticSeverity::Error,
+                node: Some(surface.id),
+                kind: LayoutIssueKind::ReadingSurfaceSize {
+                    expected,
+                    actual: surface.picture.source,
+                },
+                rect: None,
+            });
+        }
+    }
     for node in &nodes {
         check_identifier(node.id(), &mut identifiers, &mut issues);
         validate_node(node, metrics, pictures, &mut issues);
@@ -10880,7 +11030,7 @@ fn render_all_with_selected_font(
             // The bars themselves are only a background. Drawing them as
             // separate nodes is what lets a tab switch repaint the content
             // area and two small bands instead of the entire panel.
-            LayoutKind::TopBar | LayoutKind::NavBar => {
+            LayoutKind::TopBar | LayoutKind::NavBar | LayoutKind::ReadingFooter => {
                 fill_clipped(surface, node.rect, tone::PAPER, clip);
             }
             // Paper, not surface. The band is the quietest thing on the panel
@@ -13427,6 +13577,108 @@ mod page_turn_tests {
         let layout = Screen::new(1, vec![]).layout();
         assert_eq!(layout.hit_test(10, 500), None);
     }
+    #[test]
+    fn reading_chrome_overlays_the_same_full_panel_picture() {
+        let picture = TilePicture::new(
+            PictureHandle(41),
+            CLARA_BW_METRICS.width as u32,
+            CLARA_BW_METRICS.height as u32,
+        );
+        let screen = |chrome| {
+            let mut screen = Screen::new(7, Vec::new())
+                .with_top_bar(TopBar::new(NodeId(1), "Episode One"))
+                .with_page_turns(ActionId(10), ActionId(11));
+            screen.page_turns = screen
+                .page_turns
+                .map(|turns| turns.with_menu(ActionId(12)).with_position(4, 12));
+            screen.with_reading_surface(Some(ReadingSurface::new(
+                NodeId(2),
+                picture,
+                chrome,
+            )))
+        };
+
+        let hidden = screen(ReadingChrome::Hidden)
+            .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
+        let overlay = screen(ReadingChrome::Overlay)
+            .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
+        let full_panel = Rect {
+            x: 0,
+            y: 0,
+            width: CLARA_BW_METRICS.width,
+            height: CLARA_BW_METRICS.height,
+        };
+
+        let picture_rect = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .find(|node| node.kind == LayoutKind::Picture(PictureHandle(41)))
+                .expect("reading picture")
+                .rect
+        };
+        assert_eq!(picture_rect(&hidden), full_panel);
+        assert_eq!(picture_rect(&overlay), full_panel);
+        assert_eq!(hidden.content, full_panel);
+        assert_eq!(overlay.content, full_panel);
+        assert!(!hidden.nodes.iter().any(|node| matches!(
+            node.kind,
+            LayoutKind::TopBar | LayoutKind::PagePosition | LayoutKind::ReadingFooter
+        )));
+        assert!(overlay
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::TopBar));
+        assert!(overlay
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::ReadingFooter));
+        assert!(overlay
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::PagePosition));
+
+        let back = overlay
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Back)
+            .expect("overlay Back target");
+        assert_eq!(
+            overlay.hit_test(back.rect.x + 1, back.rect.y + 1),
+            Some(ActionId::BACK)
+        );
+        assert_eq!(
+            overlay.hit_test(
+                CLARA_BW_METRICS.width / 2,
+                CLARA_BW_METRICS.height / 2
+            ),
+            Some(ActionId(12))
+        );
+    }
+
+    #[test]
+    fn reading_surface_reports_wrong_panel_dimensions() {
+        let screen = Screen::new(8, Vec::new()).with_reading_surface(Some(
+            ReadingSurface::new(
+                NodeId(1),
+                TilePicture::new(PictureHandle(2), 100, 200),
+                ReadingChrome::Hidden,
+            ),
+        ));
+        assert!(
+            screen
+                .validate(&CLARA_BW_METRICS)
+                .iter()
+                .any(|issue| matches!(
+                    issue.kind,
+                    LayoutIssueKind::ReadingSurfaceSize {
+                        actual: (100, 200),
+                        ..
+                    }
+                ))
+        );
+    }
+
 }
 
 #[cfg(test)]
