@@ -22,9 +22,10 @@ pub use kobo_ui::{
     BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome, ControlState,
     DiagnosticSeverity, DisplayMetrics, Emphasis, Fold, FontHandle, Freeform, Glyph, InlineFormula,
     LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind, ParagraphAlignment,
-    ParagraphPresentation, Percent, PictureHandle, ProseArea, RichTextSpan, Row, RowLead, RowState,
-    Screen, SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture,
-    TileShape, TileState, TopBar, TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS,
+    ParagraphPresentation, Percent, PictureHandle, ProseArea, ReadingChrome, ReadingSurface,
+    RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space, TextHit, TextPresentation,
+    TextSelection, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
+    CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS,
     MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS,
     MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
@@ -450,6 +451,7 @@ pub struct ScreenBuilder {
     id: u32,
     next_node: u32,
     top_bar: Option<TopBar>,
+    reading_surface: Option<ReadingSurface>,
     nodes: Vec<Node>,
     nav_bar: Option<NavBar>,
     bottom_action: Option<BottomAction>,
@@ -471,6 +473,7 @@ impl ScreenBuilder {
             id: stable_id(name.as_ref()),
             next_node: 1,
             top_bar: None,
+            reading_surface: None,
             nodes: Vec::new(),
             nav_bar: None,
             bottom_action: None,
@@ -1549,6 +1552,13 @@ impl ScreenBuilder {
         })
     }
 
+    #[must_use]
+    pub fn reading_surface(mut self, picture: TilePicture, chrome: ReadingChrome) -> Self {
+        let id = self.next_id();
+        self.reading_surface = Some(ReadingSurface::new(id, picture, chrome));
+        self
+    }
+
     /// Adds the fixed bottom bar.
     ///
     /// Note there is no back destination to add: back belongs to the runtime's
@@ -2582,6 +2592,7 @@ impl ScreenBuilder {
         Screen {
             id: self.id,
             top_bar: self.top_bar,
+            reading_surface: self.reading_surface,
             nodes: self.nodes,
             nav_bar: self.nav_bar,
             bottom_action: self.bottom_action,
@@ -5813,6 +5824,24 @@ mod tests {
             screen.nodes.last(),
             Some(Node::Button { action, .. }) if *action == action_id("close")
         ));
+    }
+
+    #[test]
+    fn builder_declares_one_semantic_reading_surface() {
+        let picture = TilePicture::new(PictureHandle(7), 1072, 1448);
+        let screen = ScreenBuilder::new("comic")
+            .top_bar("Episode One")
+            .reading_surface(picture, ReadingChrome::Overlay)
+            .page_turns("previous", "next")
+            .reading_menu("chrome")
+            .page_position(2, 9)
+            .build();
+
+        let surface = screen.reading_surface.expect("reading surface");
+        assert_eq!(surface.picture, picture);
+        assert_eq!(surface.chrome, ReadingChrome::Overlay);
+        assert!(surface.id.0 > 0);
+        assert!(screen.nodes.is_empty());
     }
 
     #[test]
