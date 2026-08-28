@@ -1,4 +1,4 @@
-use kobo_json::{ObjectBuilder, Value};
+use kobo_json::Value;
 use kobo_sim::SimulatorAuthPaths;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -6,19 +6,20 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::bomtoon_handoff::{
+    wait_for_payload, Challenge, HandoffError, HandoffPayload, HostLock, PendingHandoff,
+};
+
 const USAGE: &str = "usage: kobo bomtoon (login (--device IP | --sim) | extension install)";
 const LOGIN_URL: &str = "https://www.bomtoon.tw/user/login";
-const COOKIE_URL: &str = "https://www.bomtoon.tw/";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const LOGIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEVICE_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_CDP_FRAME_BYTES: usize = 1024 * 1024;
 const UNSUPPORTED_HOST: &str = "BOMTOON login is supported only on macOS";
 const BROWSER_LAUNCH_FAILED: &str = "browser launch failed";
 const LOGIN_TIMED_OUT: &str = "login timeout";
@@ -56,50 +57,6 @@ const EXTENSION_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-const CHROME_LAUNCH_PROGRAM: &str = r#"set -u
-owner=$1
-browser=$2
-profile=$3
-shift 3
-browser_pid=
-stop_browser() {
-    if [ -n "$browser_pid" ] && kill -0 "$browser_pid" 2>/dev/null; then
-        kill -TERM "$browser_pid" 2>/dev/null || true
-        attempt=0
-        while kill -0 "$browser_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
-            sleep 0.05
-            attempt=$((attempt + 1))
-        done
-        if kill -0 "$browser_pid" 2>/dev/null; then
-            kill -KILL "$browser_pid" 2>/dev/null || true
-        fi
-    fi
-    if [ -n "$browser_pid" ]; then
-        wait "$browser_pid" 2>/dev/null || true
-    fi
-}
-cleanup() {
-    trap '' HUP INT TERM
-    stop_browser
-    rm -rf -- "$profile"
-    exit 0
-}
-trap cleanup HUP INT TERM
-exec 3<&0
-exec 4>&1
-"$browser" "$@" &
-browser_pid=$!
-exec 0<&-
-while kill -0 "$browser_pid" 2>/dev/null; do
-    parent=$(ps -o ppid= -p $$ 2>/dev/null) || cleanup
-    [ "$parent" -eq "$owner" ] || cleanup
-    sleep 0.1
-done
-wait "$browser_pid"
-status=$?
-rm -rf -- "$profile"
-exit "$status"
-"#;
 
 const DEVICE_INSTALL_PROGRAM: &str = r#"set -eu
 umask 077
@@ -240,46 +197,6 @@ trap - EXIT HUP INT TERM
 exit 0
 "#;
 
-const BROWSER_SESSION_EXPRESSION: &str = r"(async () => {
-    try {
-        const response = await fetch('/api/auth/session', {
-            credentials: 'same-origin',
-            cache: 'no-store',
-            headers: { Accept: 'application/json' }
-        });
-        if (!response.ok) return { authenticated: false };
-        const session = await response.json();
-        const user = session && session.user;
-        if (!user || typeof user !== 'object' || Array.isArray(user)) {
-            return { authenticated: false };
-        }
-        const validToken = (value) => value
-            && typeof value === 'object'
-            && !Array.isArray(value)
-            && typeof value.token === 'string'
-            && value.token.length > 0
-            && !/[\u0000-\u001f\u007f]/.test(value.token)
-            && Number.isSafeInteger(value.createdAt)
-            && value.createdAt >= 0
-            && Number.isSafeInteger(value.expiredAt)
-            && value.expiredAt > value.createdAt;
-        if (!validToken(user.accessToken) || !validToken(user.refreshToken)) {
-            return { authenticated: false };
-        }
-        const encoder = new TextEncoder();
-        const access = encoder.encode(user.accessToken.token);
-        const refresh = encoder.encode(user.refreshToken.token);
-        const material = new Uint8Array(access.length + 1 + refresh.length);
-        material.set(access, 0);
-        material[access.length] = 0;
-        material.set(refresh, access.length + 1);
-        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', material));
-        const tokenFingerprint = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
-        return { authenticated: true, tokenFingerprint };
-    } catch (_) {
-        return { authenticated: false };
-    }
-})()";
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -361,39 +278,11 @@ fn install_extension() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn login(target: &LoginTarget) -> Result<(), String> {
-    let browser = discover_chrome().ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let profile = create_private_profile_at(&std::env::temp_dir())
-        .map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let Ok(child) = launch_chrome(&browser, &profile) else {
-        let _ = fs::remove_dir_all(&profile);
-        return Err(BROWSER_LAUNCH_FAILED.to_owned());
-    };
-    let mut guard = ChromeGuard::new(child, profile, RealProfileCleaner);
-    let input = guard
-        .child_mut()
-        .stdin
-        .take()
-        .ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let output = guard
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let pipe = DevToolsPipe::new(output, input);
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
-    let browser_result = run_browser_login(pipe, deadline, || {
-        let _ = guard.cleanup();
-    });
-    let cleanup_result = guard.close();
-    let (cookie, browser_fingerprint) = match browser_result {
-        Ok(value) if cleanup_result.is_ok() => value,
-        Ok(_) => return Err(BROWSER_LAUNCH_FAILED.to_owned()),
-        Err(error) => return Err(error.message().to_owned()),
-    };
-
-    validate_and_install(
-        &cookie,
-        &browser_fingerprint,
+    login_with(
+        HostLock::acquire,
+        Challenge::new,
+        open_normal_chrome,
+        wait_for_payload,
         |selected| {
             kobo_net::bomtoon::validate_session_cookie(selected)
                 .map_err(|_| SESSION_VALIDATION_FAILED.to_owned())
@@ -402,38 +291,101 @@ fn login(target: &LoginTarget) -> Result<(), String> {
     )
 }
 
-fn chrome_candidates(home: Option<&Path>) -> Vec<PathBuf> {
-    let system_chrome =
-        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-    let system_chromium = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
-    let user_chrome =
-        home.map(|path| path.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"));
-    let user_chromium =
-        home.map(|path| path.join("Applications/Chromium.app/Contents/MacOS/Chromium"));
-    [
-        Some(system_chrome),
-        user_chrome,
-        Some(system_chromium),
-        user_chromium,
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn login_url(challenge: &Challenge) -> String {
+    format!("{LOGIN_URL}{}", challenge.fragment())
 }
 
-fn discover_chrome_with(
-    home: Option<&Path>,
-    mut is_file: impl FnMut(&Path) -> bool,
-) -> Option<PathBuf> {
-    chrome_candidates(home)
-        .into_iter()
-        .find(|candidate| is_file(candidate))
+fn open_normal_chrome_with(
+    challenge: &Challenge,
+    run: impl FnOnce(&mut Command) -> io::Result<ExitStatus>,
+) -> Result<(), String> {
+    let mut command = Command::new("open");
+    command.args(["-a", "Google Chrome"]);
+    command.arg(login_url(challenge));
+    match run(&mut command) {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(BROWSER_LAUNCH_FAILED.to_owned()),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn discover_chrome() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    discover_chrome_with(home.as_deref(), Path::is_file)
+fn open_normal_chrome(challenge: &Challenge) -> Result<(), String> {
+    open_normal_chrome_with(challenge, Command::status)
+}
+
+trait LoginHandoff: Sized {
+    fn payload(&self) -> &HandoffPayload;
+    fn succeed(self) -> io::Result<()>;
+    fn fail(self) -> io::Result<()>;
+}
+
+impl LoginHandoff for PendingHandoff {
+    fn payload(&self) -> &HandoffPayload {
+        PendingHandoff::payload(self)
+    }
+
+    fn succeed(self) -> io::Result<()> {
+        PendingHandoff::succeed(self)
+    }
+
+    fn fail(self) -> io::Result<()> {
+        PendingHandoff::fail(self)
+    }
+}
+
+fn login_with<Lock, Listener, Handoff>(
+    acquire_lock: impl FnOnce() -> io::Result<Lock>,
+    create_challenge: impl FnOnce() -> io::Result<(Challenge, Listener)>,
+    open_browser: impl FnOnce(&Challenge) -> Result<(), String>,
+    receive_payload: impl FnOnce(
+        &Listener,
+        &Challenge,
+        Instant,
+    ) -> Result<Handoff, HandoffError>,
+    validate: impl FnOnce(&str) -> Result<String, String>,
+    install: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String>
+where
+    Handoff: LoginHandoff,
+{
+    let _host_lock = acquire_lock().map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
+    let (challenge, listener) =
+        create_challenge().map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
+    open_browser(&challenge).map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
+    let deadline = Instant::now()
+        .checked_add(LOGIN_TIMEOUT)
+        .ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
+    let handoff = receive_payload(&listener, &challenge, deadline).map_err(|error| match error {
+        HandoffError::Timeout => format!(
+            "{LOGIN_TIMED_OUT}; run kobo bomtoon extension install if the extension is not loaded"
+        ),
+        HandoffError::Listener => BROWSER_LAUNCH_FAILED.to_owned(),
+    })?;
+    drop(listener);
+
+    let cookies = browser_cookies(handoff.payload());
+    let selected = match select_session_cookie(&cookies) {
+        Ok(selected) => selected,
+        Err(()) => {
+            let _ = handoff.fail();
+            return Err(COOKIE_SELECTION_FAILED.to_owned());
+        }
+    };
+    let result = validate_and_install(
+        &selected,
+        &handoff.payload().fingerprint,
+        validate,
+        install,
+    );
+    match result {
+        Ok(()) => handoff
+            .succeed()
+            .map_err(|_| BROWSER_LAUNCH_FAILED.to_owned()),
+        Err(error) => {
+            let _ = handoff.fail();
+            Err(error)
+        }
+    }
 }
 
 fn private_name(prefix: &str) -> String {
@@ -445,32 +397,9 @@ fn private_name(prefix: &str) -> String {
     format!("{prefix}-{}-{epoch}-{counter}", std::process::id())
 }
 
-fn create_private_profile_at(root: &Path) -> io::Result<PathBuf> {
-    for _ in 0..128 {
-        let path = root.join(private_name("kobo-bomtoon-chrome"));
-        let mut builder = DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&path) {
-            Ok(()) => {
-                if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
-                    let _ = fs::remove_dir_all(&path);
-                    return Err(error);
-                }
-                return Ok(path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "temporary profile collision",
-    ))
-}
-
 fn create_private_directory_at(root: &Path) -> io::Result<PathBuf> {
     for _ in 0..128 {
-        let path = root.join(private_name("kobo-bomtoon-extension"));
+        let path = root.join(private_name("kobo-bomtoon-private"));
         let mut builder = DirBuilder::new();
         builder.mode(0o700);
         match builder.create(&path) {
@@ -487,437 +416,8 @@ fn create_private_directory_at(root: &Path) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "temporary extension directory collision",
+        "private directory collision",
     ))
-}
-
-#[cfg(target_os = "macos")]
-fn launch_chrome(browser: &Path, profile: &Path) -> Result<Child, ()> {
-    let profile_argument = format!("--user-data-dir={}", profile.display());
-    Command::new("/bin/sh")
-        .args(["-c", CHROME_LAUNCH_PROGRAM, "kobo-chrome"])
-        .arg(std::process::id().to_string())
-        .arg(browser)
-        .arg(profile)
-        .args([
-            "--remote-debugging-pipe",
-            profile_argument.as_str(),
-            "--no-first-run",
-            "--no-default-browser-check",
-            LOGIN_URL,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| ())
-}
-
-trait BrowserProcess {
-    fn stop(&mut self) -> io::Result<()>;
-    fn wait_for_exit(&mut self) -> io::Result<()>;
-}
-
-impl BrowserProcess for Child {
-    fn stop(&mut self) -> io::Result<()> {
-        let status = Command::new("/bin/kill")
-            .args(["-TERM", &self.id().to_string()])
-            .status()?;
-        if status.success() || self.try_wait()?.is_some() {
-            Ok(())
-        } else {
-            Err(io::Error::other("browser supervisor did not stop"))
-        }
-    }
-
-    fn wait_for_exit(&mut self) -> io::Result<()> {
-        self.wait().map(|_| ())
-    }
-}
-
-trait ProfileCleaner {
-    fn remove_profile(&mut self, profile: &Path) -> io::Result<()>;
-}
-
-struct RealProfileCleaner;
-
-impl ProfileCleaner for RealProfileCleaner {
-    fn remove_profile(&mut self, profile: &Path) -> io::Result<()> {
-        match fs::remove_dir_all(profile) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-struct ChromeGuard<C: BrowserProcess, F: ProfileCleaner> {
-    child: C,
-    profile: PathBuf,
-    cleaner: F,
-    process_exited: bool,
-    profile_removed: bool,
-}
-
-impl<C: BrowserProcess, F: ProfileCleaner> ChromeGuard<C, F> {
-    fn new(child: C, profile: PathBuf, cleaner: F) -> Self {
-        Self {
-            child,
-            profile,
-            cleaner,
-            process_exited: false,
-            profile_removed: false,
-        }
-    }
-
-    fn child_mut(&mut self) -> &mut C {
-        &mut self.child
-    }
-
-    fn cleanup(&mut self) -> Result<(), ()> {
-        if !self.process_exited {
-            self.child.stop().map_err(|_| ())?;
-            self.child.wait_for_exit().map_err(|_| ())?;
-            self.process_exited = true;
-        }
-        if !self.profile_removed {
-            self.cleaner.remove_profile(&self.profile).map_err(|_| ())?;
-            self.profile_removed = true;
-        }
-        Ok(())
-    }
-
-    fn close(mut self) -> Result<(), ()> {
-        self.cleanup()
-    }
-}
-
-impl<C: BrowserProcess, F: ProfileCleaner> Drop for ChromeGuard<C, F> {
-    fn drop(&mut self) {
-        let _ = self.cleanup();
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CdpError {
-    Transport,
-    Framing,
-    Protocol,
-    Timeout,
-}
-
-struct DevToolsPipe<R: Read, W: Write> {
-    reader: R,
-    writer: W,
-    next_id: u32,
-    buffered: Vec<u8>,
-    failed: Option<CdpError>,
-}
-
-impl<R: Read, W: Write> DevToolsPipe<R, W> {
-    fn new(reader: R, writer: W) -> Self {
-        Self {
-            reader,
-            writer,
-            next_id: 1,
-            buffered: Vec::new(),
-            failed: None,
-        }
-    }
-
-    fn call(
-        &mut self,
-        deadline: Instant,
-        method: &str,
-        params: Value,
-        session_id: Option<&str>,
-    ) -> Result<Value, CdpError> {
-        if let Some(error) = self.failed {
-            return Err(error);
-        }
-        let result = self.call_inner(deadline, method, params, session_id);
-        if let Err(error) = &result {
-            self.buffered.clear();
-            self.failed = Some(*error);
-        }
-        result
-    }
-
-    fn call_inner(
-        &mut self,
-        deadline: Instant,
-        method: &str,
-        params: Value,
-        session_id: Option<&str>,
-    ) -> Result<Value, CdpError> {
-        ensure_cdp_deadline(deadline)?;
-        let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).ok_or(CdpError::Protocol)?;
-        let mut request = ObjectBuilder::new()
-            .set("id", id)
-            .set("method", method)
-            .set("params", params);
-        if let Some(session_id) = session_id {
-            request = request.set("sessionId", session_id);
-        }
-        let encoded = request.build().to_json();
-        self.writer
-            .write_all(encoded.as_bytes())
-            .and_then(|()| self.writer.write_all(&[0]))
-            .and_then(|()| self.writer.flush())
-            .map_err(|_| CdpError::Transport)?;
-        ensure_cdp_deadline(deadline)?;
-
-        loop {
-            let frame = self.read_frame(deadline)?;
-            ensure_cdp_deadline(deadline)?;
-            let text = std::str::from_utf8(&frame).map_err(|_| CdpError::Framing)?;
-            let response = kobo_json::parse(text).map_err(|_| CdpError::Framing)?;
-            let Some(response_id) = response.get("id").and_then(Value::as_i64) else {
-                continue;
-            };
-            if response_id != i64::from(id) {
-                continue;
-            }
-            if response.get("error").is_some() {
-                return Err(CdpError::Protocol);
-            }
-            return response.get("result").cloned().ok_or(CdpError::Protocol);
-        }
-    }
-
-    fn read_frame(&mut self, deadline: Instant) -> Result<Vec<u8>, CdpError> {
-        loop {
-            ensure_cdp_deadline(deadline)?;
-            if let Some(end) = self.buffered.iter().position(|byte| *byte == 0) {
-                if end > MAX_CDP_FRAME_BYTES {
-                    return Err(CdpError::Framing);
-                }
-                let mut frame = self.buffered.drain(..=end).collect::<Vec<_>>();
-                frame.pop();
-                if frame.is_empty() {
-                    return Err(CdpError::Framing);
-                }
-                return Ok(frame);
-            }
-            if self.buffered.len() > MAX_CDP_FRAME_BYTES {
-                return Err(CdpError::Framing);
-            }
-            let mut chunk = [0_u8; 8192];
-            let remaining = MAX_CDP_FRAME_BYTES.saturating_sub(self.buffered.len());
-            let limit = (remaining + 1).min(chunk.len());
-            let read = self
-                .reader
-                .read(&mut chunk[..limit])
-                .map_err(|_| CdpError::Transport)?;
-            ensure_cdp_deadline(deadline)?;
-            if read == 0 {
-                return Err(CdpError::Transport);
-            }
-            self.buffered.extend_from_slice(&chunk[..read]);
-        }
-    }
-}
-
-fn ensure_cdp_deadline(deadline: Instant) -> Result<(), CdpError> {
-    (Instant::now() < deadline)
-        .then_some(())
-        .ok_or(CdpError::Timeout)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BrowserFlowError {
-    Launch,
-    Timeout,
-    CookieSelection,
-}
-
-impl BrowserFlowError {
-    fn message(self) -> &'static str {
-        match self {
-            Self::Launch => BROWSER_LAUNCH_FAILED,
-            Self::Timeout => LOGIN_TIMED_OUT,
-            Self::CookieSelection => COOKIE_SELECTION_FAILED,
-        }
-    }
-}
-
-fn empty_object() -> Value {
-    ObjectBuilder::new().build()
-}
-
-fn run_browser_login<R, W>(
-    pipe: DevToolsPipe<R, W>,
-    deadline: Instant,
-    mut cancel: impl FnMut(),
-) -> Result<(String, String), BrowserFlowError>
-where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
-{
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _worker = thread::spawn(move || {
-        let mut pipe = pipe;
-        let result = browser_login(&mut pipe, deadline);
-        let _ = sender.send(result);
-    });
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => {
-            cancel();
-            Err(BrowserFlowError::Timeout)
-        }
-        Err(RecvTimeoutError::Disconnected) => Err(BrowserFlowError::Launch),
-    }
-}
-
-fn browser_login<R: Read, W: Write>(
-    pipe: &mut DevToolsPipe<R, W>,
-    deadline: Instant,
-) -> Result<(String, String), BrowserFlowError> {
-    browser_login_with(pipe, deadline, thread::sleep)
-}
-
-fn browser_login_with<R: Read, W: Write>(
-    pipe: &mut DevToolsPipe<R, W>,
-    deadline: Instant,
-    mut pause: impl FnMut(Duration),
-) -> Result<(String, String), BrowserFlowError> {
-    let target_id = bomtoon_target(pipe, deadline, &mut pause)?;
-    let attached = pipe
-        .call(
-            deadline,
-            "Target.attachToTarget",
-            ObjectBuilder::new()
-                .set("targetId", target_id)
-                .set("flatten", true)
-                .build(),
-            None,
-        )
-        .map_err(|error| browser_cdp_error(error, BrowserFlowError::Launch))?;
-    let session_id = attached
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or(BrowserFlowError::Launch)?
-        .to_owned();
-    let browser_fingerprint = loop {
-        match page_authentication(pipe, &session_id, deadline) {
-            Ok(Some(fingerprint)) => break fingerprint,
-            Ok(None) => retry_pause(deadline, &mut pause)?,
-            Err(error) => {
-                return Err(browser_cdp_error(error, BrowserFlowError::Launch));
-            }
-        }
-    };
-    let cookies = pipe
-        .call(
-            deadline,
-            "Network.getCookies",
-            ObjectBuilder::new().set("urls", vec![COOKIE_URL]).build(),
-            Some(&session_id),
-        )
-        .map_err(|error| browser_cdp_error(error, BrowserFlowError::CookieSelection))?;
-    let cookies =
-        parse_network_cookies(&cookies).map_err(|()| BrowserFlowError::CookieSelection)?;
-    let selected =
-        select_session_cookie(&cookies).map_err(|()| BrowserFlowError::CookieSelection)?;
-    Ok((selected, browser_fingerprint))
-}
-
-fn browser_cdp_error(error: CdpError, stage: BrowserFlowError) -> BrowserFlowError {
-    if error == CdpError::Timeout {
-        BrowserFlowError::Timeout
-    } else {
-        stage
-    }
-}
-
-fn retry_pause(
-    deadline: Instant,
-    pause: &mut impl FnMut(Duration),
-) -> Result<(), BrowserFlowError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(BrowserFlowError::Timeout)?;
-    pause(LOGIN_POLL_INTERVAL.min(remaining));
-    (Instant::now() < deadline)
-        .then_some(())
-        .ok_or(BrowserFlowError::Timeout)
-}
-
-fn bomtoon_target<R: Read, W: Write>(
-    pipe: &mut DevToolsPipe<R, W>,
-    deadline: Instant,
-    pause: &mut impl FnMut(Duration),
-) -> Result<String, BrowserFlowError> {
-    loop {
-        let targets = pipe
-            .call(deadline, "Target.getTargets", empty_object(), None)
-            .map_err(|error| browser_cdp_error(error, BrowserFlowError::Launch))?;
-        let infos = targets
-            .get("targetInfos")
-            .and_then(Value::as_array)
-            .ok_or(BrowserFlowError::Launch)?;
-        for target in infos {
-            let kind = target
-                .get("type")
-                .and_then(Value::as_str)
-                .ok_or(BrowserFlowError::Launch)?;
-            let url = target
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or(BrowserFlowError::Launch)?;
-            let target_id = target
-                .get("targetId")
-                .and_then(Value::as_str)
-                .ok_or(BrowserFlowError::Launch)?;
-            if kind == "page" && bomtoon_page_url(url) {
-                return Ok(target_id.to_owned());
-            }
-        }
-        retry_pause(deadline, pause)?;
-    }
-}
-
-fn bomtoon_page_url(url: &str) -> bool {
-    url == "https://www.bomtoon.tw" || url.starts_with("https://www.bomtoon.tw/")
-}
-
-fn page_authentication<R: Read, W: Write>(
-    pipe: &mut DevToolsPipe<R, W>,
-    session_id: &str,
-    deadline: Instant,
-) -> Result<Option<String>, CdpError> {
-    let evaluated = pipe.call(
-        deadline,
-        "Runtime.evaluate",
-        ObjectBuilder::new()
-            .set("expression", BROWSER_SESSION_EXPRESSION)
-            .set("awaitPromise", true)
-            .set("returnByValue", true)
-            .build(),
-        Some(session_id),
-    )?;
-    if evaluated.get("exceptionDetails").is_some() {
-        return Err(CdpError::Protocol);
-    }
-    let value = evaluated
-        .get("result")
-        .and_then(|result| result.get("value"))
-        .ok_or(CdpError::Protocol)?;
-    match value.get("authenticated").and_then(Value::as_bool) {
-        Some(false) => Ok(None),
-        Some(true) => {
-            let fingerprint = value
-                .get("tokenFingerprint")
-                .and_then(Value::as_str)
-                .filter(|value| valid_fingerprint(value))
-                .ok_or(CdpError::Protocol)?;
-            Ok(Some(fingerprint.to_owned()))
-        }
-        None => Err(CdpError::Protocol),
-    }
 }
 
 fn valid_fingerprint(value: &str) -> bool {
@@ -933,37 +433,19 @@ struct BrowserCookie {
     value: String,
     domain: String,
     path: String,
+    secure: bool,
 }
 
-fn parse_network_cookies(result: &Value) -> Result<Vec<BrowserCookie>, ()> {
-    result
-        .get("cookies")
-        .and_then(Value::as_array)
-        .ok_or(())?
+fn browser_cookies(payload: &HandoffPayload) -> Vec<BrowserCookie> {
+    payload
+        .cookies
         .iter()
-        .map(|cookie| {
-            Ok(BrowserCookie {
-                name: cookie
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or(())?
-                    .to_owned(),
-                value: cookie
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .ok_or(())?
-                    .to_owned(),
-                domain: cookie
-                    .get("domain")
-                    .and_then(Value::as_str)
-                    .ok_or(())?
-                    .to_owned(),
-                path: cookie
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or(())?
-                    .to_owned(),
-            })
+        .map(|cookie| BrowserCookie {
+            name: cookie.name.clone(),
+            value: cookie.value.clone(),
+            domain: cookie.domain.clone(),
+            path: cookie.path.clone(),
+            secure: cookie.secure,
         })
         .collect()
 }
@@ -1003,11 +485,12 @@ fn has_family(cookies: &[BrowserCookie], family: &str) -> bool {
     })
 }
 
-fn valid_cookie_scope(cookie: &BrowserCookie) -> bool {
+fn valid_cookie_scope(cookie: &BrowserCookie, family: &str) -> bool {
     matches!(
         cookie.domain.strip_prefix('.').unwrap_or(&cookie.domain),
         "bomtoon.tw" | "www.bomtoon.tw"
     ) && cookie.path == "/"
+        && (family != SECURE_COOKIE || cookie.secure)
 }
 
 fn select_session_cookie(cookies: &[BrowserCookie]) -> Result<String, ()> {
@@ -1028,7 +511,7 @@ fn select_cookie_family(cookies: &[BrowserCookie], family: &str) -> Result<Strin
         let Some(member) = family_member(&cookie.name, family)? else {
             continue;
         };
-        if !valid_cookie_scope(cookie)
+        if !valid_cookie_scope(cookie, family)
             || cookie.value.is_empty()
             || cookie.value.bytes().any(|byte| byte.is_ascii_control())
         {
@@ -1662,9 +1145,12 @@ fn install_simulator(cookie: &str) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bomtoon_handoff::{
+        Challenge, HandoffCookie, HandoffError, HandoffPayload,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
-    use std::io::Cursor;
+    use std::os::unix::process::ExitStatusExt;
     use std::rc::Rc;
 
     fn argument_list(values: &[&str]) -> Vec<String> {
@@ -1677,6 +1163,7 @@ mod tests {
             value: value.to_owned(),
             domain: ".bomtoon.tw".to_owned(),
             path: "/".to_owned(),
+            secure: true,
         }
     }
 
@@ -1691,7 +1178,7 @@ mod tests {
 
     impl TestDirectories {
         fn new() -> Self {
-            let root = create_private_profile_at(&std::env::temp_dir()).expect("test root");
+            let root = create_private_directory_at(&std::env::temp_dir()).expect("test root");
             let state = root.join("state");
             let paths = SimulatorAuthPaths {
                 secrets: root.join("secrets"),
@@ -1897,29 +1384,6 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    #[test]
-    fn chrome_discovery_checks_system_and_user_application_directories() {
-        let home = Path::new("/Users/browser-owner");
-        let candidates = chrome_candidates(Some(home));
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-                home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-                PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-                home.join("Applications/Chromium.app/Contents/MacOS/Chromium"),
-            ]
-        );
-        let checked = Rc::new(RefCell::new(Vec::new()));
-        let observed = Rc::clone(&checked);
-        let wanted = candidates[3].clone();
-        let found = discover_chrome_with(Some(home), |path| {
-            observed.borrow_mut().push(path.to_owned());
-            path == wanted
-        });
-        assert_eq!(found, Some(wanted));
-        assert_eq!(*checked.borrow(), candidates);
-    }
 
     #[test]
     fn secure_nextauth_cookie_wins_without_combining_families() {
@@ -1987,178 +1451,420 @@ mod tests {
         );
     }
 
-    struct PartialReader {
-        inner: Cursor<Vec<u8>>,
-        maximum: usize,
+    fn test_challenge() -> Challenge {
+        let (challenge, listener) = Challenge::new().expect("test challenge");
+        drop(listener);
+        challenge
     }
 
-    impl Read for PartialReader {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            let end = output.len().min(self.maximum);
-            self.inner.read(&mut output[..end])
+    fn handoff_payload(cookies: Vec<BrowserCookie>, fingerprint: String) -> HandoffPayload {
+        HandoffPayload {
+            version: 1,
+            fingerprint,
+            cookies: cookies
+                .into_iter()
+                .map(|cookie| HandoffCookie {
+                    name: cookie.name,
+                    value: cookie.value,
+                    domain: cookie.domain,
+                    path: cookie.path,
+                    secure: cookie.secure,
+                })
+                .collect(),
         }
     }
 
-    fn push_cdp_frame(buffer: &mut Vec<u8>, frame: &str) {
-        buffer.extend_from_slice(frame.as_bytes());
-        buffer.push(0);
+    struct FakeHandoff {
+        payload: HandoffPayload,
+        events: Rc<RefCell<Vec<&'static str>>>,
+        drops: Option<Rc<Cell<usize>>>,
     }
 
-    struct BlockingReader {
-        release: Receiver<()>,
+    impl LoginHandoff for FakeHandoff {
+        fn payload(&self) -> &HandoffPayload {
+            &self.payload
+        }
+
+        fn succeed(self) -> io::Result<()> {
+            self.events.borrow_mut().push("204");
+            Ok(())
+        }
+
+        fn fail(self) -> io::Result<()> {
+            self.events.borrow_mut().push("422");
+            Ok(())
+        }
     }
 
-    impl Read for BlockingReader {
-        fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
-            let _ = self.release.recv();
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "injected blocked pipe release",
-            ))
+    impl Drop for FakeHandoff {
+        fn drop(&mut self) {
+            if let Some(drops) = &self.drops {
+                drops.set(drops.get() + 1);
+            }
+        }
+    }
+
+    struct DropSpy(Rc<Cell<usize>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
         }
     }
 
     #[test]
-    fn cdp_messages_are_nul_terminated_and_partial_reads_are_reassembled() {
-        let mut incoming = br#"{"method":"Runtime.consoleAPICalled","params":{}}"#.to_vec();
-        incoming.push(0);
-        incoming.extend_from_slice(br#"{"id":77,"result":{"ignored":true}}"#);
-        incoming.push(0);
-        incoming.extend_from_slice(br#"{"id":1,"result":{"accepted":true}}"#);
-        incoming.push(0);
-        let reader = PartialReader {
-            inner: Cursor::new(incoming),
-            maximum: 3,
+    fn a_secure_family_member_requires_the_secure_attribute() {
+        let mut exposed = cookie(SECURE_COOKIE, "secret");
+        exposed.secure = false;
+        assert!(select_session_cookie(&[exposed]).is_err());
+    }
+
+    #[test]
+    fn handoff_payload_maps_only_cookie_fields() {
+        let payload = HandoffPayload {
+            version: 1,
+            fingerprint: fingerprint('a'),
+            cookies: vec![HandoffCookie {
+                name: SECURE_COOKIE.to_owned(),
+                value: "secret".to_owned(),
+                domain: ".bomtoon.tw".to_owned(),
+                path: "/".to_owned(),
+                secure: true,
+            }],
         };
-        let mut pipe = DevToolsPipe::new(reader, Vec::new());
-        let result = pipe
-            .call(
-                Instant::now() + Duration::from_secs(1),
-                "Runtime.evaluate",
-                empty_object(),
-                Some("flat-session"),
-            )
-            .expect("matching result");
-        assert_eq!(result.get("accepted").and_then(Value::as_bool), Some(true));
-        assert_eq!(pipe.writer.last(), Some(&0));
-        let request = std::str::from_utf8(&pipe.writer[..pipe.writer.len() - 1])
-            .ok()
-            .and_then(|json| kobo_json::parse(json).ok())
-            .expect("request JSON");
-        assert_eq!(request.get("id").and_then(Value::as_i64), Some(1));
         assert_eq!(
-            request.get("sessionId").and_then(Value::as_str),
-            Some("flat-session")
+            browser_cookies(&payload),
+            vec![cookie(SECURE_COOKIE, "secret")]
         );
-
-        let mut rejected = br#"{"id":1,"error":{"message":"credential-material"}}"#.to_vec();
-        rejected.push(0);
-        let mut pipe = DevToolsPipe::new(Cursor::new(rejected), Vec::new());
-        assert_eq!(
-            pipe.call(
-                Instant::now() + Duration::from_secs(1),
-                "Network.getCookies",
-                empty_object(),
-                None,
-            ),
-            Err(CdpError::Protocol)
-        );
-        assert!(!format!("{:?}", CdpError::Protocol).contains("credential-material"));
     }
 
     #[test]
-    fn browser_deadline_cancels_blocked_cdp_io() {
-        let (release, blocked) = mpsc::sync_channel(1);
-        let cancelled = Rc::new(Cell::new(false));
-        let observed = Rc::clone(&cancelled);
-        let result = run_browser_login(
-            DevToolsPipe::new(BlockingReader { release: blocked }, Vec::new()),
-            Instant::now() + Duration::from_millis(10),
-            || {
-                observed.set(true);
-                let _ = release.send(());
-            },
+    fn normal_chrome_receives_only_the_exact_fragment_login_url() {
+        let challenge = test_challenge();
+        let expected_url = format!("{LOGIN_URL}{}", challenge.fragment());
+        let mut observed = Vec::new();
+        assert_eq!(
+            open_normal_chrome_with(&challenge, |command| {
+                observed.push(command.get_program().to_os_string());
+                observed.extend(command.get_args().map(ToOwned::to_owned));
+                Ok(std::process::ExitStatus::from_raw(0))
+            }),
+            Ok(())
         );
-        assert_eq!(result, Err(BrowserFlowError::Timeout));
-        assert!(cancelled.get());
-    }
-
-    #[test]
-    fn target_and_authentication_poll_only_explicit_incomplete_results() {
-        let expected_fingerprint = fingerprint('a');
-        let frames = vec![
-            r#"{"id":1,"result":{"targetInfos":[{"type":"page","url":"about:blank","targetId":"transient"}]}}"#.to_owned(),
-            r#"{"id":2,"result":{"targetInfos":[{"type":"page","url":"https://www.bomtoon.tw/user/login","targetId":"bomtoon"}]}}"#.to_owned(),
-            r#"{"id":3,"result":{"sessionId":"flat-session"}}"#.to_owned(),
-            r#"{"id":4,"result":{"result":{"value":{"authenticated":false}}}}"#.to_owned(),
-            format!(
-                r#"{{"id":5,"result":{{"result":{{"value":{{"authenticated":true,"tokenFingerprint":"{expected_fingerprint}"}}}}}}}}"#
-            ),
-            format!(
-                r#"{{"id":6,"result":{{"cookies":[{{"name":"{SECURE_COOKIE}","value":"selected","domain":".bomtoon.tw","path":"/"}}]}}}}"#
-            ),
+        assert_eq!(
+            observed,
+            ["open", "-a", "Google Chrome", expected_url.as_str()]
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<std::ffi::OsString>>()
+        );
+        let rendered = observed
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let forbidden = [
+            SECURE_COOKIE.to_owned(),
+            "fingerprint".to_owned(),
+            "token".to_owned(),
+            "email".to_owned(),
+            "userId".to_owned(),
+            ["remote", "debugging"].join("-"),
+            ["user", "data", "dir"].join("-"),
         ];
-        let mut incoming = Vec::new();
-        for frame in frames {
-            push_cdp_frame(&mut incoming, &frame);
+        for forbidden in &forbidden {
+            assert!(
+                !rendered.contains(forbidden),
+                "browser argument exposed {forbidden}"
+            );
         }
-        let pauses = Cell::new(0);
-        let mut pipe = DevToolsPipe::new(Cursor::new(incoming), Vec::new());
-        let result = browser_login_with(&mut pipe, Instant::now() + Duration::from_secs(1), |_| {
-            pauses.set(pauses.get() + 1);
-        });
-        assert_eq!(
-            result,
-            Ok((format!("{SECURE_COOKIE}=selected"), expected_fingerprint))
-        );
-        assert_eq!(pauses.get(), 2);
     }
 
     #[test]
-    fn fatal_cdp_errors_abort_and_oversized_frames_poison_the_pipe() {
-        let mut incoming = Vec::new();
-        for frame in [
-            r#"{"id":1,"result":{"targetInfos":[{"type":"page","url":"https://www.bomtoon.tw/user/login","targetId":"bomtoon"}]}}"#,
-            r#"{"id":2,"result":{"sessionId":"flat-session"}}"#,
-            r#"{"id":3,"error":{"message":"sensitive response text"}}"#,
-        ] {
-            push_cdp_frame(&mut incoming, frame);
-        }
-        let mut pipe = DevToolsPipe::new(Cursor::new(incoming), Vec::new());
+    fn normal_chrome_launch_failures_use_the_fixed_error() {
+        let challenge = test_challenge();
         assert_eq!(
-            browser_login_with(
-                &mut pipe,
-                Instant::now() + Duration::from_secs(1),
-                |_| panic!("fatal protocol errors must not poll"),
-            ),
-            Err(BrowserFlowError::Launch)
+            open_normal_chrome_with(&challenge, |_| {
+                Ok(std::process::ExitStatus::from_raw(1 << 8))
+            }),
+            Err(BROWSER_LAUNCH_FAILED.to_owned())
         );
-        assert_eq!(pipe.writer.split(|byte| *byte == 0).count() - 1, 3);
-
-        let oversized = vec![b'x'; MAX_CDP_FRAME_BYTES + 1];
-        let mut pipe = DevToolsPipe::new(Cursor::new(oversized), Vec::new());
         assert_eq!(
-            pipe.call(
-                Instant::now() + Duration::from_secs(1),
-                "Target.getTargets",
-                empty_object(),
-                None,
-            ),
-            Err(CdpError::Framing)
+            open_normal_chrome_with(&challenge, |_| {
+                Err(io::Error::other("injected launch failure"))
+            }),
+            Err(BROWSER_LAUNCH_FAILED.to_owned())
         );
-        assert!(pipe.buffered.is_empty());
-        let written = pipe.writer.len();
-        assert_eq!(
-            pipe.call(
-                Instant::now() + Duration::from_secs(1),
-                "Target.getTargets",
-                empty_object(),
-                None,
-            ),
-            Err(CdpError::Framing)
-        );
-        assert_eq!(pipe.writer.len(), written);
     }
+
+    #[test]
+    fn matching_handoff_selects_validates_installs_then_sends_204() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let locked = Rc::clone(&events);
+        let challenged = Rc::clone(&events);
+        let opened = Rc::clone(&events);
+        let received = Rc::clone(&events);
+        let responded = Rc::clone(&events);
+        let validated = Rc::clone(&events);
+        let installed = Rc::clone(&events);
+        let expected_fingerprint = fingerprint('a');
+        let payload = handoff_payload(
+            vec![
+                cookie(INSECURE_COOKIE, "not-selected"),
+                cookie(SECURE_COOKIE, "selected"),
+            ],
+            expected_fingerprint.clone(),
+        );
+
+        assert_eq!(
+            login_with(
+                || {
+                    locked.borrow_mut().push("lock");
+                    Ok(DropSpy(Rc::new(Cell::new(0))))
+                },
+                || {
+                    challenged.borrow_mut().push("challenge");
+                    Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0)))))
+                },
+                |_| {
+                    opened.borrow_mut().push("open");
+                    Ok(())
+                },
+                |_, _, deadline| {
+                    assert!(deadline > Instant::now());
+                    received.borrow_mut().push("receive");
+                    Ok(FakeHandoff {
+                        payload,
+                        events: responded,
+                        drops: None,
+                    })
+                },
+                |selected| {
+                    validated.borrow_mut().push("validate");
+                    assert_eq!(selected, format!("{SECURE_COOKIE}=selected"));
+                    Ok(expected_fingerprint)
+                },
+                |selected| {
+                    installed.borrow_mut().push("install");
+                    assert_eq!(selected, format!("{SECURE_COOKIE}=selected"));
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                "lock",
+                "challenge",
+                "open",
+                "receive",
+                "validate",
+                "install",
+                "204",
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_handoff_cookies_install_nothing_and_send_422() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let responded = Rc::clone(&events);
+        let payload = handoff_payload(
+            vec![cookie(&format!("{SECURE_COOKIE}.1"), "missing-zero")],
+            fingerprint('a'),
+        );
+        assert_eq!(
+            login_with(
+                || Ok(DropSpy(Rc::new(Cell::new(0)))),
+                || Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0))))),
+                |_| Ok(()),
+                |_, _, _| {
+                    Ok(FakeHandoff {
+                        payload,
+                        events: responded,
+                        drops: None,
+                    })
+                },
+                |_| panic!("malformed cookies must not be validated"),
+                |_| panic!("malformed cookies must not be installed"),
+            ),
+            Err(COOKIE_SELECTION_FAILED.to_owned())
+        );
+        assert_eq!(*events.borrow(), ["422"]);
+    }
+
+    #[test]
+    fn validation_failure_or_fingerprint_mismatch_sends_422_without_installing() {
+        for validation in [
+            Err("injected validator failure".to_owned()),
+            Ok(fingerprint('b')),
+        ] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let responded = Rc::clone(&events);
+            let validated = Rc::clone(&events);
+            let payload = handoff_payload(
+                vec![cookie(SECURE_COOKIE, "selected")],
+                fingerprint('a'),
+            );
+            assert_eq!(
+                login_with(
+                    || Ok(DropSpy(Rc::new(Cell::new(0)))),
+                    || Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0))))),
+                    |_| Ok(()),
+                    |_, _, _| {
+                        Ok(FakeHandoff {
+                            payload,
+                            events: responded,
+                            drops: None,
+                        })
+                    },
+                    |_| {
+                        validated.borrow_mut().push("validate");
+                        validation
+                    },
+                    |_| panic!("an invalid session must not be installed"),
+                ),
+                Err(SESSION_VALIDATION_FAILED.to_owned())
+            );
+            assert_eq!(*events.borrow(), ["validate", "422"]);
+        }
+    }
+
+    #[test]
+    fn target_failure_sends_422_after_the_install_attempt() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let responded = Rc::clone(&events);
+        let installed = Rc::clone(&events);
+        let expected_fingerprint = fingerprint('a');
+        let payload = handoff_payload(
+            vec![cookie(SECURE_COOKIE, "selected")],
+            expected_fingerprint.clone(),
+        );
+        assert_eq!(
+            login_with(
+                || Ok(DropSpy(Rc::new(Cell::new(0)))),
+                || Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0))))),
+                |_| Ok(()),
+                |_, _, _| {
+                    Ok(FakeHandoff {
+                        payload,
+                        events: responded,
+                        drops: None,
+                    })
+                },
+                |_| Ok(expected_fingerprint),
+                |_| {
+                    installed.borrow_mut().push("install");
+                    Err("injected target failure".to_owned())
+                },
+            ),
+            Err(TARGET_INSTALLATION_FAILED.to_owned())
+        );
+        assert_eq!(*events.borrow(), ["install", "422"]);
+    }
+
+    #[test]
+    fn handoff_timeout_names_the_extension_install_guidance() {
+        assert_eq!(
+            login_with(
+                || Ok(DropSpy(Rc::new(Cell::new(0)))),
+                || Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0))))),
+                |_| Ok(()),
+                |_, _, _| -> Result<FakeHandoff, HandoffError> {
+                    Err(HandoffError::Timeout)
+                },
+                |_| panic!("a timeout has no cookie"),
+                |_| panic!("a timeout cannot install"),
+            ),
+            Err(format!(
+                "{LOGIN_TIMED_OUT}; run kobo bomtoon extension install if the extension is not loaded"
+            ))
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResourceResult {
+        BrowserFailure,
+        Timeout,
+        CookieFailure,
+        ValidationFailure,
+        InstallationFailure,
+        Success,
+    }
+
+    #[test]
+    fn every_login_result_drops_the_host_lock_listener_and_pending_handoff() {
+        for scenario in [
+            ResourceResult::BrowserFailure,
+            ResourceResult::Timeout,
+            ResourceResult::CookieFailure,
+            ResourceResult::ValidationFailure,
+            ResourceResult::InstallationFailure,
+            ResourceResult::Success,
+        ] {
+            let lock_drops = Rc::new(Cell::new(0));
+            let listener_drops = Rc::new(Cell::new(0));
+            let handoff_drops = Rc::new(Cell::new(0));
+            let lock = Rc::clone(&lock_drops);
+            let listener = Rc::clone(&listener_drops);
+            let pending = Rc::clone(&handoff_drops);
+            let payload = handoff_payload(
+                if matches!(scenario, ResourceResult::CookieFailure) {
+                    Vec::new()
+                } else {
+                    vec![cookie(SECURE_COOKIE, "selected")]
+                },
+                fingerprint('a'),
+            );
+            let _ = login_with(
+                || Ok(DropSpy(lock)),
+                || Ok((test_challenge(), DropSpy(listener))),
+                |_| {
+                    if matches!(scenario, ResourceResult::BrowserFailure) {
+                        Err(BROWSER_LAUNCH_FAILED.to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_, _, _| {
+                    if matches!(scenario, ResourceResult::Timeout) {
+                        Err(HandoffError::Timeout)
+                    } else {
+                        Ok(FakeHandoff {
+                            payload,
+                            events: Rc::new(RefCell::new(Vec::new())),
+                            drops: Some(pending),
+                        })
+                    }
+                },
+                |_| {
+                    if matches!(scenario, ResourceResult::ValidationFailure) {
+                        Err("injected validator failure".to_owned())
+                    } else {
+                        Ok(fingerprint('a'))
+                    }
+                },
+                |_| {
+                    if matches!(scenario, ResourceResult::InstallationFailure) {
+                        Err("injected target failure".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(lock_drops.get(), 1);
+            assert_eq!(listener_drops.get(), 1);
+            assert_eq!(
+                handoff_drops.get(),
+                usize::from(!matches!(
+                    scenario,
+                    ResourceResult::BrowserFailure | ResourceResult::Timeout
+                ))
+            );
+        }
+    }
+
 
     #[test]
     fn selected_cookie_is_validated_alone_before_installation() {
@@ -2436,157 +2142,4 @@ mod tests {
             .exists());
     }
 
-    #[derive(Clone)]
-    struct FakeProcess {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        wait_failures: usize,
-        stop_failures: usize,
-    }
-
-    impl BrowserProcess for FakeProcess {
-        fn stop(&mut self) -> io::Result<()> {
-            self.events.borrow_mut().push("stop");
-            if self.stop_failures > 0 {
-                self.stop_failures -= 1;
-                Err(io::Error::other("injected stop failure"))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn wait_for_exit(&mut self) -> io::Result<()> {
-            self.events.borrow_mut().push("wait");
-            if self.wait_failures > 0 {
-                self.wait_failures -= 1;
-                Err(io::Error::other("injected wait failure"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    struct FakeCleaner {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        failures: usize,
-    }
-
-    impl ProfileCleaner for FakeCleaner {
-        fn remove_profile(&mut self, _profile: &Path) -> io::Result<()> {
-            self.events.borrow_mut().push("remove");
-            if self.failures > 0 {
-                self.failures -= 1;
-                Err(io::Error::other("injected removal failure"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-    #[test]
-    fn chrome_supervisor_stops_waits_and_removes_profile_after_owner_exit() {
-        let profile = create_private_profile_at(&std::env::temp_dir()).expect("supervised profile");
-        let mut supervisor = Command::new("/bin/sh")
-            .args(["-c", CHROME_LAUNCH_PROGRAM, "test-supervisor"])
-            .arg("0")
-            .arg("/bin/sh")
-            .arg(&profile)
-            .args(["-c", "sleep 30"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn supervisor");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let status = loop {
-            if let Some(status) = supervisor.try_wait().expect("poll supervisor") {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = supervisor.kill();
-                let _ = supervisor.wait();
-                panic!("supervisor did not react to owner exit");
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert!(status.success());
-        assert!(!profile.exists());
-    }
-
-    #[test]
-    fn every_exit_path_stops_chrome_and_removes_the_profile() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        {
-            let _guard = ChromeGuard::new(
-                FakeProcess {
-                    events: Rc::clone(&events),
-                    wait_failures: 0,
-                    stop_failures: 0,
-                },
-                PathBuf::from("private-profile"),
-                FakeCleaner {
-                    events: Rc::clone(&events),
-                    failures: 0,
-                },
-            );
-        }
-        assert_eq!(*events.borrow(), ["stop", "wait", "remove"]);
-
-        events.borrow_mut().clear();
-        let guard = ChromeGuard::new(
-            FakeProcess {
-                events: Rc::clone(&events),
-                wait_failures: 1,
-                stop_failures: 0,
-            },
-            PathBuf::from("private-profile"),
-            FakeCleaner {
-                events: Rc::clone(&events),
-                failures: 0,
-            },
-        );
-        assert_eq!(guard.close(), Err(()));
-        assert_eq!(*events.borrow(), ["stop", "wait", "stop", "wait", "remove"]);
-
-        events.borrow_mut().clear();
-        let guard = ChromeGuard::new(
-            FakeProcess {
-                events: Rc::clone(&events),
-                wait_failures: 0,
-                stop_failures: 1,
-            },
-            PathBuf::from("private-profile"),
-            FakeCleaner {
-                events: Rc::clone(&events),
-                failures: 0,
-            },
-        );
-        assert_eq!(guard.close(), Err(()));
-        assert_eq!(*events.borrow(), ["stop", "stop", "wait", "remove"]);
-
-        events.borrow_mut().clear();
-        let guard = ChromeGuard::new(
-            FakeProcess {
-                events: Rc::clone(&events),
-                wait_failures: 0,
-                stop_failures: 0,
-            },
-            PathBuf::from("private-profile"),
-            FakeCleaner {
-                events: Rc::clone(&events),
-                failures: 1,
-            },
-        );
-        assert_eq!(guard.close(), Err(()));
-        assert_eq!(*events.borrow(), ["stop", "wait", "remove", "remove"]);
-
-        let root = create_private_profile_at(&std::env::temp_dir()).expect("private profile");
-        assert_eq!(
-            fs::metadata(&root)
-                .expect("profile metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        fs::remove_dir_all(root).expect("remove test profile");
-    }
 }
