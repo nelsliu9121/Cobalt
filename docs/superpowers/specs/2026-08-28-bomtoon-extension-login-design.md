@@ -1,6 +1,6 @@
 # BOMTOON Normal-Chrome Extension Login Design
 
-Status: Draft for review
+Status: Approved design
 Date: 2026-08-28
 Supersedes: The automated Chrome/CDP login driver in `2026-08-27-bomtoon-login-design.md`
 
@@ -80,7 +80,7 @@ The listener accepts only:
 - this exact schema: version `1`, a 64-character lowercase hexadecimal fingerprint, and at most 16 cookie objects containing only string `name`, `value`, `domain`, `path`, and boolean `secure`
 - per-field UTF-8 byte limits: `name` 128, `value` 4096, `domain` 255, and `path` 1024
 
-It returns a fixed success or failure body with no cookie, fingerprint, account data, or target details. Invalid HTTP or schema requests do not extend the deadline and leave the listener available. The first schema-valid payload is terminal: native validation either installs it or returns a fixed error, then the listener closes.
+The listener returns a fixed success or failure body with no cookie, fingerprint, account data, or target details. Invalid HTTP or schema requests do not extend the deadline and leave the listener available. It closes after 32 refused requests to bound local abuse. The first schema-valid payload is terminal: native validation either installs it or returns a fixed error, then the listener closes.
 
 ### Chrome extension
 
@@ -101,8 +101,7 @@ http://127.0.0.1/*
 ```
 
 Chrome requires both `cookies` and host permissions for cookie access. The loopback host permission covers the random listener port. No Google host permission is requested.
-
-A BOMTOON content script recognizes the exact fragment grammar, stores the challenge in `chrome.storage.session`, and removes the fragment. Chrome documents `storage.session` as in-memory state that is cleared when the extension reloads, updates, is disabled, or the browser restarts. The Google redirect may leave BOMTOON, but the challenge survives the redirect because it belongs to the extension session rather than the page.
+A BOMTOON content script recognizes the exact fragment grammar, sends the challenge to the extension service worker, and removes the fragment. The service worker stores the challenge in `chrome.storage.session`; content scripts do not receive direct access to that storage area. Chrome documents `storage.session` as in-memory state that is cleared when the extension reloads, updates, is disabled, or the browser restarts. The Google redirect may leave BOMTOON, but the challenge survives because it belongs to the extension session rather than the page.
 
 After login, the user clicks the extension action and chooses `Send BOMTOON sign-in to Kobo`. The extension:
 
@@ -112,9 +111,9 @@ After login, the user clicks the extension action and chooses `Send BOMTOON sign
 4. Computes SHA-256 over access token, a NUL byte, and refresh token.
 5. Sends only the hexadecimal fingerprint out of the page context.
 6. Reads cookies from the active tab's cookie store.
-7. Keeps only the secure or insecure NextAuth session base names and numeric chunks.
+7. Keeps only cookie names equal to a NextAuth session family or prefixed by that family plus a dot; native Rust validates base-versus-chunk grammar and rejects malformed members.
 8. POSTs bounded cookie metadata and the fingerprint to the stored loopback challenge.
-9. Clears the challenge after success, explicit cancel, or expiry.
+9. Clears the challenge after a terminal listener response, explicit cancel, or when it next observes expiry.
 
 The extension never sends token strings, email, user ID, profile fields, analytics cookies, CSRF cookies, or callback cookies. Token strings exist only in the BOMTOON page response long enough to compute the fingerprint.
 
@@ -154,10 +153,11 @@ The CLI does not close normal Chrome or remove its profile. It owns only the lis
 - Generate the nonce from OS entropy and compare it without logging it.
 - Limit the listener body to 16 KiB and the cookie array to 16 exact-shape entries.
 - Reject unknown fields, duplicate fields, and values outside their field-specific bounds.
+- Limit invalid requests to 32 and each accepted connection to a two-second read deadline within the original login deadline.
 - Never place the cookie, token values, or fingerprint in process arguments, URLs, terminal output, error strings, extension logs, screenshots, or persistent extension storage.
 - Keep extension host permissions limited to BOMTOON and IPv4 loopback.
 - Use `chrome.storage.session`; do not use `storage.local` or `storage.sync` for the challenge.
-- Clear the challenge after success, expiry, extension reload, or explicit cancel. A transport or validation failure remains retryable until the original deadline.
+- Reject an expired challenge and clear it on the next extension activation. Also clear after a terminal listener response, extension reload, or explicit cancel. A transport failure remains retryable until the original deadline.
 - Preserve strict native cookie selection and server validation. JavaScript does not decide which cookie is installed.
 - Preserve the existing target credential lease and crash-recoverable transaction.
 - Remove the current CDP driver, temporary Chrome profile, DevTools framing, and automation supervisor after every caller and test migrates.
