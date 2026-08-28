@@ -243,20 +243,31 @@ fn parse_action(arguments: &[String]) -> Result<Action, String> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn install_extension() -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_owned())?;
-    let destination = extension_directory(&home);
+fn install_extension_with<Lock>(
+    home: &Path,
+    acquire_lock: impl FnOnce() -> io::Result<Lock>,
+    materialize: impl FnOnce(&Path) -> io::Result<PathBuf>,
+) -> Result<(PathBuf, bool), String> {
+    let _host_lock = acquire_lock().map_err(|_| "extension installation failed".to_owned())?;
+    let destination = extension_directory(home);
     let replacing = destination
         .try_exists()
         .map_err(|_| "extension installation failed".to_owned())?;
     let cobalt_root = destination
         .parent()
         .ok_or_else(|| "extension installation failed".to_owned())?;
-    let installed = materialize_extension_at(cobalt_root)
-        .map_err(|_| "extension installation failed".to_owned())?;
+    let installed =
+        materialize(cobalt_root).map_err(|_| "extension installation failed".to_owned())?;
+    Ok((installed, replacing))
+}
+
+#[cfg(target_os = "macos")]
+fn install_extension() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())?;
+    let (installed, replacing) =
+        install_extension_with(&home, HostLock::acquire, materialize_extension_at)?;
 
     println!("{}", installed.display());
     println!("1. Open chrome://extensions.");
@@ -360,9 +371,10 @@ where
     };
     let result = validate_and_install(&selected, &handoff.payload().fingerprint, validate, install);
     match result {
-        Ok(()) => handoff
-            .succeed()
-            .map_err(|_| BROWSER_LAUNCH_FAILED.to_owned()),
+        Ok(()) => {
+            let _ = handoff.succeed();
+            Ok(())
+        }
         Err(error) => {
             let _ = handoff.fail();
             Err(error)
@@ -1362,6 +1374,51 @@ mod tests {
     }
 
     #[test]
+    fn extension_install_lock_serializes_destination_observation_and_materialization() {
+        let root = create_private_directory_at(&std::env::temp_dir()).expect("test root");
+        let home = root.join("home");
+        let destination = extension_directory(&home);
+        let cobalt_root = destination.parent().expect("extension parent").to_path_buf();
+        ensure_private_directory(&cobalt_root).expect("extension parent");
+        let lock_drops = Rc::new(Cell::new(0));
+        let acquired_lock_drops = Rc::clone(&lock_drops);
+        let materialization_lock_drops = Rc::clone(&lock_drops);
+
+        assert_eq!(
+            install_extension_with(
+                &home,
+                || {
+                    fs::create_dir(&destination).expect("destination created while acquiring lock");
+                    Ok(DropSpy(acquired_lock_drops))
+                },
+                |observed_root| {
+                    assert_eq!(observed_root, cobalt_root);
+                    assert_eq!(materialization_lock_drops.get(), 0);
+                    Ok(destination.clone())
+                },
+            ),
+            Ok((destination.clone(), true))
+        );
+        assert_eq!(lock_drops.get(), 1);
+
+        let sentinel = destination.join("existing-install");
+        fs::write(&sentinel, "preserve me").expect("sentinel");
+        assert_eq!(
+            install_extension_with(
+                &home,
+                || Err::<DropSpy, _>(io::Error::new(io::ErrorKind::AddrInUse, "locked")),
+                |_| panic!("a contending install must not materialize the extension"),
+            ),
+            Err("extension installation failed".to_owned())
+        );
+        assert_eq!(
+            fs::read_to_string(sentinel).expect("unchanged install"),
+            "preserve me"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn secure_nextauth_cookie_wins_without_combining_families() {
         let cookies = vec![
             cookie(INSECURE_COOKIE, "insecure-family"),
@@ -1454,6 +1511,7 @@ mod tests {
         payload: HandoffPayload,
         events: Rc<RefCell<Vec<&'static str>>>,
         drops: Option<Rc<Cell<usize>>>,
+        succeed_fails: bool,
     }
 
     impl LoginHandoff for FakeHandoff {
@@ -1463,7 +1521,14 @@ mod tests {
 
         fn succeed(self) -> io::Result<()> {
             self.events.borrow_mut().push("204");
-            Ok(())
+            if self.succeed_fails {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected response failure",
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn fail(self) -> io::Result<()> {
@@ -1613,6 +1678,7 @@ mod tests {
                         payload,
                         events: responded,
                         drops: None,
+                        succeed_fails: false,
                     })
                 },
                 |selected| {
@@ -1643,6 +1709,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_success_response_failure_does_not_fail_committed_login() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let responded = Rc::clone(&events);
+        let validated = Rc::clone(&events);
+        let installed = Rc::clone(&events);
+        let expected_fingerprint = fingerprint('a');
+        let payload = handoff_payload(
+            vec![cookie(SECURE_COOKIE, "selected")],
+            expected_fingerprint.clone(),
+        );
+
+        assert_eq!(
+            login_with(
+                || Ok(DropSpy(Rc::new(Cell::new(0)))),
+                || Ok((test_challenge(), DropSpy(Rc::new(Cell::new(0))))),
+                |_| Ok(()),
+                |_, _, _| {
+                    Ok(FakeHandoff {
+                        payload,
+                        events: responded,
+                        drops: None,
+                        succeed_fails: true,
+                    })
+                },
+                |_| {
+                    validated.borrow_mut().push("validate");
+                    Ok(expected_fingerprint)
+                },
+                |_| {
+                    installed.borrow_mut().push("install");
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(*events.borrow(), ["validate", "install", "204"]);
+    }
+
+    #[test]
     fn malformed_handoff_cookies_install_nothing_and_send_422() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let responded = Rc::clone(&events);
@@ -1660,6 +1765,7 @@ mod tests {
                         payload,
                         events: responded,
                         drops: None,
+                        succeed_fails: false,
                     })
                 },
                 |_| panic!("malformed cookies must not be validated"),
@@ -1691,6 +1797,7 @@ mod tests {
                             payload,
                             events: responded,
                             drops: None,
+                            succeed_fails: false,
                         })
                     },
                     |_| {
@@ -1725,6 +1832,7 @@ mod tests {
                         payload,
                         events: responded,
                         drops: None,
+                        succeed_fails: false,
                     })
                 },
                 |_| Ok(expected_fingerprint),
@@ -1809,6 +1917,7 @@ mod tests {
                             payload,
                             events: Rc::new(RefCell::new(Vec::new())),
                             drops: Some(pending),
+                            succeed_fails: false,
                         })
                     }
                 },

@@ -46,13 +46,13 @@ The directory uses mode `0700`. Setup prints the path and these one-time Chrome 
 4. Select the printed directory.
 5. Pin the Cobalt BOMTOON Login extension if desired.
 
-A later CLI release may replace the materialized files atomically. Chrome may require the user to select Reload on the extensions page after an update.
+A later CLI release may replace the materialized files atomically. Extension installation and login share the fixed host-local lock: installation acquires it before checking whether the destination exists and holds it until materialization, backup cleanup or rollback, and replacement bookkeeping finish. Chrome may require the user to select Reload on the extensions page after an update.
 
 ### CLI rendezvous
 
 `kobo bomtoon login --sim` and `kobo bomtoon login --device <IP>`:
 
-1. Acquire the host-local lock by exclusively binding `127.0.0.1:53941`; the lock socket never accepts or reads data.
+1. Acquire the shared host-local lock by exclusively binding `127.0.0.1:53941`; the lock socket never accepts or reads data.
 2. Bind the HTTP rendezvous listener to `127.0.0.1` on an operating-system-selected port.
 3. Generate a 32-byte nonce with the operating system CSPRNG.
 4. Open the BOMTOON login page in normal Chrome using macOS `open`.
@@ -60,7 +60,8 @@ A later CLI release may replace the materialized files atomically. Chrome may re
 6. Wait for one valid extension POST or the existing bounded login deadline.
 7. Reconstruct and validate the cookie using the existing native checks.
 8. Install the cookie with the existing transactional simulator or device path.
-9. Close the listener and release the host-local lock.
+9. Attempt the fixed terminal response after the native target installation commits. A failed success-response write is best-effort and does not undo or fail the committed installation.
+10. Close the listener and release the host-local lock.
 
 The fragment format is:
 
@@ -80,7 +81,7 @@ The listener accepts only:
 - this exact schema: version `1`, a 64-character lowercase hexadecimal fingerprint, and at most 16 cookie objects containing only string `name`, `value`, `domain`, `path`, and boolean `secure`
 - per-field UTF-8 byte limits: `name` 128, `value` 4096, `domain` 255, and `path` 1024
 
-The listener returns a fixed success or failure body with no cookie, fingerprint, account data, or target details. Invalid HTTP or schema requests do not extend the deadline and leave the listener available. It closes after 32 refused requests to bound local abuse. The first schema-valid payload is terminal: native validation either installs it or returns a fixed error, then the listener closes.
+The listener returns a fixed success or failure body with no cookie, fingerprint, account data, or target details. Invalid HTTP or schema requests do not extend the deadline and leave the listener available. It closes after 32 refused requests to bound local abuse. The first schema-valid payload is terminal: native validation either installs it or returns a fixed error, then the CLI attempts exactly one terminal response and closes the listener. A failed 204 delivery after native validation and target installation commit does not roll back the target or turn the committed operation into `browser launch failed`.
 
 ### Chrome extension
 
@@ -143,13 +144,14 @@ The CLI remains the authority for cookie selection. It applies the existing rule
 | Page and native fingerprints differ | CLI returns `session validation failed`; target state is unchanged |
 | Loopback POST fails | Extension keeps the challenge so the user can retry before timeout |
 | Target install fails | Existing transaction restores the previous target state |
+| Terminal 204 delivery fails after commit | Target remains committed and CLI reports success; the extension may retain the challenge until expiry |
 | Login succeeds | Listener closes, extension clears the challenge, and CLI reports success without account data |
 
-The CLI does not close normal Chrome or remove its profile. It owns only the listener, nonce, host lock, and target transaction.
+The CLI does not close normal Chrome or remove its profile. It owns only the listener, nonce, shared host lock, extension replacement, and target transaction while the corresponding command runs.
 
 ## Security Requirements
 
-- Bind the rendezvous only to IPv4 loopback on an operating-system-selected port. Bind the host lock only to `127.0.0.1:53941`; never accept or read lock-port connections. Do not listen on LAN, wildcard, or IPv6 wildcard addresses.
+- Bind the rendezvous only to IPv4 loopback on an operating-system-selected port. Serialize both extension replacement and login with the same host lock bound only to `127.0.0.1:53941`; never accept or read lock-port connections. Extension installation acquires it before observing the destination and retains it through materialization and cleanup. Do not listen on LAN, wildcard, or IPv6 wildcard addresses.
 - Generate the nonce from OS entropy and compare it without logging it.
 - Limit the listener body to 16 KiB and the cookie array to 16 exact-shape entries.
 - Reject unknown fields, duplicate fields, and values outside their field-specific bounds.

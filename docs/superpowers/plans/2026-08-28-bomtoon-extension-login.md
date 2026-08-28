@@ -15,7 +15,7 @@
 - Add `kobo bomtoon extension install` for one-time unpacked-extension setup.
 - Materialize the extension under `~/Library/Application Support/Cobalt/bomtoon-login-extension` with directory mode `0700`.
 - Bind the rendezvous only to `127.0.0.1` on an operating-system-selected port.
-- Bind the host lock exclusively to `127.0.0.1:53941`; never accept or read data from that socket.
+- Bind the shared host lock exclusively to `127.0.0.1:53941`; never accept or read data from that socket. Use it to serialize both extension replacement and login, acquiring it before observing the extension destination and retaining it through materialization and cleanup.
 - Generate a 32-byte nonce from `/dev/urandom`; encode it as 43 unpadded base64url characters.
 - Put only protocol version, loopback port, and nonce in `#cobalt-login=v1.<port>.<nonce>`.
 - Refuse at most 32 invalid requests and cap each connection read at two seconds within the original login deadline.
@@ -445,17 +445,18 @@ Define `EXTENSION_FILES: &[(&str, &[u8])]` with `include_bytes!` for `manifest.j
 
 - [ ] **Step 4: Implement atomic materialization**
 
-`extension_directory(home)` returns `home/Library/Application Support/Cobalt/bomtoon-login-extension`. `materialize_extension_at(cobalt_root)` must:
+`extension_directory(home)` returns `home/Library/Application Support/Cobalt/bomtoon-login-extension`. The production installation path must:
 
-1. Ensure `cobalt_root` exists with mode `0700`.
-2. Create a same-parent private staging directory using `private_name`.
-3. Write every embedded file with `OpenOptionsExt::mode(0o600)`, `write_all`, and `sync_all`.
-4. Sync the staging directory.
-5. Rename an existing destination to a same-parent backup.
-6. Rename staging to the destination and sync the parent.
-7. Restore the backup if the destination rename fails.
-8. Remove the backup only after the destination exists and is synced.
-9. Clean staging and backup paths on every error without printing their contents.
+1. Acquire the existing `HostLock` before checking whether the destination exists and retain it through the full materialization result, including backup cleanup or rollback and replacement bookkeeping.
+2. Ensure `cobalt_root` exists with mode `0700`.
+3. Create a same-parent private staging directory using `private_name`.
+4. Write every embedded file with `OpenOptionsExt::mode(0o600)`, `write_all`, and `sync_all`.
+5. Sync the staging directory.
+6. Rename an existing destination to a same-parent backup.
+7. Rename staging to the destination and sync the parent.
+8. Restore the backup if the destination rename fails.
+9. Remove the backup only after the destination exists and is synced.
+10. Clean staging and backup paths on every error without printing their contents.
 
 Wire `command` so `InstallExtension` requires macOS, resolves `HOME`, calls the materializer, then prints only the installed path and the five approved `chrome://extensions` setup steps. It must not open `chrome://extensions` automatically.
 If the destination already existed, also print `Reload Cobalt BOMTOON Login on chrome://extensions.` without opening Chrome.
@@ -703,7 +704,8 @@ Extract `login_with` so tests can inject challenge creation, browser opening, pa
 - browser arguments contain no cookie, fingerprint, token, email, user ID, CDP flag, remote-debugging flag, or user-data directory;
 - cookie selection runs before server validation;
 - server validation runs before target installation;
-- a matching fingerprint installs once and sends 204;
+- a matching fingerprint installs once and attempts 204 exactly once;
+- a failed 204 write after validation and installation still returns success because the target is already committed;
 - malformed cookies return `cookie selection failed`, install nothing, and send 422;
 - validator failure or fingerprint mismatch returns `session validation failed`, install nothing, and sends 422;
 - target failure returns `target installation failed` and sends 422;
@@ -755,8 +757,8 @@ The production wrapper calls `Command::status`. It must not discover the Chrome 
 6. Run `select_session_cookie`; on failure, consume the pending handoff with 422 and return `COOKIE_SELECTION_FAILED`.
 7. Call `kobo_net::bomtoon::validate_session_cookie` through `validate_and_install`.
 8. Install through the unchanged `install_target` only on equal valid fingerprints.
-9. Send 204 on success or 422 on native validation/install failure.
-10. Return only existing fixed CLI error strings. The timeout string adds `; run kobo bomtoon extension install if the extension is not loaded`.
+9. After native validation and target installation commit, attempt 204 exactly once. Treat an I/O failure delivering that success response as best-effort: do not roll back the target or return `browser launch failed`.
+10. Send 422 on native validation/install failure and preserve the existing fixed CLI errors. The timeout string adds `; run kobo bomtoon extension install if the extension is not loaded`.
 
 Keep `validate_and_install`, `install_device`, `install_simulator`, and all transaction code unchanged except signatures forced by the new payload source.
 
