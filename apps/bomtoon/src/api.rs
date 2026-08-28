@@ -1,9 +1,12 @@
 use kobo_sdk::{Credential, Header, Task};
 
 const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
+const IMAGES_URL: &str =
+    "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
 const CONTENT_BYTES: u32 = 512 * 1024;
+const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
 
@@ -43,6 +46,30 @@ pub fn content(alias: &str) -> Task {
     )
 }
 
+pub fn images(content: &str, episode: &str) -> Task {
+    let mut headers = balcony_headers();
+    headers.push(Header::new(
+        "x-referer",
+        format!("https://www.bomtoon.tw/viewer/{content}/{episode}"),
+    ));
+    fetch(
+        format!("{IMAGES_URL}{content}/{episode}?imageWidth=1080"),
+        IMAGE_MANIFEST_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        headers,
+    )
+}
+
+pub fn image(url: &str) -> Task {
+    Task::Fetch {
+        url: url.to_owned(),
+        offset: 0,
+        max_bytes: kobo_image::MAX_SOURCE_BYTES as u32,
+        credential: None,
+        headers: response_headers("image/webp"),
+    }
+}
+
 pub fn logout() -> Task {
     Task::RevokeCredential {
         credential: "bomtoon-access-token".to_owned(),
@@ -78,8 +105,8 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 
 #[cfg(test)]
 mod tests {
-    use super::{content, library, recent};
-    use kobo_sdk::{SecretHeader, Task};
+    use super::{content, image, images, library, recent, ACCEPT_LANGUAGE};
+    use kobo_sdk::{Credential, Header, SecretHeader, Task};
 
     #[test]
     fn content_uses_exact_bearer_json_endpoint() {
@@ -195,4 +222,70 @@ mod tests {
                 && header.value == "https://www.bomtoon.tw/my/library/recent"
         }));
     }
+
+    #[test]
+    fn image_manifest_uses_exact_bearer_route_headers_and_ceiling() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = images("hunter_q", "ep-1")
+        else {
+            panic!("expected manifest fetch");
+        };
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080"
+        );
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 512 * 1024);
+        assert_eq!(
+            credential,
+            Some(Credential::bearer("bomtoon-access-token"))
+        );
+        assert_eq!(
+            headers,
+            vec![
+                Header::new("Accept", "application/json"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+                Header::new("x-balcony-id", "BOMTOON_TW"),
+                Header::new("x-balcony-timezone", "Asia/Taipei"),
+                Header::new("x-platform", "MOBILE_IOS"),
+                Header::new(
+                    "x-referer",
+                    "https://www.bomtoon.tw/viewer/hunter_q/ep-1"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn signed_image_fetch_has_no_account_credential() {
+        let signed_url =
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k";
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = image(signed_url)
+        else {
+            panic!("expected image fetch");
+        };
+        assert!(url == signed_url, "image URL mismatch");
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, kobo_image::MAX_SOURCE_BYTES as u32);
+        assert_eq!(credential, None);
+        assert_eq!(
+            headers,
+            vec![
+                Header::new("Accept", "image/webp"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+            ]
+        );
+    }
+
 }
