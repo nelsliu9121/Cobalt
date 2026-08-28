@@ -45,7 +45,7 @@ Add these helpers after `tiny_jpeg()` and before `decode_base64()`:
 
 ```rust
 fn tiny_lossy_webp() -> Vec<u8> {
-    decode_base64("UklGRiIAAABXRUJQVlA4IC4AAAAwAQCdASoBAAEAAUAmJaQAA3AA/vuUAAA=")
+    decode_base64("UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAUAmJaQAA3AA/vuUAAA=")
 }
 
 fn transparent_lossless_webp() -> Vec<u8> {
