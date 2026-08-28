@@ -39,11 +39,12 @@ The first reader includes:
 - strict manifest and signed-URL validation
 - uncredentialed signed WebP fetches
 - a bounded shared image ceiling with small source-size headroom
-- width scaling and fixed-height grayscale slicing
-- standard page turns, page position, and Back behavior
+- width scaling and fixed-height grayscale slicing against the full panel
+- standard page-turn gestures with center-tap reader chrome
+- fixed-geometry overlay header, page position, and Back behavior
 - one manifest refresh when a signed image URL is rejected
 - reader-specific loading, unsupported-content, decode, and network errors
-- parser, policy, image, state, and Clara BW layout tests
+- parser, policy, image, state, protocol, and Clara BW layout tests
 - browser and runtime simulator evidence using an authenticated-free episode
 
 ## Non-goals
@@ -159,9 +160,9 @@ The limit remains shared by `size()`, `decode()`, `Picture::from_grey`, and resi
 
 `kobo-image` adds a width-scaling operation that preserves aspect ratio and returns a grayscale `Picture`. It validates the target dimensions against the same pixel ceiling before allocation. Existing contain, contain-enlarging, and cover behavior does not change.
 
-The reader scales one decoded source image to the reader picture width. It then copies consecutive row ranges into fixed-height grayscale slices sized for the current display metrics and reader chrome. The implementation reuses the UI layout's physical measurements rather than introducing a Clara-specific pixel constant.
+The reader scales one decoded source image to the full reader panel width. It then copies consecutive row ranges into fixed-height grayscale slices sized from the current display metrics. The picture geometry is independent of reader-chrome visibility.
 
-Every non-final slice has the full reader picture height. The final slice is white-padded below the remaining source rows so content stays top-aligned and the screen geometry does not jump. Slices neither overlap nor omit source rows.
+Every non-final slice has the full panel height. The final slice is white-padded below the remaining source rows so content stays top-aligned and the screen geometry does not jump. Slices neither overlap nor omit source rows.
 
 The reader retains one scaled source `Picture` while moving among its slices. Crossing to another source drops that decoded picture and fetches the new source. Returning across a source boundary fetches and decodes the previous source again. No compressed or decoded episode cache is retained.
 
@@ -178,18 +179,25 @@ The BOMTOON state gains a reader view and explicit pending states for manifest, 
 - one scaled source picture
 - one uploaded slice handle
 - whether the current image has already used its manifest-refresh retry
+- whether overlay reader chrome is visible
 
 Only the recorded task ID may mutate this state. Pending actions do not turn pages or start a second reader request. Stale outcomes after Back, retry, or a newer task are ignored.
 
-The reader screen uses:
+The reader opens with chrome hidden and one unframed picture filling the panel. It uses the standard three reading zones:
 
-- the standard top bar with the selected episode title
-- one unframed picture
-- standard Previous and Next page-turn zones
-- one-based page position
-- application-owned Back to the episode list
+- left: Previous
+- center: show or hide reader chrome
+- right: Next
 
-Previous and Next first move among slices of the current source. Crossing a source boundary starts that source's image task. Previous on the first page and Next on the final page are harmless no-ops. Back releases the current runtime picture handle, drops decoded source data and signed URLs, restores the episode list page, and ignores any stale task outcome.
+Visible reader chrome consists of an opaque header over the unchanged picture with application-owned Back and the selected episode title, plus an opaque footer with the one-based page position. Hidden chrome draws neither band. Showing or hiding chrome does not change the picture rectangle, scale, slice height, total page count, or current source row.
+
+Previous and Next first move among slices of the current source. Crossing a source boundary starts that source's image task. A successful page turn hides reader chrome. Previous on the first page and Next on the final page are harmless no-ops and leave chrome unchanged. A center tap explicitly dismisses visible chrome. Back releases the current runtime picture handle, drops decoded source data and signed URLs, restores the episode list page, and ignores any stale task outcome.
+
+The reusable UI contract adds a screen-level `ReadingSurface` containing a picture reference and one of two chrome modes: hidden or overlay. This is not a flowing `Node::Picture`: the layout places it at `(0, 0)` with the complete display width and height, so normal screen margins and physical-height caps cannot create gutters or shrink the comic. The uploaded slice dimensions must exactly equal that rectangle.
+
+The screen continues to carry standard top-bar, page-position, and page-turn metadata. In hidden mode, layout draws only the reading surface and turn zones. In overlay mode, layout first computes that identical surface and zones, then draws the opaque header and footer over them. Overlay hit targets take precedence over reading zones. Existing non-reader screens, flowing pictures, and layout-reserving top bars and page positions do not change.
+
+`kobo-ui` owns `ReadingSurface`, chrome layout, hit testing, rendering, and validation. `kobo-protocol` preserves the surface and chrome mode across the application/runtime boundary and rejects unknown mode values. `kobo-sdk::ScreenBuilder` exposes a semantic reading-surface method without making BOMTOON construct wire or layout types directly.
 
 The app uploads a new slice under a fresh handle before changing the screen. After the upload succeeds, it queues the new reader screen and then releases the prior handle, so the displayed screen never references a dropped picture. A failed upload is an episode-specific rendering error. Application exit still benefits from the runtime's existing release-all behavior.
 
@@ -206,6 +214,8 @@ Manifest `NoCredential` returns to the signed-out screen. Manifest `Unauthorized
 Decoded dimensions must equal manifest dimensions. A mismatch invalidates that source and prevents page-count drift. Oversized compressed bodies, dimensions above 7,000,000 pixels, unknown formats, and malformed WebP data retain their existing `kobo-image` distinctions but are presented as an episode image failure.
 
 Logout and account clearing release any current reader handle and remove manifest, source, slice, and selection state along with the existing library, recent, and episode data.
+
+Loading and error screens use normal layout-reserving chrome rather than overlay reader chrome.
 
 ## Tests
 
@@ -265,6 +275,11 @@ BOMTOON state tests cover:
 - page turns within one source and across source boundaries
 - Previous and Next boundaries
 - stable total page count
+- reader opens with chrome hidden
+- center tap shows and hides the overlay header and footer
+- a successful page turn hides visible chrome
+- boundary no-ops preserve chrome visibility
+- chrome toggles preserve picture geometry, slice identity, and page count
 - one manifest refresh and same-order retry after CDN `Unauthorized`
 - refreshed-manifest shape and path mismatch rejection
 - no account-state change for CDN failure
@@ -273,7 +288,7 @@ BOMTOON state tests cover:
 - stale task rejection
 - picture handle replacement, Back cleanup, logout cleanup, and exit behavior
 
-Layout checks use `CLARA_BW_METRICS` to prove the top bar, picture, page position, and page-turn zones remain within the panel. The picture is unframed and its final padded slice remains top-aligned.
+Layout checks use `CLARA_BW_METRICS` to prove the picture and page-turn zones fill the same panel rectangle in both chrome modes. They prove that hidden mode draws no header or footer, overlay mode keeps the header, Back target, footer, and page position within the panel, overlay hit targets win over reading zones, and the final padded slice remains top-aligned.
 
 ## Verification
 
@@ -289,12 +304,14 @@ cargo check -p kobo-bomtoon --target armv7-unknown-linux-musleabihf
 Exercise the changed surface in the browser simulator with the authenticated-free episode:
 
 - open the title and episode list
-- open the free episode
-- turn within one source image
+- open the free episode and confirm it starts with full-screen artwork
+- center-tap to show the header and footer without resizing the artwork
+- center-tap again to dismiss them
+- show chrome, turn within one source image, and confirm the turn hides chrome
 - cross a source-image boundary
 - go backward across that boundary
 - reach a later page after the original signed URLs have expired, proving refresh and retry
-- return to the episode list
+- show chrome and return to the episode list through Back
 
 Repeat the reader path in the runtime simulator. Record that no purchase, physical Kobo, or captured credential value was used.
 
@@ -315,6 +332,9 @@ Expected implementation files:
 - `apps/bomtoon/src/main.rs`
 - `apps/bomtoon/src/model.rs`
 - `apps/bomtoon/src/parse.rs`
+- `crates/kobo-protocol/src/lib.rs`
+- `crates/kobo-sdk/src/lib.rs`
+- `crates/kobo-ui/src/lib.rs`
 - `apps/catalog.json`
 - `crates/kobo-image/src/lib.rs`
 - `crates/kobo-net/src/lib.rs`
