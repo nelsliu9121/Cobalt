@@ -25,10 +25,10 @@ pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The most pixels a picture may decode to, whatever its header claims.
 ///
-/// Four times the panel, so a source larger than the screen is still allowed
-/// (downscaling a big photograph is exactly what this is for) while a header
-/// claiming forty thousand square is refused before a buffer is allocated.
-pub const MAX_PIXELS: u64 = 4 * 1072 * 1448;
+/// BOMTOON episodes have been observed at up to 6,553,600 pixels. The
+/// 7,000,000-pixel boundary admits those tall sources with measured headroom
+/// while still refusing hostile dimensions before a buffer is allocated.
+pub const MAX_PIXELS: u64 = 7_000_000;
 
 /// How far [`Picture::fit_enlarging`] will blow a small picture up.
 ///
@@ -184,6 +184,27 @@ impl Picture {
     #[must_use]
     pub fn into_grey(self) -> Vec<u8> {
         self.grey
+    }
+
+    /// Scales the picture to exactly `target_width`, keeping its aspect ratio.
+    ///
+    /// Unlike [`Picture::fit`], this operation deliberately enlarges a small
+    /// picture when asked. The target dimensions are validated before the
+    /// resize allocates its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImageError::EmptyBox`] for a zero source dimension or target
+    /// width, and [`ImageError::TooManyPixels`] for an oversized result.
+    pub fn scale_to_width(&self, target_width: u32) -> Result<Self, ImageError> {
+        let (width, height) = width_scaled_size((self.width, self.height), target_width)?;
+        if width == self.width && height == self.height {
+            return Ok(self.clone());
+        }
+        let source = image::GrayImage::from_raw(self.width, self.height, self.grey.clone())
+            .ok_or_else(|| ImageError::Undecodable("the picture is not its own size".to_owned()))?;
+        let scaled = image::imageops::resize(&source, width, height, FilterType::Lanczos3);
+        Self::from_grey(width, height, scaled.into_raw())
     }
 
     /// The largest size that fits inside `width` by `height` without changing
@@ -484,6 +505,32 @@ pub fn fitted_size(source: (u32, u32), width: u32, height: u32) -> (u32, u32) {
     }
 }
 
+/// The exact-width size of a source image, preserving its aspect ratio.
+///
+/// The height uses the same integer rounding as [`Picture::scale_to_width`],
+/// so manifest planning and decoded images cannot disagree.
+///
+/// # Errors
+///
+/// Returns [`ImageError::EmptyBox`] for a zero source dimension or target
+/// width, and [`ImageError::TooManyPixels`] when the result exceeds
+/// [`MAX_PIXELS`].
+pub fn width_scaled_size(
+    source: (u32, u32),
+    target_width: u32,
+) -> Result<(u32, u32), ImageError> {
+    if source.0 == 0 || source.1 == 0 || target_width == 0 {
+        return Err(ImageError::EmptyBox);
+    }
+    let target_height = u32::try_from(
+        (u64::from(target_width) * u64::from(source.1)) / u64::from(source.0),
+    )
+    .unwrap_or(u32::MAX)
+    .max(1);
+    checked_pixels(target_width, target_height)?;
+    Ok((target_width, target_height))
+}
+
 /// Reads a picture that arrived over the network.
 ///
 /// # Errors
@@ -546,8 +593,8 @@ pub fn decode(bytes: &[u8]) -> Result<Picture, ImageError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, fitted_size, size, FitMode, ImageError, Picture, MAX_ENLARGEMENT, MAX_PIXELS,
-        PANEL_GREYS,
+        decode, fitted_size, size, width_scaled_size, FitMode, ImageError, Picture,
+        MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
     };
     use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
     use std::io::Cursor;
@@ -710,6 +757,45 @@ mod tests {
         let error = Picture::from_grey(100_000, 100_000, Vec::new()).expect_err("refused");
         assert!(matches!(error, ImageError::TooManyPixels { .. }));
         assert!(u64::from(100_000_u32) * u64::from(100_000_u32) > MAX_PIXELS);
+    }
+
+    #[test]
+    fn shared_pixel_limit_accepts_exactly_seven_million() {
+        assert!(Picture::from_grey(2_000, 3_500, vec![0; 7_000_000]).is_ok());
+        assert_eq!(
+            Picture::from_grey(1, 7_000_001, vec![0; 7_000_001]),
+            Err(ImageError::TooManyPixels { pixels: 7_000_001 })
+        );
+    }
+
+    #[test]
+    fn exact_width_size_and_resize_share_rounding() {
+        assert_eq!(width_scaled_size((4, 8), 2), Ok((2, 4)));
+        let source = Picture::from_grey(4, 8, (0..32).collect()).expect("source");
+        let scaled = source.scale_to_width(2).expect("scale");
+        assert_eq!((scaled.width(), scaled.height()), (2, 4));
+    }
+
+    #[test]
+    fn width_scaling_is_explicitly_allowed_to_enlarge() {
+        let source = Picture::from_grey(1, 1, vec![127]).expect("source");
+        let scaled = source.scale_to_width(3).expect("scale");
+        assert_eq!((scaled.width(), scaled.height()), (3, 3));
+    }
+
+    #[test]
+    fn width_scaling_rejects_target_allocation_before_resize() {
+        assert!(matches!(
+            width_scaled_size((1, 7_000_000), 2),
+            Err(ImageError::TooManyPixels { .. })
+        ));
+    }
+
+    #[test]
+    fn width_scaling_rejects_empty_dimensions() {
+        assert_eq!(width_scaled_size((0, 1), 1), Err(ImageError::EmptyBox));
+        assert_eq!(width_scaled_size((1, 0), 1), Err(ImageError::EmptyBox));
+        assert_eq!(width_scaled_size((1, 1), 0), Err(ImageError::EmptyBox));
     }
 
     #[test]
