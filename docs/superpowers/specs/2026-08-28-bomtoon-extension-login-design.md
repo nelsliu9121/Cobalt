@@ -52,8 +52,8 @@ A later CLI release may replace the materialized files atomically. Chrome may re
 
 `kobo bomtoon login --sim` and `kobo bomtoon login --device <IP>`:
 
-1. Acquire a host-local lock so only one BOMTOON login handoff can run.
-2. Bind an HTTP listener to `127.0.0.1` on an operating-system-selected port.
+1. Acquire the host-local lock by exclusively binding `127.0.0.1:53941`; the lock socket never accepts or reads data.
+2. Bind the HTTP rendezvous listener to `127.0.0.1` on an operating-system-selected port.
 3. Generate a 32-byte nonce with the operating system CSPRNG.
 4. Open the BOMTOON login page in normal Chrome using macOS `open`.
 5. Put only the protocol version, loopback port, and base64url nonce in the URL fragment.
@@ -149,7 +149,7 @@ The CLI does not close normal Chrome or remove its profile. It owns only the lis
 
 ## Security Requirements
 
-- Bind only IPv4 loopback. Do not listen on LAN, wildcard, IPv6 wildcard, or a Unix socket exposed outside the user account.
+- Bind the rendezvous only to IPv4 loopback on an operating-system-selected port. Bind the host lock only to `127.0.0.1:53941`; never accept or read lock-port connections. Do not listen on LAN, wildcard, or IPv6 wildcard addresses.
 - Generate the nonce from OS entropy and compare it without logging it.
 - Limit the listener body to 16 KiB and the cookie array to 16 exact-shape entries.
 - Reject unknown fields, duplicate fields, and values outside their field-specific bounds.

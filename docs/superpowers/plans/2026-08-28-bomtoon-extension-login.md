@@ -15,6 +15,7 @@
 - Add `kobo bomtoon extension install` for one-time unpacked-extension setup.
 - Materialize the extension under `~/Library/Application Support/Cobalt/bomtoon-login-extension` with directory mode `0700`.
 - Bind the rendezvous only to `127.0.0.1` on an operating-system-selected port.
+- Bind the host lock exclusively to `127.0.0.1:53941`; never accept or read data from that socket.
 - Generate a 32-byte nonce from `/dev/urandom`; encode it as 43 unpadded base64url characters.
 - Put only protocol version, loopback port, and nonce in `#cobalt-login=v1.<port>.<nonce>`.
 - Refuse at most 32 invalid requests and cap each connection read at two seconds within the original login deadline.
@@ -486,7 +487,7 @@ rtk git commit -m "feat(cli): install BOMTOON extension"
 **Interfaces:**
 
 - Consumes: `kobo_json::parse` and the exact HTTP/JSON limits from Global Constraints.
-- Produces: `Challenge::new() -> io::Result<(Challenge, TcpListener)>`, `Challenge::fragment() -> String`, `HostLock::acquire(&Path) -> io::Result<HostLock>`, `wait_for_payload(&TcpListener, &Challenge, Instant) -> Result<PendingHandoff, HandoffError>`, `PendingHandoff::payload() -> &HandoffPayload`, and `PendingHandoff::{succeed, fail}`.
+- Produces: `Challenge::new() -> io::Result<(Challenge, TcpListener)>`, `Challenge::fragment() -> String`, `HostLock::acquire() -> io::Result<HostLock>`, `wait_for_payload(&TcpListener, &Challenge, Instant) -> Result<PendingHandoff, HandoffError>`, `PendingHandoff::payload() -> &HandoffPayload`, and `PendingHandoff::{succeed, fail}`.
 
 Use these types:
 
@@ -593,8 +594,9 @@ Add boundary tests for the 16 KiB body ceiling, 17 cookies, every string limit, 
 Use a temporary root and real loopback sockets. Prove:
 
 - the second `HostLock::acquire` fails while the first guard lives;
+- 256 repeated acquisition attempts cannot bypass the first guard;
 - dropping the first guard permits reacquisition;
-- a stale Unix socket is removed and recovered;
+- an unrelated listener already bound to `127.0.0.1:53941` makes acquisition fail closed;
 - invalid HTTP receives status 400 and a later valid request still succeeds before the original deadline;
 - `PendingHandoff::succeed` writes status 204 with no body;
 - `PendingHandoff::fail` writes status 422 with a fixed body containing no payload values;
@@ -635,9 +637,9 @@ Use only `TcpListener`, `TcpStream`, `Read`, and `Write` from the standard libra
 
 `PendingHandoff::succeed` writes `HTTP/1.1 204 No Content`, `Connection: close`, and `Content-Length: 0`. `fail` writes status 422 and one fixed ASCII body. Both consume `self`, call `shutdown(Shutdown::Both)`, and expose no payload in the response.
 
-- [ ] **Step 6: Implement the stale-safe host lock**
+- [ ] **Step 6: Implement the kernel-backed host lock**
 
-Use `std::os::unix::net::{UnixListener, UnixStream}` at `cobalt_root.join(".bomtoon-login.lock")`. If bind succeeds, retain the listener and the socket metadata device/inode in `HostLock`. If the path exists, connect once: a successful connection means another login is active; connection refusal means stale, so remove and bind once. `Drop` removes the socket path only when `MetadataExt::{dev, ino}` still match the acquired socket. The Cobalt parent directory is mode `0700`.
+Define `HOST_LOCK_PORT: u16 = 53941`. `HostLock::acquire` binds `TcpListener::bind((Ipv4Addr::LOCALHOST, HOST_LOCK_PORT))` and retains the listener without accepting or reading connections. Kernel-exclusive binding supplies atomic acquisition and crash cleanup; dropping `HostLock` closes the socket. Any `AddrInUse`, including an unrelated local process, fails closed as an active login. Add an internal `acquire_at(port)` helper so tests can select an unused loopback port without racing unrelated services; the production wrapper always passes `HOST_LOCK_PORT`.
 
 - [ ] **Step 7: Run handoff tests**
 
@@ -745,17 +747,16 @@ The production wrapper calls `Command::status`. It must not discover the Chrome 
 
 `login` must:
 
-1. Resolve the Cobalt application-support directory.
-2. Acquire `HostLock`.
-3. Create `Challenge` and loopback listener.
-4. Open the normal Chrome URL.
-5. Wait until `Instant::now() + LOGIN_TIMEOUT` for one schema-valid payload.
-6. Convert `HandoffCookie` values to `BrowserCookie` without copying unrelated fields.
-7. Run `select_session_cookie`; on failure, consume the pending handoff with 422 and return `COOKIE_SELECTION_FAILED`.
-8. Call `kobo_net::bomtoon::validate_session_cookie` through `validate_and_install`.
-9. Install through the unchanged `install_target` only on equal valid fingerprints.
-10. Send 204 on success or 422 on native validation/install failure.
-11. Return only existing fixed CLI error strings. The timeout string adds `; run kobo bomtoon extension install if the extension is not loaded`.
+1. Acquire `HostLock`.
+2. Create `Challenge` and loopback listener.
+3. Open the normal Chrome URL.
+4. Wait until `Instant::now() + LOGIN_TIMEOUT` for one schema-valid payload.
+5. Convert `HandoffCookie` values to `BrowserCookie` without copying unrelated fields.
+6. Run `select_session_cookie`; on failure, consume the pending handoff with 422 and return `COOKIE_SELECTION_FAILED`.
+7. Call `kobo_net::bomtoon::validate_session_cookie` through `validate_and_install`.
+8. Install through the unchanged `install_target` only on equal valid fingerprints.
+9. Send 204 on success or 422 on native validation/install failure.
+10. Return only existing fixed CLI error strings. The timeout string adds `; run kobo bomtoon extension install if the extension is not loaded`.
 
 Keep `validate_and_install`, `install_device`, `install_simulator`, and all transaction code unchanged except signatures forced by the new payload source.
 
