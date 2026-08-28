@@ -278,10 +278,10 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
     let authority = uri
         .authority()
         .ok_or(ParseError::InvalidValue("image URL"))?;
-    if authority.as_str().contains('@')
-        || authority.host() != "image.balcony.studio"
-        || !matches!(authority.port_u16(), None | Some(443))
-    {
+    if !matches!(
+        authority.as_str(),
+        "image.balcony.studio" | "image.balcony.studio:443"
+    ) {
         return Err(ParseError::InvalidValue("image URL"));
     }
     let path = uri.path();
@@ -384,8 +384,17 @@ mod tests {
     }
 
     #[test]
-    fn scrambled_manifest_is_explicitly_unsupported() {
-        let bytes = br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":1280,"height":5000,"imagePath":"https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k","line":4,"point":"cipher"}]}"#;
+    fn non_null_line_is_explicitly_unsupported() {
+        let bytes = br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":1280,"height":5000,"imagePath":"https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k","line":4,"point":null}]}"#;
+        assert!(matches!(
+            images(bytes),
+            Err(ParseError::UnsupportedScramble)
+        ));
+    }
+
+    #[test]
+    fn non_null_point_is_explicitly_unsupported() {
+        let bytes = br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":1280,"height":5000,"imagePath":"https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k","line":null,"point":"cipher"}]}"#;
         assert!(matches!(
             images(bytes),
             Err(ParseError::UnsupportedScramble)
@@ -427,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_url_rejects_every_origin_path_and_query_mutation() {
+    fn signed_url_rejects_origin_path_and_unknown_query_mutations() {
         for (case, url) in [
             "http://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
             "https://attacker.invalid/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
@@ -436,10 +445,7 @@ mod tests {
             "https://image.balcony.studio/other/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
             "https://image.balcony.studio/tw/ep/one.png?Policy=p&Signature=s&Key-Pair-Id=k",
             "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k#fragment",
-            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k",
-            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Policy=q&Signature=s&Key-Pair-Id=k",
             "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k&extra=x",
-            "https://image.balcony.studio/tw/ep/one.webp?Policy=&Signature=s&Key-Pair-Id=k",
         ]
         .into_iter()
         .enumerate()
@@ -452,21 +458,97 @@ mod tests {
     }
 
     #[test]
-    fn signed_query_order_is_not_semantic() {
-        let url =
-            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k&Policy=p";
-        assert!(images(&manifest(&[image(1, 1, 1, url)])).is_ok());
+    fn signed_url_rejects_malformed_present_ports() {
+        for (case, url) in [
+            "https://image.balcony.studio:/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio:not-a-port/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio:65536/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio:0443/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://IMAGE.BALCONY.STUDIO/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                images(&manifest(&[image(1, 1, 1, url)])).is_err(),
+                "case {case}"
+            );
+        }
     }
 
     #[test]
-    fn image_fields_must_exist_with_their_exact_types() {
-        for bytes in [
-            br#"{"result":"SUCCESS","data":[{}]}"#.as_slice(),
-            br#"{"result":"SUCCESS","data":[{"orderNo":"1","width":1,"height":1,"imagePath":"x","line":null,"point":null}]}"#.as_slice(),
-            br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":4294967296,"height":1,"imagePath":"x","line":null,"point":null}]}"#.as_slice(),
-        ] {
-            assert!(images(bytes).is_err());
+    fn signed_url_accepts_implicit_and_explicit_default_ports() {
+        for (case, url) in [
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio:443/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                images(&manifest(&[image(1, 1, 1, url)])).is_ok(),
+                "case {case}"
+            );
         }
+    }
+
+    #[test]
+    fn signed_query_order_and_equals_in_values_are_supported() {
+        for (case, url) in [
+            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k&Policy=p",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s==&Key-Pair-Id=k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                images(&manifest(&[image(1, 1, 1, url)])).is_ok(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_query_requires_each_key_once_with_a_value() {
+        for (case, url) in [
+            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Policy=q&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Signature=t&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k&Key-Pair-Id=l",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&&Signature=s&Key-Pair-Id=k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                matches!(
+                    images(&manifest(&[image(1, 1, 1, url)])),
+                    Err(ParseError::InvalidValue("image URL"))
+                ),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_fields_preserve_error_categories() {
+        assert!(matches!(
+            images(br#"{"result":"SUCCESS","data":[{}]}"#),
+            Err(ParseError::Missing("image.orderNo"))
+        ));
+        assert!(matches!(
+            images(br#"{"result":"SUCCESS","data":[{"orderNo":"1","width":1,"height":1,"imagePath":"x","line":null,"point":null}]}"#),
+            Err(ParseError::WrongType("image.orderNo"))
+        ));
+        assert!(matches!(
+            images(br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":4294967296,"height":1,"imagePath":"x","line":null,"point":null}]}"#),
+            Err(ParseError::InvalidValue("image.width"))
+        ));
     }
 
     #[test]
