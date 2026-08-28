@@ -130,9 +130,8 @@ struct Bomtoon {
 impl Bomtoon {
     fn show(&self, context: &mut Context) {
         let owns_back = self.account == AccountState::Active
-            && self.pending.is_none()
             && match self.view {
-                View::Episodes => self.problem.is_none(),
+                View::Episodes => self.pending.is_none() && self.problem.is_none(),
                 View::Reader => true,
                 View::Status | View::Library => false,
             };
@@ -755,6 +754,10 @@ impl Bomtoon {
     }
 
     fn leave_reader(&mut self, context: &mut Context) {
+        if let Some(task) = self.task.take() {
+            context.cancel(task);
+        }
+        self.pending = None;
         let old = self
             .reader
             .take()
@@ -937,8 +940,8 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
-        let can_go_back = self.account == AccountState::Active && self.pending.is_none();
-        if action == ActionId::BACK && can_go_back && self.view == View::Reader {
+        let can_leave_reader = self.account == AccountState::Active && self.view == View::Reader;
+        if action == ActionId::BACK && can_leave_reader {
             self.leave_reader(context);
             return;
         }
@@ -1306,7 +1309,7 @@ mod tests {
         (runner, commands)
     }
 
-    fn reader_waiting_for_manifest() -> (AppRunner<Bomtoon>, TaskId) {
+    fn reader_waiting_for_manifest() -> (AppRunner<Bomtoon>, TaskId, Vec<Command>) {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
@@ -1316,11 +1319,11 @@ mod tests {
         );
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
-        (runner, manifest_task)
+        (runner, manifest_task, commands)
     }
 
     fn reader_waiting_for_first_image() -> (AppRunner<Bomtoon>, TaskId) {
-        let (mut runner, manifest_task) = reader_waiting_for_manifest();
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest();
         let commands = runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest("/tw/ep/one.webp", "p1")),
@@ -1473,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_and_free_episode_rows_are_actions() {
+    fn only_owned_and_sample_episode_rows_are_actions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
@@ -1491,8 +1494,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(actions.contains(&action_id("episode-0")));
-        assert!(actions.contains(&action_id("episode-1")));
-        assert!(!actions.contains(&action_id("episode-2")));
+        assert!(!actions.contains(&action_id("episode-1")));
+        assert!(actions.contains(&action_id("episode-2")));
         assert!(!actions.contains(&action_id("episode-3")));
     }
 
@@ -1718,7 +1721,7 @@ mod tests {
             (TaskError::NoCredential, AccountState::SignedOut),
             (TaskError::Unauthorized, AccountState::Expired),
         ] {
-            let (mut runner, manifest_task) = reader_waiting_for_manifest();
+            let (mut runner, manifest_task, _) = reader_waiting_for_manifest();
             runner.task_outcome(manifest_task, TaskOutcome::Failed(error));
             assert_eq!(runner.app().account, expected);
         }
@@ -1734,6 +1737,22 @@ mod tests {
         );
         assert!(commands.is_empty());
         assert_eq!(runner.app().pending, before);
+    }
+
+    #[test]
+    fn back_during_reader_loading_cancels_task_and_ignores_late_outcome() {
+        let (mut runner, manifest_task, commands) = reader_waiting_for_manifest();
+        assert!(last_screen(&commands).owns_back);
+
+        let commands = runner.action(ActionId::BACK);
+        assert!(commands.contains(&Command::Cancel(manifest_task)));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(runner.app().pending, None);
+        assert_eq!(runner.app().task, None);
+        assert!(runner.app().reader_selection.is_none());
+
+        let commands = runner.task_outcome(manifest_task, TaskOutcome::Cancelled);
+        assert!(commands.is_empty());
     }
 
     #[test]

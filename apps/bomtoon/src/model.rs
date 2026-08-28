@@ -68,7 +68,7 @@ impl PurchaseState {
 
     #[must_use]
     pub const fn is_readable(&self) -> bool {
-        matches!(self, Self::Owned | Self::Free)
+        matches!(self, Self::Owned | Self::Sample)
     }
 
     pub fn label(&self) -> &str {
@@ -115,10 +115,10 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_and_free_episodes_are_readable() {
+    fn only_owned_and_sample_episodes_are_readable() {
         assert!(PurchaseState::Owned.is_readable());
-        assert!(PurchaseState::Free.is_readable());
-        assert!(!PurchaseState::Sample.is_readable());
+        assert!(PurchaseState::Sample.is_readable());
+        assert!(!PurchaseState::Free.is_readable());
         assert!(!PurchaseState::NotOwned.is_readable());
         assert!(!PurchaseState::Other("RENTAL".to_owned()).is_readable());
     }
