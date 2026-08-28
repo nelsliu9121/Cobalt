@@ -1,6 +1,7 @@
 .DS_Store
 /.kobo/
 /target/
+/.worktrees/
 /.pass
 
 # Credentials. `kobo secret` reads keys off this machine and writes them
