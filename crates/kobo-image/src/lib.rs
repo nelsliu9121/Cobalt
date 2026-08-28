@@ -566,6 +566,16 @@ mod tests {
         decode_base64(BASE64)
     }
 
+    fn tiny_lossy_webp() -> Vec<u8> {
+        decode_base64("UklGRiIAAABXRUJQVlA4IC4AAAAwAQCdASoBAAEAAUAmJaQAA3AA/vuUAAA=")
+    }
+
+    fn transparent_lossless_webp() -> Vec<u8> {
+        decode_base64(
+            "UklGRkIAAABXRUJQVlA4TDYAAAAvAQAAEM1VICICEeGBBAAAAAAAnL8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAo=",
+        )
+    }
+
     fn decode_base64(text: &str) -> Vec<u8> {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = Vec::new();
@@ -623,6 +633,31 @@ mod tests {
         assert_eq!(picture.width(), 4);
         assert_eq!(picture.height(), 4);
         assert_eq!(picture.grey().len(), 16);
+    }
+
+    #[test]
+    fn a_real_lossy_webp_decodes_to_grey_bytes() {
+        let picture = decode(&tiny_lossy_webp()).expect("decode the WebP");
+        assert_eq!((picture.width(), picture.height()), (1, 1));
+        assert_eq!(picture.grey(), &[234]);
+    }
+
+    #[test]
+    fn transparent_webp_pixels_are_composited_onto_paper() {
+        let picture = decode(&transparent_lossless_webp()).expect("decode the WebP");
+        assert_eq!((picture.width(), picture.height()), (2, 1));
+        assert_eq!(picture.grey(), &[255, 0]);
+    }
+
+    #[test]
+    fn webp_header_size_matches_decode() {
+        for webp in [tiny_lossy_webp(), transparent_lossless_webp()] {
+            let picture = decode(&webp).expect("decode the WebP");
+            assert_eq!(
+                size(&webp).expect("read the WebP header"),
+                (picture.width(), picture.height())
+            );
+        }
     }
 
     #[test]
