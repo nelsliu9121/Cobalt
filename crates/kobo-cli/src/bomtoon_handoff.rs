@@ -1,9 +1,7 @@
 use kobo_json::Value;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{
-    Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
-};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -101,8 +99,7 @@ impl HostLock {
 }
 
 fn nonce_from(source: &mut impl Read) -> io::Result<String> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut entropy = [0_u8; 32];
     source.read_exact(&mut entropy)?;
     let mut encoded = String::with_capacity(43);
@@ -246,9 +243,7 @@ fn read_with_deadline(
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(())?;
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| ())?;
+        stream.set_read_timeout(Some(remaining)).map_err(|_| ())?;
         match stream.read(buffer) {
             Ok(read) => return Ok(read),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -271,6 +266,7 @@ fn has_immediate_trailing_bytes(stream: &TcpStream) -> Result<bool, ()> {
     }
 }
 
+#[cfg(test)]
 fn parse_request(request: &[u8], port: u16, nonce: &str) -> Result<HandoffPayload, ()> {
     let header_end = find_header_end(request).ok_or(())?;
     if header_end > MAX_HEADER_BYTES {
@@ -459,7 +455,9 @@ impl<'a> StrictObject<'a> {
                 .iter()
                 .position(|allowed_name| name == allowed_name)
                 .ok_or(())?;
-            let bit = 1_u8.checked_shl(u32::try_from(index).map_err(|_| ())?).ok_or(())?;
+            let bit = 1_u8
+                .checked_shl(u32::try_from(index).map_err(|_| ())?)
+                .ok_or(())?;
             if seen & bit != 0 {
                 return Err(());
             }
@@ -503,8 +501,7 @@ mod tests {
 
     const PORT: u16 = 43_125;
     const NONCE: &str = "nonce";
-    const FINGERPRINT: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FINGERPRINT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn request_bytes(
         method: &str,
@@ -548,9 +545,7 @@ mod tests {
     }
 
     fn body_with_cookie(cookie: &str) -> String {
-        format!(
-            r#"{{"version":1,"fingerprint":"{FINGERPRINT}","cookies":[{cookie}]}}"#
-        )
+        format!(r#"{{"version":1,"fingerprint":"{FINGERPRINT}","cookies":[{cookie}]}}"#)
     }
 
     fn request_with_header_size(body: &str, header_size: usize) -> Vec<u8> {
@@ -614,7 +609,10 @@ mod tests {
     #[test]
     fn nonce_is_unpadded_base64url_with_full_entropy_length() {
         let source: Vec<u8> = (0_u8..32).collect();
-        assert_eq!(nonce_from(&mut Cursor::new(source)).expect("nonce").len(), 43);
+        assert_eq!(
+            nonce_from(&mut Cursor::new(source)).expect("nonce").len(),
+            43
+        );
         assert!(nonce_from(&mut Cursor::new(vec![0xff; 32]))
             .expect("nonce")
             .bytes()
@@ -625,7 +623,9 @@ mod tests {
     fn challenge_binds_ipv4_loopback_and_formats_exact_fragment() {
         let (challenge, listener) = Challenge::new().expect("challenge");
         let address = listener.local_addr().expect("listener address");
-        assert!(matches!(address, std::net::SocketAddr::V4(address) if address.ip() == &Ipv4Addr::LOCALHOST));
+        assert!(
+            matches!(address, std::net::SocketAddr::V4(address) if address.ip() == &Ipv4Addr::LOCALHOST)
+        );
         assert_eq!(
             challenge.fragment(),
             format!("#cobalt-login=v1.{}.{}", address.port(), challenge.nonce)
@@ -644,8 +644,7 @@ mod tests {
         assert!(parse_request(&valid, PORT, NONCE).is_ok());
         let lowercase_host = replace_once(&valid, "Host:", "host:");
         let lowercase_type = replace_once(&lowercase_host, "Content-Type:", "content-type:");
-        let lowercase_length =
-            replace_once(&lowercase_type, "Content-Length:", "content-length:");
+        let lowercase_length = replace_once(&lowercase_type, "Content-Length:", "content-length:");
         assert!(parse_request(&lowercase_length, PORT, NONCE).is_ok());
         for rejected in [
             replace_once(&valid, "POST", "GET"),
@@ -671,12 +670,7 @@ mod tests {
         maximum.push_str(&" ".repeat(MAX_BODY_BYTES - maximum.len()));
         assert_eq!(maximum.len(), MAX_BODY_BYTES);
         assert!(parse_request(&request_with_body(&maximum), PORT, NONCE).is_ok());
-        assert!(parse_request(
-            &request_with_body(&format!("{maximum} ")),
-            PORT,
-            NONCE
-        )
-        .is_err());
+        assert!(parse_request(&request_with_body(&format!("{maximum} ")), PORT, NONCE).is_err());
 
         let cookies = (0..MAX_COOKIES)
             .map(|index| cookie(&format!("cookie-{index}"), "v", ".bomtoon.tw", "/"))
@@ -736,23 +730,17 @@ mod tests {
         let short = valid_body().replacen(FINGERPRINT, &"a".repeat(63), 1);
         assert!(parse_request(&request_with_body(&short), PORT, NONCE).is_err());
         let missing = cookie("n", "v", "d", "/").replace("\"path\":\"/\",", "");
-        assert!(parse_request(
-            &request_with_body(&body_with_cookie(&missing)),
-            PORT,
-            NONCE
-        )
-        .is_err());
+        assert!(
+            parse_request(&request_with_body(&body_with_cookie(&missing)), PORT, NONCE).is_err()
+        );
         let unknown = cookie("n", "v", "d", "/").replacen(
             "\"secure\":true",
             "\"secure\":true,\"extra\":false",
             1,
         );
-        assert!(parse_request(
-            &request_with_body(&body_with_cookie(&unknown)),
-            PORT,
-            NONCE
-        )
-        .is_err());
+        assert!(
+            parse_request(&request_with_body(&body_with_cookie(&unknown)), PORT, NONCE).is_err()
+        );
         let duplicate = cookie("n", "v", "d", "/").replacen(
             "\"secure\":true",
             "\"secure\":true,\"name\":\"other\"",
@@ -862,8 +850,7 @@ mod tests {
 
     #[test]
     fn host_lock_fails_closed_when_the_port_is_prebound() {
-        let listener =
-            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("prebind lock port");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("prebind lock port");
         let port = listener.local_addr().expect("lock address").port();
         assert!(HostLock::acquire_at(port).is_err());
     }
@@ -873,7 +860,11 @@ mod tests {
         let (listener, challenge, address) = live_pair();
         let port = address.port();
         let handle = thread::spawn(move || {
-            wait_for_payload(&listener, &challenge, Instant::now() + Duration::from_secs(5))
+            wait_for_payload(
+                &listener,
+                &challenge,
+                Instant::now() + Duration::from_secs(5),
+            )
         });
 
         let mut invalid = TcpStream::connect(address).expect("invalid connection");
@@ -906,11 +897,20 @@ mod tests {
         let secret_name = "credential-name";
         let secret_value = "credential-value";
         let secret_domain = "private.example";
-        let body = body_with_cookie(&cookie(secret_name, secret_value, secret_domain, "/private"));
+        let body = body_with_cookie(&cookie(
+            secret_name,
+            secret_value,
+            secret_domain,
+            "/private",
+        ));
         let (listener, challenge, address) = live_pair();
         let port = address.port();
         let handle = thread::spawn(move || {
-            wait_for_payload(&listener, &challenge, Instant::now() + Duration::from_secs(5))
+            wait_for_payload(
+                &listener,
+                &challenge,
+                Instant::now() + Duration::from_secs(5),
+            )
         });
         let mut stream = TcpStream::connect(address).expect("connection");
         stream
@@ -921,7 +921,13 @@ mod tests {
         pending.fail().expect("reject handoff");
         let response = read_response(stream);
         assert!(response.starts_with(b"HTTP/1.1 422 Unprocessable Content\r\n"));
-        for secret in [FINGERPRINT, secret_name, secret_value, secret_domain, "/private"] {
+        for secret in [
+            FINGERPRINT,
+            secret_name,
+            secret_value,
+            secret_domain,
+            "/private",
+        ] {
             assert!(!String::from_utf8_lossy(&response).contains(secret));
         }
     }
@@ -931,7 +937,11 @@ mod tests {
         let (listener, challenge, address) = live_pair();
         let port = address.port();
         let handle = thread::spawn(move || {
-            wait_for_payload(&listener, &challenge, Instant::now() + Duration::from_secs(5))
+            wait_for_payload(
+                &listener,
+                &challenge,
+                Instant::now() + Duration::from_secs(5),
+            )
         });
         let mut slow = TcpStream::connect(address).expect("slow connection");
         slow.write_all(b"POST /bomtoon-login/nonce HTTP/1.1\r\n")
@@ -942,8 +952,7 @@ mod tests {
         let response = read_response(slow);
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
         assert!(
-            started.elapsed()
-                >= CONNECTION_READ_TIMEOUT.saturating_sub(Duration::from_millis(500))
+            started.elapsed() >= CONNECTION_READ_TIMEOUT.saturating_sub(Duration::from_millis(500))
         );
         assert!(started.elapsed() < Duration::from_millis(2_800));
 
@@ -960,7 +969,11 @@ mod tests {
         let (listener, challenge, address) = live_pair();
         let port = address.port();
         let handle = thread::spawn(move || {
-            wait_for_payload(&listener, &challenge, Instant::now() + Duration::from_secs(10))
+            wait_for_payload(
+                &listener,
+                &challenge,
+                Instant::now() + Duration::from_secs(10),
+            )
         });
         for _ in 0..MAX_REJECTED_REQUESTS {
             let mut stream = TcpStream::connect(address).expect("rejected connection");
@@ -969,7 +982,10 @@ mod tests {
                 .expect("send rejected request");
             assert!(read_response(stream).starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
         }
-        assert!(matches!(handle.join().expect("wait thread"), Err(HandoffError::Listener)));
+        assert!(matches!(
+            handle.join().expect("wait thread"),
+            Err(HandoffError::Listener)
+        ));
     }
 
     #[test]

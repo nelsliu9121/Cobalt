@@ -1,4 +1,3 @@
-use kobo_json::Value;
 use kobo_sim::SimulatorAuthPaths;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -51,12 +50,8 @@ const EXTENSION_FILES: &[(&str, &[u8])] = &[
         "popup.html",
         include_bytes!("../bomtoon-extension/popup.html"),
     ),
-    (
-        "popup.js",
-        include_bytes!("../bomtoon-extension/popup.js"),
-    ),
+    ("popup.js", include_bytes!("../bomtoon-extension/popup.js")),
 ];
-
 
 const DEVICE_INSTALL_PROGRAM: &str = r#"set -eu
 umask 077
@@ -197,7 +192,6 @@ trap - EXIT HUP INT TERM
 exit 0
 "#;
 
-
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,11 +331,7 @@ fn login_with<Lock, Listener, Handoff>(
     acquire_lock: impl FnOnce() -> io::Result<Lock>,
     create_challenge: impl FnOnce() -> io::Result<(Challenge, Listener)>,
     open_browser: impl FnOnce(&Challenge) -> Result<(), String>,
-    receive_payload: impl FnOnce(
-        &Listener,
-        &Challenge,
-        Instant,
-    ) -> Result<Handoff, HandoffError>,
+    receive_payload: impl FnOnce(&Listener, &Challenge, Instant) -> Result<Handoff, HandoffError>,
     validate: impl FnOnce(&str) -> Result<String, String>,
     install: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String>
@@ -349,34 +339,26 @@ where
     Handoff: LoginHandoff,
 {
     let _host_lock = acquire_lock().map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let (challenge, listener) =
-        create_challenge().map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
+    let (challenge, listener) = create_challenge().map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
     open_browser(&challenge).map_err(|_| BROWSER_LAUNCH_FAILED.to_owned())?;
     let deadline = Instant::now()
         .checked_add(LOGIN_TIMEOUT)
         .ok_or_else(|| BROWSER_LAUNCH_FAILED.to_owned())?;
-    let handoff = receive_payload(&listener, &challenge, deadline).map_err(|error| match error {
-        HandoffError::Timeout => format!(
+    let handoff =
+        receive_payload(&listener, &challenge, deadline).map_err(|error| match error {
+            HandoffError::Timeout => format!(
             "{LOGIN_TIMED_OUT}; run kobo bomtoon extension install if the extension is not loaded"
         ),
-        HandoffError::Listener => BROWSER_LAUNCH_FAILED.to_owned(),
-    })?;
+            HandoffError::Listener => BROWSER_LAUNCH_FAILED.to_owned(),
+        })?;
     drop(listener);
 
     let cookies = browser_cookies(handoff.payload());
-    let selected = match select_session_cookie(&cookies) {
-        Ok(selected) => selected,
-        Err(()) => {
-            let _ = handoff.fail();
-            return Err(COOKIE_SELECTION_FAILED.to_owned());
-        }
+    let Ok(selected) = select_session_cookie(&cookies) else {
+        let _ = handoff.fail();
+        return Err(COOKIE_SELECTION_FAILED.to_owned());
     };
-    let result = validate_and_install(
-        &selected,
-        &handoff.payload().fingerprint,
-        validate,
-        install,
-    );
+    let result = validate_and_install(&selected, &handoff.payload().fingerprint, validate, install);
     match result {
         Ok(()) => handoff
             .succeed()
@@ -932,10 +914,7 @@ fn remove_extension_path(path: &Path) -> io::Result<()> {
     }
 }
 
-fn record_extension_cleanup(
-    result: io::Result<()>,
-    first_error: &mut Option<io::Error>,
-) -> bool {
+fn record_extension_cleanup(result: io::Result<()>, first_error: &mut Option<io::Error>) -> bool {
     match result {
         Ok(()) => true,
         Err(error) => {
@@ -1145,9 +1124,8 @@ fn install_simulator(cookie: &str) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bomtoon_handoff::{
-        Challenge, HandoffCookie, HandoffError, HandoffPayload,
-    };
+    use crate::bomtoon_handoff::{Challenge, HandoffCookie, HandoffError, HandoffPayload};
+    use kobo_json::Value;
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::os::unix::process::ExitStatusExt;
@@ -1270,10 +1248,9 @@ mod tests {
             .iter()
             .find_map(|(name, bytes)| (*name == "manifest.json").then_some(*bytes))
             .expect("embedded manifest");
-        let manifest = kobo_json::parse(
-            std::str::from_utf8(manifest_bytes).expect("manifest is valid UTF-8"),
-        )
-        .expect("manifest is valid JSON");
+        let manifest =
+            kobo_json::parse(std::str::from_utf8(manifest_bytes).expect("manifest is valid UTF-8"))
+                .expect("manifest is valid JSON");
         let permissions = manifest
             .get("permissions")
             .and_then(Value::as_array)
@@ -1383,7 +1360,6 @@ mod tests {
         assert!(transient_names.is_empty(), "{transient_names:?}");
         fs::remove_dir_all(root).expect("cleanup");
     }
-
 
     #[test]
     fn secure_nextauth_cookie_wins_without_combining_families() {
@@ -1703,10 +1679,8 @@ mod tests {
             let events = Rc::new(RefCell::new(Vec::new()));
             let responded = Rc::clone(&events);
             let validated = Rc::clone(&events);
-            let payload = handoff_payload(
-                vec![cookie(SECURE_COOKIE, "selected")],
-                fingerprint('a'),
-            );
+            let payload =
+                handoff_payload(vec![cookie(SECURE_COOKIE, "selected")], fingerprint('a'));
             assert_eq!(
                 login_with(
                     || Ok(DropSpy(Rc::new(Cell::new(0)))),
@@ -1864,7 +1838,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn selected_cookie_is_validated_alone_before_installation() {
@@ -2141,5 +2114,4 @@ mod tests {
             .join(".bomtoon-login.transaction")
             .exists());
     }
-
 }
