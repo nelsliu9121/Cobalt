@@ -789,6 +789,8 @@ version = "0.3.0"
 dependencies = [
  "http",
  "httparse",
+ "kobo-json",
+ "kobo-policy",
  "kobo-protocol",
  "miniz_oxide 0.9.1",
  "rustls",
