@@ -50,6 +50,13 @@
   async function sendHandoff() {
     await ready;
     if (!challenge || sending) return;
+    if (!Number.isFinite(challenge.expiresAt)
+      || challenge.expiresAt <= Date.now()) {
+      await clearChallenge();
+      sendButton.disabled = true;
+      show("Run kobo bomtoon login first.");
+      return;
+    }
 
     sending = true;
     sendButton.disabled = true;

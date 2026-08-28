@@ -54,12 +54,19 @@ function popupHarness(overrides = {}) {
       handlers[`${id}:${type}`] = handler;
     },
   }]));
+  const clock = { now: overrides.now === undefined ? Date.now() : overrides.now };
+  class HarnessDate extends Date {
+    static now() {
+      return clock.now;
+    }
+  }
   const removals = [];
   const cookieReads = [];
+  const tabQueries = [];
   const tabMessages = [];
   const fetches = [];
   const challenge = overrides.challenge === undefined
-    ? { version: 1, port: 43125, nonce, expiresAt: Date.now() + 600000 }
+    ? { version: 1, port: 43125, nonce, expiresAt: clock.now + 600000 }
     : overrides.challenge;
   const tab = overrides.tab || { id: 7, url: "https://www.bomtoon.tw/library" };
   const chrome = {
@@ -76,6 +83,7 @@ function popupHarness(overrides = {}) {
     },
     tabs: {
       async query(query) {
+        tabQueries.push(plain(query));
         assert.deepEqual(plain(query), { active: true, currentWindow: true });
         return [tab];
       },
@@ -100,6 +108,7 @@ function popupHarness(overrides = {}) {
   const fetchImpl = overrides.fetch || (async () => ({ status: 204 }));
   let closes = 0;
   const target = scriptContext({
+    Date: HarnessDate,
     chrome,
     document: { getElementById: (id) => elements[id] },
     fetch: async (url, options) => {
@@ -116,8 +125,10 @@ function popupHarness(overrides = {}) {
     handlers,
     removals,
     cookieReads,
+    tabQueries,
     tabMessages,
     fetches,
+    advanceTo(value) { clock.now = value; },
     get closes() { return closes; },
   };
 }
@@ -404,6 +415,24 @@ test("popup uses the active tab cookie store, filters payload, and clears on 204
   });
   assert.equal(request.options.body.includes("csrf-secret"), false);
   assert.deepEqual(harness.removals, ["bomtoonChallenge"]);
+});
+
+test("popup revalidates expiry before starting credential work", async () => {
+  const harness = popupHarness({
+    now: 1000,
+    challenge: { version: 1, port: 43125, nonce, expiresAt: 2000 },
+  });
+  await tick();
+  assert.equal(harness.elements.send.disabled, false);
+  harness.advanceTo(2001);
+  await harness.handlers["send:click"]();
+  assert.deepEqual(harness.removals, ["bomtoonChallenge"]);
+  assert.equal(harness.elements.send.disabled, true);
+  assert.equal(harness.elements.status.textContent, "Run kobo bomtoon login first.");
+  assert.deepEqual(harness.tabQueries, []);
+  assert.deepEqual(harness.tabMessages, []);
+  assert.deepEqual(harness.cookieReads, []);
+  assert.deepEqual(harness.fetches, []);
 });
 
 test("popup keeps the challenge after a failed POST and allows retry", async () => {
