@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod authorize;
 mod bomtoon;
+mod bomtoon_handoff;
 mod connect;
 mod devsession;
 mod drive;
