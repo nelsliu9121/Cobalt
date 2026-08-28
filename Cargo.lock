@@ -619,6 +619,8 @@ dependencies = [
 name = "kobo-bomtoon"
 version = "0.3.0"
 dependencies = [
+ "http",
+ "kobo-image",
  "kobo-json",
  "kobo-sdk",
 ]

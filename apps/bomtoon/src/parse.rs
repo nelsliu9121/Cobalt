@@ -1,8 +1,11 @@
-use crate::model::{Comic, Episode, PurchaseState, RecentEntry};
+use crate::model::{Comic, Episode, EpisodeImage, PurchaseState, RecentEntry};
+use http::Uri;
 use kobo_json::Value;
 use std::{error::Error, fmt, str};
 
 const MAX_LIBRARY_PAGES: usize = 100;
+const MAX_IMAGES: usize = 256;
+const MAX_SIGNED_URL_BYTES: usize = 1024;
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -11,6 +14,7 @@ pub enum ParseError {
     Missing(&'static str),
     WrongType(&'static str),
     InvalidValue(&'static str),
+    UnsupportedScramble,
 }
 
 impl fmt::Display for ParseError {
@@ -21,6 +25,9 @@ impl fmt::Display for ParseError {
             Self::Missing(field) => write!(formatter, "response is missing {field}"),
             Self::WrongType(field) => write!(formatter, "response has the wrong type for {field}"),
             Self::InvalidValue(field) => write!(formatter, "response has an invalid {field}"),
+            Self::UnsupportedScramble => {
+                formatter.write_str("this episode uses unsupported scrambled images")
+            }
         }
     }
 }
@@ -30,7 +37,10 @@ impl Error for ParseError {
         match self {
             Self::Utf8(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Missing(_) | Self::WrongType(_) | Self::InvalidValue(_) => None,
+            Self::Missing(_)
+            | Self::WrongType(_)
+            | Self::InvalidValue(_)
+            | Self::UnsupportedScramble => None,
         }
     }
 }
@@ -137,6 +147,47 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
         .collect()
 }
 
+pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
+    let root = parse_json(bytes)?;
+    if string(&root, "result", "result")? != "SUCCESS" {
+        return Err(ParseError::InvalidValue("result"));
+    }
+    let values = field(&root, "data", "data")?
+        .as_array()
+        .ok_or(ParseError::WrongType("data"))?;
+    if values.is_empty() || values.len() > MAX_IMAGES {
+        return Err(ParseError::InvalidValue("image count"));
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let order = unsigned(item, "orderNo", "image.orderNo")?;
+            if order != index + 1 {
+                return Err(ParseError::InvalidValue("image ordering"));
+            }
+            let width = positive_u32(item, "width", "image.width")?;
+            let height = positive_u32(item, "height", "image.height")?;
+            let pixels = u64::from(width) * u64::from(height);
+            if pixels > kobo_image::MAX_PIXELS {
+                return Err(ParseError::InvalidValue("image dimensions"));
+            }
+            require_null(item, "line", "image.line")?;
+            require_null(item, "point", "image.point")?;
+            let url = string(item, "imagePath", "image.imagePath")?;
+            let path = signed_image_path(url)?;
+            Ok(EpisodeImage {
+                order,
+                width,
+                height,
+                path,
+                url: url.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn parse_json(bytes: &[u8]) -> Result<Value, ParseError> {
     let text = str::from_utf8(bytes).map_err(ParseError::Utf8)?;
     kobo_json::parse(text).map_err(ParseError::Json)
@@ -195,9 +246,82 @@ fn unsigned(value: &Value, key: &str, name: &'static str) -> Result<usize, Parse
     usize::try_from(number).map_err(|_| ParseError::InvalidValue(name))
 }
 
+fn positive_u32(value: &Value, key: &str, name: &'static str) -> Result<u32, ParseError> {
+    let number = field(value, key, name)?
+        .as_i64()
+        .ok_or(ParseError::WrongType(name))?;
+    let number = u32::try_from(number).map_err(|_| ParseError::InvalidValue(name))?;
+    if number == 0 {
+        return Err(ParseError::InvalidValue(name));
+    }
+    Ok(number)
+}
+
+fn require_null(value: &Value, key: &str, name: &'static str) -> Result<(), ParseError> {
+    match value.get(key) {
+        None => Err(ParseError::Missing(name)),
+        Some(Value::Null) => Ok(()),
+        Some(_) => Err(ParseError::UnsupportedScramble),
+    }
+}
+
+fn signed_image_path(url: &str) -> Result<String, ParseError> {
+    if url.len() > MAX_SIGNED_URL_BYTES || url.contains('#') {
+        return Err(ParseError::InvalidValue("image URL"));
+    }
+    let uri = url
+        .parse::<Uri>()
+        .map_err(|_| ParseError::InvalidValue("image URL"))?;
+    if uri.scheme_str() != Some("https") {
+        return Err(ParseError::InvalidValue("image URL"));
+    }
+    let authority = uri
+        .authority()
+        .ok_or(ParseError::InvalidValue("image URL"))?;
+    if authority.as_str().contains('@')
+        || authority.host() != "image.balcony.studio"
+        || !matches!(authority.port_u16(), None | Some(443))
+    {
+        return Err(ParseError::InvalidValue("image URL"));
+    }
+    let path = uri.path();
+    if !path.starts_with("/tw/ep/") || !path.ends_with(".webp") {
+        return Err(ParseError::InvalidValue("image URL"));
+    }
+
+    let query = uri
+        .query()
+        .ok_or(ParseError::InvalidValue("image URL"))?;
+    let mut policy = None;
+    let mut signature = None;
+    let mut key_pair_id = None;
+    for pair in query.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or(ParseError::InvalidValue("image URL"))?;
+        if value.is_empty() {
+            return Err(ParseError::InvalidValue("image URL"));
+        }
+        let slot = match key {
+            "Policy" => &mut policy,
+            "Signature" => &mut signature,
+            "Key-Pair-Id" => &mut key_pair_id,
+            _ => return Err(ParseError::InvalidValue("image URL")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(ParseError::InvalidValue("image URL"));
+        }
+    }
+    if policy.is_none() || signature.is_none() || key_pair_id.is_none() {
+        return Err(ParseError::InvalidValue("image URL"));
+    }
+
+    Ok(path.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{episodes, library, recent, ParseError};
+    use super::{episodes, images, library, recent, ParseError};
     use crate::model::PurchaseState;
 
     const CONTENT: &[u8] = br#"{
@@ -210,6 +334,140 @@ mod tests {
         ]
       }
     }"#;
+
+    fn signed(path: &str, policy: &str, signature: &str, key: &str) -> String {
+        format!(
+            "https://image.balcony.studio{path}?Policy={policy}&Signature={signature}&Key-Pair-Id={key}"
+        )
+    }
+
+    fn manifest(entries: &[String]) -> Vec<u8> {
+        format!("{{\"result\":\"SUCCESS\",\"data\":[{}]}}", entries.join(",")).into_bytes()
+    }
+
+    fn image(order: usize, width: u32, height: u32, url: &str) -> String {
+        format!(
+            "{{\"orderNo\":{order},\"width\":{width},\"height\":{height},\"imagePath\":\"{url}\",\"line\":null,\"point\":null}}"
+        )
+    }
+
+    fn signed_of_len(length: usize) -> String {
+        let prefix = "https://image.balcony.studio/tw/ep/one.webp?Policy=";
+        let suffix = "&Signature=s&Key-Pair-Id=k";
+        assert!(length >= prefix.len() + suffix.len());
+        format!(
+            "{prefix}{}{suffix}",
+            "p".repeat(length - prefix.len() - suffix.len())
+        )
+    }
+
+    #[test]
+    fn plain_manifest_requires_contiguous_order_and_exact_signed_urls() {
+        let bytes = manifest(&[
+            image(
+                1,
+                1280,
+                5000,
+                &signed("/tw/ep/one.webp", "p1", "s1", "k1"),
+            ),
+            image(
+                2,
+                1280,
+                5120,
+                &signed("/tw/ep/two.webp", "p2", "s2", "k2"),
+            ),
+        ]);
+        let parsed = images(&bytes).expect("plain manifest");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].order, 1);
+        assert_eq!(parsed[1].path, "/tw/ep/two.webp");
+    }
+
+    #[test]
+    fn scrambled_manifest_is_explicitly_unsupported() {
+        let bytes = br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":1280,"height":5000,"imagePath":"https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k","line":4,"point":"cipher"}]}"#;
+        assert!(matches!(
+            images(bytes),
+            Err(ParseError::UnsupportedScramble)
+        ));
+    }
+
+    #[test]
+    fn manifest_count_and_url_length_are_bounded() {
+        assert!(images(&manifest(&[])).is_err());
+        let too_many = (1..=257)
+            .map(|order| {
+                image(
+                    order,
+                    1,
+                    1,
+                    &signed("/tw/ep/one.webp", "p", "s", "k"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(images(&manifest(&too_many)).is_err());
+        assert!(images(&manifest(&[image(1, 1, 1, &signed_of_len(1024))])).is_ok());
+        assert!(images(&manifest(&[image(1, 1, 1, &signed_of_len(1025))])).is_err());
+    }
+
+    #[test]
+    fn manifest_dimensions_and_order_are_strict() {
+        let url = signed("/tw/ep/one.webp", "p", "s", "k");
+        assert!(images(&manifest(&[image(1, 2_000, 3_500, &url)])).is_ok());
+        assert!(images(&manifest(&[image(1, 1, 7_000_001, &url)])).is_err());
+        assert!(images(&manifest(&[image(1, 0, 1, &url)])).is_err());
+        for entries in [
+            vec![image(0, 1, 1, &url)],
+            vec![image(2, 1, 1, &url)],
+            vec![image(1, 1, 1, &url), image(1, 1, 1, &url)],
+            vec![image(1, 1, 1, &url), image(3, 1, 1, &url)],
+        ] {
+            assert!(images(&manifest(&entries)).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_url_rejects_every_origin_path_and_query_mutation() {
+        for (case, url) in [
+            "http://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://attacker.invalid/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio:444/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://user@image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/other/one.webp?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.png?Policy=p&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k#fragment",
+            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Policy=q&Signature=s&Key-Pair-Id=k",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=p&Signature=s&Key-Pair-Id=k&extra=x",
+            "https://image.balcony.studio/tw/ep/one.webp?Policy=&Signature=s&Key-Pair-Id=k",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                images(&manifest(&[image(1, 1, 1, url)])).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_query_order_is_not_semantic() {
+        let url =
+            "https://image.balcony.studio/tw/ep/one.webp?Signature=s&Key-Pair-Id=k&Policy=p";
+        assert!(images(&manifest(&[image(1, 1, 1, url)])).is_ok());
+    }
+
+    #[test]
+    fn image_fields_must_exist_with_their_exact_types() {
+        for bytes in [
+            br#"{"result":"SUCCESS","data":[{}]}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":[{"orderNo":"1","width":1,"height":1,"imagePath":"x","line":null,"point":null}]}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":[{"orderNo":1,"width":4294967296,"height":1,"imagePath":"x","line":null,"point":null}]}"#.as_slice(),
+        ] {
+            assert!(images(bytes).is_err());
+        }
+    }
 
     #[test]
     fn library_response_becomes_typed_comics() {

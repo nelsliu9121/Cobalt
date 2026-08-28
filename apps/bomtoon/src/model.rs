@@ -14,6 +14,15 @@ pub struct Episode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpisodeImage {
+    pub order: usize,
+    pub width: u32,
+    pub height: u32,
+    pub path: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecentEntry {
     pub content_alias: String,
     pub content_title: String,
@@ -57,6 +66,11 @@ impl PurchaseState {
         }
     }
 
+    #[must_use]
+    pub const fn is_readable(&self) -> bool {
+        matches!(self, Self::Owned | Self::Free)
+    }
+
     pub fn label(&self) -> &str {
         match self {
             Self::Owned => "Owned",
@@ -98,6 +112,15 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn only_owned_and_free_episodes_are_readable() {
+        assert!(PurchaseState::Owned.is_readable());
+        assert!(PurchaseState::Free.is_readable());
+        assert!(!PurchaseState::Sample.is_readable());
+        assert!(!PurchaseState::NotOwned.is_readable());
+        assert!(!PurchaseState::Other("RENTAL".to_owned()).is_readable());
     }
 
     #[test]

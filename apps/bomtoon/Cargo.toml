@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+http = "1.3"
+kobo-image = { path = "../../crates/kobo-image" }
 kobo-json = { path = "../../crates/kobo-json" }
 kobo-sdk = { path = "../../crates/kobo-sdk" }
 
