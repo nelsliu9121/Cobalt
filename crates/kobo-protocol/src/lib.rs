@@ -2252,6 +2252,20 @@ fn take_picture_format(reader: &mut Reader<'_>) -> Result<PictureFormat, Protoco
     }
 }
 
+fn take_exact_picture_body<'a>(
+    reader: &mut Reader<'a>,
+    expected: usize,
+) -> Result<&'a [u8], ProtocolError> {
+    let remaining = reader.remaining();
+    if remaining < expected {
+        return Err(ProtocolError::Truncated);
+    }
+    if remaining > expected {
+        return Err(ProtocolError::LengthMismatch);
+    }
+    reader.take(expected)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one explicit bounded request tag table"
@@ -3983,7 +3997,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             if expected > MAX_INLINE_PICTURE_BYTES {
                 return Err(ProtocolError::FrameTooLarge);
             }
-            let bytes = reader.take(expected)?.to_vec();
+            let bytes = take_exact_picture_body(&mut reader, expected)?.to_vec();
             let pixels = match format {
                 PictureFormat::Gray8 => PicturePixels::Gray8(bytes),
                 PictureFormat::Rgb8 => PicturePixels::Rgb8(bytes),
@@ -8612,9 +8626,17 @@ mod picture_tests {
     }
 
     #[test]
-    fn declared_rgb_picture_bodies_with_five_or_seven_bytes_are_refused() {
-        for body in [&[1, 2, 3, 4, 5][..], &[1, 2, 3, 4, 5, 6, 7][..]] {
-            assert!(decode(&raw_picture_frame(18, 2, 1, 1, body)).is_err());
+    fn declared_rgb_picture_bodies_with_five_or_seven_bytes_are_refused_before_allocation() {
+        for (body, error) in [
+            (&[1, 2, 3, 4, 5][..], ProtocolError::Truncated),
+            (&[1, 2, 3, 4, 5, 6, 7][..], ProtocolError::LengthMismatch),
+        ] {
+            let mut reader = Reader::new(body);
+            assert_eq!(
+                take_exact_picture_body(&mut reader, 6),
+                Err(error.clone())
+            );
+            assert_eq!(decode(&raw_picture_frame(18, 2, 1, 1, body)), Err(error));
         }
     }
 
