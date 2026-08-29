@@ -650,11 +650,14 @@ impl Bomtoon {
             return false;
         };
         match intent {
-            FetchIntent::Foreground { page } => reader.plans.get(page).is_some_and(|plan| {
-                plan.segments
-                    .iter()
-                    .any(|segment| segment.source == source)
-            }),
+            FetchIntent::Foreground { page } => {
+                self.retry == Retry::Page(page)
+                    && reader.plans.get(page).is_some_and(|plan| {
+                        plan.segments
+                            .iter()
+                            .any(|segment| segment.source == source)
+                    })
+            }
             FetchIntent::Prefetch => {
                 source_relevant_to_window(source, &reader.plans, &reader.window)
                     || match self.retry {
@@ -805,11 +808,12 @@ impl Bomtoon {
                 .filter_map(|(&source, &intent)| {
                     let relevant = match intent {
                         FetchIntent::Foreground { page } => {
-                            reader.plans.get(page).is_some_and(|plan| {
-                                plan.segments
-                                    .iter()
-                                    .any(|segment| segment.source == source)
-                            })
+                            desired_page == Some(page)
+                                && reader.plans.get(page).is_some_and(|plan| {
+                                    plan.segments
+                                        .iter()
+                                        .any(|segment| segment.source == source)
+                                })
                         }
                         FetchIntent::Prefetch => {
                             source_relevant_to_window(source, &reader.plans, &reader.window)
@@ -1321,7 +1325,6 @@ impl Bomtoon {
                         if reader.refresh_waiters.contains_key(&source) {
                             let intent = FetchIntent::Foreground { page };
                             reader.refresh_waiters.insert(source, intent);
-                            reader.refresh_attempted.insert(source, intent);
                             planned_refresh_promotion = reader.refresh_task;
                         } else if let Some(&task) = reader.source_fetches.get(&source) {
                             planned_promotion = Some((task, source, page));
@@ -5103,6 +5106,152 @@ mod tests {
     }
 
     #[test]
+    fn promoted_prefetch_refresh_preserves_original_intent_after_second_unauthorized() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, source_task) =
+                reader_with_source_task(format, FetchIntent::Prefetch);
+            runner.task_outcome(
+                source_task,
+                TaskOutcome::Failed(TaskError::Unauthorized),
+            );
+            let refresh = runner
+                .app()
+                .reader
+                .as_ref()
+                .and_then(|reader| reader.refresh_task)
+                .expect("background refresh");
+
+            runner.action(action_id(READER_NEXT));
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert_eq!(runner.app().retry, Retry::Page(1));
+            assert_eq!(
+                reader.refresh_waiters.get(&1),
+                Some(&FetchIntent::Foreground { page: 1 })
+            );
+            assert_eq!(
+                reader.refresh_attempted.get(&1),
+                Some(&FetchIntent::Prefetch)
+            );
+
+            runner.task_outcome(
+                refresh,
+                TaskOutcome::Completed(image_manifest_sources_with_policy(5, "i")),
+            );
+            let retried = active_reader_source(runner.app(), 1)
+                .map(|(task, intent)| {
+                    assert_eq!(intent, FetchIntent::Foreground { page: 1 });
+                    task
+                })
+                .expect("promoted refreshed source");
+            runner.task_outcome(retried, TaskOutcome::Failed(TaskError::Unauthorized));
+
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert!(app.problem.is_none());
+            assert!(app.foreground_reader_task.is_none());
+            assert!(reader.refresh_task.is_none());
+            assert!(reader.source_failures.contains_key(&1));
+            assert_eq!(
+                reader.refresh_attempted.get(&1),
+                Some(&FetchIntent::Prefetch)
+            );
+            assert!(app.screen().reading_surface.is_some());
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
+    fn queued_foreground_refresh_waiter_is_dropped_after_page_turn_retargets() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, _) = reader_with_source_task(format, FetchIntent::Prefetch);
+            let refresh = TaskId(42);
+            let first_source = TaskId(43);
+            {
+                let app = runner.app_mut();
+                app.reader_tasks.clear();
+                app.foreground_reader_task = Some(refresh);
+                app.retry = Retry::Page(2);
+                app.reader_tasks.insert(
+                    refresh,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::ManifestRefresh,
+                    },
+                );
+                app.reader_tasks.insert(
+                    first_source,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::PrefetchSource { source: 1 },
+                    },
+                );
+                let mut source_fetches = BTreeMap::from([(1, first_source)]);
+                if format == PictureFormat::Gray8 {
+                    let second_source = TaskId(44);
+                    source_fetches.insert(3, second_source);
+                    app.reader_tasks.insert(
+                        second_source,
+                        ReaderTaskEntry {
+                            generation: 1,
+                            purpose: ReaderTaskPurpose::PrefetchSource { source: 3 },
+                        },
+                    );
+                }
+                let reader = app.reader.as_mut().expect("reader");
+                reader.source_fetches = source_fetches;
+                reader.refresh_task = Some(refresh);
+                reader
+                    .refresh_waiters
+                    .insert(2, FetchIntent::Foreground { page: 2 });
+                reader
+                    .refresh_attempted
+                    .insert(2, FetchIntent::Foreground { page: 2 });
+            }
+
+            runner.task_outcome(
+                refresh,
+                TaskOutcome::Completed(image_manifest_sources_with_policy(5, "t")),
+            );
+            assert!(runner
+                .app()
+                .reader
+                .as_ref()
+                .expect("reader")
+                .refresh_waiters
+                .contains_key(&2));
+
+            runner.action(action_id(READER_NEXT));
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert_eq!(runner.app().retry, Retry::Page(1));
+            assert!(!reader.refresh_waiters.contains_key(&2));
+            assert_eq!(
+                active_reader_source(runner.app(), 1).map(|(_, intent)| intent),
+                Some(FetchIntent::Foreground { page: 1 })
+            );
+
+            runner.task_outcome(first_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+            let maintenance = runner
+                .app()
+                .reader
+                .as_ref()
+                .and_then(|reader| reader.maintenance_task)
+                .expect("page-one maintenance");
+            runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert_eq!(reader.page, 1);
+            assert!(app.problem.is_none());
+            assert_ne!(
+                active_reader_source(app, 2).map(|(_, intent)| intent),
+                Some(FetchIntent::Foreground { page: 2 })
+            );
+            assert!(app.foreground_reader_task.is_none());
+            assert!(!reader.refresh_waiters.contains_key(&2));
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
     fn manifest_refresh_drains_foreground_before_lower_prefetch_with_format_bounds() {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let (mut runner, _) = reader_with_source_task(format, FetchIntent::Prefetch);
@@ -5111,6 +5260,7 @@ mod tests {
                 let app = runner.app_mut();
                 app.reader_tasks.clear();
                 app.foreground_reader_task = Some(refresh);
+                app.retry = Retry::Page(2);
                 app.reader_tasks.insert(
                     refresh,
                     ReaderTaskEntry {
@@ -5164,6 +5314,7 @@ mod tests {
             let app = runner.app_mut();
             app.reader_tasks.clear();
             app.foreground_reader_task = Some(active_foreground);
+            app.retry = Retry::Page(2);
             app.reader_tasks.insert(
                 refresh,
                 ReaderTaskEntry {
@@ -5212,6 +5363,7 @@ mod tests {
             let app = runner.app_mut();
             app.reader_tasks.clear();
             app.foreground_reader_task = Some(refresh);
+            app.retry = Retry::Page(2);
             app.reader_tasks.insert(
                 refresh,
                 ReaderTaskEntry {
