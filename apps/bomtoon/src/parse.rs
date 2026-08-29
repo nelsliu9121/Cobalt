@@ -1,4 +1,4 @@
-use crate::model::{Comic, Episode, EpisodeImage, PurchaseState, RecentEntry};
+use crate::model::{Comic, Episode, EpisodeAvailability, EpisodeImage, PurchaseState, RecentEntry};
 use http::Uri;
 use kobo_json::Value;
 use std::{error::Error, fmt, str};
@@ -135,13 +135,22 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
     values
         .iter()
         .map(|item| {
-            let status = nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?;
-            let is_sample = boolean(item, "isSample", "episode.isSample")?;
-            let paid = optional_boolean(item, "paid", "episode.paid")?;
+            let availability = EpisodeAvailability {
+                status: nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?,
+                episode_type: optional_string(item, "type", "episode.type")?,
+                is_sample: boolean(item, "isSample", "episode.isSample")?,
+                paid: optional_boolean(item, "paid", "episode.paid")?,
+                possession_coin: optional_unsigned(
+                    item,
+                    "possessionCoin",
+                    "episode.possessionCoin",
+                )?,
+                rent_coin: optional_unsigned(item, "rentCoin", "episode.rentCoin")?,
+            };
             Ok(Episode {
                 alias: string(item, "alias", "episode.alias")?.to_owned(),
                 title: string(item, "title", "episode.title")?.to_owned(),
-                purchase: PurchaseState::from_remote(status, is_sample, paid),
+                purchase: PurchaseState::from_remote(availability),
             })
         })
         .collect()
@@ -215,6 +224,18 @@ fn nullable_string<'a>(
     }
 }
 
+fn optional_string<'a>(
+    value: &'a Value,
+    key: &str,
+    name: &'static str,
+) -> Result<Option<&'a str>, ParseError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(ParseError::WrongType(name)),
+    }
+}
+
 fn boolean(value: &Value, key: &str, name: &'static str) -> Result<bool, ParseError> {
     field(value, key, name)?
         .as_bool()
@@ -244,6 +265,22 @@ fn unsigned(value: &Value, key: &str, name: &'static str) -> Result<usize, Parse
         .as_i64()
         .ok_or(ParseError::WrongType(name))?;
     usize::try_from(number).map_err(|_| ParseError::InvalidValue(name))
+}
+
+fn optional_unsigned(
+    value: &Value,
+    key: &str,
+    name: &'static str,
+) -> Result<Option<usize>, ParseError> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let number = value.as_i64().ok_or(ParseError::WrongType(name))?;
+            usize::try_from(number)
+                .map(Some)
+                .map_err(|_| ParseError::InvalidValue(name))
+        }
+    }
 }
 
 fn positive_u32(value: &Value, key: &str, name: &'static str) -> Result<u32, ParseError> {
@@ -326,9 +363,13 @@ mod tests {
       "result":"SUCCESS",
       "data":{
         "episodes":[
-          {"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null,"paid":null},
-          {"alias":"owned","title":"Owned","isSample":false,"purchaseStatus":"POSSESSION","paid":true},
-          {"alias":"locked","title":"Locked","isSample":false,"purchaseStatus":null,"paid":null}
+          {"alias":"f1","title":"Free preview","type":"PREVIEW","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0,"permanentCoin":3},
+          {"alias":"1","title":"Episode 1","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0,"permanentCoin":3},
+          {"alias":"2","title":"Episode 2","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":3,"rentCoin":2,"permanentCoin":3},
+          {"alias":"owned","title":"Owned","type":"PREVIEW","isSample":true,"purchaseStatus":"POSSESSION","paid":false,"possessionCoin":0,"rentCoin":0},
+          {"alias":"legacy-sample","title":"Legacy sample","isSample":true,"purchaseStatus":"NONE","paid":null},
+          {"alias":"legacy-free","title":"Legacy free","isSample":false,"purchaseStatus":"NONE","paid":false},
+          {"alias":"omitted","title":"Omitted prices and type","isSample":false,"purchaseStatus":"NONE","paid":null}
         ]
       }
     }"#;
@@ -548,18 +589,31 @@ mod tests {
     #[test]
     fn episodes_are_read_from_data_episodes() {
         let parsed = episodes(CONTENT).expect("valid content response");
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].alias, "sample");
-        assert_eq!(parsed[1].title, "Owned");
-        assert_eq!(parsed[2].alias, "locked");
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed[0].alias, "f1");
+        assert_eq!(parsed[1].title, "Episode 1");
+        assert_eq!(parsed[2].alias, "2");
     }
 
     #[test]
-    fn null_purchase_status_is_sample_when_sample_and_not_owned_otherwise() {
+    fn live_availability_fields_map_with_fail_closed_precedence() {
         let parsed = episodes(CONTENT).expect("valid content response");
-        assert_eq!(parsed[0].purchase, PurchaseState::Sample);
-        assert_eq!(parsed[1].purchase, PurchaseState::Owned);
-        assert_eq!(parsed[2].purchase, PurchaseState::NotOwned);
+        let purchases = parsed
+            .iter()
+            .map(|episode| episode.purchase.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            purchases,
+            [
+                PurchaseState::Sample,
+                PurchaseState::Free,
+                PurchaseState::NotOwned,
+                PurchaseState::Owned,
+                PurchaseState::Sample,
+                PurchaseState::Free,
+                PurchaseState::NotOwned,
+            ]
+        );
     }
 
     #[test]
@@ -585,9 +639,21 @@ mod tests {
                 .as_slice(),
             br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"paid":"false"}]}}"#
                 .as_slice(),
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"type":false}]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"possessionCoin":"0"}]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"rentCoin":false}]}}"#
+                .as_slice(),
         ] {
             assert!(matches!(episodes(body), Err(ParseError::WrongType(_))));
         }
+
+        let negative_price = br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"possessionCoin":-1}]}}"#;
+        assert!(matches!(
+            episodes(negative_price),
+            Err(ParseError::InvalidValue("episode.possessionCoin"))
+        ));
     }
 
     #[test]

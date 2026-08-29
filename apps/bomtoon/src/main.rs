@@ -3766,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_and_sample_episode_rows_are_actions() {
+    fn owned_sample_and_free_episode_rows_are_actions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
@@ -3784,7 +3784,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(actions.contains(&action_id("episode-0")));
-        assert!(!actions.contains(&action_id("episode-1")));
+        assert!(actions.contains(&action_id("episode-1")));
         assert!(actions.contains(&action_id("episode-2")));
         assert!(!actions.contains(&action_id("episode-3")));
     }

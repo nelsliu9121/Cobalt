@@ -30,6 +30,16 @@ pub struct RecentEntry {
     pub episode_title: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpisodeAvailability<'a> {
+    pub status: Option<&'a str>,
+    pub episode_type: Option<&'a str>,
+    pub is_sample: bool,
+    pub paid: Option<bool>,
+    pub possession_coin: Option<usize>,
+    pub rent_coin: Option<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PurchaseState {
     Owned,
@@ -52,23 +62,26 @@ pub fn display_text(text: &str, fallback: &str) -> String {
 }
 
 impl PurchaseState {
-    pub fn from_remote(status: Option<&str>, is_sample: bool, paid: Option<bool>) -> Self {
-        if status == Some("POSSESSION") {
+    pub fn from_remote(availability: EpisodeAvailability<'_>) -> Self {
+        if availability.status == Some("POSSESSION") {
             Self::Owned
-        } else if is_sample {
+        } else if availability.episode_type == Some("PREVIEW") || availability.is_sample {
             Self::Sample
-        } else if paid == Some(false) {
+        } else if availability.possession_coin == Some(0)
+            || availability.rent_coin == Some(0)
+            || availability.paid == Some(false)
+        {
             Self::Free
-        } else if status.is_none() || status == Some("NONE") {
+        } else if availability.status.is_none() || availability.status == Some("NONE") {
             Self::NotOwned
         } else {
-            Self::Other(status.unwrap_or_default().to_owned())
+            Self::Other(availability.status.unwrap_or_default().to_owned())
         }
     }
 
     #[must_use]
     pub const fn is_readable(&self) -> bool {
-        matches!(self, Self::Owned | Self::Sample)
+        matches!(self, Self::Owned | Self::Sample | Self::Free)
     }
 
     pub fn label(&self) -> &str {
@@ -84,41 +97,107 @@ impl PurchaseState {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_text, PurchaseState};
+    use super::{display_text, EpisodeAvailability, PurchaseState};
 
     #[test]
-    fn purchase_state_uses_remote_precedence_and_nullable_status() {
+    fn purchase_state_uses_live_availability_with_fail_closed_precedence() {
         let cases = [
-            (Some("POSSESSION"), true, Some(false), PurchaseState::Owned),
-            (None, true, None, PurchaseState::Sample),
-            (Some("NONE"), true, Some(false), PurchaseState::Sample),
-            (None, false, Some(false), PurchaseState::Free),
-            (Some("NONE"), false, Some(false), PurchaseState::Free),
-            (Some("RENTAL"), false, Some(false), PurchaseState::Free),
-            (None, false, None, PurchaseState::NotOwned),
-            (None, false, Some(true), PurchaseState::NotOwned),
-            (Some("NONE"), false, None, PurchaseState::NotOwned),
             (
-                Some("RENTAL"),
-                false,
-                Some(true),
-                PurchaseState::Other("RENTAL".to_owned()),
+                "hunter f1",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: Some("PREVIEW"),
+                    is_sample: false,
+                    paid: None,
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
+                },
+                PurchaseState::Sample,
+            ),
+            (
+                "hunter episode 1",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: Some("GENERAL"),
+                    is_sample: false,
+                    paid: None,
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
+                },
+                PurchaseState::Free,
+            ),
+            (
+                "hunter episode 2",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: Some("GENERAL"),
+                    is_sample: false,
+                    paid: None,
+                    possession_coin: Some(3),
+                    rent_coin: Some(2),
+                },
+                PurchaseState::NotOwned,
+            ),
+            (
+                "owned precedence",
+                EpisodeAvailability {
+                    status: Some("POSSESSION"),
+                    episode_type: Some("PREVIEW"),
+                    is_sample: true,
+                    paid: Some(false),
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
+                },
+                PurchaseState::Owned,
+            ),
+            (
+                "legacy sample",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: None,
+                    is_sample: true,
+                    paid: None,
+                    possession_coin: None,
+                    rent_coin: None,
+                },
+                PurchaseState::Sample,
+            ),
+            (
+                "legacy free",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: None,
+                    is_sample: false,
+                    paid: Some(false),
+                    possession_coin: None,
+                    rent_coin: None,
+                },
+                PurchaseState::Free,
+            ),
+            (
+                "omitted prices and type",
+                EpisodeAvailability {
+                    status: Some("NONE"),
+                    episode_type: None,
+                    is_sample: false,
+                    paid: None,
+                    possession_coin: None,
+                    rent_coin: None,
+                },
+                PurchaseState::NotOwned,
             ),
         ];
 
-        for (status, is_sample, paid, expected) in cases {
-            assert_eq!(
-                PurchaseState::from_remote(status, is_sample, paid),
-                expected
-            );
+        for (name, availability, expected) in cases {
+            assert_eq!(PurchaseState::from_remote(availability), expected, "{name}");
         }
     }
 
     #[test]
-    fn only_owned_and_sample_episodes_are_readable() {
+    fn owned_sample_and_free_episodes_are_readable() {
         assert!(PurchaseState::Owned.is_readable());
         assert!(PurchaseState::Sample.is_readable());
-        assert!(!PurchaseState::Free.is_readable());
+        assert!(PurchaseState::Free.is_readable());
         assert!(!PurchaseState::NotOwned.is_readable());
         assert!(!PurchaseState::Other("RENTAL".to_owned()).is_readable());
     }
