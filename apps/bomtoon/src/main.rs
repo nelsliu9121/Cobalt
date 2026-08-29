@@ -731,9 +731,14 @@ impl Bomtoon {
             .as_ref()
             .and_then(|reader| reader.refresh_attempted.get(&source).copied());
         if let Some(original) = attempted {
+            let terminal = match original {
+                FetchIntent::Prefetch => FetchIntent::Prefetch,
+                FetchIntent::Foreground { page } if self.retry == Retry::Page(page) => original,
+                FetchIntent::Foreground { .. } => intent,
+            };
             self.record_source_failure(
                 source,
-                original,
+                terminal,
                 Failure::of(TaskError::Unauthorized).advice,
             );
             return;
@@ -4910,6 +4915,83 @@ mod tests {
         (runner, source_task)
     }
 
+    fn reader_with_reused_source_task(
+        format: PictureFormat,
+    ) -> (AppRunner<Bomtoon>, TaskId) {
+        let mut runner =
+            seeded_reader_with_metrics(reader_metrics(format, 1), 3, 0, false);
+        let source_task = TaskId(41);
+        {
+            let app = runner.app_mut();
+            app.retry = Retry::Page(1);
+            app.foreground_reader_task = Some(source_task);
+            app.reader_tasks.insert(
+                source_task,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::ForegroundSource { source: 0, page: 1 },
+                },
+            );
+            let reader = app.reader.as_mut().expect("reader");
+            reader.images = vec![episode_image(0, 1, 3)];
+            (reader.plans, reader.total_pages) =
+                page_plan(&reader.images, 1, 1).expect("reused source plan");
+            reader.window =
+                VecDeque::from([PageEntry::Building(
+                    PageBuild::new(1, format, 1, 1).expect("page-one build"),
+                )]);
+            reader.source_fetches = BTreeMap::from([(0, source_task)]);
+        }
+        (runner, source_task)
+    }
+
+    fn finish_reused_source_refresh(
+        runner: &mut AppRunner<Bomtoon>,
+        source_task: TaskId,
+        policy: &str,
+    ) {
+        runner.task_outcome(
+            source_task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        let refresh = runner
+            .app()
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_task)
+            .expect("foreground refresh");
+        let manifest = format!(
+            "{{\"result\":\"SUCCESS\",\"data\":[{{\"orderNo\":1,\"width\":1,\"height\":3,\"imagePath\":\"https://image.balcony.studio/tw/ep/0.webp?Policy={policy}&Signature=s&Key-Pair-Id=k\",\"line\":null,\"point\":null}}]}}"
+        )
+        .into_bytes();
+        runner.task_outcome(refresh, TaskOutcome::Completed(manifest));
+        let refreshed_source = active_reader_source(runner.app(), 0)
+            .map(|(task, intent)| {
+                assert_eq!(intent, FetchIntent::Foreground { page: 1 });
+                task
+            })
+            .expect("refreshed reused source");
+        runner.task_outcome(
+            refreshed_source,
+            TaskOutcome::Completed(BLACK_1X3_WEBP.to_vec()),
+        );
+        let maintenance = runner
+            .app()
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.maintenance_task)
+            .expect("reused source maintenance");
+        runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(reader.page, 1);
+        assert!(reader.source_cache.is_empty());
+        assert_eq!(
+            reader.refresh_attempted.get(&0),
+            Some(&FetchIntent::Foreground { page: 1 })
+        );
+        assert_reader_bounds(runner.app());
+    }
+
     fn active_reader_source(app: &Bomtoon, source: usize) -> Option<(TaskId, FetchIntent)> {
         app.reader_tasks.iter().find_map(|(task, entry)| {
             let intent = match entry.purpose {
@@ -5155,6 +5237,85 @@ mod tests {
                 reader.refresh_attempted.get(&1),
                 Some(&FetchIntent::Prefetch)
             );
+            assert!(app.screen().reading_surface.is_some());
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
+    fn stale_original_foreground_uses_current_foreground_for_terminal_unauthorized() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, source_task) = reader_with_reused_source_task(format);
+            finish_reused_source_refresh(&mut runner, source_task, "foreground");
+
+            runner.action(action_id(READER_PREVIOUS));
+            let second_fetch = active_reader_source(runner.app(), 0)
+                .map(|(task, intent)| {
+                    assert_eq!(intent, FetchIntent::Foreground { page: 0 });
+                    task
+                })
+                .expect("page-zero reused source");
+            let commands =
+                runner.task_outcome(second_fetch, TaskOutcome::Failed(TaskError::Unauthorized));
+
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert!(app.problem.is_some());
+            assert_eq!(app.retry, Retry::Page(0));
+            assert!(reader.refresh_task.is_none());
+            assert_eq!(
+                reader.refresh_attempted.get(&0),
+                Some(&FetchIntent::Foreground { page: 1 })
+            );
+            assert!(!commands
+                .iter()
+                .any(|command| matches!(command, Command::Spawn { .. })));
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
+    fn stale_original_foreground_uses_current_prefetch_for_terminal_unauthorized() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, source_task) = reader_with_reused_source_task(format);
+            finish_reused_source_refresh(&mut runner, source_task, "prefetch");
+            let prefetch = TaskId(90);
+            {
+                let app = runner.app_mut();
+                app.retry = Retry::Page(2);
+                app.foreground_reader_task = None;
+                app.reader_tasks.clear();
+                app.reader_tasks.insert(
+                    prefetch,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::PrefetchSource { source: 0 },
+                    },
+                );
+                let reader = app.reader.as_mut().expect("reader");
+                reader.window =
+                    VecDeque::from([PageEntry::Building(
+                        PageBuild::new(2, format, 1, 1).expect("page-two build"),
+                    )]);
+                reader.source_fetches = BTreeMap::from([(0, prefetch)]);
+                reader.maintenance_task = None;
+            }
+
+            let commands =
+                runner.task_outcome(prefetch, TaskOutcome::Failed(TaskError::Unauthorized));
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert!(app.problem.is_none());
+            assert!(app.foreground_reader_task.is_none());
+            assert!(reader.refresh_task.is_none());
+            assert!(reader.source_failures.contains_key(&0));
+            assert_eq!(
+                reader.refresh_attempted.get(&0),
+                Some(&FetchIntent::Foreground { page: 1 })
+            );
+            assert!(!commands
+                .iter()
+                .any(|command| matches!(command, Command::Spawn { .. })));
             assert!(app.screen().reading_surface.is_some());
             assert_reader_bounds(app);
         }
