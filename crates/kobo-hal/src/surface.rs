@@ -71,7 +71,7 @@ impl From<io::Error> for SurfaceError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChannelOffsets {
     red: u32,
     green: u32,
@@ -111,6 +111,12 @@ impl ChannelOffsets {
             | (u32::from(blue) << self.blue)
             | (u32::from(u8::MAX) << self.transparency);
         word.to_le_bytes()
+    }
+
+    fn rgb_mask(self) -> u32 {
+        (u32::from(u8::MAX) << self.red)
+            | (u32::from(u8::MAX) << self.green)
+            | (u32::from(u8::MAX) << self.blue)
     }
 }
 
@@ -227,6 +233,7 @@ impl RegionPlacement {
 pub struct RegionSnapshot {
     placement: RegionPlacement,
     pixels: Vec<u8>,
+    channels: ChannelOffsets,
 }
 
 impl RegionSnapshot {
@@ -240,19 +247,21 @@ impl RegionSnapshot {
         &self.pixels
     }
 
-    /// Returns the same region with red, green, and blue inverted and alpha
-    /// preserved. This is the reversible test pattern used by smoke tests.
+    /// Returns the same region with its measured red, green, and blue fields
+    /// inverted and its transparency field preserved. This is the reversible
+    /// test pattern used by smoke tests.
     #[must_use]
     pub fn inverted_rgb(&self) -> Self {
         let mut pixels = self.pixels.clone();
-        for (index, byte) in pixels.iter_mut().enumerate() {
-            if index % SUPPORTED_BYTES_PER_PIXEL != ALPHA_BYTE_INDEX {
-                *byte = !*byte;
-            }
+        let rgb_mask = self.channels.rgb_mask();
+        for pixel in pixels.chunks_exact_mut(SUPPORTED_BYTES_PER_PIXEL) {
+            let word = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]) ^ rgb_mask;
+            pixel.copy_from_slice(&word.to_le_bytes());
         }
         Self {
             placement: self.placement,
             pixels,
+            channels: self.channels,
         }
     }
 
@@ -327,7 +336,11 @@ impl RegionSnapshot {
                 }
             }
         }
-        Ok(Self { placement, pixels })
+        Ok(Self {
+            placement,
+            pixels,
+            channels,
+        })
     }
 }
 
@@ -354,7 +367,11 @@ pub fn read_region(
             .ok_or(SurfaceError::RegionOutsideMemory)?;
         framebuffer.read_exact_at(slice, offset)?;
     }
-    Ok(RegionSnapshot { placement, pixels })
+    Ok(RegionSnapshot {
+        placement,
+        pixels,
+        channels: ChannelOffsets::LEGACY_GRAYSCALE,
+    })
 }
 
 /// Writes `snapshot` back to the region it came from.
@@ -394,8 +411,8 @@ pub fn write_region(
 #[cfg(test)]
 mod tests {
     use super::{
-        read_region, RegionPlacement, RegionSnapshot, SurfaceError, SurfaceGeometry,
-        ALPHA_BYTE_INDEX, SUPPORTED_BYTES_PER_PIXEL,
+        read_region, ChannelOffsets, RegionPlacement, RegionSnapshot, SurfaceError,
+        SurfaceGeometry, ALPHA_BYTE_INDEX, SUPPORTED_BYTES_PER_PIXEL,
     };
     use crate::refresh::Rect;
     use kobo_pixels::PicturePixelsRef;
@@ -510,6 +527,35 @@ mod tests {
         .expect("valid RGB pixels and measured channels");
 
         assert_eq!(snapshot.pixels(), &[0xff, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn from_pixels_inversion_preserves_measured_transparency() {
+        let geometry = SurfaceGeometry {
+            width: 1,
+            height: 1,
+            stride: 4,
+            bits_per_pixel: 32,
+            memory_length: 4,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let snapshot = RegionSnapshot::from_pixels(
+            geometry,
+            region,
+            PicturePixelsRef::Rgb8(&[0x11, 0x22, 0x33]),
+            Some(TRANSPARENCY_FIRST_PANEL),
+        )
+        .expect("valid RGB pixels and measured channels");
+
+        let inverted = snapshot.inverted_rgb();
+
+        assert_eq!(inverted.pixels(), &[0xff, 0xee, 0xdd, 0xcc]);
+        assert!(inverted.inverted_rgb().matches(&snapshot));
     }
 
     #[test]
@@ -789,6 +835,7 @@ mod tests {
         let snapshot = RegionSnapshot {
             placement,
             pixels: vec![0x10, 0x20, 0x30, 0xff, 0x01, 0x02, 0x03, 0x7f],
+            channels: ChannelOffsets::LEGACY_GRAYSCALE,
         };
         let inverted = snapshot.inverted_rgb();
         assert_eq!(
@@ -802,6 +849,42 @@ mod tests {
         }
         assert!(inverted.inverted_rgb().matches(&snapshot));
         assert!(!inverted.matches(&snapshot));
+    }
+
+    #[test]
+    fn captured_snapshot_inversion_uses_legacy_channel_layout() {
+        let geometry = SurfaceGeometry {
+            width: 1,
+            height: 1,
+            stride: 4,
+            bits_per_pixel: 32,
+            memory_length: 4,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "kobo-surface-invert-{}-{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, [0x10, 0x20, 0x30, 0x7f]).expect("write fixture");
+        let file = std::fs::File::open(&path).expect("open fixture");
+        let snapshot = read_region(
+            &file,
+            geometry,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        )
+        .expect("read region");
+        drop(file);
+        std::fs::remove_file(&path).expect("remove fixture");
+
+        assert_eq!(
+            snapshot.inverted_rgb().pixels(),
+            &[0xef, 0xdf, 0xcf, 0x7f]
+        );
     }
 
     #[test]

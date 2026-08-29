@@ -47,7 +47,7 @@ use kobo_policy::{
 use kobo_protocol::{Frame, Lifecycle, Message, TaskError, TaskOutcome};
 use kobo_ui::{
     render_all, ActionId, Chrome, FontHandle, FramePlanner, PanelWaveform, PictureCache,
-    PictureFormat, Screen, Surface,
+    PictureFormat, PicturePixelsRef, Screen, Surface,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -3170,8 +3170,13 @@ impl Painter {
             }
             gray
         };
-        let frame = RegionSnapshot::from_grayscale(display.geometry(), region, &region_gray)
-            .map_err(|error| format!("prepare the frame: {error}"))?;
+        let frame = RegionSnapshot::from_pixels(
+            display.geometry(),
+            region,
+            PicturePixelsRef::Gray8(&region_gray),
+            None,
+        )
+        .map_err(|error| format!("prepare the frame: {error}"))?;
         let converted = started.elapsed();
         display
             .restore(&frame)
