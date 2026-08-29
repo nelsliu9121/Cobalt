@@ -664,6 +664,21 @@ impl Bomtoon {
         if let Some(old) = old {
             context.drop_picture(old.handle);
         }
+        let pending_maintenance = self
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.maintenance_task);
+        if pending_maintenance.is_some_and(|task| {
+            self.reader_tasks.get(&task).is_some_and(|entry| {
+                entry.generation == self.reader_generation
+                    && entry.purpose == ReaderTaskPurpose::Maintenance
+            })
+        }) {
+            return Ok(());
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            reader.maintenance_task = None;
+        }
         let maintenance = self
             .spawn_reader(
                 context,
@@ -3479,5 +3494,96 @@ mod tests {
         assert!(reader.window.is_empty());
         assert!(reader.source_cache.is_empty());
         assert!(reader.source_fetches.is_empty());
+    }
+    #[test]
+    fn rapid_ready_page_turns_coalesce_rgb_maintenance() {
+        let metrics = reader_metrics(PictureFormat::Rgb8, 1);
+        let (mut runner, manifest_task, _) =
+            reader_waiting_for_manifest_with_metrics(metrics);
+        let commands = runner.task_outcome(
+            manifest_task,
+            TaskOutcome::Completed(image_manifest_sources(5)),
+        );
+        let (first_source, _) = only_spawn(&commands);
+        runner.task_outcome(
+            first_source,
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        let first_maintenance = runner
+            .app()
+            .reader
+            .as_ref()
+            .expect("reader")
+            .maintenance_task
+            .expect("first maintenance");
+        runner.task_outcome(first_maintenance, TaskOutcome::Completed(Vec::new()));
+
+        let page_one_source = runner
+            .app()
+            .reader_tasks
+            .iter()
+            .find_map(|(task, entry)| {
+                matches!(
+                    entry.purpose,
+                    ReaderTaskPurpose::PrefetchSource { source: 1 }
+                )
+                .then_some(*task)
+            })
+            .expect("page one source");
+        runner.task_outcome(
+            page_one_source,
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        let page_two_source = runner
+            .app()
+            .reader_tasks
+            .iter()
+            .find_map(|(task, entry)| {
+                matches!(
+                    entry.purpose,
+                    ReaderTaskPurpose::PrefetchSource { source: 2 }
+                )
+                .then_some(*task)
+            })
+            .expect("page two source");
+
+        runner.action(action_id(READER_NEXT));
+        assert_eq!(runner.app().reader.as_ref().expect("reader").page, 1);
+        runner.task_outcome(
+            page_two_source,
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        let existing_maintenance = runner
+            .app()
+            .reader
+            .as_ref()
+            .expect("reader")
+            .maintenance_task
+            .expect("pending maintenance");
+        assert_eq!(runner.app().reader_tasks.len(), 2);
+
+        runner.action(action_id(READER_NEXT));
+        let app = runner.app();
+        let reader = app.reader.as_ref().expect("reader");
+        assert_eq!(reader.page, 2);
+        assert!(app.problem.is_none());
+        assert_eq!(reader.maintenance_task, Some(existing_maintenance));
+        assert_eq!(
+            app.reader_tasks
+                .values()
+                .filter(|entry| entry.purpose == ReaderTaskPurpose::Maintenance)
+                .count(),
+            1
+        );
+        assert_reader_bounds(app);
+
+        runner.task_outcome(existing_maintenance, TaskOutcome::Completed(Vec::new()));
+        let app = runner.app();
+        let reader = app.reader.as_ref().expect("reader");
+        assert!(app.problem.is_none());
+        assert_eq!(reader.page, 2);
+        assert_eq!(reader.maintenance_task, None);
+        assert_eq!(reader.window.len(), reader.limits.pages);
+        assert_reader_bounds(app);
     }
 }
