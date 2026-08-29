@@ -95,140 +95,223 @@ fn strict_png_options() -> png::DecodeOptions {
     options
 }
 
-/// Parses every chunk as an event because the high-level reader deliberately
-/// recovers from malformed ancillary chunks after the pixels are complete.
-///
-/// Unknown ancillary chunks are refused rather than preserved without
-/// validation. The supported set is the one this parser understands, including
-/// text metadata after IDAT; animation chunks are never a single panel frame.
-fn validate_png_chunks(bytes: &[u8]) -> Result<(), ImageError> {
-    let mut decoder = png::StreamingDecoder::new_with_options(strict_png_options());
-    let mut remaining = bytes;
-    let mut reached_iend = false;
-    while !remaining.is_empty() {
-        let (consumed, event) = decoder
-            .update(remaining, None)
-            .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-        remaining = &remaining[consumed..];
-        match event {
-            png::Decoded::BadAncillaryChunk(kind) => {
-                return Err(ImageError::Undecodable(format!(
-                    "invalid ancillary PNG chunk {kind:?}"
-                )));
-            }
-            png::Decoded::SkippedAncillaryChunk(kind) => {
-                return Err(ImageError::Undecodable(format!(
-                    "unsupported ancillary PNG chunk {kind:?}"
-                )));
-            }
-            png::Decoded::ChunkBegin(_, kind)
-                if matches!(kind, png::chunk::acTL | png::chunk::fcTL | png::chunk::fdAT) =>
-            {
-                return Err(ImageError::Undecodable(
-                    "animated PNG chunks are not panel frames".to_owned(),
-                ));
-            }
-            png::Decoded::ChunkComplete(kind) if kind == png::chunk::IEND => {
-                reached_iend = true;
-            }
-            png::Decoded::Nothing if consumed == 0 => {
-                return Err(ImageError::Undecodable(
-                    "the PNG decoder made no progress".to_owned(),
-                ));
-            }
-            _ => {}
-        }
+#[derive(Clone, Copy)]
+struct ValidatedPng {
+    width: u32,
+    height: u32,
+    format: PictureFormat,
+}
+
+const MAX_PNG_TEXT_BYTES: usize = 1_024;
+
+fn validate_png_text(data: &[u8]) -> Result<(), ImageError> {
+    if data.len() > MAX_PNG_TEXT_BYTES {
+        return Err(ImageError::Undecodable(format!(
+            "the PNG tEXt chunk is {} bytes, above the {MAX_PNG_TEXT_BYTES}-byte metadata bound",
+            data.len()
+        )));
     }
-    if !reached_iend {
+    let separator = data.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        ImageError::Undecodable("the PNG tEXt keyword has no separator".to_owned())
+    })?;
+    let keyword = &data[..separator];
+    let printable = keyword
+        .iter()
+        .all(|byte| matches!(*byte, 32..=126 | 161..=255));
+    let bad_spacing = keyword.first() == Some(&b' ')
+        || keyword.last() == Some(&b' ')
+        || keyword.windows(2).any(|pair| pair == b"  ");
+    if !(1..=79).contains(&keyword.len()) || !printable || bad_spacing {
         return Err(ImageError::Undecodable(
-            "the PNG ended before IEND".to_owned(),
+            "the PNG tEXt keyword is invalid".to_owned(),
         ));
     }
     Ok(())
 }
 
+/// Validates the complete, deliberately small screenshot PNG subset without
+/// asking a general PNG parser to retain or decompress metadata.
+fn validate_png_structure(bytes: &[u8]) -> Result<ValidatedPng, ImageError> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(ImageError::TooManyBytes { bytes: bytes.len() });
+    }
+    if bytes.get(..SIGNATURE.len()) != Some(SIGNATURE) {
+        return Err(ImageError::Undecodable(
+            "the PNG signature is missing or corrupt".to_owned(),
+        ));
+    }
+
+    let mut at = SIGNATURE.len();
+    let mut header = None;
+    let mut saw_idat = false;
+    let mut idat_ended = false;
+    loop {
+        let chunk_header_end = at.checked_add(8).ok_or_else(|| {
+            ImageError::Undecodable("the PNG chunk header overflows this platform".to_owned())
+        })?;
+        let chunk_header = bytes.get(at..chunk_header_end).ok_or_else(|| {
+            ImageError::Undecodable("the PNG ends inside a chunk header".to_owned())
+        })?;
+        let length = usize::try_from(u32::from_be_bytes(
+            chunk_header[..4]
+                .try_into()
+                .expect("four-byte PNG chunk length"),
+        ))
+        .map_err(|_| {
+            ImageError::Undecodable("the PNG chunk length does not fit this platform".to_owned())
+        })?;
+        let kind = &chunk_header[4..8];
+        let data_end = chunk_header_end.checked_add(length).ok_or_else(|| {
+            ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
+        })?;
+        let chunk_end = data_end.checked_add(4).ok_or_else(|| {
+            ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
+        })?;
+        let data = bytes
+            .get(chunk_header_end..data_end)
+            .ok_or_else(|| ImageError::Undecodable("the PNG ends inside a chunk".to_owned()))?;
+        let stored_crc = u32::from_be_bytes(
+            bytes
+                .get(data_end..chunk_end)
+                .ok_or_else(|| {
+                    ImageError::Undecodable("the PNG ends inside a chunk CRC".to_owned())
+                })?
+                .try_into()
+                .expect("four-byte PNG chunk CRC"),
+        );
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(data);
+        if crc.finalize() != stored_crc {
+            return Err(ImageError::Undecodable(format!(
+                "the PNG chunk {kind:?} has a corrupt CRC"
+            )));
+        }
+
+        match kind {
+            b"IHDR" => {
+                if at != SIGNATURE.len() || header.is_some() || length != 13 {
+                    return Err(ImageError::Undecodable(
+                        "IHDR must be the first chunk, exactly once, with length 13".to_owned(),
+                    ));
+                }
+                let width = u32::from_be_bytes(
+                    data[..4].try_into().expect("four-byte PNG width"),
+                );
+                let height = u32::from_be_bytes(
+                    data[4..8].try_into().expect("four-byte PNG height"),
+                );
+                let format = match (data[8], data[9]) {
+                    (8, 0) => PictureFormat::Gray8,
+                    (8, 2) => PictureFormat::Rgb8,
+                    _ => {
+                        return Err(ImageError::Undecodable(
+                            "the PNG is not eight-bit Gray8 or RGB8".to_owned(),
+                        ));
+                    }
+                };
+                if data[10] != 0 || data[11] != 0 || data[12] != 0 {
+                    return Err(ImageError::Undecodable(
+                        "the PNG uses unsupported compression, filtering, or interlacing"
+                            .to_owned(),
+                    ));
+                }
+                checked_pixels(width, height)?;
+                header = Some(ValidatedPng {
+                    width,
+                    height,
+                    format,
+                });
+            }
+            b"IDAT" => {
+                if header.is_none() {
+                    return Err(ImageError::Undecodable(
+                        "IDAT appears before IHDR".to_owned(),
+                    ));
+                }
+                if idat_ended {
+                    return Err(ImageError::Undecodable(
+                        "PNG IDAT chunks must be consecutive".to_owned(),
+                    ));
+                }
+                saw_idat = true;
+            }
+            b"tEXt" => {
+                if header.is_none() {
+                    return Err(ImageError::Undecodable(
+                        "tEXt appears before IHDR".to_owned(),
+                    ));
+                }
+                validate_png_text(data)?;
+                idat_ended |= saw_idat;
+            }
+            b"IEND" => {
+                if header.is_none() || !saw_idat || length != 0 || chunk_end != bytes.len() {
+                    return Err(ImageError::Undecodable(
+                        "IEND must be empty, final, and follow image data".to_owned(),
+                    ));
+                }
+                return Ok(header.expect("validated PNG header"));
+            }
+            _ => {
+                return Err(ImageError::Undecodable(format!(
+                    "unsupported PNG chunk {kind:?}"
+                )));
+            }
+        }
+        at = chunk_end;
+    }
+}
+
 /// Decodes a complete PNG without changing its Gray8 or RGB8 representation.
 ///
-/// The source must use an eight-bit grayscale or truecolor IHDR, end exactly
-/// at a valid IEND chunk, and pass the PNG decoder's chunk/data validation.
-/// This is for format-preserving frame transport; [`decode`] remains the
-/// normal image ingestion path that composites and converts a source.
+/// The supported screenshot subset is signature, one non-interlaced eight-bit
+/// Gray8/RGB8 IHDR, optional manually validated bounded tEXt, one or more
+/// consecutive IDAT chunks, and a final empty IEND. Every chunk CRC, the
+/// compressed stream checksum, dimensions, and decoded byte length are
+/// verified. Compressed text, profiles, palettes, transparency, all other
+/// metadata, and animation are rejected before the general decoder sees them.
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::Undecodable`] for truncated, corrupt, trailing, or
-/// differently typed PNGs, and the ordinary pixel-bound error for hostile
-/// dimensions.
+/// Returns [`ImageError::Undecodable`] for truncated, corrupt, trailing,
+/// unsupported-metadata-bearing, animated, or differently typed PNGs, and the
+/// ordinary source/pixel bound errors for hostile inputs.
 pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
-    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    const IEND: &[u8; 12] = b"\0\0\0\0IEND\xaeB`\x82";
-    if bytes.get(..8) != Some(SIGNATURE)
-        || bytes.get(8..12) != Some(&13_u32.to_be_bytes())
-        || bytes.get(12..16) != Some(b"IHDR")
-        || !bytes.ends_with(IEND)
-    {
-        return Err(ImageError::Undecodable(
-            "the PNG is incomplete or has an invalid container".to_owned(),
-        ));
-    }
-    let mut chunk_at = SIGNATURE.len();
-    loop {
-        let Some(header) = bytes.get(chunk_at..chunk_at.saturating_add(8)) else {
-            return Err(ImageError::Undecodable(
-                "the PNG ends inside a chunk header".to_owned(),
-            ));
-        };
-        let length = usize::try_from(u32::from_be_bytes(
-            header[..4].try_into().expect("four-byte PNG chunk length"),
-        ))
-        .unwrap_or(usize::MAX);
-        let Some(chunk_end) = chunk_at
-            .checked_add(12)
-            .and_then(|end| end.checked_add(length))
-        else {
-            return Err(ImageError::Undecodable(
-                "the PNG chunk length overflows this platform".to_owned(),
-            ));
-        };
-        if chunk_end > bytes.len() {
-            return Err(ImageError::Undecodable(
-                "the PNG ends inside a chunk".to_owned(),
-            ));
-        }
-        if &header[4..8] == b"IEND" {
-            if length != 0 || chunk_end != bytes.len() {
-                return Err(ImageError::Undecodable(
-                    "the PNG has data after its IEND chunk".to_owned(),
-                ));
-            }
-            break;
-        }
-        chunk_at = chunk_end;
-    }
-    validate_png_chunks(bytes)?;
-    let mut reader = png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options())
+    let validated = validate_png_structure(bytes)?;
+    let expected = validated
+        .format
+        .byte_len(validated.width, validated.height)
+        .ok_or_else(|| {
+            ImageError::Undecodable("the PNG byte length does not fit this platform".to_owned())
+        })?;
+    let decoder_bytes = expected.checked_add(MAX_SOURCE_BYTES).ok_or_else(|| {
+        ImageError::Undecodable("the PNG allocation bound does not fit this platform".to_owned())
+    })?;
+    let mut decoder =
+        png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options());
+    decoder.set_limits(png::Limits {
+        bytes: decoder_bytes,
+    });
+    let mut reader = decoder
         .read_info()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     let info = reader.info();
-    if info.animation_control.is_some() {
+    if info.size() != (validated.width, validated.height)
+        || info.bit_depth != png::BitDepth::Eight
+        || info.interlaced
+        || !matches!(
+            (validated.format, info.color_type),
+            (PictureFormat::Gray8, png::ColorType::Grayscale)
+                | (PictureFormat::Rgb8, png::ColorType::Rgb)
+        )
+    {
         return Err(ImageError::Undecodable(
-            "animated PNGs are not panel frames".to_owned(),
+            "the PNG decoder changed its declared representation".to_owned(),
         ));
     }
-    let (width, height) = info.size();
-    let format = match (info.bit_depth, info.color_type) {
-        (png::BitDepth::Eight, png::ColorType::Grayscale) => PictureFormat::Gray8,
-        (png::BitDepth::Eight, png::ColorType::Rgb) => PictureFormat::Rgb8,
-        _ => {
-            return Err(ImageError::Undecodable(
-                "the PNG is not eight-bit Gray8 or RGB8".to_owned(),
-            ));
-        }
-    };
-    checked_pixels(width, height)?;
-    let expected = format.byte_len(width, height).ok_or_else(|| {
-        ImageError::Undecodable("the PNG byte length does not fit this platform".to_owned())
-    })?;
     if reader.output_buffer_size() != Some(expected) {
         return Err(ImageError::Undecodable(
             "the PNG decoder changed its declared pixel representation".to_owned(),
@@ -238,12 +321,12 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
     let output = reader
         .next_frame(&mut pixels)
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    if output.width != width
-        || output.height != height
+    if output.width != validated.width
+        || output.height != validated.height
         || output.buffer_size() != expected
         || output.bit_depth != png::BitDepth::Eight
         || !matches!(
-            (format, output.color_type),
+            (validated.format, output.color_type),
             (PictureFormat::Gray8, png::ColorType::Grayscale)
                 | (PictureFormat::Rgb8, png::ColorType::Rgb)
         )
@@ -255,11 +338,11 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
     reader
         .finish()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    let pixels = match format {
+    let pixels = match validated.format {
         PictureFormat::Gray8 => PicturePixels::Gray8(pixels),
         PictureFormat::Rgb8 => PicturePixels::Rgb8(pixels),
     };
-    Picture::from_pixels(width, height, pixels)
+    Picture::from_pixels(validated.width, validated.height, pixels)
 }
 
 /// Wraps raw eight-bit grayscale framebuffer pixels up as a PNG.
@@ -994,7 +1077,7 @@ mod tests {
     use super::{
         decode, decode_png, decode_webp, encode_png, fitted_size, picture_clone_count,
         reset_picture_clone_count, size, width_scaled_size, AxisSample, FitMode, ImageError,
-        Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
+        Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, MAX_SOURCE_BYTES, PANEL_GREYS,
     };
     use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
     use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
@@ -1035,16 +1118,40 @@ mod tests {
         chunk
     }
 
+    fn chunk_start(png: &[u8], target: &[u8; 4]) -> usize {
+        let mut at = 8;
+        loop {
+            let length = usize::try_from(u32::from_be_bytes(
+                png[at..at + 4].try_into().expect("PNG test chunk length"),
+            ))
+            .expect("PNG test chunk length fits");
+            if &png[at + 4..at + 8] == target {
+                return at;
+            }
+            at += length + 12;
+            assert!(at < png.len(), "fixture has no {target:?} chunk");
+        }
+    }
+
+    fn with_chunk_before(
+        png: &[u8],
+        before: &[u8; 4],
+        kind: &[u8; 4],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let at = chunk_start(png, before);
+        let chunk = png_chunk(kind, data);
+        let mut joined = Vec::with_capacity(png.len() + chunk.len());
+        joined.extend_from_slice(&png[..at]);
+        joined.extend_from_slice(&chunk);
+        joined.extend_from_slice(&png[at..]);
+        joined
+    }
+
     fn with_post_idat_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let png = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
             .expect("RGB PNG fixture");
-        let iend = png.len() - 12;
-        let chunk = png_chunk(kind, data);
-        let mut joined = Vec::with_capacity(png.len() + chunk.len());
-        joined.extend_from_slice(&png[..iend]);
-        joined.extend_from_slice(&chunk);
-        joined.extend_from_slice(&png[iend..]);
-        joined
+        with_chunk_before(&png, b"IEND", kind, data)
     }
 
     /// A real four by four JPEG, so the decoder is exercised against a file
@@ -1321,13 +1428,139 @@ mod tests {
     }
 
     #[test]
-    fn decode_png_accepts_legal_text_after_image_data() {
-        let png = with_post_idat_chunk(b"tEXt", b"Note\0complete");
-        let picture = decode_png(&png).expect("legal post-IDAT text");
+    fn decode_png_accepts_generated_gray8_and_rgb8_artifacts() {
+        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[17, 231]))
+            .expect("generated Gray8 PNG");
+        let gray = decode_png(&gray).expect("decode generated Gray8 PNG");
+        assert_eq!(gray.pixels(), PicturePixelsRef::Gray8(&[17, 231]));
+
+        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[255, 0, 0, 0, 255, 7]))
+            .expect("generated RGB8 PNG");
+        let rgb = decode_png(&rgb).expect("decode generated RGB8 PNG");
         assert_eq!(
-            picture.pixels(),
+            rgb.pixels(),
+            PicturePixelsRef::Rgb8(&[255, 0, 0, 0, 255, 7])
+        );
+    }
+
+    #[test]
+    fn decode_png_accepts_bounded_text_before_and_after_image_data() {
+        let base = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
+            .expect("RGB PNG fixture");
+        let before = with_chunk_before(&base, b"IDAT", b"tEXt", b"Note\0before");
+        let before = decode_png(&before).expect("bounded pre-IDAT tEXt");
+        assert_eq!(
+            before.pixels(),
             PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])
         );
+
+        let after = with_post_idat_chunk(b"tEXt", b"Note\0after");
+        let after = decode_png(&after).expect("bounded post-IDAT tEXt");
+        assert_eq!(
+            after.pixels(),
+            PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn decode_png_refuses_idat_after_post_image_text() {
+        let text = with_post_idat_chunk(b"tEXt", b"Note\0complete");
+        let nonconsecutive = with_chunk_before(&text, b"IEND", b"IDAT", &[]);
+        assert!(decode_png(&nonconsecutive).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_sources_over_the_compressed_byte_bound() {
+        let oversized = vec![0; MAX_SOURCE_BYTES + 1];
+        assert!(matches!(
+            decode_png(&oversized),
+            Err(ImageError::TooManyBytes { bytes }) if bytes == oversized.len()
+        ));
+    }
+
+    #[test]
+    fn decode_png_refuses_interlaced_screenshot_artifacts() {
+        let mut png =
+            encode_png(2, 1, PicturePixelsRef::Gray8(&[17, 231])).expect("Gray8 PNG fixture");
+        png[28] = 1;
+        let ihdr_crc = png_crc(&png[12..29]);
+        png[29..33].copy_from_slice(&ihdr_crc.to_be_bytes());
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_oversized_text_metadata_instead_of_allocating_it() {
+        let mut text = b"Note\0".to_vec();
+        text.resize(128 * 1024, b'x');
+        let png = with_post_idat_chunk(b"tEXt", &text);
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_post_idat_transparency() {
+        let png = with_post_idat_chunk(b"tRNS", &[0, 1, 0, 2, 0, 3]);
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_corrupt_compressed_and_international_text() {
+        let compressed = with_post_idat_chunk(b"zTXt", b"Note\0\0not-zlib");
+        assert!(decode_png(&compressed).is_err());
+
+        let international =
+            with_post_idat_chunk(b"iTXt", b"Note\0\x01\0\0\0not-zlib");
+        assert!(decode_png(&international).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_malformed_icc_profiles() {
+        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
+            .expect("RGB PNG fixture");
+        let png = with_chunk_before(&rgb, b"IDAT", b"iCCP", b"Profile\0\0not-zlib");
+        assert!(decode_png(&png).is_err());
+
+        let mut large_profile = b"Profile\0\0".to_vec();
+        large_profile.resize(128 * 1024, 0);
+        let png = with_chunk_before(&rgb, b"IDAT", b"iCCP", &large_profile);
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_illegal_and_malformed_palettes() {
+        let gray =
+            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let illegal = with_chunk_before(&gray, b"IDAT", b"PLTE", &[1, 2, 3]);
+        assert!(decode_png(&illegal).is_err());
+
+        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
+            .expect("RGB PNG fixture");
+        let malformed = with_chunk_before(&rgb, b"IDAT", b"PLTE", &[1, 2]);
+        assert!(decode_png(&malformed).is_err());
+
+        let supported_shape = with_chunk_before(&rgb, b"IDAT", b"PLTE", &[1, 2, 3]);
+        assert!(decode_png(&supported_shape).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_wrong_length_transparency() {
+        let gray =
+            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let malformed = with_chunk_before(&gray, b"IDAT", b"tRNS", &[1]);
+        assert!(decode_png(&malformed).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_transparency_even_with_exact_payload_lengths() {
+        let gray =
+            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let gray_transparency = with_chunk_before(&gray, b"IDAT", b"tRNS", &[0, 1]);
+        assert!(decode_png(&gray_transparency).is_err());
+
+        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
+            .expect("RGB PNG fixture");
+        let rgb_transparency =
+            with_chunk_before(&rgb, b"IDAT", b"tRNS", &[0, 1, 0, 2, 0, 3]);
+        assert!(decode_png(&rgb_transparency).is_err());
     }
 
     #[test]
@@ -1354,6 +1587,20 @@ mod tests {
     fn decode_png_refuses_text_without_keyword_separator() {
         let png = with_post_idat_chunk(b"tEXt", b"missing separator");
         assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_illegal_text_keywords() {
+        for text in [
+            b"\0empty".as_slice(),
+            b" leading\0text",
+            b"trailing \0text",
+            b"two  spaces\0text",
+            b"control\x1f\0text",
+        ] {
+            let png = with_post_idat_chunk(b"tEXt", text);
+            assert!(decode_png(&png).is_err());
+        }
     }
 
     #[test]

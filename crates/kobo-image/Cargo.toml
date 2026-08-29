@@ -7,12 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+crc32fast = "1.5.0"
 # Decoding only. The default feature set pulls in a dozen formats this device
 # will never meet, and every one of them is code that runs on a reader.
 # 0.25.9 raised its MSRV above the workspace's documented Rust 1.85.
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
 kobo-pixels = { path = "../kobo-pixels" }
-# Full-stream frame validation; `image` stops decoding once pixels are complete.
+# Exact typed PNG decoding after the bounded structural validator.
 png = "0.18.1"
 
 [lints]

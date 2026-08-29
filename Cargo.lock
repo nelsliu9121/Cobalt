@@ -766,6 +766,7 @@ dependencies = [
 name = "kobo-image"
 version = "0.3.0"
 dependencies = [
+ "crc32fast",
  "image",
  "kobo-pixels",
  "png 0.18.1",

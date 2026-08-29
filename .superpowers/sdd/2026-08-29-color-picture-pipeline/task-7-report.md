@@ -165,3 +165,38 @@ None.
 ### Concerns
 
 None.
+
+## Review Fix Round 4
+
+### Changes
+
+- Deleted the permissive low-level `png::StreamingDecoder` pass and replaced it with an allocation-free structural walk over the borrowed source bytes. It enforces the 4 MiB source cap before parsing, an exact first/once 13-byte IHDR, eight-bit non-interlaced Gray8/RGB8, bounded pixels, checked chunk bounds, and a verified CRC for every accepted chunk.
+- Reduced the accepted screenshot container to IHDR, one or more consecutive IDAT chunks, an empty final IEND, and manually validated `tEXt` of at most 1,024 bytes. `tEXt` keywords require the separator, 1–79 printable Latin-1 bytes, and legal spacing; post-IDAT text closes the IDAT sequence.
+- Rejects PLTE, tRNS, iCCP, zTXt, iTXt, APNG, and every other ancillary or critical chunk before the general decoder can retain or inflate metadata.
+- Kept the high-level decoder only for actual zlib/Adler and complete pixel decoding, gave it a finite allocation limit derived from the exact output size plus the bounded source, and compares its dimensions, type, interlace state, output size, and full frame against the structurally validated IHDR.
+- Added generated Gray8/RGB8 success cases and direct regressions for oversized source/text metadata, post-IDAT and exact-length/wrong-length transparency, corrupt compressed text, malformed and large ICC profiles, illegal/malformed/supported-shape palettes, illegal text keywords, interlace, and nonconsecutive IDAT.
+
+### RED Evidence
+
+- `cargo test -p kobo-image decode_png_` — 8 passed and 6 failed before the validator replacement. The old path accepted post-IDAT tRNS, corrupt zTXt, malformed iCCP, illegal Gray8 PLTE, 128 KiB tEXt metadata, and did not report an oversized source as `TooManyBytes`.
+
+### Verification
+
+- `cargo test -p kobo-image decode_png_` — 18 passed, 0 failed.
+- `cargo test -p kobo-image` — 59 passed, 0 failed.
+- `cargo test -p kobo-cli frame_validation_` — 2 passed, 0 failed.
+- `cargo test -p kobo-cli` — 248 passed, 0 failed.
+- `cargo run -p kobo-cli -- shot --address 127.0.0.1:8880 --out target/task7-review4-simulator-shot.png` — the actual built-in simulator screenshot was fully validated and saved at 1072×1448.
+- `git diff --check` — passed.
+
+### Self-review
+
+- No low-level general PNG parser runs before the structural subset decision, and the structural walk holds no metadata buffer. Unsupported compressed/profile/palette/transparency chunks cannot reach an allocation or decompression path.
+- The only retained ancillary format is bounded uncompressed `tEXt`; its syntax and ordering are checked directly, while the decoder's independent finite limit remains defense in depth.
+- CRC validation covers IHDR, every IDAT, accepted tEXt, and IEND. `next_frame` plus `finish` still proves zlib/Adler integrity and complete exact typed pixels.
+- Valid exact-length Gray8/RGB8 tRNS and valid-shape RGB PLTE are also refused, proving the policy does not rely on malformed payloads to reject unsupported metadata.
+- No runtime, simulator, CLI source, real profile capability, BOMTOON file, todo tracker, formatter, linter, or workspace-wide suite was touched or run.
+
+### Concerns
+
+None.
