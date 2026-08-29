@@ -877,6 +877,7 @@ dependencies = [
 name = "kobo-sdk"
 version = "0.3.0"
 dependencies = [
+ "kobo-image",
  "kobo-policy",
  "kobo-protocol",
  "kobo-text",
@@ -921,6 +922,7 @@ dependencies = [
 name = "kobo-sim"
 version = "0.3.0"
 dependencies = [
+ "kobo-image",
  "kobo-net",
  "kobo-policy",
  "kobo-profile",

@@ -46,8 +46,8 @@ use kobo_policy::{
 };
 use kobo_protocol::{Frame, Lifecycle, Message, TaskError, TaskOutcome};
 use kobo_ui::{
-    render_all, ActionId, Chrome, FontHandle, FramePlanner, PanelWaveform, PictureCache,
-    PictureFormat, PicturePixelsRef, Screen, Surface,
+    render_all, ActionId, Chrome, FontHandle, FramePlanner, FrameTransition, PanelWaveform,
+    PictureCache, PictureFormat, PicturePixels, Screen, Surface,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -156,6 +156,23 @@ fn metrics_for(screen: &Screen) -> kobo_ui::DisplayMetrics {
     kobo_ui::set_text_scale(metrics.text_scale);
     kobo_ui::set_reading_scale(screen.text_scale.unwrap_or(metrics.text_scale));
     metrics
+}
+
+/// Renders one retained screen in the shallowest format its referenced
+/// pictures require and this session accepts.
+fn render_screen_surface(
+    screen: &Screen,
+    metrics: &kobo_ui::DisplayMetrics,
+    chrome: &Chrome,
+    pictures: &dyn kobo_ui::Pictures,
+    surface: &mut Surface,
+    dirty: Option<kobo_ui::Rect>,
+) {
+    let format = kobo_ui::surface_format_for(screen, metrics, pictures);
+    if surface.format != format {
+        *surface = Surface::new_in(surface.width, surface.height, format);
+    }
+    render_all(screen, metrics, chrome, pictures, surface, dirty);
 }
 
 /// Puts the front light back to where the session found it, on the way out.
@@ -858,9 +875,10 @@ fn announce_reboot(display: &DisplaySession, whole_screen: Rect) -> Result<(), S
         usize::try_from(whole_screen.width).unwrap_or(0),
         usize::try_from(whole_screen.height).unwrap_or(0),
     );
-    render_all(
+    let metrics = metrics_for(&screen);
+    render_screen_surface(
         &screen,
-        &metrics_for(&screen),
+        &metrics,
         &Chrome::with_back(false),
         &(),
         &mut surface,
@@ -1142,6 +1160,7 @@ fn host_applications(
     let mut next_id = 1_u64;
     let mut surface = Surface::new(whole_screen.width as usize, whole_screen.height as usize);
     let mut panel = Painter::new(surface.width, surface.height);
+    let accepted_picture_format = crate::device_metrics().picture_format;
     // Not `simulated()`. On the real panel that answered every battery read
     // with the same invented 72 percent, which is worse than refusing: an
     // application cannot tell an invented number from a measured one, so it
@@ -1638,9 +1657,10 @@ fn host_applications(
                                 // it, or releasing the finger would invert a
                                 // rectangle of the new screen instead.
                                 pressed = None;
-                                render_all(
+                                let metrics = metrics_for(&screen);
+                                render_screen_surface(
                                     &screen,
-                                    &metrics_for(&screen),
+                                    &metrics,
                                     &chrome,
                                     &apps[index].pictures,
                                     &mut surface,
@@ -1659,7 +1679,14 @@ fn host_applications(
                             width,
                             height,
                             pixels,
-                        } => match apps[index].pictures.put_report(handle, width, height, pixels) {
+                        } => match put_session_picture(
+                            &mut apps[index].pictures,
+                            accepted_picture_format,
+                            handle,
+                            width,
+                            height,
+                            pixels,
+                        ) {
                             None => trace(&format!("picture {} refused", handle.0)),
                             Some(evicted) => trace_picture_evictions(handle, &evicted),
                         },
@@ -1669,7 +1696,14 @@ fn host_applications(
                             height,
                             format,
                         } => {
-                            if !apps[index].pictures.begin_upload(handle, width, height, format) {
+                            if !begin_session_picture(
+                                &mut apps[index].pictures,
+                                accepted_picture_format,
+                                handle,
+                                width,
+                                height,
+                                format,
+                            ) {
                                 trace(&format!("picture {} upload refused", handle.0));
                             }
                         }
@@ -2375,9 +2409,10 @@ fn repaint(
         return Ok(());
     };
     let chrome = chrome_for(&screen, apps[index].path == home, status);
-    render_all(
+    let metrics = metrics_for(&screen);
+    render_screen_surface(
         &screen,
-        &metrics_for(&screen),
+        &metrics,
         &chrome,
         &apps[index].pictures,
         surface,
@@ -2935,6 +2970,36 @@ fn text_hold_for(
     layout.hit_text(x, y).map(|hit| (action, hit))
 }
 
+fn session_accepts_picture(accepted: PictureFormat, supplied: PictureFormat) -> bool {
+    supplied == PictureFormat::Gray8 || accepted == PictureFormat::Rgb8
+}
+
+fn put_session_picture(
+    pictures: &mut PictureCache,
+    accepted: PictureFormat,
+    handle: kobo_ui::PictureHandle,
+    width: u32,
+    height: u32,
+    pixels: PicturePixels,
+) -> Option<Vec<kobo_ui::PictureHandle>> {
+    if !session_accepts_picture(accepted, pixels.format()) {
+        return None;
+    }
+    pictures.put_report(handle, width, height, pixels)
+}
+
+fn begin_session_picture(
+    pictures: &mut PictureCache,
+    accepted: PictureFormat,
+    handle: kobo_ui::PictureHandle,
+    width: u32,
+    height: u32,
+    format: PictureFormat,
+) -> bool {
+    session_accepts_picture(accepted, format)
+        && pictures.begin_upload(handle, width, height, format)
+}
+
 fn trace_picture_evictions(handle: kobo_ui::PictureHandle, evicted: &[kobo_ui::PictureHandle]) {
     if evicted.is_empty() {
         return;
@@ -3131,14 +3196,36 @@ impl Painter {
         whole_screen: Rect,
         surface: &Surface,
     ) -> Result<(), String> {
-        if surface.format != PictureFormat::Gray8 {
-            return Err("color framebuffer output is not implemented".to_owned());
-        }
+        self.paint_with(surface, |transition| {
+            Self::write_transition(display, whole_screen, surface, transition)
+        })
+    }
+
+    /// Applies a planned frame and advances the planner only after the whole
+    /// output operation succeeds.
+    fn paint_with(
+        &mut self,
+        surface: &Surface,
+        apply: impl FnOnce(FrameTransition) -> Result<(), String>,
+    ) -> Result<(), String> {
         let Some(transition) = self.frames.plan(surface) else {
             // Nothing moved. Refreshing anyway costs a visible flicker and
             // some battery to show exactly the same picture.
             return Ok(());
         };
+        apply(transition)?;
+        if !self.frames.commit(surface, transition) {
+            return Err("the frame planner rejected a completed refresh".to_owned());
+        }
+        Ok(())
+    }
+
+    fn write_transition(
+        display: &DisplaySession,
+        whole_screen: Rect,
+        surface: &Surface,
+        transition: FrameTransition,
+    ) -> Result<(), String> {
         let region = Rect {
             x: u32::try_from(transition.region.x).unwrap_or(0),
             y: u32::try_from(transition.region.y).unwrap_or(0),
@@ -3154,29 +3241,16 @@ impl Painter {
         };
 
         let started = Instant::now();
-        // Convert and write only the rows the transition touches. The write
+        // Copy and convert only the rows the transition touches. The write
         // path runs at a few megabytes per second on the i.MX6's uncached
         // framebuffer, so writing the whole screen for every frame cost about
         // 1.6 seconds per tap regardless of how small the change was.
-        let region_gray = {
-            let out_of_surface = || "the transition region is not inside the surface".to_owned();
-            let x = usize::try_from(transition.region.x).map_err(|_| out_of_surface())?;
-            let y = usize::try_from(transition.region.y).map_err(|_| out_of_surface())?;
-            let width = usize::try_from(transition.region.width).map_err(|_| out_of_surface())?;
-            let height = usize::try_from(transition.region.height).map_err(|_| out_of_surface())?;
-            let mut gray = Vec::with_capacity(width.saturating_mul(height));
-            for row in 0..height {
-                let start = (y + row) * surface.width + x;
-                let end = start + width;
-                gray.extend_from_slice(surface.bytes().get(start..end).ok_or_else(out_of_surface)?);
-            }
-            gray
-        };
+        let region_pixels = extract_region_pixels(surface, transition.region)?;
         let frame = RegionSnapshot::from_pixels(
             display.geometry(),
             region,
-            PicturePixelsRef::Gray8(&region_gray),
-            None,
+            region_pixels.as_ref(),
+            display.profile().color,
         )
         .map_err(|error| format!("prepare the frame: {error}"))?;
         let converted = started.elapsed();
@@ -3195,13 +3269,13 @@ impl Painter {
         let timing = display
             .refresh_timed(plan)
             .map_err(|error| format!("show the frame: {error}"))?;
-        // One line per frame: how long the grayscale conversion, the
-        // framebuffer write and the two ioctls each took, and what was
-        // refreshed with which waveform. This is what found the Libra 2 tap
-        // delay, so it stays, but off by default and behind its own switch:
-        // every frame on every device is the wrong place for unconditional
-        // output. Stderr rather than the black box, which costs an fsync per
-        // line; start.sh already captures stderr.
+        // One line per frame: how long pixel conversion, the framebuffer write
+        // and the two ioctls each took, and what was refreshed with which
+        // waveform. This is what found the Libra 2 tap delay, so it stays, but
+        // off by default and behind its own switch: every frame on every device
+        // is the wrong place for unconditional output. Stderr rather than the
+        // black box, which costs an fsync per line; start.sh already captures
+        // stderr.
         if frame_timing_wanted() {
             eprintln!(
                 "frame {}x{} wf={} convert={}ms write={}ms submit={}us wait={}ms",
@@ -3214,12 +3288,43 @@ impl Painter {
                 timing.wait.as_millis(),
             );
         }
-
-        if !self.frames.commit(surface, transition) {
-            return Err("the frame planner rejected a completed refresh".to_owned());
-        }
         Ok(())
     }
+}
+
+fn extract_region_pixels(
+    surface: &Surface,
+    region: kobo_ui::Rect,
+) -> Result<PicturePixels, String> {
+    let out_of_surface = || "the transition region is not inside the surface".to_owned();
+    let x = usize::try_from(region.x).map_err(|_| out_of_surface())?;
+    let y = usize::try_from(region.y).map_err(|_| out_of_surface())?;
+    let width = usize::try_from(region.width).map_err(|_| out_of_surface())?;
+    let height = usize::try_from(region.height).map_err(|_| out_of_surface())?;
+    let end_x = x.checked_add(width).ok_or_else(out_of_surface)?;
+    let end_y = y.checked_add(height).ok_or_else(out_of_surface)?;
+    if end_x > surface.width || end_y > surface.height {
+        return Err(out_of_surface());
+    }
+    let bytes_per_pixel = surface.format.bytes_per_pixel();
+    let row_bytes = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(out_of_surface)?;
+    let capacity = row_bytes.checked_mul(height).ok_or_else(out_of_surface)?;
+    let mut pixels = Vec::with_capacity(capacity);
+    for row in y..end_y {
+        let start = row
+            .checked_mul(surface.width)
+            .and_then(|pixel| pixel.checked_add(x))
+            .and_then(|pixel| pixel.checked_mul(bytes_per_pixel))
+            .ok_or_else(out_of_surface)?;
+        let end = start.checked_add(row_bytes).ok_or_else(out_of_surface)?;
+        pixels.extend_from_slice(surface.bytes().get(start..end).ok_or_else(out_of_surface)?);
+    }
+    Ok(match surface.format {
+        PictureFormat::Gray8 => PicturePixels::Gray8(pixels),
+        PictureFormat::Rgb8 => PicturePixels::Rgb8(pixels),
+    })
 }
 
 /// Where panel touches are delivered right now.
@@ -3435,6 +3540,260 @@ mod tests {
     }
 
     use super::*;
+
+    fn color_metrics() -> kobo_ui::DisplayMetrics {
+        kobo_ui::DisplayMetrics {
+            picture_format: PictureFormat::Rgb8,
+            ..kobo_ui::CLARA_BW_METRICS
+        }
+    }
+
+    fn picture_screen(handles: &[(kobo_ui::PictureHandle, (u32, u32))]) -> Screen {
+        Screen::new(
+            7,
+            handles
+                .iter()
+                .enumerate()
+                .map(|(index, (handle, source))| kobo_ui::Node::Picture {
+                    id: kobo_ui::NodeId(u32::try_from(index + 1).expect("node id")),
+                    handle: *handle,
+                    source: *source,
+                    max_height_tenths_mm: 100,
+                    framed: false,
+                })
+                .collect(),
+        )
+        .with_top_bar(kobo_ui::TopBar::new(kobo_ui::NodeId(90), "Color picture"))
+    }
+
+    #[test]
+    fn rgb_picture_selects_rgb_surface_and_keeps_chrome_neutral() {
+        let handle = kobo_ui::PictureHandle(1);
+        let mut pictures = PictureCache::default();
+        assert!(put_session_picture(
+            &mut pictures,
+            PictureFormat::Rgb8,
+            handle,
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![255, 0, 0, 0, 0, 255]),
+        )
+        .is_some());
+        let screen = picture_screen(&[(handle, (2, 1))]);
+        let metrics = color_metrics();
+        let chrome = Chrome::with_back(true);
+        let mut surface = Surface::new(
+            usize::try_from(metrics.width).expect("positive width"),
+            usize::try_from(metrics.height).expect("positive height"),
+        );
+
+        render_screen_surface(&screen, &metrics, &chrome, &pictures, &mut surface, None);
+
+        assert_eq!(surface.format, PictureFormat::Rgb8);
+        let triples = surface.bytes().chunks_exact(3).collect::<Vec<_>>();
+        assert!(triples.iter().any(|pixel| **pixel == [255, 0, 0]));
+        assert!(triples.iter().any(|pixel| **pixel == [0, 0, 255]));
+        assert!(
+            triples.iter().all(|pixel| {
+                pixel[0] == pixel[1] && pixel[1] == pixel[2]
+                    || **pixel == [255, 0, 0]
+                    || **pixel == [0, 0, 255]
+            }),
+            "grayscale chrome gained a color cast"
+        );
+    }
+
+    #[test]
+    fn rgb_picture_upload_is_refused_by_gray_session_without_replacing_live_picture() {
+        let handle = kobo_ui::PictureHandle(2);
+        let mut pictures = PictureCache::default();
+        assert!(put_session_picture(
+            &mut pictures,
+            PictureFormat::Gray8,
+            handle,
+            2,
+            1,
+            kobo_ui::PicturePixels::Gray8(vec![11, 22]),
+        )
+        .is_some());
+
+        assert!(put_session_picture(
+            &mut pictures,
+            PictureFormat::Gray8,
+            handle,
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .is_none());
+        assert!(!begin_session_picture(
+            &mut pictures,
+            PictureFormat::Gray8,
+            handle,
+            2,
+            1,
+            PictureFormat::Rgb8,
+        ));
+        assert!(begin_session_picture(
+            &mut pictures,
+            PictureFormat::Rgb8,
+            handle,
+            2,
+            1,
+            PictureFormat::Rgb8,
+        ));
+        assert!(pictures.upload_chunk(handle, 0, &[1, 2, 3]));
+        assert!(pictures.commit_upload(handle).is_none());
+        assert_eq!(
+            kobo_ui::Pictures::get(&pictures, handle),
+            Some(kobo_ui::PicturePixelsRef::Gray8(&[11, 22]))
+        );
+    }
+
+    #[test]
+    fn rgb_picture_gray_upload_stays_shallow_until_rgb_is_referenced() {
+        let gray = kobo_ui::PictureHandle(3);
+        let rgb = kobo_ui::PictureHandle(4);
+        let mut pictures = PictureCache::default();
+        assert!(put_session_picture(
+            &mut pictures,
+            PictureFormat::Rgb8,
+            gray,
+            2,
+            1,
+            kobo_ui::PicturePixels::Gray8(vec![31, 223]),
+        )
+        .is_some());
+        assert!(put_session_picture(
+            &mut pictures,
+            PictureFormat::Rgb8,
+            rgb,
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![255, 0, 0, 0, 255, 0]),
+        )
+        .is_some());
+        let metrics = color_metrics();
+        let chrome = Chrome::default();
+        let mut surface = Surface::new(
+            usize::try_from(metrics.width).expect("positive width"),
+            usize::try_from(metrics.height).expect("positive height"),
+        );
+
+        let gray_only = picture_screen(&[(gray, (2, 1))]);
+        render_screen_surface(
+            &gray_only,
+            &metrics,
+            &chrome,
+            &pictures,
+            &mut surface,
+            None,
+        );
+        assert_eq!(surface.format, PictureFormat::Gray8);
+        assert!(
+            surface.bytes().contains(&31) && surface.bytes().contains(&223),
+            "the Gray8 picture was not drawn"
+        );
+
+        let composed = picture_screen(&[(gray, (2, 1)), (rgb, (2, 1))]);
+        render_screen_surface(
+            &composed,
+            &metrics,
+            &chrome,
+            &pictures,
+            &mut surface,
+            None,
+        );
+        assert_eq!(surface.format, PictureFormat::Rgb8);
+        assert!(
+            surface.bytes().chunks_exact(3).any(|pixel| pixel == [31; 3])
+                && surface
+                    .bytes()
+                    .chunks_exact(3)
+                    .any(|pixel| pixel == [223; 3]),
+            "Gray8 pixels did not expand to equal RGB channels"
+        );
+    }
+
+    #[test]
+    fn rgb_picture_region_reaches_profile_lowering_without_losing_channels() {
+        let surface = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .expect("valid typed surface");
+        let transition = FramePlanner::new(2, 1)
+            .plan(&surface)
+            .expect("first frame");
+        let pixels = extract_region_pixels(&surface, transition.region).expect("typed region");
+        let color = kobo_profile::ColorPanel {
+            red: kobo_profile::ChannelField {
+                offset: 16,
+                length: 8,
+            },
+            green: kobo_profile::ChannelField {
+                offset: 8,
+                length: 8,
+            },
+            blue: kobo_profile::ChannelField {
+                offset: 0,
+                length: 8,
+            },
+            transparency: kobo_profile::ChannelField {
+                offset: 24,
+                length: 8,
+            },
+            clean_waveform: 10,
+            regal_waveform: 11,
+            cfa_flags: 0x600,
+            clean_interval: 4,
+        };
+        let snapshot = RegionSnapshot::from_pixels(
+            kobo_hal::SurfaceGeometry {
+                width: 2,
+                height: 1,
+                stride: 8,
+                bits_per_pixel: 32,
+                memory_length: 8,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            pixels.as_ref(),
+            Some(color),
+        )
+        .expect("pack RGB frame");
+        assert_eq!(snapshot.pixels(), &[3, 2, 1, 255, 6, 5, 4, 255]);
+    }
+
+    #[test]
+    fn rgb_picture_failed_output_does_not_commit_the_planner() {
+        let surface = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .expect("valid typed surface");
+        let mut painter = Painter::new(2, 1);
+        assert!(painter
+            .paint_with(&surface, |_| Err("write failed".to_owned()))
+            .is_err());
+        assert_eq!(painter.frames.refreshes(), 0);
+
+        let mut retried = None;
+        painter
+            .paint_with(&surface, |transition| {
+                retried = Some(transition);
+                Ok(())
+            })
+            .expect("retry succeeds");
+        assert_eq!(retried.expect("planned retry").refresh, 1);
+        assert_eq!(painter.frames.refreshes(), 1);
+    }
 
     fn hello() -> Screen {
         Screen::new(1, Vec::new()).with_top_bar(kobo_ui::TopBar::new(kobo_ui::NodeId(1), "Hello"))

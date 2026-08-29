@@ -8852,6 +8852,28 @@ impl Surface {
         }
     }
 
+    /// Builds a surface from an already typed, complete pixel buffer.
+    ///
+    /// Returns `None` rather than truncating or padding when the dimensions do
+    /// not describe the supplied bytes.
+    #[must_use]
+    pub fn from_pixels(width: usize, height: usize, pixels: PicturePixels) -> Option<Self> {
+        let format = pixels.format();
+        let expected = width
+            .checked_mul(height)?
+            .checked_mul(format.bytes_per_pixel())?;
+        if pixels.byte_count() != expected {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            format,
+            pixels: pixels.into_bytes(),
+        })
+    }
+
+
     #[must_use]
     pub fn pixels(&self) -> PicturePixelsRef<'_> {
         match self.format {
@@ -9515,6 +9537,63 @@ impl Pictures for () {
     fn get(&self, _handle: PictureHandle) -> Option<PicturePixelsRef<'_>> {
         None
     }
+}
+
+/// Chooses the shallowest pixel format that can draw this screen faithfully.
+///
+/// An RGB-capable session still renders ordinary screens as Gray8. RGB storage
+/// is selected only when the retained screen actually refers to a cached RGB
+/// picture; unrelated cache entries and missing handles cannot deepen it.
+#[must_use]
+pub fn surface_format_for(
+    screen: &Screen,
+    metrics: &DisplayMetrics,
+    pictures: &dyn Pictures,
+) -> PictureFormat {
+    if metrics.picture_format != PictureFormat::Rgb8 {
+        return PictureFormat::Gray8;
+    }
+    let reading_is_rgb = screen
+        .reading_surface
+        .as_ref()
+        .is_some_and(|reading| picture_is_rgb(reading.picture.handle, pictures));
+    let overlay_is_rgb = screen
+        .overlay
+        .as_ref()
+        .is_some_and(|overlay| nodes_reference_rgb(&overlay.nodes, pictures));
+    if reading_is_rgb || overlay_is_rgb || nodes_reference_rgb(&screen.nodes, pictures) {
+        PictureFormat::Rgb8
+    } else {
+        PictureFormat::Gray8
+    }
+}
+
+fn nodes_reference_rgb(nodes: &[Node], pictures: &dyn Pictures) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::RichText { formulae, .. } => formulae
+            .iter()
+            .any(|formula| picture_is_rgb(formula.handle, pictures)),
+        Node::Card { children, .. } => nodes_reference_rgb(children, pictures),
+        Node::Band { slots, .. } => slots
+            .iter()
+            .any(|slot| nodes_reference_rgb(&slot.nodes, pictures)),
+        Node::Rows { rows, .. } => rows.iter().any(|row| {
+            matches!(
+                row.lead,
+                RowLead::Picture(picture, _) if picture_is_rgb(picture.handle, pictures)
+            )
+        }),
+        Node::TileGrid { tiles, .. } => tiles.iter().any(|tile| {
+            tile.picture
+                .is_some_and(|picture| picture_is_rgb(picture.handle, pictures))
+        }),
+        Node::Picture { handle, .. } => picture_is_rgb(*handle, pictures),
+        _ => false,
+    })
+}
+
+fn picture_is_rgb(handle: PictureHandle, pictures: &dyn Pictures) -> bool {
+    matches!(pictures.get(handle), Some(PicturePixelsRef::Rgb8(_)))
 }
 
 impl Screen {

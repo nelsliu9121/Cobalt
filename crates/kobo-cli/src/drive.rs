@@ -312,9 +312,7 @@ impl Driver {
 
     /// Writes the panel out as a PNG and returns where it went.
     fn shot(&mut self, name: &str) -> Result<PathBuf, String> {
-        let frame = self.frame()?;
-        let png = kobo_image::encode_png_grey(FRAME_WIDTH, FRAME_HEIGHT, &frame)
-            .map_err(|error| format!("encode the frame: {error}"))?;
+        let png = self.frame_png()?;
         self.taken += 1;
         let name = if name.is_empty() {
             format!("{:03}", self.taken)
@@ -336,23 +334,27 @@ impl Driver {
             .find(|control| control.says(label)))
     }
 
-    /// The raw grey bytes of the panel as the simulator has it.
+    /// A format-preserving PNG of the panel as the simulator has it.
     ///
     /// # Errors
     ///
     /// Returns an error when the simulator cannot be reached, or answers with
-    /// a frame that is not the size of the panel -- which would silently come
-    /// out as a picture skewed one pixel further with every row.
-    pub fn frame(&self) -> Result<Vec<u8>, String> {
-        let frame = self.get(if self.ideal { "/ideal-frame" } else { "/frame" })?;
-        let expected = (FRAME_WIDTH as usize) * (FRAME_HEIGHT as usize);
-        if frame.len() != expected {
+    /// something other than an eight-bit Gray8/RGB8 PNG of the simulated panel.
+    pub fn frame_png(&self) -> Result<Vec<u8>, String> {
+        let png = self.get(if self.ideal { "/ideal-frame" } else { "/frame" })?;
+        let valid = png.get(..8) == Some(b"\x89PNG\r\n\x1a\n")
+            && png.get(12..16) == Some(b"IHDR")
+            && png.get(16..20) == Some(&FRAME_WIDTH.to_be_bytes())
+            && png.get(20..24) == Some(&FRAME_HEIGHT.to_be_bytes())
+            && png.get(24) == Some(&8)
+            && matches!(png.get(25), Some(0 | 2));
+        if !valid {
             return Err(format!(
-                "the simulator sent {} bytes for a {FRAME_WIDTH}x{FRAME_HEIGHT} panel, not {expected}",
-                frame.len()
+                "the simulator did not send an eight-bit Gray8/RGB8 PNG for a \
+                 {FRAME_WIDTH}x{FRAME_HEIGHT} panel"
             ));
         }
-        Ok(frame)
+        Ok(png)
     }
 
     /// Everything the renderer put on the panel.

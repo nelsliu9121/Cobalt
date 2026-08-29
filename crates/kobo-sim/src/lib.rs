@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Localhost-only browser simulator for Kobo grayscale screens.
+//! Localhost-only browser simulator for typed Kobo screens.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,8 +18,8 @@ use kobo_policy::{shelf::Shelf, store::Store, DeviceServices, ManagedCredentials
 use kobo_profile::{DeviceProfile, PanelPose, CLARA_BW_391};
 use kobo_protocol::{read_from, write_to, Frame, Lifecycle, Message};
 use kobo_ui::{
-    ActionId, DisplayMetrics, FramePlanner, FrameTransition, Node, NodeId, PanelWaveform, Screen,
-    Surface,
+    ActionId, DisplayMetrics, FramePlanner, FrameTransition, Node, NodeId, PanelWaveform,
+    PictureFormat, PicturePixels, PicturePixelsRef, Screen, Surface,
 };
 
 const MAX_HTTP_HEADER: usize = 8 * 1024;
@@ -106,35 +106,44 @@ struct SimulatedTouch {
 /// of residue left by non-cleaning updates.
 #[derive(Debug)]
 struct PanelPreview {
+    width: usize,
+    height: usize,
     planner: FramePlanner,
-    ideal: Vec<u8>,
-    visible: Vec<u8>,
+    ideal: PicturePixels,
+    visible: PicturePixels,
     last: Option<FrameTransition>,
 }
 
 impl PanelPreview {
-    fn new() -> Self {
-        let width = PROFILE.width as usize;
-        let height = PROFILE.height as usize;
+    fn new(width: usize, height: usize) -> Self {
         let pixels = width.saturating_mul(height);
         Self {
+            width,
+            height,
             planner: FramePlanner::new(width, height),
-            ideal: vec![kobo_ui::tone::PAPER; pixels],
-            visible: vec![kobo_ui::tone::INK; pixels],
+            ideal: PicturePixels::Gray8(vec![kobo_ui::tone::PAPER; pixels]),
+            visible: PicturePixels::Gray8(vec![kobo_ui::tone::INK; pixels]),
             last: None,
         }
     }
 
     fn update(&mut self, surface: &Surface) {
-        self.ideal.clear();
-        self.ideal.extend_from_slice(surface.bytes());
+        self.ideal = owned_pixels(surface.pixels());
         let Some(transition) = self.planner.plan(surface) else {
+            if self.visible.format() != surface.format {
+                self.visible = convert_achromatic(&self.visible, surface.format)
+                    .unwrap_or_else(|| owned_pixels(surface.pixels()));
+            }
             self.last = None;
             return;
         };
         if transition.full {
-            self.visible.copy_from_slice(surface.bytes());
+            self.visible = owned_pixels(surface.pixels());
         } else {
+            if self.visible.format() != surface.format {
+                self.visible = convert_achromatic(&self.visible, surface.format)
+                    .unwrap_or_else(|| owned_pixels(surface.pixels()));
+            }
             self.apply_partial(surface, transition);
         }
         if self.planner.commit(surface, transition) {
@@ -155,17 +164,124 @@ impl PanelPreview {
         let Ok(height) = usize::try_from(transition.region.height) else {
             return;
         };
-        for y in top..top.saturating_add(height) {
-            let row = y.saturating_mul(surface.width);
-            for x in left..left.saturating_add(width) {
-                let index = row.saturating_add(x);
-                let Some(target) = surface.bytes().get(index).copied() else {
+        match (surface.pixels(), &mut self.visible) {
+            (PicturePixelsRef::Gray8(target), PicturePixels::Gray8(visible)) => {
+                apply_partial_channels(
+                    target,
+                    visible,
+                    surface.width,
+                    1,
+                    (left, top, width, height),
+                    transition.waveform,
+                );
+            }
+            (PicturePixelsRef::Rgb8(target), PicturePixels::Rgb8(visible)) => {
+                apply_partial_channels(
+                    target,
+                    visible,
+                    surface.width,
+                    3,
+                    (left, top, width, height),
+                    transition.waveform,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn frame(&self, ideal: bool) -> PicturePixelsRef<'_> {
+        if ideal {
+            self.ideal.as_ref()
+        } else {
+            self.visible.as_ref()
+        }
+    }
+
+    fn rgba_frame(&self, ideal: bool) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(
+            self.width
+                .saturating_mul(self.height)
+                .saturating_mul(4),
+        );
+        match self.frame(ideal) {
+            PicturePixelsRef::Gray8(gray) => {
+                for tone in gray {
+                    rgba.extend_from_slice(&[*tone, *tone, *tone, u8::MAX]);
+                }
+            }
+            PicturePixelsRef::Rgb8(rgb) => {
+                for pixel in rgb.chunks_exact(3) {
+                    rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]);
+                }
+            }
+        }
+        rgba
+    }
+
+    fn png(&self, ideal: bool) -> Result<Vec<u8>, String> {
+        kobo_image::encode_png(
+            u32::try_from(self.width).map_err(|_| "simulated width is too large")?,
+            u32::try_from(self.height).map_err(|_| "simulated height is too large")?,
+            self.frame(ideal),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn owned_pixels(pixels: PicturePixelsRef<'_>) -> PicturePixels {
+    match pixels {
+        PicturePixelsRef::Gray8(gray) => PicturePixels::Gray8(gray.to_vec()),
+        PicturePixelsRef::Rgb8(rgb) => PicturePixels::Rgb8(rgb.to_vec()),
+    }
+}
+
+fn convert_achromatic(pixels: &PicturePixels, format: PictureFormat) -> Option<PicturePixels> {
+    match (pixels, format) {
+        (PicturePixels::Gray8(gray), PictureFormat::Gray8) => {
+            Some(PicturePixels::Gray8(gray.clone()))
+        }
+        (PicturePixels::Rgb8(rgb), PictureFormat::Rgb8) => Some(PicturePixels::Rgb8(rgb.clone())),
+        (PicturePixels::Gray8(gray), PictureFormat::Rgb8) => {
+            let mut rgb = Vec::with_capacity(gray.len().saturating_mul(3));
+            for tone in gray {
+                rgb.extend_from_slice(&[*tone; 3]);
+            }
+            Some(PicturePixels::Rgb8(rgb))
+        }
+        (PicturePixels::Rgb8(rgb), PictureFormat::Gray8) => {
+            let mut gray = Vec::with_capacity(rgb.len() / 3);
+            for pixel in rgb.chunks_exact(3) {
+                if pixel[0] != pixel[1] || pixel[1] != pixel[2] {
+                    return None;
+                }
+                gray.push(pixel[0]);
+            }
+            Some(PicturePixels::Gray8(gray))
+        }
+    }
+}
+
+fn apply_partial_channels(
+    target: &[u8],
+    visible: &mut [u8],
+    surface_width: usize,
+    channels: usize,
+    (left, top, width, height): (usize, usize, usize, usize),
+    waveform: PanelWaveform,
+) {
+    for y in top..top.saturating_add(height) {
+        let row = y.saturating_mul(surface_width);
+        for x in left..left.saturating_add(width) {
+            let pixel = row.saturating_add(x);
+            let start = pixel.saturating_mul(channels);
+            for channel in 0..channels {
+                let Some(target) = target.get(start + channel).copied() else {
                     continue;
                 };
-                let Some(visible) = self.visible.get_mut(index) else {
+                let Some(visible) = visible.get_mut(start + channel) else {
                     continue;
                 };
-                let target = match transition.waveform {
+                let target = match waveform {
                     PanelWaveform::Du => {
                         if target < 128 {
                             kobo_ui::tone::INK
@@ -179,19 +295,11 @@ impl PanelPreview {
                     | PanelWaveform::Gcc16 => target,
                 };
                 // An LCD cannot reproduce electrophoretic residue. Retaining
-                // one sixteenth of the previous displayed value makes stale
+                // one sixteenth of the previous displayed channel makes stale
                 // edges visible without claiming hardware-measured physics.
                 *visible = u8::try_from((u16::from(target) * 15 + u16::from(*visible)) / 16)
                     .unwrap_or(target);
             }
-        }
-    }
-
-    fn frame(&self, ideal: bool) -> &[u8] {
-        if ideal {
-            &self.ideal
-        } else {
-            &self.visible
         }
     }
 }
@@ -219,7 +327,7 @@ impl Simulator {
         let mut simulator = Self {
             counter: 0,
             screen: Screen::new(1, Vec::new()),
-            panel: PanelPreview::new(),
+            panel: PanelPreview::new(PROFILE.width as usize, PROFILE.height as usize),
             scenario: Scenario::Normal,
             lifecycle: Lifecycle::Foreground,
             last_touch: None,
@@ -238,27 +346,43 @@ impl Simulator {
         &self.screen
     }
 
+    /// Returns the visible panel as exact RGBA bytes for embedding clients.
+    ///
+    /// Gray8 tones expand to equal channels; RGB8 triples are preserved.
     #[must_use]
     pub fn frame(&mut self) -> Vec<u8> {
         self.render_frame(false)
     }
 
+    /// Returns the residue-free target frame as exact RGBA bytes.
     #[must_use]
     pub fn ideal_frame(&mut self) -> Vec<u8> {
         self.render_frame(true)
     }
 
     fn render_frame(&mut self, ideal: bool) -> Vec<u8> {
-        let mut surface = Surface::new(PROFILE.width as usize, PROFILE.height as usize);
+        self.update_panel();
+        self.panel.rgba_frame(ideal)
+    }
+
+    fn render_png(&mut self, ideal: bool) -> Result<Vec<u8>, String> {
+        self.update_panel();
+        self.panel.png(ideal)
+    }
+
+    fn update_panel(&mut self) {
+        let metrics = profile_metrics();
+        let format = kobo_ui::surface_format_for(&self.screen, &metrics, &());
+        let mut surface =
+            Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
         kobo_ui::render_with(
             &self.screen,
-            &profile_metrics(),
+            &metrics,
             &kobo_ui::Chrome::default(),
             &mut surface,
             None,
         );
         self.panel.update(&surface);
-        self.panel.frame(ideal).to_vec()
     }
 
     pub fn touch(&mut self, x: i32, y: i32) -> Option<ActionId> {
@@ -375,12 +499,12 @@ impl Server {
                 SHELL.as_bytes(),
             ),
             ("GET", "/frame") => {
-                let frame = self.simulator.frame();
-                write_response(&mut stream, 200, "application/octet-stream", &frame)
+                let png = self.simulator.render_png(false).map_err(io::Error::other)?;
+                write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/ideal-frame") => {
-                let frame = self.simulator.ideal_frame();
-                write_response(&mut stream, 200, "application/octet-stream", &frame)
+                let png = self.simulator.render_png(true).map_err(io::Error::other)?;
+                write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/simulation") => {
                 let body = self.simulator.simulation_json();
@@ -728,6 +852,7 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
         let mut held = state
             .lock()
             .map_err(|_| io::Error::other("app state lock poisoned"))?;
+        let accepted = profile_metrics().picture_format;
         let pictures = held.active_pictures_mut();
         match message {
             Message::PutPicture {
@@ -735,14 +860,22 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
                 width,
                 height,
                 pixels,
-            } => picture_result(handle, pictures.put_report(handle, width, height, pixels)),
+            } => {
+                let result = if accepts_picture_format(accepted, pixels.format()) {
+                    pictures.put_report(handle, width, height, pixels)
+                } else {
+                    None
+                };
+                picture_result(handle, result)
+            }
             Message::BeginPicture {
                 handle,
                 width,
                 height,
                 format,
-            } => (!pictures.begin_upload(handle, width, height, format))
-                .then(|| format!("picture {} upload refused", handle.0)),
+            } => (!accepts_picture_format(accepted, format)
+                || !pictures.begin_upload(handle, width, height, format))
+            .then(|| format!("picture {} upload refused", handle.0)),
             Message::PictureChunk {
                 handle,
                 offset,
@@ -768,6 +901,10 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
         Some(message) => note(state, &message),
         None => Ok(()),
     }
+}
+
+fn accepts_picture_format(accepted: PictureFormat, supplied: PictureFormat) -> bool {
+    supplied == PictureFormat::Gray8 || accepted == PictureFormat::Rgb8
 }
 
 fn picture_result(
@@ -843,7 +980,7 @@ impl AppState {
             logs: Vec::new(),
             pictures: kobo_ui::PictureCache::default(),
             pressure_pictures: kobo_ui::PictureCache::new(256 * 1024),
-            panel: PanelPreview::new(),
+            panel: PanelPreview::new(PROFILE.width as usize, PROFILE.height as usize),
             scenario: Scenario::Normal,
             lifecycle: Lifecycle::Foreground,
             last_touch: None,
@@ -1043,6 +1180,22 @@ impl AppState {
     }
 }
 
+fn render_app_panel(state: &mut AppState) {
+    let metrics = profile_metrics();
+    let format =
+        kobo_ui::surface_format_for(&state.screen, &metrics, state.active_pictures());
+    let mut surface = Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
+    kobo_ui::render_all(
+        &state.screen,
+        &metrics,
+        &kobo_ui::Chrome::default(),
+        state.active_pictures(),
+        &mut surface,
+        None,
+    );
+    state.panel.update(&surface);
+}
+
 /// Connected SDK app state and the serialized action writer.
 #[derive(Clone, Debug)]
 pub struct AppSession {
@@ -1093,22 +1246,14 @@ impl AppSession {
         Ok(())
     }
 
-    fn render_frame(&self, ideal: bool) -> Vec<u8> {
+
+    fn render_png(&self, ideal: bool) -> Result<Vec<u8>, String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut surface = Surface::new(PROFILE.width as usize, PROFILE.height as usize);
-        kobo_ui::render_all(
-            &state.screen,
-            &profile_metrics(),
-            &kobo_ui::Chrome::default(),
-            state.active_pictures(),
-            &mut surface,
-            None,
-        );
-        state.panel.update(&surface);
-        state.panel.frame(ideal).to_vec()
+        render_app_panel(&mut state);
+        state.panel.png(ideal)
     }
 
     fn set_scenario(&self, scenario: Scenario) -> io::Result<()> {
@@ -1155,12 +1300,12 @@ impl AppSession {
                 SHELL.as_bytes(),
             ),
             ("GET", "/frame") => {
-                let frame = self.render_frame(false);
-                write_response(&mut stream, 200, "application/octet-stream", &frame)
+                let png = self.render_png(false).map_err(io::Error::other)?;
+                write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/ideal-frame") => {
-                let frame = self.render_frame(true);
-                write_response(&mut stream, 200, "application/octet-stream", &frame)
+                let png = self.render_png(true).map_err(io::Error::other)?;
+                write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/simulation") => {
                 let body = {
@@ -2499,7 +2644,7 @@ function showDiagnostics(){list.replaceChildren();if(!issues.length){const item=
 function outline(rect,color,width){if(!rect)return;ctx.save();ctx.lineWidth=width;ctx.strokeStyle=color;ctx.strokeRect(rect.x+width/2,rect.y+width/2,Math.max(0,rect.width-width),Math.max(0,rect.height-width));ctx.restore();}
 function drawOverlays(){if(refreshRegion.checked&&transition)outline(transition.region,"#006fbb",6);if(!overlay.checked)return;for(const issue of issues){outline(issue.rect,issue.severity==="error"?"#d00000":"#b56a00",5);}}
 function showSimulation(sim){profile=sim.profile;transition=sim.transition;scenario.value=sim.scenario;document.getElementById("profile-badge").textContent=profile.id;document.getElementById("geometry").textContent=profile.width+" × "+profile.height;document.getElementById("density").textContent=profile.pixelsPerInch+" PPI";document.getElementById("rotation").textContent=profile.rotation;document.getElementById("lifecycle").textContent=sim.lifecycle;const touch=sim.touch;document.getElementById("display-touch").textContent=touch?touch.display.x+", "+touch.display.y:"—";document.getElementById("raw-touch").textContent=touch?touch.raw.x+", "+touch.raw.y:"—";document.getElementById("waveform").textContent=transition?transition.waveform:"—";document.getElementById("update-kind").textContent=transition?(transition.full?"full / cleaning":"partial"):"unchanged";document.getElementById("region").textContent=transition?transition.region.width+"×"+transition.region.height+" @ "+transition.region.x+","+transition.region.y:"—";document.getElementById("refresh-count").textContent=sim.refreshCount;document.getElementById("partial-count").textContent=sim.partialsSinceClean+" / 8";}
-async function frame(){const path=ideal.checked?"/ideal-frame":"/frame";const response=checked(await fetch(path,{cache:"no-store"}));const raw=new Uint8Array(await response.arrayBuffer());const [diagnostics,simulation]=await Promise.all([fetch("/diagnostics",{cache:"no-store"}).then(checked).then(r=>r.json()),fetch("/simulation",{cache:"no-store"}).then(checked).then(r=>r.json())]);issues=diagnostics.issues;showSimulation(simulation);if(raw.length!==profile.width*profile.height)throw Error("Invalid "+profile.id+" frame");if(canvas.width!==profile.width||canvas.height!==profile.height){canvas.width=profile.width;canvas.height=profile.height;}const image=ctx.createImageData(profile.width,profile.height);for(let i=0;i<raw.length;i++){const p=i*4;image.data[p]=image.data[p+1]=image.data[p+2]=raw[i];image.data[p+3]=255;}ctx.putImageData(image,0,0);showDiagnostics();drawOverlays();if(!ideal.checked&&transition&&transition.full&&transition.refresh!==lastFlash){lastFlash=transition.refresh;canvas.classList.remove("clean-flash");void canvas.offsetWidth;canvas.classList.add("clean-flash");}status.textContent=issues.length?"Frame loaded with "+issues.length+" diagnostic"+(issues.length===1?"":"s")+".":"Frame loaded; layout clean.";}
+async function frame(){const path=ideal.checked?"/ideal-frame":"/frame";const response=checked(await fetch(path,{cache:"no-store"}));const bitmap=await createImageBitmap(await response.blob());const [diagnostics,simulation]=await Promise.all([fetch("/diagnostics",{cache:"no-store"}).then(checked).then(r=>r.json()),fetch("/simulation",{cache:"no-store"}).then(checked).then(r=>r.json())]);issues=diagnostics.issues;showSimulation(simulation);if(bitmap.width!==profile.width||bitmap.height!==profile.height){bitmap.close();throw Error("Invalid "+profile.id+" frame");}if(canvas.width!==profile.width||canvas.height!==profile.height){canvas.width=profile.width;canvas.height=profile.height;}ctx.drawImage(bitmap,0,0);bitmap.close();showDiagnostics();drawOverlays();if(!ideal.checked&&transition&&transition.full&&transition.refresh!==lastFlash){lastFlash=transition.refresh;canvas.classList.remove("clean-flash");void canvas.offsetWidth;canvas.classList.add("clean-flash");}status.textContent=issues.length?"Frame loaded with "+issues.length+" diagnostic"+(issues.length===1?"":"s")+".":"Frame loaded; layout clean.";}
 function touchLocation(event){const rect=canvas.getBoundingClientRect();return{x:Math.floor((event.clientX-rect.left)*profile.width/rect.width),y:Math.floor((event.clientY-rect.top)*profile.height/rect.height)};}
 async function touch(next){point=next;checked(await fetch("/touch",{method:"POST",headers:{"Content-Type":"text/plain"},body:"x="+point.x+"&y="+point.y}));await frame();status.textContent="Touch delivered through the Clara BW transform.";}
 async function post(path,body){checked(await fetch(path,{method:"POST",headers:{"Content-Type":"text/plain"},body}));await frame();}
@@ -2899,6 +3044,112 @@ mod tests {
     }
 
     #[test]
+    fn color_buffers_convert_gray8_and_rgb8_to_exact_rgba() {
+        let mut gray_panel = PanelPreview::new(2, 1);
+        let gray = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Gray8(vec![0x20, 0x80]),
+        )
+        .expect("valid Gray8 surface");
+        gray_panel.update(&gray);
+        assert_eq!(
+            gray_panel.frame(true),
+            PicturePixelsRef::Gray8(&[0x20, 0x80])
+        );
+        assert_eq!(
+            gray_panel.rgba_frame(true),
+            vec![0x20, 0x20, 0x20, 0xff, 0x80, 0x80, 0x80, 0xff]
+        );
+        let gray_png = gray_panel.png(true).expect("Gray8 PNG");
+        assert_eq!(gray_png.get(25), Some(&0), "PNG was not grayscale");
+
+        let mut color_panel = PanelPreview::new(2, 1);
+        let rgb = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![10, 20, 30, 40, 50, 60]),
+        )
+        .expect("valid RGB8 surface");
+        color_panel.update(&rgb);
+        assert_eq!(
+            color_panel.frame(true),
+            PicturePixelsRef::Rgb8(&[10, 20, 30, 40, 50, 60])
+        );
+        assert_eq!(
+            color_panel.frame(false),
+            PicturePixelsRef::Rgb8(&[10, 20, 30, 40, 50, 60])
+        );
+        assert_eq!(
+            color_panel.rgba_frame(true),
+            vec![10, 20, 30, 0xff, 40, 50, 60, 0xff]
+        );
+        let rgb_png = color_panel.png(true).expect("RGB8 PNG");
+        assert_eq!(rgb_png.get(25), Some(&2), "PNG was not RGB");
+    }
+
+    #[test]
+    fn color_buffers_keep_color_distinctions_and_record_color_waveforms() {
+        let mut panel = PanelPreview::new(2, 1);
+        let first = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![10, 20, 30, 40, 50, 60]),
+        )
+        .expect("valid RGB8 surface");
+        panel.update(&first);
+        assert_eq!(
+            panel.last.expect("first transition").waveform,
+            PanelWaveform::Gcc16
+        );
+        assert!(simulation_json(
+            &panel,
+            Scenario::Normal,
+            Lifecycle::Foreground,
+            None
+        )
+        .contains("\"waveform\":\"GCC16\""));
+
+        let second = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![30, 20, 10, 40, 50, 60]),
+        )
+        .expect("valid RGB8 surface");
+        panel.update(&second);
+        assert_eq!(
+            panel.last.expect("changed color transition").waveform,
+            PanelWaveform::Glrc16
+        );
+        assert_eq!(
+            panel.frame(false),
+            PicturePixelsRef::Rgb8(&[28, 20, 11, 40, 50, 60]),
+            "ghosting was not applied independently per channel"
+        );
+        assert!(simulation_json(
+            &panel,
+            Scenario::Normal,
+            Lifecycle::Foreground,
+            None
+        )
+        .contains("\"waveform\":\"GLRC16\""));
+
+        panel.update(&second);
+        assert!(panel.last.is_none(), "an equal RGB frame refreshed");
+        let equal_luma_but_different_color = Surface::from_pixels(
+            2,
+            1,
+            kobo_ui::PicturePixels::Rgb8(vec![20, 30, 10, 40, 50, 60]),
+        )
+        .expect("valid RGB8 surface");
+        panel.update(&equal_luma_but_different_color);
+        assert!(
+            panel.last.is_some(),
+            "RGB frame equality collapsed distinct colors"
+        );
+    }
+
+    #[test]
     fn parses_bounded_http_request() {
         let request = parse_request(b"POST /touch HTTP/1.1\r\nHost: localhost\r\n\r\nx=12&y=34")
             .expect("valid request");
@@ -2911,7 +3162,7 @@ mod tests {
         let mut simulator = Simulator::new();
         assert_eq!(
             simulator.frame().len(),
-            (PROFILE.width * PROFILE.height) as usize
+            (PROFILE.width * PROFILE.height * 4) as usize
         );
         let button = simulator.screen().layout().nodes[2].rect;
         assert_eq!(

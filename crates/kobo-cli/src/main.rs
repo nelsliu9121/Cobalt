@@ -4407,16 +4407,21 @@ fn shot_command(arguments: &[String]) -> Result<(), String> {
         }
         index += 1;
     }
-    let (width, height, grey) = if let Some(host) = host {
+    let (width, height, png) = if let Some(host) = host {
         let transcript = capture_remote_fixed_artifact(&host, &RemoteArtifact::capture())?;
-        drive::decode_capture(&transcript)?
+        let (width, height, gray) = drive::decode_capture(&transcript)?;
+        let png = kobo_image::encode_png(
+            width,
+            height,
+            kobo_image::PicturePixelsRef::Gray8(&gray),
+        )
+        .map_err(|error| format!("encode the panel: {error}"))?;
+        (width, height, png)
     } else {
         let driver = drive::Driver::new(&address, Path::new(".")).ideal(ideal);
         let (width, height) = drive::SIMULATED_PANEL;
-        (width, height, driver.frame()?)
+        (width, height, driver.frame_png()?)
     };
-    let png = kobo_image::encode_png_grey(width, height, &grey)
-        .map_err(|error| format!("encode the panel: {error}"))?;
     fs::write(&output, png).map_err(|error| format!("write {}: {error}", output.display()))?;
     println!("shot {} ({width}x{height})", output.display());
     Ok(())
@@ -4532,10 +4537,10 @@ fn pull_recording(host: &str) -> Result<Vec<u8>, String> {
     gunzip(&output.stdout)
 }
 
-/// One recorded frame: when it appeared, and what was on the panel.
+/// One recorded frame: when it appeared, and its explicitly typed pixels.
 struct RecordedFrame {
     millis: u32,
-    grey: Vec<u8>,
+    pixels: kobo_image::PicturePixels,
 }
 
 /// Reads the device's recording format.
@@ -4544,6 +4549,11 @@ struct RecordedFrame {
 /// the device can be unplugged or run out of room mid-write, and half a frame
 /// decoded as a whole one would be a picture of nothing that looks like a
 /// rendering bug.
+///
+/// `KOBOCST1` is permanently the Gray8 recording shape written by the current
+/// read-only doctor. A future RGB shape must use another magic and carry its
+/// format; treating these bytes as RGB would turn three gray pixels into one
+/// invented color pixel.
 fn decode_recording(raw: &[u8]) -> Result<(u32, u32, Vec<RecordedFrame>), String> {
     const MAGIC: &[u8; 8] = b"KOBOCST1";
     if raw.len() < 16 || &raw[..8] != MAGIC {
@@ -4562,7 +4572,9 @@ fn decode_recording(raw: &[u8]) -> Result<(u32, u32, Vec<RecordedFrame>), String
         let millis = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
         frames.push(RecordedFrame {
             millis,
-            grey: raw[at + 4..at + 4 + pixels].to_vec(),
+            pixels: kobo_image::PicturePixels::Gray8(
+                raw[at + 4..at + 4 + pixels].to_vec(),
+            ),
         });
         at += 4 + pixels;
     }
@@ -4592,7 +4604,7 @@ fn write_recording(
     fs::create_dir_all(directory)
         .map_err(|error| format!("create {}: {error}", directory.display()))?;
     for (index, frame) in frames.iter().enumerate() {
-        let png = kobo_image::encode_png_grey(*width, *height, &frame.grey)
+        let png = kobo_image::encode_png(*width, *height, frame.pixels.as_ref())
             .map_err(|error| format!("encode frame {index}: {error}"))?;
         let path = directory.join(format!("frame-{index:04}.png"));
         fs::write(&path, png).map_err(|error| format!("write {}: {error}", path.display()))?;
@@ -5530,7 +5542,10 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].millis, 0);
         assert_eq!(frames[1].millis, 500);
-        assert_eq!(frames[1].grey, vec![0x40; 6]);
+        assert_eq!(
+            frames[1].pixels,
+            kobo_image::PicturePixels::Gray8(vec![0x40; 6])
+        );
     }
 
     #[test]
@@ -5545,7 +5560,10 @@ mod tests {
         let ramp: Vec<u8> = (0..=255_u8).step_by(1).take(256).collect();
         raw.extend_from_slice(&ramp);
         let (_, _, frames) = super::decode_recording(&raw).expect("decode");
-        assert_eq!(frames[0].grey, ramp);
+        assert_eq!(
+            frames[0].pixels,
+            kobo_image::PicturePixels::Gray8(ramp)
+        );
     }
 
     #[test]
