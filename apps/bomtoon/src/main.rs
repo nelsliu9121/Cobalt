@@ -64,6 +64,20 @@ struct PageLocation {
     slice: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageSegment {
+    source: usize,
+    source_row: u32,
+    rows: u32,
+    destination_row: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PagePlan {
+    segments: Vec<PageSegment>,
+    content_rows: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Retry {
     #[default]
@@ -1097,6 +1111,137 @@ fn page_plan(
     Ok((pages, total))
 }
 
+fn validate_continuous_page(plan: &PagePlan) -> Result<(), String> {
+    let mut next_destination = 0_u32;
+    let mut previous_source = None;
+    for segment in &plan.segments {
+        if segment.rows == 0 || segment.destination_row != next_destination {
+            return Err("The comic page plan is not contiguous.".to_owned());
+        }
+        if let Some(previous) = previous_source {
+            if segment.source < previous {
+                return Err("The comic page plan is not source-ordered.".to_owned());
+            }
+        }
+        segment
+            .source_row
+            .checked_add(segment.rows)
+            .ok_or_else(|| "The comic source interval is not supported.".to_owned())?;
+        next_destination = next_destination
+            .checked_add(segment.rows)
+            .ok_or_else(|| "The comic destination interval is not supported.".to_owned())?;
+        if next_destination > plan.content_rows {
+            return Err("The comic page plan is not contiguous.".to_owned());
+        }
+        previous_source = Some(segment.source);
+    }
+    if next_destination != plan.content_rows {
+        return Err("The comic page plan is not contiguous.".to_owned());
+    }
+    Ok(())
+}
+
+fn continuous_page_plan(
+    images: &[EpisodeImage],
+    panel_width: u32,
+    panel_height: u32,
+) -> Result<(Vec<PagePlan>, u16), String> {
+    if panel_width == 0 || panel_height == 0 {
+        return Err("The comic page dimensions are not supported.".to_owned());
+    }
+
+    let panel_rows = u64::from(panel_height);
+    let mut total_rows = 0_u64;
+    for image in images {
+        let (_, scaled_height) =
+            kobo_image::width_scaled_size((image.width, image.height), panel_width)
+                .map_err(|error| error.to_string())?;
+        total_rows = total_rows
+            .checked_add(u64::from(scaled_height))
+            .ok_or_else(|| "The comic height is not supported.".to_owned())?;
+    }
+
+    let page_count = total_rows.div_ceil(panel_rows);
+    let total_pages =
+        u16::try_from(page_count).map_err(|_| "The comic has too many pages.".to_owned())?;
+    let mut plans = Vec::with_capacity(usize::from(total_pages));
+    for page in 0..page_count {
+        let page_start = page
+            .checked_mul(panel_rows)
+            .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
+        let remaining = total_rows
+            .checked_sub(page_start)
+            .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
+        let content_rows = u32::try_from(remaining.min(panel_rows))
+            .map_err(|_| "The comic page height is not supported.".to_owned())?;
+        plans.push(PagePlan {
+            segments: Vec::new(),
+            content_rows,
+        });
+    }
+
+    let mut source_start = 0_u64;
+    for (source, image) in images.iter().enumerate() {
+        let (_, scaled_height) =
+            kobo_image::width_scaled_size((image.width, image.height), panel_width)
+                .map_err(|error| error.to_string())?;
+        let source_end = source_start
+            .checked_add(u64::from(scaled_height))
+            .ok_or_else(|| "The comic source interval is not supported.".to_owned())?;
+        let mut page = source_start / panel_rows;
+        loop {
+            let page_start = page
+                .checked_mul(panel_rows)
+                .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
+            if page_start >= source_end {
+                break;
+            }
+            let plan_index = usize::try_from(page)
+                .map_err(|_| "The comic page index is not supported.".to_owned())?;
+            let plan = plans
+                .get_mut(plan_index)
+                .ok_or_else(|| "The comic page index is not supported.".to_owned())?;
+            let page_end = page_start
+                .checked_add(u64::from(plan.content_rows))
+                .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
+            let overlap_start = page_start.max(source_start);
+            let overlap_end = page_end.min(source_end);
+            if overlap_start < overlap_end {
+                let source_row = overlap_start
+                    .checked_sub(source_start)
+                    .ok_or_else(|| "The comic source row is not supported.".to_owned())?;
+                let rows = overlap_end
+                    .checked_sub(overlap_start)
+                    .ok_or_else(|| "The comic segment height is not supported.".to_owned())?;
+                let destination_row = overlap_start
+                    .checked_sub(page_start)
+                    .ok_or_else(|| "The comic destination row is not supported.".to_owned())?;
+                plan.segments.push(PageSegment {
+                    source,
+                    source_row: u32::try_from(source_row)
+                        .map_err(|_| "The comic source row is not supported.".to_owned())?,
+                    rows: u32::try_from(rows)
+                        .map_err(|_| "The comic segment height is not supported.".to_owned())?,
+                    destination_row: u32::try_from(destination_row)
+                        .map_err(|_| "The comic destination row is not supported.".to_owned())?,
+                });
+            }
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| "The comic page index is not supported.".to_owned())?;
+        }
+        source_start = source_end;
+    }
+
+    if source_start != total_rows {
+        return Err("The comic source intervals are not contiguous.".to_owned());
+    }
+    for plan in &plans {
+        validate_continuous_page(plan)?;
+    }
+    Ok((plans, total_pages))
+}
+
 fn previous_location(pages: &[usize], current: PageLocation) -> Option<PageLocation> {
     if current.slice > 0 {
         return Some(PageLocation {
@@ -1270,6 +1415,248 @@ mod tests {
             "{{\"result\":\"SUCCESS\",\"data\":[{{\"orderNo\":1,\"width\":1,\"height\":1,\"imagePath\":\"https://image.balcony.studio{path}?Policy={policy}&Signature=s&Key-Pair-Id=k\",\"line\":null,\"point\":null}}]}}"
         )
         .into_bytes()
+    }
+
+    fn episode_image(source: usize, width: u32, height: u32) -> EpisodeImage {
+        EpisodeImage {
+            order: source + 1,
+            width,
+            height,
+            path: format!("/tw/ep/{source}.webp"),
+            url: format!("https://image.balcony.studio/tw/ep/{source}.webp"),
+        }
+    }
+
+    fn plan_for_heights(heights: &[u32]) -> (Vec<PagePlan>, u16) {
+        let images = heights
+            .iter()
+            .enumerate()
+            .map(|(source, height)| episode_image(source, 2, *height))
+            .collect::<Vec<_>>();
+        continuous_page_plan(&images, 2, 4).expect("continuous page plan")
+    }
+
+    #[test]
+    fn short_sources_share_a_page_without_seam_padding() {
+        let (plans, total_pages) = plan_for_heights(&[2, 2]);
+        assert_eq!(total_pages, 1);
+        assert_eq!(
+            plans,
+            vec![PagePlan {
+                segments: vec![
+                    PageSegment {
+                        source: 0,
+                        source_row: 0,
+                        rows: 2,
+                        destination_row: 0,
+                    },
+                    PageSegment {
+                        source: 1,
+                        source_row: 0,
+                        rows: 2,
+                        destination_row: 2,
+                    },
+                ],
+                content_rows: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn continuous_page_plan_handles_seams_at_global_rows_3_4_and_5() {
+        let (row_3, _) = plan_for_heights(&[3, 2]);
+        assert_eq!(
+            row_3,
+            vec![
+                PagePlan {
+                    segments: vec![
+                        PageSegment {
+                            source: 0,
+                            source_row: 0,
+                            rows: 3,
+                            destination_row: 0,
+                        },
+                        PageSegment {
+                            source: 1,
+                            source_row: 0,
+                            rows: 1,
+                            destination_row: 3,
+                        },
+                    ],
+                    content_rows: 4,
+                },
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 1,
+                        source_row: 1,
+                        rows: 1,
+                        destination_row: 0,
+                    }],
+                    content_rows: 1,
+                },
+            ]
+        );
+
+        let (row_4, _) = plan_for_heights(&[4, 2]);
+        assert_eq!(
+            row_4,
+            vec![
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 0,
+                        source_row: 0,
+                        rows: 4,
+                        destination_row: 0,
+                    }],
+                    content_rows: 4,
+                },
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 1,
+                        source_row: 0,
+                        rows: 2,
+                        destination_row: 0,
+                    }],
+                    content_rows: 2,
+                },
+            ]
+        );
+
+        let (row_5, _) = plan_for_heights(&[5, 2]);
+        assert_eq!(
+            row_5,
+            vec![
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 0,
+                        source_row: 0,
+                        rows: 4,
+                        destination_row: 0,
+                    }],
+                    content_rows: 4,
+                },
+                PagePlan {
+                    segments: vec![
+                        PageSegment {
+                            source: 0,
+                            source_row: 4,
+                            rows: 1,
+                            destination_row: 0,
+                        },
+                        PageSegment {
+                            source: 1,
+                            source_row: 0,
+                            rows: 2,
+                            destination_row: 1,
+                        },
+                    ],
+                    content_rows: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn continuous_page_plan_packs_one_row_sources_in_source_order() {
+        let (plans, total_pages) = plan_for_heights(&[1, 1, 1, 1]);
+        assert_eq!(total_pages, 1);
+        assert_eq!(
+            plans,
+            vec![PagePlan {
+                segments: (0..4)
+                    .map(|source| PageSegment {
+                        source,
+                        source_row: 0,
+                        rows: 1,
+                        destination_row: u32::try_from(source).expect("destination row"),
+                    })
+                    .collect(),
+                content_rows: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn continuous_page_plan_keeps_the_final_partial_page() {
+        let (plans, total_pages) = plan_for_heights(&[5]);
+        assert_eq!(total_pages, 2);
+        assert_eq!(
+            plans,
+            vec![
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 0,
+                        source_row: 0,
+                        rows: 4,
+                        destination_row: 0,
+                    }],
+                    content_rows: 4,
+                },
+                PagePlan {
+                    segments: vec![PageSegment {
+                        source: 0,
+                        source_row: 4,
+                        rows: 1,
+                        destination_row: 0,
+                    }],
+                    content_rows: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn continuous_page_plan_rejects_zero_dimensions() {
+        let valid = episode_image(0, 2, 2);
+        assert!(continuous_page_plan(std::slice::from_ref(&valid), 0, 4).is_err());
+        assert!(continuous_page_plan(std::slice::from_ref(&valid), 2, 0).is_err());
+        assert!(continuous_page_plan(&[episode_image(0, 0, 2)], 2, 4).is_err());
+        assert!(continuous_page_plan(&[episode_image(0, 2, 0)], 2, 4).is_err());
+    }
+
+    #[test]
+    fn cumulative_height_above_u32_uses_checked_global_intervals() {
+        let source_height = 1_u32 << 22;
+        let source_count =
+            usize::try_from(u64::from(u32::MAX) / u64::from(source_height) + 1)
+                .expect("source count");
+        let images = (0..source_count)
+            .map(|source| episode_image(source, 1, source_height))
+            .collect::<Vec<_>>();
+
+        let (plans, total_pages) =
+            continuous_page_plan(&images, 1, u32::MAX).expect("u64 global plan");
+
+        assert_eq!(total_pages, 2);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].content_rows, u32::MAX);
+        assert_eq!(
+            plans[1],
+            PagePlan {
+                segments: vec![PageSegment {
+                    source: source_count - 1,
+                    source_row: source_height - 1,
+                    rows: 1,
+                    destination_row: 0,
+                }],
+                content_rows: 1,
+            }
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| u64::from(plan.content_rows))
+                .sum::<u64>(),
+            u64::from(u32::MAX) + 1
+        );
+    }
+
+    #[test]
+    fn continuous_page_plan_rejects_more_than_u16_pages() {
+        let height = u32::from(u16::MAX) + 1;
+        let error = continuous_page_plan(&[episode_image(0, 1, height)], 1, 1)
+            .expect_err("page count above u16 must fail");
+        assert_eq!(error, "The comic has too many pages.");
     }
 
     fn started() -> (AppRunner<Bomtoon>, Vec<Command>) {
