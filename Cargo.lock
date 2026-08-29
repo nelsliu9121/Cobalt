@@ -722,6 +722,7 @@ version = "0.3.0"
 dependencies = [
  "kobo-abi",
  "kobo-doc",
+ "kobo-pixels",
  "kobo-profile",
  "kobo-protocol",
  "minimp3",

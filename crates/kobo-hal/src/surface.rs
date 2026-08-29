@@ -8,6 +8,8 @@
 //! `device-write` feature, so a default build has no callable pixel-write path.
 
 use crate::refresh::Rect;
+use kobo_pixels::PicturePixelsRef;
+use kobo_profile::{ChannelField, ColorPanel};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -44,7 +46,7 @@ impl std::fmt::Display for SurfaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedPixelFormat => {
-                formatter.write_str("surface is not 32-bit four-byte pixels")
+                formatter.write_str("surface pixel or channel format is unsupported")
             }
             Self::InconsistentGeometry => {
                 formatter.write_str("surface stride or length is inconsistent with its resolution")
@@ -67,6 +69,56 @@ impl From<io::Error> for SurfaceError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+#[derive(Clone, Copy)]
+struct ChannelOffsets {
+    red: u32,
+    green: u32,
+    blue: u32,
+    transparency: u32,
+}
+
+impl ChannelOffsets {
+    const LEGACY_GRAYSCALE: Self = Self {
+        red: 0,
+        green: 8,
+        blue: 16,
+        transparency: 24,
+    };
+
+    fn from_color(color: ColorPanel) -> Result<Self, SurfaceError> {
+        let fields = [color.red, color.green, color.blue, color.transparency];
+        let mut occupied = 0_u32;
+        for field in fields {
+            let mask = channel_mask(field).ok_or(SurfaceError::UnsupportedPixelFormat)?;
+            if occupied & mask != 0 {
+                return Err(SurfaceError::UnsupportedPixelFormat);
+            }
+            occupied |= mask;
+        }
+        Ok(Self {
+            red: u32::from(color.red.offset),
+            green: u32::from(color.green.offset),
+            blue: u32::from(color.blue.offset),
+            transparency: u32::from(color.transparency.offset),
+        })
+    }
+
+    fn pack(self, red: u8, green: u8, blue: u8) -> [u8; SUPPORTED_BYTES_PER_PIXEL] {
+        let word = (u32::from(red) << self.red)
+            | (u32::from(green) << self.green)
+            | (u32::from(blue) << self.blue)
+            | (u32::from(u8::MAX) << self.transparency);
+        word.to_le_bytes()
+    }
+}
+
+fn channel_mask(field: ChannelField) -> Option<u32> {
+    if field.length != 8 || u16::from(field.offset) + u16::from(field.length) > 32 {
+        return None;
+    }
+    Some(u32::from(u8::MAX) << field.offset)
 }
 
 /// A validated placement of one region inside one surface.
@@ -210,41 +262,70 @@ impl RegionSnapshot {
         self.placement == other.placement && self.pixels == other.pixels
     }
 
-    /// Builds a writable region from one rendered 8-bit grayscale image.
+    /// Builds a writable region from typed rendered pixels.
     ///
-    /// This is the only way rendered pixels become framebuffer bytes, and it
-    /// deliberately produces the same `RegionSnapshot` type that `capture`
-    /// returns. A rendered frame is therefore constrained exactly like a
-    /// captured one: it carries a validated placement, so drawing it can only
-    /// ever touch the region it was built for, and a renderer that produces the
-    /// wrong number of pixels is rejected here rather than writing a shifted
-    /// image across the whole screen.
-    ///
-    /// Each grayscale value is expanded to the panel's 32-bit format with equal
-    /// red, green, and blue and an opaque alpha byte.
+    /// Gray pixels are expanded to equal red, green, and blue values. RGB
+    /// pixels require measured channel fields; grayscale without a color
+    /// capability preserves the verified legacy channel order. Snapshot rows
+    /// contain only region pixels, while placement retains the framebuffer
+    /// stride used by reads and writes.
     ///
     /// # Errors
     ///
-    /// Returns an error when the region is invalid for `geometry` or `gray`
-    /// does not hold exactly one byte per pixel of `region`.
-    pub fn from_grayscale(
+    /// Returns an error when the geometry or region is invalid, the typed byte
+    /// length does not exactly describe the region, RGB pixels have no color
+    /// mapping, or any supplied channel field is unsupported.
+    pub fn from_pixels(
         geometry: SurfaceGeometry,
         region: Rect,
-        gray: &[u8],
+        source: PicturePixelsRef<'_>,
+        color: Option<ColorPanel>,
     ) -> Result<Self, SurfaceError> {
         let placement = RegionPlacement::new(geometry, region)?;
-        let expected = (region.width as usize).saturating_mul(region.height as usize);
-        if gray.len() != expected {
+        let pixel_count = usize::try_from(region.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(region.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(SurfaceError::RegionMismatch)?;
+        let (source_bytes, source_bytes_per_pixel) = match source {
+            PicturePixelsRef::Gray8(bytes) => (bytes, 1),
+            PicturePixelsRef::Rgb8(bytes) => (bytes, 3),
+        };
+        let expected_source_bytes = pixel_count
+            .checked_mul(source_bytes_per_pixel)
+            .ok_or(SurfaceError::RegionMismatch)?;
+        if source_bytes.len() != expected_source_bytes {
             return Err(SurfaceError::RegionMismatch);
         }
+
+        let channels = match color {
+            Some(color) => ChannelOffsets::from_color(color)?,
+            None if matches!(source, PicturePixelsRef::Gray8(_)) => {
+                ChannelOffsets::LEGACY_GRAYSCALE
+            }
+            None => return Err(SurfaceError::UnsupportedPixelFormat),
+        };
         let mut pixels = vec![0_u8; placement.total_bytes()];
-        for (index, byte) in pixels.iter_mut().enumerate() {
-            let pixel = index / SUPPORTED_BYTES_PER_PIXEL;
-            *byte = if index % SUPPORTED_BYTES_PER_PIXEL == ALPHA_BYTE_INDEX {
-                u8::MAX
-            } else {
-                gray.get(pixel).copied().unwrap_or(u8::MAX)
-            };
+        match source {
+            PicturePixelsRef::Gray8(gray) => {
+                for (target, tone) in pixels
+                    .chunks_exact_mut(SUPPORTED_BYTES_PER_PIXEL)
+                    .zip(gray.iter().copied())
+                {
+                    target.copy_from_slice(&channels.pack(tone, tone, tone));
+                }
+            }
+            PicturePixelsRef::Rgb8(rgb) => {
+                for (target, source) in pixels
+                    .chunks_exact_mut(SUPPORTED_BYTES_PER_PIXEL)
+                    .zip(rgb.chunks_exact(3))
+                {
+                    target.copy_from_slice(&channels.pack(source[0], source[1], source[2]));
+                }
+            }
         }
         Ok(Self { placement, pixels })
     }
@@ -317,7 +398,8 @@ mod tests {
         ALPHA_BYTE_INDEX, SUPPORTED_BYTES_PER_PIXEL,
     };
     use crate::refresh::Rect;
-
+    use kobo_pixels::PicturePixelsRef;
+    use kobo_profile::{ChannelField, ColorPanel};
     const CLARA: SurfaceGeometry = SurfaceGeometry {
         width: 1072,
         height: 1448,
@@ -325,6 +407,265 @@ mod tests {
         bits_per_pixel: 32,
         memory_length: 6_243_328,
     };
+
+    const BGRA_PANEL: ColorPanel = ColorPanel {
+        red: ChannelField {
+            offset: 16,
+            length: 8,
+        },
+        green: ChannelField {
+            offset: 8,
+            length: 8,
+        },
+        blue: ChannelField {
+            offset: 0,
+            length: 8,
+        },
+        transparency: ChannelField {
+            offset: 24,
+            length: 8,
+        },
+        clean_waveform: 10,
+        regal_waveform: 11,
+        cfa_flags: 0x600,
+        clean_interval: 4,
+    };
+
+    const TRANSPARENCY_FIRST_PANEL: ColorPanel = ColorPanel {
+        red: ChannelField {
+            offset: 8,
+            length: 8,
+        },
+        green: ChannelField {
+            offset: 16,
+            length: 8,
+        },
+        blue: ChannelField {
+            offset: 24,
+            length: 8,
+        },
+        transparency: ChannelField {
+            offset: 0,
+            length: 8,
+        },
+        clean_waveform: 10,
+        regal_waveform: 11,
+        cfa_flags: 0x600,
+        clean_interval: 4,
+    };
+
+    #[test]
+    fn from_rgb_packs_offsets_and_excludes_stride_padding() {
+        let geometry = SurfaceGeometry {
+            width: 2,
+            height: 1,
+            stride: 12,
+            bits_per_pixel: 32,
+            memory_length: 12,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+
+        let snapshot = RegionSnapshot::from_pixels(
+            geometry,
+            region,
+            PicturePixelsRef::Rgb8(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+            Some(BGRA_PANEL),
+        )
+        .expect("valid RGB pixels and measured channels");
+
+        assert_eq!(
+            snapshot.pixels(),
+            &[0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44, 0xff]
+        );
+        assert_eq!(snapshot.placement().row_bytes(), 8);
+    }
+
+    #[test]
+    fn from_rgb_places_opaque_transparency_at_measured_offset() {
+        let geometry = SurfaceGeometry {
+            width: 1,
+            height: 1,
+            stride: 4,
+            bits_per_pixel: 32,
+            memory_length: 4,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+
+        let snapshot = RegionSnapshot::from_pixels(
+            geometry,
+            region,
+            PicturePixelsRef::Rgb8(&[0x11, 0x22, 0x33]),
+            Some(TRANSPARENCY_FIRST_PANEL),
+        )
+        .expect("valid RGB pixels and measured channels");
+
+        assert_eq!(snapshot.pixels(), &[0xff, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn from_rgb_rejects_missing_or_invalid_color_mapping() {
+        let geometry = SurfaceGeometry {
+            width: 1,
+            height: 1,
+            stride: 4,
+            bits_per_pixel: 32,
+            memory_length: 4,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert!(matches!(
+            RegionSnapshot::from_pixels(
+                geometry,
+                region,
+                PicturePixelsRef::Rgb8(&[1, 2, 3]),
+                None,
+            ),
+            Err(SurfaceError::UnsupportedPixelFormat)
+        ));
+
+        let mut short_channel = BGRA_PANEL;
+        short_channel.red.length = 7;
+        let mut outside_word = BGRA_PANEL;
+        outside_word.transparency.offset = 25;
+        let mut overlapping = BGRA_PANEL;
+        overlapping.red.offset = overlapping.green.offset;
+        for color in [short_channel, outside_word, overlapping] {
+            assert!(matches!(
+                RegionSnapshot::from_pixels(
+                    geometry,
+                    region,
+                    PicturePixelsRef::Rgb8(&[1, 2, 3]),
+                    Some(color),
+                ),
+                Err(SurfaceError::UnsupportedPixelFormat)
+            ));
+        }
+    }
+
+    #[test]
+    fn from_rgb_rejects_wrong_typed_length() {
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        let geometry = SurfaceGeometry {
+            width: 2,
+            height: 1,
+            stride: 8,
+            bits_per_pixel: 32,
+            memory_length: 8,
+        };
+
+        assert!(matches!(
+            RegionSnapshot::from_pixels(
+                geometry,
+                region,
+                PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5]),
+                Some(BGRA_PANEL),
+            ),
+            Err(SurfaceError::RegionMismatch)
+        ));
+    }
+
+    #[test]
+    fn from_pixels_gray8_expands_to_equal_rgb_channels() {
+        let geometry = SurfaceGeometry {
+            width: 2,
+            height: 1,
+            stride: 8,
+            bits_per_pixel: 32,
+            memory_length: 8,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+
+        let snapshot = RegionSnapshot::from_pixels(
+            geometry,
+            region,
+            PicturePixelsRef::Gray8(&[0x12, 0xab]),
+            None,
+        )
+        .expect("valid grayscale pixels");
+
+        assert_eq!(
+            snapshot.pixels(),
+            &[0x12, 0x12, 0x12, 0xff, 0xab, 0xab, 0xab, 0xff]
+        );
+    }
+
+    #[test]
+    fn from_pixels_gray8_uses_valid_color_mapping() {
+        let geometry = SurfaceGeometry {
+            width: 1,
+            height: 1,
+            stride: 4,
+            bits_per_pixel: 32,
+            memory_length: 4,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+
+        let snapshot = RegionSnapshot::from_pixels(
+            geometry,
+            region,
+            PicturePixelsRef::Gray8(&[0x7f]),
+            Some(TRANSPARENCY_FIRST_PANEL),
+        )
+        .expect("valid grayscale pixels and measured channels");
+
+        assert_eq!(snapshot.pixels(), &[0xff, 0x7f, 0x7f, 0x7f]);
+    }
+
+    #[test]
+    fn from_pixels_gray8_rejects_wrong_typed_length() {
+        let geometry = SurfaceGeometry {
+            width: 2,
+            height: 1,
+            stride: 8,
+            bits_per_pixel: 32,
+            memory_length: 8,
+        };
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+
+        assert!(matches!(
+            RegionSnapshot::from_pixels(
+                geometry,
+                region,
+                PicturePixelsRef::Gray8(&[1]),
+                None,
+            ),
+            Err(SurfaceError::RegionMismatch)
+        ));
+    }
 
     #[test]
     fn places_the_verified_smoke_region() {

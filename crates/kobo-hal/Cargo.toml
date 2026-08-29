@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 kobo-abi = { path = "../kobo-abi", default-features = false }
 kobo-doc = { path = "../kobo-doc" }
+kobo-pixels = { path = "../kobo-pixels" }
 kobo-profile = { path = "../kobo-profile" }
 kobo-protocol = { path = "../kobo-protocol" }
 minimp3 = "0.5.2"
