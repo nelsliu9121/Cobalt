@@ -552,14 +552,20 @@ fn serve_application(
                 // Per screen, as the device does it: a book is drawn
                 // without a band and everything else with one.
                 let chrome = simulated_chrome(name, &screen);
-                write_screen(frame_path, screen, &chrome, name, &pictures)?;
+                write_screen(frame_path, screen, &chrome, name, &pictures, metrics)?;
             }
             Message::PutPicture {
                 handle,
                 width,
                 height,
                 pixels,
-            } => match pictures.put_report(handle, width, height, pixels) {
+            } => match pictures.put_report_for(
+                metrics.picture_format,
+                handle,
+                width,
+                height,
+                pixels,
+            ) {
                 None => println!("picture {} refused", handle.0),
                 Some(evicted) if !evicted.is_empty() => {
                     println!("picture {} evicted {evicted:?}", handle.0);
@@ -572,7 +578,13 @@ fn serve_application(
                 height,
                 format,
             } => {
-                if !pictures.begin_upload(handle, width, height, format) {
+                if !pictures.begin_upload_for(
+                    metrics.picture_format,
+                    handle,
+                    width,
+                    height,
+                    format,
+                ) {
                     println!("picture {} upload refused", handle.0);
                 }
             }
@@ -791,18 +803,20 @@ fn write_screen(
     chrome: &kobo_ui::Chrome,
     name: &str,
     pictures: &dyn kobo_ui::Pictures,
+    metrics: kobo_ui::DisplayMetrics,
 ) -> Result<(), Box<dyn Error>> {
-    let mut surface = Surface::new(
-        usize::try_from(crate::device_metrics().width)?,
-        usize::try_from(crate::device_metrics().height)?,
-    );
     // The same two steps the device takes, in the same order, because a
     // preview drawn with different chrome is a preview of a screen that will
     // never exist. Rendering with &Chrome::default() here meant the way back
     // was the one part of every screen that could not be looked at without a
     // reader, and it is the part that traps somebody when it is missing.
     let screen = kobo_ui::ensure_way_back(screen, chrome, name);
-    let metrics = crate::device_metrics();
+    let format = kobo_ui::surface_format_for(&screen, &metrics, pictures);
+    let mut surface = Surface::new_in(
+        usize::try_from(metrics.width)?,
+        usize::try_from(metrics.height)?,
+        format,
+    );
     // The same reason as on the device: the typeface sets at the ambient
     // scale, so a preview of a screen that asked for larger prose has to say
     // so or it is a preview of a screen nobody will see. The interface around
@@ -810,14 +824,19 @@ fn write_screen(
     kobo_ui::set_text_scale(metrics.text_scale);
     kobo_ui::set_reading_scale(screen.text_scale.unwrap_or(metrics.text_scale));
     kobo_ui::render_all(&screen, &metrics, chrome, pictures, &mut surface, None);
+    let png = kobo_image::encode_png(
+        u32::try_from(surface.width)?,
+        u32::try_from(surface.height)?,
+        surface.pixels(),
+    )?;
 
-    let temporary = path.with_extension(format!("raw.tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!("png.tmp-{}", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)?;
     let result = (|| -> std::io::Result<()> {
-        file.write_all(surface.bytes())?;
+        file.write_all(&png)?;
         file.sync_all()?;
         fs::rename(&temporary, path)
     })();
@@ -922,6 +941,103 @@ mod tests {
         let metrics = super::metrics_for_profile(&profile, kobo_ui::CLARA_BW_METRICS)
             .expect("the supported profile fits layout coordinates");
         assert_eq!(metrics.picture_format, kobo_ui::PictureFormat::Rgb8);
+    }
+
+    #[test]
+    fn host_gray_session_refuses_rgb_and_cancels_equal_length_upload() {
+        let handle = kobo_ui::PictureHandle(41);
+        let mut pictures = kobo_ui::PictureCache::default();
+        assert!(pictures
+            .put_report_for(
+                kobo_ui::PictureFormat::Gray8,
+                handle,
+                2,
+                1,
+                kobo_ui::PicturePixels::Gray8(vec![11, 22]),
+            )
+            .is_some());
+        assert!(pictures
+            .put_report_for(
+                kobo_ui::PictureFormat::Gray8,
+                handle,
+                2,
+                1,
+                kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+            )
+            .is_none());
+        assert!(pictures.begin_upload_for(
+            kobo_ui::PictureFormat::Gray8,
+            handle,
+            6,
+            1,
+            kobo_ui::PictureFormat::Gray8,
+        ));
+        assert!(!pictures.begin_upload_for(
+            kobo_ui::PictureFormat::Gray8,
+            handle,
+            2,
+            1,
+            kobo_ui::PictureFormat::Rgb8,
+        ));
+        assert!(!pictures.upload_chunk(handle, 0, &[1, 2, 3, 4, 5, 6]));
+        assert!(pictures.commit_upload(handle).is_none());
+        assert_eq!(
+            kobo_ui::Pictures::get(&pictures, handle),
+            Some(kobo_ui::PicturePixelsRef::Gray8(&[11, 22]))
+        );
+    }
+
+    #[test]
+    fn host_color_metrics_render_rgb_picture_to_format_preserving_png() {
+        let metrics = kobo_ui::DisplayMetrics {
+            picture_format: kobo_ui::PictureFormat::Rgb8,
+            ..kobo_ui::CLARA_BW_METRICS
+        };
+        let handle = kobo_ui::PictureHandle(42);
+        let mut pictures = kobo_ui::PictureCache::default();
+        assert!(pictures
+            .put_report_for(
+                metrics.picture_format,
+                handle,
+                2,
+                1,
+                kobo_ui::PicturePixels::Rgb8(vec![255, 0, 0, 0, 0, 255]),
+            )
+            .is_some());
+        let screen = kobo_ui::Screen::new(
+            8,
+            vec![kobo_ui::Node::Picture {
+                id: kobo_ui::NodeId(1),
+                handle,
+                source: (2, 1),
+                max_height_tenths_mm: 100,
+                framed: false,
+            }],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "kobod-host-color-frame-{}.png",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        super::write_screen(
+            &path,
+            screen,
+            &kobo_ui::Chrome::default(),
+            "launcher",
+            &pictures,
+            metrics,
+        )
+        .expect("render typed host frame");
+        let png = std::fs::read(&path).expect("read host frame");
+        let picture = kobo_image::decode_png(&png).expect("decode typed host frame");
+        assert_eq!(picture.format(), kobo_image::PictureFormat::Rgb8);
+        let kobo_image::PicturePixelsRef::Rgb8(rgb) = picture.pixels() else {
+            panic!("host frame collapsed to Gray8");
+        };
+        assert!(rgb.chunks_exact(3).any(|pixel| pixel == [255, 0, 0]));
+        assert!(rgb.chunks_exact(3).any(|pixel| pixel == [0, 0, 255]));
+        std::fs::remove_file(path).expect("remove host frame");
     }
 
     fn plain() -> kobo_ui::Screen {

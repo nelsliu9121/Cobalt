@@ -2970,9 +2970,6 @@ fn text_hold_for(
     layout.hit_text(x, y).map(|hit| (action, hit))
 }
 
-fn session_accepts_picture(accepted: PictureFormat, supplied: PictureFormat) -> bool {
-    supplied == PictureFormat::Gray8 || accepted == PictureFormat::Rgb8
-}
 
 fn put_session_picture(
     pictures: &mut PictureCache,
@@ -2982,10 +2979,7 @@ fn put_session_picture(
     height: u32,
     pixels: PicturePixels,
 ) -> Option<Vec<kobo_ui::PictureHandle>> {
-    if !session_accepts_picture(accepted, pixels.format()) {
-        return None;
-    }
-    pictures.put_report(handle, width, height, pixels)
+    pictures.put_report_for(accepted, handle, width, height, pixels)
 }
 
 fn begin_session_picture(
@@ -2996,8 +2990,7 @@ fn begin_session_picture(
     height: u32,
     format: PictureFormat,
 ) -> bool {
-    session_accepts_picture(accepted, format)
-        && pictures.begin_upload(handle, width, height, format)
+    pictures.begin_upload_for(accepted, handle, width, height, format)
 }
 
 fn trace_picture_evictions(handle: kobo_ui::PictureHandle, evicted: &[kobo_ui::PictureHandle]) {
@@ -3604,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn rgb_picture_upload_is_refused_by_gray_session_without_replacing_live_picture() {
+    fn rejected_rgb_begin_cancels_equal_length_gray_upload_without_replacing_live_picture() {
         let handle = kobo_ui::PictureHandle(2);
         let mut pictures = PictureCache::default();
         assert!(put_session_picture(
@@ -3626,6 +3619,14 @@ mod tests {
             kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
         )
         .is_none());
+        assert!(begin_session_picture(
+            &mut pictures,
+            PictureFormat::Gray8,
+            handle,
+            6,
+            1,
+            PictureFormat::Gray8,
+        ));
         assert!(!begin_session_picture(
             &mut pictures,
             PictureFormat::Gray8,
@@ -3634,15 +3635,10 @@ mod tests {
             1,
             PictureFormat::Rgb8,
         ));
-        assert!(begin_session_picture(
-            &mut pictures,
-            PictureFormat::Rgb8,
-            handle,
-            2,
-            1,
-            PictureFormat::Rgb8,
-        ));
-        assert!(pictures.upload_chunk(handle, 0, &[1, 2, 3]));
+        assert!(
+            !pictures.upload_chunk(handle, 0, &[1, 2, 3, 4, 5, 6]),
+            "the rejected RGB begin left the equal-length Gray8 upload writable"
+        );
         assert!(pictures.commit_upload(handle).is_none());
         assert_eq!(
             kobo_ui::Pictures::get(&pictures, handle),

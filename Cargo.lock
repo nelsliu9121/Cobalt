@@ -1030,6 +1030,7 @@ dependencies = [
  "kobo-abi",
  "kobo-app-store",
  "kobo-hal",
+ "kobo-image",
  "kobo-json",
  "kobo-net",
  "kobo-policy",

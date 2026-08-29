@@ -88,6 +88,96 @@ pub fn encode_png(
     Ok(png)
 }
 
+/// Decodes a complete PNG without changing its Gray8 or RGB8 representation.
+///
+/// The source must use an eight-bit grayscale or truecolor IHDR, end exactly
+/// at a valid IEND chunk, and pass the PNG decoder's chunk/data validation.
+/// This is for format-preserving frame transport; [`decode`] remains the
+/// normal image ingestion path that composites and converts a source.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Undecodable`] for truncated, corrupt, trailing, or
+/// differently typed PNGs, and the ordinary pixel-bound error for hostile
+/// dimensions.
+pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const IEND: &[u8; 12] = b"\0\0\0\0IEND\xaeB`\x82";
+    if bytes.get(..8) != Some(SIGNATURE)
+        || bytes.get(8..12) != Some(&13_u32.to_be_bytes())
+        || bytes.get(12..16) != Some(b"IHDR")
+        || !bytes.ends_with(IEND)
+    {
+        return Err(ImageError::Undecodable(
+            "the PNG is incomplete or has an invalid container".to_owned(),
+        ));
+    }
+    let mut chunk_at = SIGNATURE.len();
+    loop {
+        let Some(header) = bytes.get(chunk_at..chunk_at.saturating_add(8)) else {
+            return Err(ImageError::Undecodable(
+                "the PNG ends inside a chunk header".to_owned(),
+            ));
+        };
+        let length = usize::try_from(u32::from_be_bytes(
+            header[..4].try_into().expect("four-byte PNG chunk length"),
+        ))
+        .unwrap_or(usize::MAX);
+        let Some(chunk_end) = chunk_at
+            .checked_add(12)
+            .and_then(|end| end.checked_add(length))
+        else {
+            return Err(ImageError::Undecodable(
+                "the PNG chunk length overflows this platform".to_owned(),
+            ));
+        };
+        if chunk_end > bytes.len() {
+            return Err(ImageError::Undecodable(
+                "the PNG ends inside a chunk".to_owned(),
+            ));
+        }
+        if &header[4..8] == b"IEND" {
+            if length != 0 || chunk_end != bytes.len() {
+                return Err(ImageError::Undecodable(
+                    "the PNG has data after its IEND chunk".to_owned(),
+                ));
+            }
+            break;
+        }
+        chunk_at = chunk_end;
+    }
+    let format = match (bytes.get(24), bytes.get(25)) {
+        (Some(8), Some(0)) => PictureFormat::Gray8,
+        (Some(8), Some(2)) => PictureFormat::Rgb8,
+        _ => {
+            return Err(ImageError::Undecodable(
+                "the PNG is not eight-bit Gray8 or RGB8".to_owned(),
+            ));
+        }
+    };
+    let decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    checked_pixels(width, height)?;
+    let expected = format.byte_len(width, height).ok_or_else(|| {
+        ImageError::Undecodable("the PNG byte length does not fit this platform".to_owned())
+    })?;
+    if decoder.total_bytes() != u64::try_from(expected).unwrap_or(u64::MAX) {
+        return Err(ImageError::Undecodable(
+            "the PNG decoder changed its declared pixel representation".to_owned(),
+        ));
+    }
+    let mut pixels = vec![0; expected];
+    decoder
+        .read_image(&mut pixels)
+        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+    let pixels = match format {
+        PictureFormat::Gray8 => PicturePixels::Gray8(pixels),
+        PictureFormat::Rgb8 => PicturePixels::Rgb8(pixels),
+    };
+    Picture::from_pixels(width, height, pixels)
+}
+
 /// Wraps raw eight-bit grayscale framebuffer pixels up as a PNG.
 ///
 /// # Errors

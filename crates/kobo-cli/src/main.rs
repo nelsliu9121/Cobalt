@@ -3899,16 +3899,20 @@ fn run_simulation(arguments: &[String]) -> Result<(), String> {
             "simulation failed: app={app_status}, daemon={daemon_status}"
         ));
     }
-    let expected = 1072_usize * 1448;
-    let actual = fs::metadata(&simulation.frame)
-        .map_err(|error| format!("inspect rendered frame: {error}"))?
-        .len();
-    if actual != expected as u64 {
+    let frame = fs::read(&simulation.frame)
+        .map_err(|error| format!("read rendered frame: {error}"))?;
+    let decoded = kobo_image::decode_png(&frame)
+        .map_err(|error| format!("validate rendered frame: {error}"))?;
+    if (decoded.width(), decoded.height()) != drive::SIMULATED_PANEL {
         return Err(format!(
-            "rendered frame is {actual} bytes; expected {expected}"
+            "rendered frame is {}x{}; expected {}x{}",
+            decoded.width(),
+            decoded.height(),
+            drive::SIMULATED_PANEL.0,
+            drive::SIMULATED_PANEL.1,
         ));
     }
-    let output = Path::new("target/kobo-sim-last.raw");
+    let output = Path::new("target/kobo-sim-last.png");
     fs::copy(&simulation.frame, output).map_err(|error| format!("save rendered frame: {error}"))?;
     println!(
         "host runtime completed for {package}; frame: {}",
@@ -3987,7 +3991,7 @@ impl SimulationGuard {
         fs::create_dir(&root).map_err(|error| format!("create {}: {error}", root.display()))?;
         let guard = Self {
             socket: root.join("kobod.sock"),
-            frame: root.join("frame.raw"),
+            frame: root.join("frame.png"),
             root,
             daemon: None,
             daemon_frame_temporary: None,
@@ -4010,7 +4014,7 @@ impl SimulationGuard {
             .map_err(|error| format!("start simulated kobod: {error}"))?;
         self.daemon_frame_temporary = Some(
             self.frame
-                .with_extension(format!("raw.tmp-{}", daemon.id())),
+                .with_extension(format!("png.tmp-{}", daemon.id())),
         );
         self.daemon = Some(daemon);
         Ok(())

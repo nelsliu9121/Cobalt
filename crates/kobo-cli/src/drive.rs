@@ -342,18 +342,7 @@ impl Driver {
     /// something other than an eight-bit Gray8/RGB8 PNG of the simulated panel.
     pub fn frame_png(&self) -> Result<Vec<u8>, String> {
         let png = self.get(if self.ideal { "/ideal-frame" } else { "/frame" })?;
-        let valid = png.get(..8) == Some(b"\x89PNG\r\n\x1a\n")
-            && png.get(12..16) == Some(b"IHDR")
-            && png.get(16..20) == Some(&FRAME_WIDTH.to_be_bytes())
-            && png.get(20..24) == Some(&FRAME_HEIGHT.to_be_bytes())
-            && png.get(24) == Some(&8)
-            && matches!(png.get(25), Some(0 | 2));
-        if !valid {
-            return Err(format!(
-                "the simulator did not send an eight-bit Gray8/RGB8 PNG for a \
-                 {FRAME_WIDTH}x{FRAME_HEIGHT} panel"
-            ));
-        }
+        validate_frame_png(&png, FRAME_WIDTH, FRAME_HEIGHT)?;
         Ok(png)
     }
 
@@ -456,6 +445,23 @@ impl Driver {
             .map_err(|error| format!("read the answer to {method} {path}: {error}"))?;
         split_response(&answer, path)
     }
+}
+
+fn validate_frame_png(png: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let picture = kobo_image::decode_png(png).map_err(|error| {
+        format!(
+            "the simulator did not send a complete eight-bit Gray8/RGB8 PNG \
+             for a {width}x{height} panel: {error}"
+        )
+    })?;
+    if picture.width() != width || picture.height() != height {
+        return Err(format!(
+            "the simulator sent a {}x{} PNG for a {width}x{height} panel",
+            picture.width(),
+            picture.height()
+        ));
+    }
+    Ok(())
 }
 
 /// Pulls the picture out of a device transcript.
@@ -747,7 +753,7 @@ fn parse_point(text: &str) -> Result<(i32, i32), String> {
 mod tests {
     use super::{
         base64_decode, decode_capture, json_array, json_field, json_number, json_objects,
-        json_point, split_response,
+        json_point, split_response, validate_frame_png,
     };
 
     const BODY: &str = r#"{"nodes":[{"kind":"Button","x":10,"y":20,"width":30,"height":40,"centre":{"x":25,"y":40},"action":77,"lines":["Search","for a \"book\""]},{"kind":"Divider","x":0,"y":1,"width":2,"height":3,"centre":{"x":1,"y":2},"action":null,"lines":[]}]}"#;
@@ -818,6 +824,59 @@ mod tests {
             "a partial group is a truncated transfer"
         );
         assert!(base64_decode("Zm9!").is_err());
+    }
+
+    #[test]
+    fn frame_validation_accepts_complete_gray8_and_rgb8_pngs() {
+        let gray = kobo_image::encode_png(
+            2,
+            1,
+            kobo_image::PicturePixelsRef::Gray8(&[10, 20]),
+        )
+        .expect("encode Gray8 PNG");
+        let rgb = kobo_image::encode_png(
+            2,
+            1,
+            kobo_image::PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]),
+        )
+        .expect("encode RGB8 PNG");
+
+        assert!(validate_frame_png(&gray, 2, 1).is_ok());
+        assert!(validate_frame_png(&rgb, 2, 1).is_ok());
+        assert!(validate_frame_png(&gray, 1, 2).is_err());
+    }
+
+    #[test]
+    fn frame_validation_refuses_truncated_or_corrupt_pngs() {
+        let valid = kobo_image::encode_png(
+            2,
+            1,
+            kobo_image::PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]),
+        )
+        .expect("encode RGB8 PNG");
+
+        assert!(validate_frame_png(&valid[..valid.len() - 1], 2, 1).is_err());
+
+        let mut bad_crc = valid.clone();
+        bad_crc[29] ^= 1;
+        assert!(validate_frame_png(&bad_crc, 2, 1).is_err());
+
+        let mut bad_data = valid.clone();
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b"\0\0\0\0IEND\xaeB`\x82");
+        assert!(validate_frame_png(&trailing, 2, 1).is_err());
+
+        let idat = bad_data
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .expect("IDAT chunk");
+        bad_data[idat + 4] ^= 1;
+        assert!(validate_frame_png(&bad_data, 2, 1).is_err());
+
+        let mut bad_iend = valid;
+        let end = bad_iend.len() - 1;
+        bad_iend[end] ^= 1;
+        assert!(validate_frame_png(&bad_iend, 2, 1).is_err());
     }
 
     #[test]

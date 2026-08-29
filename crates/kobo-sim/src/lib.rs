@@ -860,22 +860,17 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
                 width,
                 height,
                 pixels,
-            } => {
-                let result = if accepts_picture_format(accepted, pixels.format()) {
-                    pictures.put_report(handle, width, height, pixels)
-                } else {
-                    None
-                };
-                picture_result(handle, result)
-            }
+            } => picture_result(
+                handle,
+                pictures.put_report_for(accepted, handle, width, height, pixels),
+            ),
             Message::BeginPicture {
                 handle,
                 width,
                 height,
                 format,
-            } => (!accepts_picture_format(accepted, format)
-                || !pictures.begin_upload(handle, width, height, format))
-            .then(|| format!("picture {} upload refused", handle.0)),
+            } => (!pictures.begin_upload_for(accepted, handle, width, height, format))
+                .then(|| format!("picture {} upload refused", handle.0)),
             Message::PictureChunk {
                 handle,
                 offset,
@@ -903,9 +898,6 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
     }
 }
 
-fn accepts_picture_format(accepted: PictureFormat, supplied: PictureFormat) -> bool {
-    supplied == PictureFormat::Gray8 || accepted == PictureFormat::Rgb8
-}
 
 fn picture_result(
     handle: kobo_ui::PictureHandle,
@@ -3041,6 +3033,58 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .expect("protect private directory");
         root
+    }
+
+    #[test]
+    fn rejected_rgb_begin_cancels_equal_length_gray_upload_in_simulator() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let handle = kobo_ui::PictureHandle(71);
+        hold_picture(
+            &state,
+            Message::PutPicture {
+                handle,
+                width: 2,
+                height: 1,
+                pixels: kobo_ui::PicturePixels::Gray8(vec![11, 22]),
+            },
+        )
+        .expect("store live Gray8 picture");
+        hold_picture(
+            &state,
+            Message::BeginPicture {
+                handle,
+                width: 6,
+                height: 1,
+                format: PictureFormat::Gray8,
+            },
+        )
+        .expect("begin stale Gray8 upload");
+        hold_picture(
+            &state,
+            Message::BeginPicture {
+                handle,
+                width: 2,
+                height: 1,
+                format: PictureFormat::Rgb8,
+            },
+        )
+        .expect("refuse RGB8 upload");
+        hold_picture(
+            &state,
+            Message::PictureChunk {
+                handle,
+                offset: 0,
+                bytes: vec![1, 2, 3, 4, 5, 6],
+            },
+        )
+        .expect("refuse stale equal-length chunk");
+        hold_picture(&state, Message::CommitPicture { handle }).expect("refuse stale commit");
+
+        let held = state.lock().expect("app state");
+        assert_eq!(
+            kobo_ui::Pictures::get(held.active_pictures(), handle),
+            Some(kobo_ui::PicturePixelsRef::Gray8(&[11, 22]))
+        );
     }
 
     #[test]

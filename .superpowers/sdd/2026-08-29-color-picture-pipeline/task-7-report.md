@@ -59,3 +59,43 @@ Complete.
 ## Concerns
 
 None.
+
+## Review Fix Round 1
+
+### Changes
+
+- Moved session format gating into `PictureCache::put_report_for` and `begin_upload_for`, and routed the device runtime, built-in simulator, and host `kobod --sim-socket` runtime through those operations. Every `BeginPicture` now cancels an older incomplete upload before capability validation, so a refused RGB8 begin cannot complete a stale equal-length Gray8 upload.
+- Migrated the host runtime to use its negotiated metrics for upload acceptance and `surface_format_for` rendering. Host frame artifacts are now format-preserving PNGs rather than untyped raw bytes, and `kobo run --sim` validates the typed PNG before retaining it as `target/kobo-sim-last.png`.
+- Added a format-preserving `kobo_image::decode_png` path. It requires an exact eight-bit Gray8/RGB8 IHDR, structurally complete chunks ending at IEND, bounded decoded dimensions, matching decoded byte storage, and a successful full decoder read.
+- Replaced the CLI screenshot's 26-byte header sniff with full PNG decoding while retaining the original response bytes for the saved screenshot.
+- Added adversarial same-handle/equal-byte-length upload tests in the device, simulator, and host paths; host synthetic RGB rendering tests; and valid Gray8/RGB8 plus truncated, CRC-corrupt, data-corrupt, trailing, IEND-corrupt, and wrong-dimension PNG tests.
+
+### RED Evidence
+
+- The new device adversarial test failed because the six RGB chunk bytes remained writable into the stale six-byte Gray8 upload.
+- The equivalent simulator test committed those bytes as `Gray8([1, 2, 3, 4, 5, 6])`, replacing the live `Gray8([11, 22])`.
+- The new CLI validation tests initially failed to compile because the complete-frame validator did not exist.
+
+### Verification
+
+- `cargo test -p kobod --features device-write` — 85 passed, 0 failed.
+- `cargo test -p kobod` — 54 passed, 0 failed; the same 11 default-feature dead-code warnings.
+- `cargo test -p kobo-sim` — 28 passed, 0 failed.
+- `cargo test -p kobo-cli` — 248 passed, 0 failed.
+- `cargo test -p kobo-image` — 41 passed, 0 failed.
+- `cargo test -p kobo-cli frame_validation_` — 2 passed, 0 failed after the final complete-chunk validation.
+- `cargo run -p kobo-cli -- run --sim --app todo` — rendered two host-runtime screens to typed `frame.png`, validated them, and retained `target/kobo-sim-last.png`.
+- `cargo run -p kobo-cli -- shot --address 127.0.0.1:8878 --out target/task7-review-simulator-shot.png` — saved and fully decoded a 1072×1448 screenshot from the actual built-in simulator.
+- `git diff --check` — passed.
+
+### Self-review
+
+- Capability refusal, upload cancellation, and live-picture atomicity now share one cache boundary, so the three runtimes cannot drift on the critical begin semantics.
+- Host rendering uses only the metrics negotiated for that application session; it no longer rereads ambient Gray8 metrics or allocates a Gray8 surface for a synthetic RGB8 session.
+- PNG validation decodes into separate typed storage only for validation, then drops it and returns the original response bytes; saved evidence is never silently transcoded or channel-collapsed.
+- The host artifact and simulator screenshot paths both preserve Gray8/RGB8 identity, dimensions, and full decoder integrity.
+- No real profile capability, BOMTOON file, todo tracker, formatter, linter, or workspace-wide suite was touched or run.
+
+### Concerns
+
+None.

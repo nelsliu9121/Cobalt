@@ -10549,6 +10549,45 @@ impl PictureCache {
         Some(evicted)
     }
 
+    /// Stores a complete picture only when its format fits the negotiated
+    /// session capability.
+    ///
+    /// RGB sessions accept Gray8 as the shallower representation; Gray8
+    /// sessions fail closed on RGB8 rather than collapsing its channels.
+    pub fn put_report_for(
+        &mut self,
+        accepted: PictureFormat,
+        handle: PictureHandle,
+        width: u32,
+        height: u32,
+        pixels: PicturePixels,
+    ) -> Option<Vec<PictureHandle>> {
+        if pixels.format() == PictureFormat::Rgb8 && accepted != PictureFormat::Rgb8 {
+            return None;
+        }
+        self.put_report(handle, width, height, pixels)
+    }
+
+    /// Starts an upload only when its format fits the negotiated session.
+    ///
+    /// A begin always cancels the previous incomplete upload, including a
+    /// begin whose format is refused. Otherwise equal byte lengths can let
+    /// chunks for a rejected RGB picture complete a stale Gray8 upload.
+    pub fn begin_upload_for(
+        &mut self,
+        accepted: PictureFormat,
+        handle: PictureHandle,
+        width: u32,
+        height: u32,
+        format: PictureFormat,
+    ) -> bool {
+        self.pending = None;
+        if format == PictureFormat::Rgb8 && accepted != PictureFormat::Rgb8 {
+            return false;
+        }
+        self.begin_upload(handle, width, height, format)
+    }
+
     /// Starts a bounded, in-order upload without replacing the live picture.
     ///
     /// Starting another upload cancels the incomplete one. The previous live
