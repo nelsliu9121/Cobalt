@@ -344,17 +344,25 @@ impl RegionSnapshot {
     }
 }
 
-/// Reads the exact bytes of `region`.
+/// Reads the exact bytes of `region`, retaining the supplied active color
+/// mapping for channel-aware operations. `None` selects the verified legacy
+/// grayscale layout.
 ///
 /// # Errors
 ///
-/// Returns an error when the region is invalid or the read fails.
+/// Returns an error when the region or color mapping is invalid or the read
+/// fails.
 pub fn read_region(
     framebuffer: &File,
     geometry: SurfaceGeometry,
     region: Rect,
+    color: Option<ColorPanel>,
 ) -> Result<RegionSnapshot, SurfaceError> {
     let placement = RegionPlacement::new(geometry, region)?;
+    let channels = match color {
+        Some(color) => ChannelOffsets::from_color(color)?,
+        None => ChannelOffsets::LEGACY_GRAYSCALE,
+    };
     let mut pixels = vec![0_u8; placement.total_bytes()];
     for row in 0..placement.region.height {
         let offset = placement
@@ -370,7 +378,7 @@ pub fn read_region(
     Ok(RegionSnapshot {
         placement,
         pixels,
-        channels: ChannelOffsets::LEGACY_GRAYSCALE,
+        channels,
     })
 }
 
@@ -866,6 +874,7 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+            None,
         )
         .expect("read region");
         drop(file);
@@ -900,6 +909,7 @@ mod tests {
                 width: 2,
                 height: 2,
             },
+            None,
         )
         .expect("read region");
         drop(file);

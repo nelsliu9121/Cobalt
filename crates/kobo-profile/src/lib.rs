@@ -29,6 +29,12 @@ impl ChannelField {
         self.length == 8 && self.offset as u16 + self.length as u16 <= 32
     }
 
+    const fn matches(self, bitfield: Bitfield) -> bool {
+        self.offset as u32 == bitfield.offset
+            && self.length as u32 == bitfield.length
+            && bitfield.msb_right == 0
+    }
+
     const fn overlaps(self, other: Self) -> bool {
         let end = self.offset as u16 + self.length as u16;
         let other_end = other.offset as u16 + other.length as u16;
@@ -50,8 +56,8 @@ pub struct ColorPanel {
 }
 
 impl ColorPanel {
-    const fn is_valid_for(self, controller: FramebufferController) -> bool {
-        if !matches!(controller, FramebufferController::Hwtcon)
+    const fn is_valid_for(self, profile: &DeviceProfile) -> bool {
+        if !matches!(profile.framebuffer_controller, FramebufferController::Hwtcon)
             || self.clean_waveform == 0
             || self.regal_waveform == 0
             || self.clean_waveform == self.regal_waveform
@@ -61,6 +67,10 @@ impl ColorPanel {
             || !self.green.is_eight_bits_within_word()
             || !self.blue.is_eight_bits_within_word()
             || !self.transparency.is_eight_bits_within_word()
+            || !self.red.matches(profile.red)
+            || !self.green.matches(profile.green)
+            || !self.blue.matches(profile.blue)
+            || !self.transparency.matches(profile.alpha)
         {
             return false;
         }
@@ -1044,7 +1054,7 @@ impl DeviceProfile {
     #[must_use]
     pub const fn picture_format(&self) -> PictureFormat {
         match self.color {
-            Some(color) if color.is_valid_for(self.framebuffer_controller) => PictureFormat::Rgb8,
+            Some(color) if color.is_valid_for(self) => PictureFormat::Rgb8,
             Some(_) | None => PictureFormat::Gray8,
         }
     }
@@ -1054,7 +1064,7 @@ impl DeviceProfile {
         let mut mismatches = Vec::new();
         let mut blockers = Vec::new();
         if let Some(color) = self.color {
-            if !color.is_valid_for(self.framebuffer_controller) {
+            if !color.is_valid_for(self) {
                 mismatches.push("color capability is invalid".to_owned());
             }
         }
@@ -2818,6 +2828,62 @@ mod tests {
         let report = profile.validate(&clara_panel_snapshot(clara_bw_identity()));
         assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
         assert_eq!(profile.picture_format(), PictureFormat::Rgb8);
+    }
+
+    #[test]
+    fn color_is_rejected_when_channels_disagree_with_framebuffer_bitfields() {
+        for color in [
+            ColorPanel {
+                red: VALID_COLOR_PANEL.green,
+                green: VALID_COLOR_PANEL.red,
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                green: VALID_COLOR_PANEL.blue,
+                blue: VALID_COLOR_PANEL.green,
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                blue: VALID_COLOR_PANEL.transparency,
+                transparency: VALID_COLOR_PANEL.blue,
+                ..VALID_COLOR_PANEL
+            },
+        ] {
+            assert_color_capability_rejected(&DeviceProfile {
+                color: Some(color),
+                ..CLARA_BW_391
+            });
+        }
+    }
+
+    #[test]
+    fn color_is_rejected_when_a_framebuffer_channel_is_msb_right() {
+        let profile = DeviceProfile {
+            red: Bitfield {
+                msb_right: 1,
+                ..CLARA_BW_391.red
+            },
+            ..valid_color_profile()
+        };
+        let mut snapshot = clara_panel_snapshot(clara_bw_identity());
+        snapshot
+            .framebuffer
+            .as_mut()
+            .expect("framebuffer")
+            .red = profile.red;
+
+        let report = profile.validate(&snapshot);
+
+        assert_eq!(report.readiness, Readiness::Rejected);
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .any(|mismatch| mismatch.contains("color capability")),
+            "{:?}",
+            report.mismatches
+        );
+        assert_eq!(profile.picture_format(), PictureFormat::Gray8);
     }
 
     #[test]

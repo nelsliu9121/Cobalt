@@ -288,7 +288,8 @@ impl DisplaySession {
         self.geometry
     }
 
-    /// Captures the exact current bytes of `region` so they can be restored.
+    /// Captures the exact current bytes of `region` with the validated active
+    /// profile's channel mapping so they can be restored or inverted safely.
     ///
     /// # Errors
     ///
@@ -298,6 +299,7 @@ impl DisplaySession {
             &self.framebuffer,
             self.geometry,
             region,
+            self.profile.color,
         )?)
     }
 
@@ -653,10 +655,57 @@ mod tests {
     use crate::surface::{RegionPlacement, SurfaceGeometry};
     use kobo_abi::{hwtcon, mxcfb};
     use kobo_profile::{
-        DeviceProfile, DeviceSnapshot, FramebufferSnapshot, IdentitySnapshot, TouchSnapshot,
-        CLARA_BW_391, ELIPSA_2E_389, WRITE_EVIDENCE_PENDING,
+        Bitfield, ChannelField, ColorPanel, DeviceProfile, DeviceSnapshot, FramebufferSnapshot,
+        IdentitySnapshot, TouchSnapshot, CLARA_BW_391, ELIPSA_2E_389, WRITE_EVIDENCE_PENDING,
     };
     use std::path::Path;
+
+    const NON_LEGACY_COLOR: ColorPanel = ColorPanel {
+        red: ChannelField {
+            offset: 8,
+            length: 8,
+        },
+        green: ChannelField {
+            offset: 16,
+            length: 8,
+        },
+        blue: ChannelField {
+            offset: 24,
+            length: 8,
+        },
+        transparency: ChannelField {
+            offset: 0,
+            length: 8,
+        },
+        clean_waveform: 10,
+        regal_waveform: 11,
+        cfa_flags: 0x600,
+        clean_interval: 4,
+    };
+    const NON_LEGACY_COLOR_PROFILE: DeviceProfile = DeviceProfile {
+        color: Some(NON_LEGACY_COLOR),
+        red: Bitfield {
+            offset: 8,
+            length: 8,
+            msb_right: 0,
+        },
+        green: Bitfield {
+            offset: 16,
+            length: 8,
+            msb_right: 0,
+        },
+        blue: Bitfield {
+            offset: 24,
+            length: 8,
+            msb_right: 0,
+        },
+        alpha: Bitfield {
+            offset: 0,
+            length: 8,
+            msb_right: 0,
+        },
+        ..CLARA_BW_391
+    };
 
     fn matched_snapshot() -> DeviceSnapshot {
         snapshot_for(
@@ -708,6 +757,45 @@ mod tests {
             }),
             identity,
         }
+    }
+
+    #[test]
+    fn capture_inverts_the_active_profiles_non_legacy_channels() {
+        let path = std::env::temp_dir().join(format!(
+            "kobo-display-capture-{}-{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, [0x7f, 0x10, 0x20, 0x30]).expect("write framebuffer fixture");
+        let session = DisplaySession::open_verified(
+            &NON_LEGACY_COLOR_PROFILE,
+            snapshot_for(
+                &NON_LEGACY_COLOR_PROFILE,
+                IdentitySnapshot {
+                    serial_prefix: Some("N365".into()),
+                    firmware_version: Some("4.45.23697".into()),
+                    kernel_release: Some("4.9.77".into()),
+                    device_code: Some(391),
+                },
+            ),
+            &path,
+            WritePolicy::ReadyOnly,
+        )
+        .expect("open validated color session");
+
+        let captured = session
+            .capture(Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .expect("capture framebuffer pixel");
+        drop(session);
+        std::fs::remove_file(&path).expect("remove framebuffer fixture");
+
+        assert_eq!(captured.inverted_rgb().pixels(), &[0x7f, 0xef, 0xdf, 0xcf]);
+        assert!(captured.inverted_rgb().inverted_rgb().matches(&captured));
     }
 
     #[test]

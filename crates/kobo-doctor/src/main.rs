@@ -236,8 +236,8 @@ fn capture(framebuffer: &FramebufferSnapshot) -> Result<(), String> {
         width: framebuffer.width,
         height: framebuffer.height,
     };
-    let snapshot =
-        read_region(&file, geometry, whole).map_err(|error| format!("read the panel: {error}"))?;
+    let snapshot = read_region(&file, geometry, whole, None)
+        .map_err(|error| format!("read the panel: {error}"))?;
     let grey = grey_of(snapshot.pixels());
     println!(
         "{CAPTURE_HEADER} {} {} {}",
@@ -378,7 +378,7 @@ fn read_whole_panel(
             .map_err(|error| format!("{error}"))?;
         return Ok(pixels);
     }
-    read_region(file, geometry, whole)
+    read_region(file, geometry, whole, None)
         .map(|snapshot| snapshot.pixels().to_vec())
         .map_err(|error| format!("{error}"))
 }
