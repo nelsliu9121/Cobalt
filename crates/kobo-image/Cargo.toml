@@ -12,6 +12,8 @@ license.workspace = true
 # 0.25.9 raised its MSRV above the workspace's documented Rust 1.85.
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
 kobo-pixels = { path = "../kobo-pixels" }
+# Full-stream frame validation; `image` stops decoding once pixels are complete.
+png = "0.18.1"
 
 [lints]
 workspace = true

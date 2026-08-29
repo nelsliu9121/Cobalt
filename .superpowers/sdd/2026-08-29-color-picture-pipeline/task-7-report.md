@@ -99,3 +99,37 @@ None.
 ### Concerns
 
 None.
+
+## Review Fix Round 2
+
+### Changes
+
+- Replaced pixel-only PNG decoding with the `png` crate's streaming reader, using the same 0.18.1 parser already present under `image` as an explicit dependency.
+- Enabled CRC and Adler-32 verification, made ancillary CRC failures fatal, decoded the complete frame, and then called `Reader::finish` to parse and validate every remaining chunk through IEND.
+- Retained the bounded structural walk solely to prove the first IEND is the zero-length final chunk with no trailing bytes. The parser now owns CRC, known-chunk legality, critical-chunk recognition, ordering, IDAT sequence, and ancillary validation.
+- Rejected APNG animation metadata so a screenshot is one typed panel frame rather than a changing container.
+- Added post-IDAT tests covering a legal `tEXt` chunk, a corrupt ancillary CRC, and an unknown critical chunk.
+
+### RED Evidence
+
+- `cargo test -p kobo-image decode_png_` accepted both the corrupt post-IDAT ancillary chunk and the legal-CRC unknown critical chunk; 1 test passed and 2 failed.
+
+### Verification
+
+- `cargo test -p kobo-image decode_png_` — 3 passed, 0 failed.
+- `cargo test -p kobo-image` — 44 passed, 0 failed.
+- `cargo test -p kobo-cli frame_validation_` — 2 passed, 0 failed.
+- `cargo run -p kobo-cli -- shot --address 127.0.0.1:8879 --out target/task7-review2-simulator-shot.png` — strict full-stream validation saved a 1072×1448 screenshot from the actual built-in simulator.
+- `git diff --check` — passed.
+
+### Self-review
+
+- The parser's `next_frame` verifies and exhausts IDAT data; `finish` then reads all later chunks through IEND, so successful pixels can no longer hide a corrupt or illegal tail.
+- Strict options explicitly verify both PNG chunk CRCs and the compressed stream checksum and do not skip bad ancillary CRCs.
+- Legal post-IDAT ancillary metadata remains accepted, while unknown critical chunks and nonconsecutive data sequences fail through the parser's state machine.
+- Exact Gray8/RGB8 type, dimensions, decoded size, pixel bounds, original-byte retention, and final-IEND checks remain in force.
+- No real profile capability, BOMTOON file, todo tracker, formatter, linter, or workspace-wide suite was touched or run.
+
+### Concerns
+
+None.

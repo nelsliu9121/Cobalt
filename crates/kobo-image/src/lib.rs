@@ -146,30 +146,57 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
         }
         chunk_at = chunk_end;
     }
-    let format = match (bytes.get(24), bytes.get(25)) {
-        (Some(8), Some(0)) => PictureFormat::Gray8,
-        (Some(8), Some(2)) => PictureFormat::Rgb8,
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_checksums(false);
+    options.set_skip_ancillary_crc_failures(false);
+    let mut reader = png::Decoder::new_with_options(Cursor::new(bytes), options)
+        .read_info()
+        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+    let info = reader.info();
+    if info.animation_control.is_some() {
+        return Err(ImageError::Undecodable(
+            "animated PNGs are not panel frames".to_owned(),
+        ));
+    }
+    let (width, height) = info.size();
+    let format = match (info.bit_depth, info.color_type) {
+        (png::BitDepth::Eight, png::ColorType::Grayscale) => PictureFormat::Gray8,
+        (png::BitDepth::Eight, png::ColorType::Rgb) => PictureFormat::Rgb8,
         _ => {
             return Err(ImageError::Undecodable(
                 "the PNG is not eight-bit Gray8 or RGB8".to_owned(),
             ));
         }
     };
-    let decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
-        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    let (width, height) = decoder.dimensions();
     checked_pixels(width, height)?;
     let expected = format.byte_len(width, height).ok_or_else(|| {
         ImageError::Undecodable("the PNG byte length does not fit this platform".to_owned())
     })?;
-    if decoder.total_bytes() != u64::try_from(expected).unwrap_or(u64::MAX) {
+    if reader.output_buffer_size() != Some(expected) {
         return Err(ImageError::Undecodable(
             "the PNG decoder changed its declared pixel representation".to_owned(),
         ));
     }
     let mut pixels = vec![0; expected];
-    decoder
-        .read_image(&mut pixels)
+    let output = reader
+        .next_frame(&mut pixels)
+        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+    if output.width != width
+        || output.height != height
+        || output.buffer_size() != expected
+        || output.bit_depth != png::BitDepth::Eight
+        || !matches!(
+            (format, output.color_type),
+            (PictureFormat::Gray8, png::ColorType::Grayscale)
+                | (PictureFormat::Rgb8, png::ColorType::Rgb)
+        )
+    {
+        return Err(ImageError::Undecodable(
+            "the decoded PNG frame does not match its header".to_owned(),
+        ));
+    }
+    reader
+        .finish()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     let pixels = match format {
         PictureFormat::Gray8 => PicturePixels::Gray8(pixels),
@@ -908,7 +935,7 @@ fn over_white(channel: u8, alpha: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, decode_webp, encode_png, fitted_size, picture_clone_count,
+        decode, decode_png, decode_webp, encode_png, fitted_size, picture_clone_count,
         reset_picture_clone_count, size, width_scaled_size, AxisSample, FitMode, ImageError,
         Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
     };
@@ -921,6 +948,46 @@ mod tests {
             panic!("test fixture unexpectedly became RGB");
         };
         gray
+    }
+
+    fn png_crc(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0xedb8_8320
+                };
+            }
+        }
+        !crc
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::with_capacity(data.len() + 12);
+        chunk.extend_from_slice(
+            &u32::try_from(data.len())
+                .expect("PNG test chunk length")
+                .to_be_bytes(),
+        );
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        chunk.extend_from_slice(&png_crc(&chunk[4..]).to_be_bytes());
+        chunk
+    }
+
+    fn with_post_idat_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let png = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
+            .expect("RGB PNG fixture");
+        let iend = png.len() - 12;
+        let chunk = png_chunk(kind, data);
+        let mut joined = Vec::with_capacity(png.len() + chunk.len());
+        joined.extend_from_slice(&png[..iend]);
+        joined.extend_from_slice(&chunk);
+        joined.extend_from_slice(&png[iend..]);
+        joined
     }
 
     /// A real four by four JPEG, so the decoder is exercised against a file
@@ -1194,6 +1261,30 @@ mod tests {
 
         assert!(encode_png(2, 1, PicturePixelsRef::Gray8(&[0])).is_err());
         assert!(encode_png(2, 1, PicturePixelsRef::Rgb8(&[0; 5])).is_err());
+    }
+
+    #[test]
+    fn decode_png_accepts_legal_text_after_image_data() {
+        let png = with_post_idat_chunk(b"tEXt", b"Note\0complete");
+        let picture = decode_png(&png).expect("legal post-IDAT text");
+        assert_eq!(
+            picture.pixels(),
+            PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn decode_png_refuses_bad_ancillary_crc_after_image_data() {
+        let mut png = with_post_idat_chunk(b"tEXt", b"Note\0corrupt");
+        let ancillary_crc_last = png.len() - 13;
+        png[ancillary_crc_last] ^= 1;
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_unknown_critical_chunk_after_image_data() {
+        let png = with_post_idat_chunk(b"ABCD", b"unknown");
+        assert!(decode_png(&png).is_err());
     }
 
     #[test]

@@ -768,6 +768,7 @@ version = "0.3.0"
 dependencies = [
  "image",
  "kobo-pixels",
+ "png 0.18.1",
 ]
 
 [[package]]
