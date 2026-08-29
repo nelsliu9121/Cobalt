@@ -2,10 +2,10 @@ mod api;
 mod model;
 mod parse;
 
-use kobo_image::{Picture, PANEL_GREYS};
+use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, PicturePixelsRef,
-    ReadingChrome, Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
+    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, ReadingChrome,
+    Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
 };
 use model::{display_text, Comic, Episode, EpisodeImage, RecentEntry};
 use std::process::ExitCode;
@@ -76,6 +76,33 @@ struct PageSegment {
 struct PagePlan {
     segments: Vec<PageSegment>,
     content_rows: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PageBuild {
+    page: usize,
+    format: PictureFormat,
+    bytes: Vec<u8>,
+    next_segment: usize,
+}
+
+impl PageBuild {
+    fn new(
+        page: usize,
+        format: PictureFormat,
+        panel_width: u32,
+        panel_height: u32,
+    ) -> Result<Self, String> {
+        let byte_len = format
+            .byte_len(panel_width, panel_height)
+            .ok_or_else(|| "The comic page byte length is not supported.".to_owned())?;
+        Ok(Self {
+            page,
+            format,
+            bytes: vec![255; byte_len],
+            next_segment: 0,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1242,6 +1269,135 @@ fn continuous_page_plan(
     Ok((plans, total_pages))
 }
 
+fn row_byte_offset(row: u32, width: u32, format: PictureFormat) -> Option<usize> {
+    usize::try_from(row)
+        .ok()?
+        .checked_mul(usize::try_from(width).ok()?)?
+        .checked_mul(format.bytes_per_pixel())
+}
+
+fn copy_source_into_builds(
+    source_index: usize,
+    source: &Picture,
+    plans: &[PagePlan],
+    builds: &mut [PageBuild],
+    panel_width: u32,
+    panel_height: u32,
+) -> Result<(), String> {
+    for build in builds {
+        let plan = plans
+            .get(build.page)
+            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
+        let Some(segment) = plan.segments.get(build.next_segment) else {
+            continue;
+        };
+        if segment.source != source_index {
+            continue;
+        }
+        if source.format() != build.format {
+            return Err("The comic source format does not match the page build.".to_owned());
+        }
+        if source.width() != panel_width {
+            return Err("The scaled comic image width does not match the panel.".to_owned());
+        }
+        let expected_build_len = build
+            .format
+            .byte_len(panel_width, panel_height)
+            .ok_or_else(|| "The comic page byte length is not supported.".to_owned())?;
+        if build.bytes.len() != expected_build_len {
+            return Err("The comic page pixels do not match their dimensions.".to_owned());
+        }
+
+        let source_bytes = match source.pixels() {
+            PicturePixelsRef::Gray8(bytes) if build.format == PictureFormat::Gray8 => bytes,
+            PicturePixelsRef::Rgb8(bytes) if build.format == PictureFormat::Rgb8 => bytes,
+            _ => {
+                return Err("The comic source format does not match the page build.".to_owned());
+            }
+        };
+        let expected_source_len = build
+            .format
+            .byte_len(source.width(), source.height())
+            .ok_or_else(|| "The comic source byte length is not supported.".to_owned())?;
+        if source_bytes.len() != expected_source_len {
+            return Err("The comic source pixels do not match their dimensions.".to_owned());
+        }
+
+        let copied_len = row_byte_offset(segment.rows, panel_width, build.format)
+            .ok_or_else(|| "The comic segment byte length is not supported.".to_owned())?;
+        let source_start = row_byte_offset(segment.source_row, panel_width, build.format)
+            .ok_or_else(|| "The comic source byte offset is not supported.".to_owned())?;
+        let source_end = source_start
+            .checked_add(copied_len)
+            .ok_or_else(|| "The comic source byte interval is not supported.".to_owned())?;
+        let destination_start =
+            row_byte_offset(segment.destination_row, panel_width, build.format)
+                .ok_or_else(|| "The comic page byte offset is not supported.".to_owned())?;
+        let destination_end = destination_start
+            .checked_add(copied_len)
+            .ok_or_else(|| "The comic page byte interval is not supported.".to_owned())?;
+        let source_rows = source_bytes
+            .get(source_start..source_end)
+            .ok_or_else(|| "The comic source pixels do not cover the planned segment.".to_owned())?;
+        let destination = build
+            .bytes
+            .get_mut(destination_start..destination_end)
+            .ok_or_else(|| "The comic page pixels do not cover the planned segment.".to_owned())?;
+        destination.copy_from_slice(source_rows);
+        build.next_segment = build
+            .next_segment
+            .checked_add(1)
+            .ok_or_else(|| "The comic page has too many segments.".to_owned())?;
+    }
+    Ok(())
+}
+
+fn finish_build(
+    build: PageBuild,
+    plan: &PagePlan,
+    panel_width: u32,
+    panel_height: u32,
+) -> Result<Picture, String> {
+    if build.next_segment != plan.segments.len() {
+        return Err("The comic page build is incomplete.".to_owned());
+    }
+    let pixels = match build.format {
+        PictureFormat::Gray8 => PicturePixels::Gray8(build.bytes),
+        PictureFormat::Rgb8 => PicturePixels::Rgb8(build.bytes),
+    };
+    let mut picture = Picture::from_pixels(panel_width, panel_height, pixels)
+        .map_err(|error| error.to_string())?;
+    if picture.format() == PictureFormat::Gray8 {
+        picture
+            .dither(PANEL_GREYS)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(picture)
+}
+
+fn decode_reader_source(
+    bytes: &[u8],
+    expected: &EpisodeImage,
+    format: PictureFormat,
+    panel_width: u32,
+) -> Result<Picture, String> {
+    let decoded =
+        kobo_image::decode_webp(bytes, format).map_err(|error| error.to_string())?;
+    if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
+        return Err("BOMTOON returned different comic image dimensions.".to_owned());
+    }
+    let source = decoded
+        .scale_to_width(panel_width)
+        .map_err(|error| error.to_string())?;
+    let expected_scaled =
+        kobo_image::width_scaled_size((expected.width, expected.height), panel_width)
+            .map_err(|error| error.to_string())?;
+    if (source.width(), source.height()) != expected_scaled {
+        return Err("The scaled comic image dimensions do not match the page plan.".to_owned());
+    }
+    Ok(source)
+}
+
 fn previous_location(pages: &[usize], current: PageLocation) -> Option<PageLocation> {
     if current.slice > 0 {
         return Some(PageLocation {
@@ -1363,8 +1519,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use kobo_sdk::{
-        AppRunner, Chrome, Command, Credential, DisplayMetrics, Node, PictureFormat, PictureHandle,
-        ReadingChrome, SecretHeader, Task, TilePicture, CLARA_BW_METRICS,
+        AppRunner, Chrome, Command, Credential, DisplayMetrics, Node, PictureHandle, ReadingChrome,
+        SecretHeader, Task, TilePicture, CLARA_BW_METRICS,
     };
 
     const LIBRARY_RESPONSE: &[u8] = br#"{
@@ -1657,6 +1813,269 @@ mod tests {
         let error = continuous_page_plan(&[episode_image(0, 1, height)], 1, 1)
             .expect_err("page count above u16 must fail");
         assert_eq!(error, "The comic has too many pages.");
+    }
+
+    fn seam_plan() -> PagePlan {
+        PagePlan {
+            segments: vec![
+                PageSegment {
+                    source: 0,
+                    source_row: 0,
+                    rows: 1,
+                    destination_row: 0,
+                },
+                PageSegment {
+                    source: 1,
+                    source_row: 0,
+                    rows: 1,
+                    destination_row: 1,
+                },
+            ],
+            content_rows: 2,
+        }
+    }
+
+    #[test]
+    fn typed_page_assembly_gray8_dithers_once_after_the_source_seam() {
+        let plans = vec![seam_plan()];
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
+        let first = Picture::from_grey(2, 1, vec![10, 10]).expect("first source");
+        let second = Picture::from_grey(2, 1, vec![20, 20]).expect("second source");
+
+        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2)
+            .expect("first segment");
+        assert_eq!(builds[0].bytes, [10, 10, 255, 255]);
+        assert_eq!(builds[0].next_segment, 1);
+        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2)
+            .expect("duplicate source is ignored");
+        assert_eq!(builds[0].next_segment, 1);
+        copy_source_into_builds(1, &second, &plans, &mut builds, 2, 2)
+            .expect("second segment");
+        assert_eq!(builds[0].bytes, [10, 10, 20, 20]);
+
+        let mut expected =
+            Picture::from_grey(2, 2, vec![10, 10, 20, 20]).expect("undithered page");
+        expected.dither(PANEL_GREYS).expect("whole-page dither");
+        let picture = finish_build(builds.pop().expect("build"), &plans[0], 2, 2)
+            .expect("finished Gray8 page");
+
+        assert_eq!(picture.pixels(), expected.pixels());
+    }
+
+    #[test]
+    fn typed_page_assembly_rgb8_preserves_exact_colors_across_the_source_seam() {
+        let plans = vec![seam_plan()];
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
+        let red = Picture::from_pixels(
+            2,
+            1,
+            PicturePixels::Rgb8(vec![255, 0, 0, 255, 0, 0]),
+        )
+        .expect("red source");
+        let blue = Picture::from_pixels(
+            2,
+            1,
+            PicturePixels::Rgb8(vec![0, 0, 255, 0, 0, 255]),
+        )
+        .expect("blue source");
+
+        copy_source_into_builds(0, &red, &plans, &mut builds, 2, 2).expect("red segment");
+        copy_source_into_builds(1, &blue, &plans, &mut builds, 2, 2).expect("blue segment");
+        let picture = finish_build(builds.pop().expect("build"), &plans[0], 2, 2)
+            .expect("finished RGB8 page");
+
+        assert_eq!(
+            picture.pixels(),
+            PicturePixelsRef::Rgb8(&[
+                255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn page_assembly_final_padding_is_white_and_bytes_per_pixel_correct() {
+        let plan = PagePlan {
+            segments: vec![PageSegment {
+                source: 0,
+                source_row: 0,
+                rows: 1,
+                destination_row: 0,
+            }],
+            content_rows: 1,
+        };
+        let plans = vec![plan.clone()];
+
+        let grey = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
+        let mut grey_builds =
+            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
+        copy_source_into_builds(0, &grey, &plans, &mut grey_builds, 2, 2)
+            .expect("Gray8 segment");
+        let grey_page = finish_build(
+            grey_builds.pop().expect("Gray8 build"),
+            &plan,
+            2,
+            2,
+        )
+        .expect("Gray8 page");
+        assert_eq!(
+            grey_page.pixels(),
+            PicturePixelsRef::Gray8(&[0, 0, 255, 255])
+        );
+
+        let rgb = Picture::from_pixels(
+            2,
+            1,
+            PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .expect("RGB8 source");
+        let mut rgb_builds =
+            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
+        copy_source_into_builds(0, &rgb, &plans, &mut rgb_builds, 2, 2)
+            .expect("RGB8 segment");
+        let rgb_page =
+            finish_build(rgb_builds.pop().expect("RGB8 build"), &plan, 2, 2).expect("RGB8 page");
+        assert_eq!(
+            rgb_page.pixels(),
+            PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6, 255, 255, 255, 255, 255, 255])
+        );
+    }
+
+    #[test]
+    fn page_assembly_format_mismatch_is_refused() {
+        let plans = vec![PagePlan {
+            segments: vec![PageSegment {
+                source: 0,
+                source_row: 0,
+                rows: 1,
+                destination_row: 0,
+            }],
+            content_rows: 1,
+        }];
+        let source = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 1).expect("RGB8 build")];
+
+        assert!(
+            copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err(),
+            "a Gray8 source must not enter an RGB8 build"
+        );
+    }
+
+    #[test]
+    fn page_assembly_wrong_scaled_width_is_refused() {
+        let plans = vec![PagePlan {
+            segments: vec![PageSegment {
+                source: 0,
+                source_row: 0,
+                rows: 1,
+                destination_row: 0,
+            }],
+            content_rows: 1,
+        }];
+        let source = Picture::from_grey(1, 1, vec![0]).expect("narrow source");
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 1).expect("build")];
+
+        assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err());
+    }
+
+    #[test]
+    fn page_assembly_truncated_source_rows_are_refused() {
+        let plans = vec![PagePlan {
+            segments: vec![PageSegment {
+                source: 0,
+                source_row: 0,
+                rows: 2,
+                destination_row: 0,
+            }],
+            content_rows: 2,
+        }];
+        let source = Picture::from_grey(2, 1, vec![0, 0]).expect("one-row source");
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+
+        assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 2).is_err());
+    }
+
+    #[test]
+    fn page_assembly_incomplete_build_is_refused() {
+        let plan = seam_plan();
+        let mut builds =
+            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+        let source = Picture::from_grey(2, 1, vec![0, 0]).expect("first source");
+        copy_source_into_builds(
+            0,
+            &source,
+            std::slice::from_ref(&plan),
+            &mut builds,
+            2,
+            2,
+        )
+        .expect("first segment");
+
+        assert!(finish_build(builds.pop().expect("build"), &plan, 2, 2).is_err());
+    }
+
+    #[test]
+    fn page_assembly_rejects_unrepresentable_page_buffer() {
+        assert!(PageBuild::new(
+            0,
+            PictureFormat::Rgb8,
+            u32::MAX,
+            u32::MAX
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn webp_decode_boundary_preserves_format_and_validates_scaled_dimensions() {
+        let expected = episode_image(0, 1, 1);
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let source =
+                decode_reader_source(TINY_WEBP, &expected, format, 2).expect("bounded WebP");
+            assert_eq!((source.width(), source.height()), (2, 2));
+            assert_eq!(source.format(), format);
+        }
+    }
+
+    #[test]
+    fn webp_decode_boundary_refuses_wrong_manifest_dimensions_before_scaling() {
+        let expected = episode_image(0, 2, 2);
+        let error = decode_reader_source(TINY_WEBP, &expected, PictureFormat::Gray8, 0)
+            .expect_err("manifest dimensions must be checked before the invalid scale width");
+
+        assert_eq!(
+            error,
+            "BOMTOON returned different comic image dimensions."
+        );
+    }
+
+    #[test]
+    fn webp_decode_boundary_refuses_non_webp_and_platform_oversize_sources() {
+        let png = kobo_image::encode_png_grey(1, 1, &[0]).expect("valid non-WebP picture");
+        assert!(
+            decode_reader_source(
+                &png,
+                &episode_image(0, 1, 1),
+                PictureFormat::Gray8,
+                1,
+            )
+            .is_err()
+        );
+        let oversized = vec![0; 4 * 1024 * 1024 + 1];
+        let error = decode_reader_source(
+            &oversized,
+            &episode_image(0, 1, 1),
+            PictureFormat::Gray8,
+            1,
+        )
+        .expect_err("the platform source-byte bound must run before WebP parsing");
+        assert_eq!(
+            error,
+            "the picture is 4194305 bytes, and 4194304 is the most that is read"
+        );
     }
 
     fn started() -> (AppRunner<Bomtoon>, Vec<Command>) {
