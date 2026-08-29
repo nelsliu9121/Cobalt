@@ -133,3 +133,35 @@ None.
 ### Concerns
 
 None.
+
+## Review Fix Round 3
+
+### Changes
+
+- Added a strict low-level `png::StreamingDecoder` event pass over the complete source before the high-level typed pixel decode.
+- Treats every `BadAncillaryChunk` event as fatal, including valid-CRC chunks whose contents or placement are illegal.
+- Rejects every skipped/unknown ancillary chunk fail-closed; the supported ancillary set is exactly what the parser validates.
+- Rejects `acTL`, `fcTL`, and `fdAT` at chunk begin regardless of position, while retaining legal supported metadata such as well-formed post-IDAT `tEXt`.
+- Kept the high-level reader for bounded Gray8/RGB8 pixel production and exact output validation.
+
+### RED Evidence
+
+- `cargo test -p kobo-image decode_png_` accepted a valid-CRC post-IDAT `gAMA`, a malformed `tEXt` with no required NUL separator, and a post-IDAT `acTL`; 3 tests passed and 3 failed.
+
+### Verification
+
+- `cargo test -p kobo-image decode_png_` — 6 passed, 0 failed.
+- `cargo test -p kobo-image` — 47 passed, 0 failed.
+- `cargo test -p kobo-cli frame_validation_` — 2 passed, 0 failed.
+- `git diff --check` — passed.
+
+### Self-review
+
+- The strict event pass observes parser failures the high-level `Reader::finish` intentionally downgrades, so ancillary syntax and ordering can no longer disappear after successful pixels.
+- Known legal post-IDAT text is parsed and accepted; malformed, misplaced, animated, unknown, and CRC-invalid chunks are refused.
+- Critical ordering, IDAT consecutiveness, CRC/Adler integrity, final IEND, exact Gray8/RGB8 type, dimensions, decoded size, and pixel bounds remain enforced.
+- No real profile capability, BOMTOON file, todo tracker, formatter, linter, or workspace-wide suite was touched or run.
+
+### Concerns
+
+None.

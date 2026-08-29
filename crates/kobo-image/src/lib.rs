@@ -88,6 +88,65 @@ pub fn encode_png(
     Ok(png)
 }
 
+fn strict_png_options() -> png::DecodeOptions {
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_checksums(false);
+    options.set_skip_ancillary_crc_failures(false);
+    options
+}
+
+/// Parses every chunk as an event because the high-level reader deliberately
+/// recovers from malformed ancillary chunks after the pixels are complete.
+///
+/// Unknown ancillary chunks are refused rather than preserved without
+/// validation. The supported set is the one this parser understands, including
+/// text metadata after IDAT; animation chunks are never a single panel frame.
+fn validate_png_chunks(bytes: &[u8]) -> Result<(), ImageError> {
+    let mut decoder = png::StreamingDecoder::new_with_options(strict_png_options());
+    let mut remaining = bytes;
+    let mut reached_iend = false;
+    while !remaining.is_empty() {
+        let (consumed, event) = decoder
+            .update(remaining, None)
+            .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+        remaining = &remaining[consumed..];
+        match event {
+            png::Decoded::BadAncillaryChunk(kind) => {
+                return Err(ImageError::Undecodable(format!(
+                    "invalid ancillary PNG chunk {kind:?}"
+                )));
+            }
+            png::Decoded::SkippedAncillaryChunk(kind) => {
+                return Err(ImageError::Undecodable(format!(
+                    "unsupported ancillary PNG chunk {kind:?}"
+                )));
+            }
+            png::Decoded::ChunkBegin(_, kind)
+                if matches!(kind, png::chunk::acTL | png::chunk::fcTL | png::chunk::fdAT) =>
+            {
+                return Err(ImageError::Undecodable(
+                    "animated PNG chunks are not panel frames".to_owned(),
+                ));
+            }
+            png::Decoded::ChunkComplete(kind) if kind == png::chunk::IEND => {
+                reached_iend = true;
+            }
+            png::Decoded::Nothing if consumed == 0 => {
+                return Err(ImageError::Undecodable(
+                    "the PNG decoder made no progress".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !reached_iend {
+        return Err(ImageError::Undecodable(
+            "the PNG ended before IEND".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes a complete PNG without changing its Gray8 or RGB8 representation.
 ///
 /// The source must use an eight-bit grayscale or truecolor IHDR, end exactly
@@ -146,10 +205,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
         }
         chunk_at = chunk_end;
     }
-    let mut options = png::DecodeOptions::default();
-    options.set_ignore_checksums(false);
-    options.set_skip_ancillary_crc_failures(false);
-    let mut reader = png::Decoder::new_with_options(Cursor::new(bytes), options)
+    validate_png_chunks(bytes)?;
+    let mut reader = png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options())
         .read_info()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     let info = reader.info();
@@ -1284,6 +1341,27 @@ mod tests {
     #[test]
     fn decode_png_refuses_unknown_critical_chunk_after_image_data() {
         let png = with_post_idat_chunk(b"ABCD", b"unknown");
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_gamma_after_image_data() {
+        let png = with_post_idat_chunk(b"gAMA", &45_455_u32.to_be_bytes());
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_text_without_keyword_separator() {
+        let png = with_post_idat_chunk(b"tEXt", b"missing separator");
+        assert!(decode_png(&png).is_err());
+    }
+
+    #[test]
+    fn decode_png_refuses_animation_control_after_image_data() {
+        let mut animation = Vec::new();
+        animation.extend_from_slice(&1_u32.to_be_bytes());
+        animation.extend_from_slice(&0_u32.to_be_bytes());
+        let png = with_post_idat_chunk(b"acTL", &animation);
         assert!(decode_png(&png).is_err());
     }
 
