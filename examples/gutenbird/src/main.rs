@@ -42,9 +42,9 @@ use kobo_read::{Memory, Outcome, Reader};
 use kobo_sdk::keyboard::{Keyboard, Pressed};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, DiagnosticSeverity, Failure, FontHandle,
-    Glyph, Header, KoboApp, LogLevel, PictureHandle, PicturePixels, RowLead, ScreenBuilder,
-    ShelfDownload, ShelfProgress, ShelfUpload, StoreResult, Task, TaskId, TaskOutcome, Tile,
-    TilePicture, TileShape, TileState, MAX_STORE_VALUE,
+    Glyph, Header, KoboApp, LogLevel, PictureHandle, PicturePixels, PicturePixelsRef, RowLead,
+    ScreenBuilder, ShelfDownload, ShelfProgress, ShelfUpload, StoreResult, Task, TaskId,
+    TaskOutcome, Tile, TilePicture, TileShape, TileState, MAX_STORE_VALUE,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
@@ -1955,7 +1955,9 @@ impl Gutenbird {
         if let (Ok(width), Ok(height)) = (u32::try_from(cell_width), u32::try_from(cell_height)) {
             if let Ok(picture) = kobo_image::decode(bytes) {
                 if let Ok(mut picture) = picture.fit_enlarging(width, height) {
-                    picture.dither(kobo_image::PANEL_GREYS);
+                    if picture.dither(kobo_image::PANEL_GREYS).is_err() {
+                        return;
+                    }
                     let handle = PictureHandle(NAV_COVER_HANDLE_BASE + self.nav_cover_handle);
                     self.nav_cover_handle =
                         self.nav_cover_handle.wrapping_add(1) % NAV_COVER_HANDLES;
@@ -1964,7 +1966,7 @@ impl Gutenbird {
                         handle,
                         drawn_width,
                         drawn_height,
-                        PicturePixels::Gray8(picture.into_grey()),
+                        picture.into_pixels(),
                     ) {
                         if let Some(entry) = self.stack.last_mut() {
                             if let Some(at) = entry
@@ -2135,15 +2137,14 @@ impl Gutenbird {
         let Ok(mut picture) = picture.fit_enlarging(cell_width, cell_height) else {
             return false;
         };
-        picture.dither(kobo_image::PANEL_GREYS);
+        if picture.dither(kobo_image::PANEL_GREYS).is_err() {
+            return false;
+        }
         let handle = PictureHandle(u32::try_from(index).unwrap_or(0));
         let (width, height) = (picture.width(), picture.height());
-        let Some(reference) = context.put_picture(
-            handle,
-            width,
-            height,
-            PicturePixels::Gray8(picture.into_grey()),
-        ) else {
+        let Some(reference) =
+            context.put_picture(handle, width, height, picture.into_pixels())
+        else {
             return false;
         };
         if let Some(entry) = self.stack.last_mut() {
@@ -2265,13 +2266,17 @@ impl Gutenbird {
         let Ok(mut picture) = picture.fit_enlarging(width, height) else {
             return false;
         };
-        picture.dither(kobo_image::PANEL_GREYS);
+        if picture.dither(kobo_image::PANEL_GREYS).is_err() {
+            return false;
+        }
         // Padded out to the reserved box rather than handed over at whatever
         // size it came back. A cover an eighth taller than three by two would
         // otherwise be an eighth taller on the page than the frame that was
         // standing in for it, and the block underneath would move by that much
         // at the moment it arrived -- which is the whole thing being fixed.
-        let padded = on_paper(&picture, width, height);
+        let Ok(padded) = on_paper(&picture, width, height) else {
+            return false;
+        };
         let Some(reference) =
             context.put_picture(
                 OPEN_COVER_HANDLE,
@@ -2761,7 +2766,11 @@ fn cover_key(url: &str) -> String {
 /// A picture larger than the sheet in either direction is cropped rather than
 /// scaled: callers fit before they get here, and silently resampling would
 /// disagree with what was measured.
-fn on_paper(picture: &kobo_image::Picture, width: u32, height: u32) -> Vec<u8> {
+fn on_paper(
+    picture: &kobo_image::Picture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
     let sheet_width = usize::try_from(width).unwrap_or(0);
     let sheet_height = usize::try_from(height).unwrap_or(0);
     let mut sheet = vec![u8::MAX; sheet_width * sheet_height];
@@ -2772,7 +2781,9 @@ fn on_paper(picture: &kobo_image::Picture, width: u32, height: u32) -> Vec<u8> {
         .min(sheet_height);
     let left = (sheet_width - copied_width) / 2;
     let top = (sheet_height - copied_height) / 2;
-    let grey = picture.grey();
+    let PicturePixelsRef::Gray8(grey) = picture.pixels() else {
+        return Err("this operation requires a grayscale picture".to_owned());
+    };
     for row in 0..copied_height {
         let from = row * source_width;
         let to = (top + row) * sheet_width + left;
@@ -2784,7 +2795,7 @@ fn on_paper(picture: &kobo_image::Picture, width: u32, height: u32) -> Vec<u8> {
         };
         target.copy_from_slice(source);
     }
-    sheet
+    Ok(sheet)
 }
 
 fn stamp(url: &str) -> u32 {

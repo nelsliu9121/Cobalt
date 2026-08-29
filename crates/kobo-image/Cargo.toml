@@ -11,6 +11,7 @@ license.workspace = true
 # will never meet, and every one of them is code that runs on a reader.
 # 0.25.9 raised its MSRV above the workspace's documented Rust 1.85.
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+kobo-pixels = { path = "../kobo-pixels" }
 
 [lints]
 workspace = true

@@ -11,9 +11,9 @@
 //! takes the reader's memory and, on a device with no swap and no fan, the
 //! reader with it.
 
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
+pub use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
 use std::fmt;
 use std::io::Cursor;
 
@@ -44,37 +44,57 @@ pub const MAX_ENLARGEMENT: u32 = 3;
 /// two everything becomes a woodcut.
 pub const PANEL_GREYS: u8 = 16;
 
-/// Wraps grey panel bytes up as a PNG.
-///
-/// The other direction from everything else here, and it exists for one
-/// reason: a frame off the panel is 1072 by 1448 bytes of raw grey, which is
-/// not a thing a person can look at or an agent can read. A screenshot that
-/// has to be converted before it can be opened is a screenshot nobody takes.
-///
-/// Greyscale, eight bit, no palette -- the same shape the surface already
-/// holds, so this is an encode and not a conversion.
+/// The most horizontal samples the fixed-point scaler holds at once.
+pub const AXIS_SAMPLE_CHUNK: usize = 2_048;
+
+/// Wraps typed picture pixels up as a PNG.
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::Undecodable`] when `grey` is not exactly
-/// `width * height` bytes, and [`ImageError::TooManyPixels`] past
+/// Returns [`ImageError::Undecodable`] when the pixel byte length does not
+/// match its format and dimensions, and [`ImageError::TooManyPixels`] past
 /// [`MAX_PIXELS`].
-pub fn encode_png_grey(width: u32, height: u32, grey: &[u8]) -> Result<Vec<u8>, ImageError> {
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS {
-        return Err(ImageError::TooManyPixels { pixels });
-    }
-    if grey.len() as u64 != pixels {
+pub fn encode_png(
+    width: u32,
+    height: u32,
+    pixels: PicturePixelsRef<'_>,
+) -> Result<Vec<u8>, ImageError> {
+    checked_pixels(width, height)?;
+    let (bytes, format, color_type) = match pixels {
+        PicturePixelsRef::Gray8(bytes) => (
+            bytes,
+            PictureFormat::Gray8,
+            image::ExtendedColorType::L8,
+        ),
+        PicturePixelsRef::Rgb8(bytes) => (
+            bytes,
+            PictureFormat::Rgb8,
+            image::ExtendedColorType::Rgb8,
+        ),
+    };
+    let expected = format.byte_len(width, height).ok_or_else(|| {
+        ImageError::Undecodable("the picture byte length does not fit this platform".to_owned())
+    })?;
+    if bytes.len() != expected {
         return Err(ImageError::Undecodable(format!(
-            "{} bytes for a {width} by {height} frame, which needs {pixels}",
-            grey.len()
+            "{} bytes for a {width} by {height} {format:?} picture, which needs {expected}",
+            bytes.len()
         )));
     }
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(grey, width, height, image::ExtendedColorType::L8)
+        .write_image(bytes, width, height, color_type)
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     Ok(png)
+}
+
+/// Wraps raw eight-bit grayscale framebuffer pixels up as a PNG.
+///
+/// # Errors
+///
+/// Returns the same errors as [`encode_png`].
+pub fn encode_png_grey(width: u32, height: u32, grey: &[u8]) -> Result<Vec<u8>, ImageError> {
+    encode_png(width, height, PicturePixelsRef::Gray8(grey))
 }
 
 /// How a picture should occupy the rectangle a component assigned to it.
@@ -127,42 +147,52 @@ impl fmt::Display for ImageError {
 
 impl std::error::Error for ImageError {}
 
-/// One picture, in the only form the panel has any use for: eight bit grey,
-/// one byte per pixel, top row first, no padding.
-///
-/// The same layout the drawing surface uses, so painting one is a copy rather
-/// than a conversion.
+/// One typed picture, row-major from the top with no row padding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Picture {
     width: u32,
     height: u32,
-    grey: Vec<u8>,
+    pixels: PicturePixels,
 }
 
 impl Picture {
-    /// Builds a picture from grey bytes that are already the right shape.
+    /// Builds a picture from typed bytes that are already the right shape.
     ///
     /// # Errors
     ///
     /// Returns [`ImageError::TooManyPixels`] when the dimensions exceed
-    /// [`MAX_PIXELS`], and [`ImageError::Undecodable`] when `grey` is not
-    /// exactly `width * height` bytes.
-    pub fn from_grey(width: u32, height: u32, grey: Vec<u8>) -> Result<Self, ImageError> {
-        let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_PIXELS {
-            return Err(ImageError::TooManyPixels { pixels });
-        }
-        if grey.len() as u64 != pixels {
+    /// [`MAX_PIXELS`], and [`ImageError::Undecodable`] when the byte length
+    /// does not match the dimensions and format.
+    pub fn from_pixels(
+        width: u32,
+        height: u32,
+        pixels: PicturePixels,
+    ) -> Result<Self, ImageError> {
+        checked_pixels(width, height)?;
+        let format = pixels.format();
+        let expected = format.byte_len(width, height).ok_or_else(|| {
+            ImageError::Undecodable("the picture byte length does not fit this platform".to_owned())
+        })?;
+        if pixels.byte_count() != expected {
             return Err(ImageError::Undecodable(format!(
-                "{} bytes for a {width} by {height} picture, which needs {pixels}",
-                grey.len()
+                "{} bytes for a {width} by {height} {format:?} picture, which needs {expected}",
+                pixels.byte_count()
             )));
         }
         Ok(Self {
             width,
             height,
-            grey,
+            pixels,
         })
+    }
+
+    /// Builds a Gray8 picture from bytes that are already the right shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_pixels`].
+    pub fn from_grey(width: u32, height: u32, grey: Vec<u8>) -> Result<Self, ImageError> {
+        Self::from_pixels(width, height, PicturePixels::Gray8(grey))
     }
 
     #[must_use]
@@ -175,45 +205,38 @@ impl Picture {
         self.height
     }
 
-    /// The pixels, one grey byte each, row by row from the top.
     #[must_use]
-    pub fn grey(&self) -> &[u8] {
-        &self.grey
+    pub const fn format(&self) -> PictureFormat {
+        self.pixels.format()
     }
 
     #[must_use]
-    pub fn into_grey(self) -> Vec<u8> {
-        self.grey
+    pub fn pixels(&self) -> PicturePixelsRef<'_> {
+        self.pixels.as_ref()
     }
 
-    /// Scales the picture to exactly `target_width`, keeping its aspect ratio.
+    #[must_use]
+    pub fn into_pixels(self) -> PicturePixels {
+        self.pixels
+    }
+
+    /// Scales to exactly `target_width`, keeping the aspect ratio.
     ///
-    /// Unlike [`Picture::fit`], this operation deliberately enlarges a small
-    /// picture when asked. The target dimensions are validated before the
-    /// resize allocates its output.
+    /// The operation consumes the source so an equal-width picture returns its
+    /// original allocation. Other widths allocate only the final pixels and a
+    /// fixed chunk of horizontal fixed-point samples.
     ///
     /// # Errors
     ///
     /// Returns [`ImageError::EmptyBox`] for a zero source dimension or target
     /// width, and [`ImageError::TooManyPixels`] for an oversized result.
-    pub fn scale_to_width(&self, target_width: u32) -> Result<Self, ImageError> {
+    pub fn scale_to_width(self, target_width: u32) -> Result<Self, ImageError> {
         let (width, height) = width_scaled_size((self.width, self.height), target_width)?;
-        if width == self.width && height == self.height {
-            return Ok(self.clone());
-        }
-        let source = image::GrayImage::from_raw(self.width, self.height, self.grey.clone())
-            .ok_or_else(|| ImageError::Undecodable("the picture is not its own size".to_owned()))?;
-        let scaled = image::imageops::resize(&source, width, height, FilterType::Lanczos3);
-        Self::from_grey(width, height, scaled.into_raw())
+        self.resample(width, height)
     }
 
     /// The largest size that fits inside `width` by `height` without changing
     /// the shape of the picture.
-    ///
-    /// Separate from [`Picture::fit`] so a layout can ask how much room a
-    /// picture will really take before deciding to give it any. A cover is
-    /// taller than it is wide and a screenshot is wider than it is tall, and a
-    /// row that reserves a square for both wastes most of it on one of them.
     #[must_use]
     pub fn size_within(&self, width: u32, height: u32) -> (u32, u32) {
         if self.width == 0 || self.height == 0 || width == 0 || height == 0 {
@@ -221,9 +244,6 @@ impl Picture {
         }
         let by_width = u64::from(width) * u64::from(self.height);
         let by_height = u64::from(height) * u64::from(self.width);
-        // Whichever edge runs out first decides, and the other is derived from
-        // it, so the ratio survives exactly rather than to within rounding on
-        // both axes independently.
         if by_width <= by_height {
             let scaled = by_width / u64::from(self.width);
             (width, u32::try_from(scaled).unwrap_or(height).max(1))
@@ -233,11 +253,7 @@ impl Picture {
         }
     }
 
-    /// Scales the picture to sit inside `width` by `height`, keeping its shape.
-    ///
-    /// A picture smaller than the box is returned untouched rather than blown
-    /// up. On a panel with no colour and a slow refresh an enlarged thumbnail
-    /// reads as a fault, while a small picture reads as a small picture.
+    /// Scales the picture inside a box without enlarging a smaller source.
     ///
     /// # Errors
     ///
@@ -249,22 +265,10 @@ impl Picture {
         if self.width <= width && self.height <= height {
             return Ok(self.clone());
         }
-        // Lanczos rather than nearest or triangle, inside `scaled_to`.
-        // Lettering on a book cover is the usual subject, and it is the only
-        // filter here that keeps it legible at a third of its original size.
         self.scaled_to(width, height)
     }
 
-    /// Scales the picture to fill `width` by `height` as closely as its shape
-    /// allows, enlarging it by up to [`MAX_ENLARGEMENT`] if it is smaller.
-    ///
-    /// [`Picture::fit`] is the right answer for a picture shown at whatever
-    /// size it happens to be. This is the right answer for a picture given a
-    /// cell of its own: a book cover published at 190 by 300 sits in a third of
-    /// a portrait tile on a 300 pixel-per-inch panel and reads as a stamp
-    /// somebody dropped in an empty box. Enlargement is bounded because past
-    /// three times a cover stops being lettering and becomes a blur, and the
-    /// remainder is left as margin rather than smeared.
+    /// Fits inside a box while enlarging by at most [`MAX_ENLARGEMENT`].
     ///
     /// # Errors
     ///
@@ -278,10 +282,7 @@ impl Picture {
         self.scaled_to(width.min(ceiling_width), height.min(ceiling_height))
     }
 
-    /// Prepares a picture with an explicit, discoverable fit policy.
-    ///
-    /// This is the preferred entry point for application code; the older
-    /// `fit` methods remain available for source compatibility.
+    /// Prepares a picture with an explicit fit policy.
     ///
     /// # Errors
     ///
@@ -295,9 +296,7 @@ impl Picture {
         }
     }
 
-    /// Fills `width` by `height`, preserving aspect ratio and cropping from the
-    /// centre. Useful for tile artwork and full-bleed hero images where empty
-    /// bands are more distracting than losing the outer edge of a photograph.
+    /// Fills a box, preserving aspect ratio and cropping from the centre.
     ///
     /// # Errors
     ///
@@ -321,63 +320,113 @@ impl Picture {
                 height,
             )
         };
-        checked_pixels(scaled_width, scaled_height)?;
-        let source = image::GrayImage::from_raw(self.width, self.height, self.grey.clone())
-            .ok_or_else(|| ImageError::Undecodable("the picture is not its own size".to_owned()))?;
-        let scaled =
-            image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3);
         let left = (scaled_width - width) / 2;
         let top = (scaled_height - height) / 2;
-        let cropped = image::imageops::crop_imm(&scaled, left, top, width, height).to_image();
-        Self::from_grey(width, height, cropped.into_raw())
+        self.clone().resample_region(
+            width,
+            height,
+            scaled_width,
+            scaled_height,
+            left,
+            top,
+        )
     }
 
-    /// Resamples to the largest size inside the box, in either direction.
     fn scaled_to(&self, width: u32, height: u32) -> Result<Self, ImageError> {
         let (target_width, target_height) = self.size_within(width, height);
         if target_width == 0 || target_height == 0 {
             return Err(ImageError::EmptyBox);
         }
-        if target_width == self.width && target_height == self.height {
-            return Ok(self.clone());
-        }
-        checked_pixels(target_width, target_height)?;
-        let source = image::GrayImage::from_raw(self.width, self.height, self.grey.clone())
-            .ok_or_else(|| ImageError::Undecodable("the picture is not its own size".to_owned()))?;
-        let scaled =
-            image::imageops::resize(&source, target_width, target_height, FilterType::Lanczos3);
-        Ok(Self {
-            width: target_width,
-            height: target_height,
-            grey: scaled.into_raw(),
-        })
+        self.clone().resample(target_width, target_height)
     }
 
-    /// Reduces the picture to `levels` evenly spaced greys, spreading what is
-    /// lost into the pixels not yet visited.
+    fn resample(self, width: u32, height: u32) -> Result<Self, ImageError> {
+        if width == self.width && height == self.height {
+            return Ok(self);
+        }
+        self.resample_region(width, height, width, height, 0, 0)
+    }
+
+    fn resample_region(
+        self,
+        width: u32,
+        height: u32,
+        mapped_width: u32,
+        mapped_height: u32,
+        left: u32,
+        top: u32,
+    ) -> Result<Self, ImageError> {
+        checked_pixels(width, height)?;
+        if width == 0
+            || height == 0
+            || self.width == 0
+            || self.height == 0
+            || mapped_width == 0
+            || mapped_height == 0
+        {
+            return Err(ImageError::EmptyBox);
+        }
+        let format = self.format();
+        let source_width = self.width;
+        let source_height = self.height;
+        let source = self.pixels.into_bytes();
+        let bytes = match format {
+            PictureFormat::Gray8 => resample_bytes::<1>(
+                &source,
+                source_width,
+                source_height,
+                width,
+                height,
+                mapped_width,
+                mapped_height,
+                left,
+                top,
+            ),
+            PictureFormat::Rgb8 => resample_bytes::<3>(
+                &source,
+                source_width,
+                source_height,
+                width,
+                height,
+                mapped_width,
+                mapped_height,
+                left,
+                top,
+            ),
+        };
+        let pixels = match format {
+            PictureFormat::Gray8 => PicturePixels::Gray8(bytes),
+            PictureFormat::Rgb8 => PicturePixels::Rgb8(bytes),
+        };
+        Self::from_pixels(width, height, pixels)
+    }
+
+    /// Reduces Gray8 pixels to evenly spaced levels with Floyd–Steinberg error
+    /// diffusion.
     ///
-    /// Floyd–Steinberg, because the alternative on a panel with sixteen greys
-    /// is banding, and a band across a photograph is far more obvious than the
-    /// grain this leaves. Fewer than two levels is treated as two: one grey is
-    /// not a picture.
-    pub fn dither(&mut self, levels: u8) {
+    /// # Errors
+    ///
+    /// Returns [`ImageError::Undecodable`] for an RGB8 picture.
+    pub fn dither(&mut self, levels: u8) -> Result<(), ImageError> {
+        let PicturePixels::Gray8(grey) = &mut self.pixels else {
+            return Err(ImageError::Undecodable(
+                "dithering requires a grayscale picture".to_owned(),
+            ));
+        };
         let levels = u32::from(levels.max(2));
         let width = self.width as usize;
         let height = self.height as usize;
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
-        // Carried beside the pixels rather than inside them. Rounding the
-        // error back into a byte at every step is what makes naive error
-        // diffusion drift dark.
         let mut current_error = vec![0_i32; width];
         let mut next_error = vec![0_i32; width];
         for y in 0..height {
             for x in 0..width {
                 let index = y * width + x;
-                let wanted = i32::from(self.grey[index]) + current_error[x];
+                let wanted = i32::from(grey[index]) + current_error[x];
                 let quantized = nearest_level(wanted, levels);
-                self.grey[index] = u8::try_from(quantized.clamp(0, 255)).unwrap_or(255);
+                grey[index] = u8::try_from(quantized.clamp(0, 255)).unwrap_or(255);
                 let residue = wanted - quantized;
                 if residue == 0 {
                     continue;
@@ -398,7 +447,124 @@ impl Picture {
             std::mem::swap(&mut current_error, &mut next_error);
             next_error.fill(0);
         }
+        Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AxisSample {
+    low: u32,
+    high: u32,
+    upper_weight: u32,
+}
+
+fn axis_sample(position: u32, source_extent: u32, mapped_extent: u32) -> AxisSample {
+    if source_extent <= 1 || mapped_extent <= 1 {
+        return AxisSample::default();
+    }
+    let denominator = u64::from(mapped_extent - 1);
+    let numerator = u64::from(position) * u64::from(source_extent - 1);
+    let low = u32::try_from(numerator / denominator).unwrap_or(source_extent - 1);
+    AxisSample {
+        low,
+        high: low.saturating_add(1).min(source_extent - 1),
+        upper_weight: u32::try_from(numerator % denominator).unwrap_or(0),
+    }
+}
+
+fn axis_denominator(mapped_extent: u32) -> u64 {
+    u64::from(mapped_extent.saturating_sub(1).max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resample_bytes<const CHANNELS: usize>(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+    mapped_width: u32,
+    mapped_height: u32,
+    left: u32,
+    top: u32,
+) -> Vec<u8> {
+    let output_len = usize::try_from(u64::from(width) * u64::from(height))
+        .expect("bounded picture pixels fit usize")
+        .checked_mul(CHANNELS)
+        .expect("bounded picture bytes fit usize");
+    let mut output = Vec::with_capacity(output_len);
+    let mut horizontal = Vec::with_capacity(AXIS_SAMPLE_CHUNK);
+    let horizontal_denominator = axis_denominator(mapped_width);
+    let vertical_denominator = axis_denominator(mapped_height);
+    let denominator = horizontal_denominator * vertical_denominator;
+
+    for y in 0..height {
+        let vertical = axis_sample(top + y, source_height, mapped_height);
+        let upper_y = u64::from(vertical.upper_weight);
+        let lower_y = vertical_denominator - upper_y;
+        for chunk_start in (0..width).step_by(AXIS_SAMPLE_CHUNK) {
+            horizontal.clear();
+            let chunk_len = (width - chunk_start).min(AXIS_SAMPLE_CHUNK as u32);
+            for offset in 0..chunk_len {
+                horizontal.push(axis_sample(
+                    left + chunk_start + offset,
+                    source_width,
+                    mapped_width,
+                ));
+            }
+            for sample in &horizontal {
+                let upper_x = u64::from(sample.upper_weight);
+                let lower_x = horizontal_denominator - upper_x;
+                for channel in 0..CHANNELS {
+                    let upper_left = u64::from(source[source_index::<CHANNELS>(
+                        source_width,
+                        sample.low,
+                        vertical.low,
+                        channel,
+                    )]);
+                    let upper_right = u64::from(source[source_index::<CHANNELS>(
+                        source_width,
+                        sample.high,
+                        vertical.low,
+                        channel,
+                    )]);
+                    let lower_left = u64::from(source[source_index::<CHANNELS>(
+                        source_width,
+                        sample.low,
+                        vertical.high,
+                        channel,
+                    )]);
+                    let lower_right = u64::from(source[source_index::<CHANNELS>(
+                        source_width,
+                        sample.high,
+                        vertical.high,
+                        channel,
+                    )]);
+                    let upper = upper_left * lower_x + upper_right * upper_x;
+                    let lower = lower_left * lower_x + lower_right * upper_x;
+                    let value = (upper * lower_y + lower * upper_y + denominator / 2)
+                        / denominator;
+                    output.push(u8::try_from(value).expect("interpolation stays in one byte"));
+                }
+            }
+        }
+    }
+    debug_assert_eq!(output.len(), output_len);
+    output
+}
+
+fn source_index<const CHANNELS: usize>(
+    width: u32,
+    x: u32,
+    y: u32,
+    channel: usize,
+) -> usize {
+    let pixel = u64::from(y) * u64::from(width) + u64::from(x);
+    usize::try_from(pixel)
+        .expect("bounded source index fits usize")
+        .checked_mul(CHANNELS)
+        .and_then(|index| index.checked_add(channel))
+        .expect("bounded source byte index fits usize")
 }
 
 fn div_ceil(numerator: u64, denominator: u32) -> u32 {
@@ -527,7 +693,7 @@ pub fn width_scaled_size(source: (u32, u32), target_width: u32) -> Result<(u32, 
     Ok((target_width, target_height))
 }
 
-/// Reads a picture that arrived over the network.
+/// Reads a picture in the compatibility Gray8 format.
 ///
 /// # Errors
 ///
@@ -535,27 +701,42 @@ pub fn width_scaled_size(source: (u32, u32), target_width: u32) -> Result<(u32, 
 /// claiming more than [`MAX_PIXELS`] before allocating for it, and reports
 /// whatever the decoder said otherwise.
 pub fn decode(bytes: &[u8]) -> Result<Picture, ImageError> {
+    decode_picture(bytes, PictureFormat::Gray8, None)
+}
+
+/// Reads a WebP into the explicitly requested pixel format.
+///
+/// # Errors
+///
+/// Applies the same byte and pixel limits as [`decode`] and refuses every
+/// guessed source format other than WebP before decoding pixel storage.
+pub fn decode_webp(bytes: &[u8], format: PictureFormat) -> Result<Picture, ImageError> {
+    decode_picture(bytes, format, Some(image::ImageFormat::WebP))
+}
+
+fn decode_picture(
+    bytes: &[u8],
+    format: PictureFormat,
+    required: Option<image::ImageFormat>,
+) -> Result<Picture, ImageError> {
     if bytes.len() > MAX_SOURCE_BYTES {
         return Err(ImageError::TooManyBytes { bytes: bytes.len() });
     }
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    if reader.format().is_none() {
-        return Err(ImageError::UnknownFormat);
+    let detected = reader.format().ok_or(ImageError::UnknownFormat)?;
+    if required.is_some_and(|required| required != detected) {
+        return Err(ImageError::Undecodable(
+            "the typed decoder accepts WebP only".to_owned(),
+        ));
     }
-    // Asked before decoding, not after. This is the check that stops a header
-    // claiming a billion pixels from becoming a billion pixel allocation.
     let (width, height) = reader
         .into_dimensions()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS {
-        return Err(ImageError::TooManyPixels { pixels });
-    }
-    let mut decoder = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| ImageError::Undecodable(error.to_string()))?
+    checked_pixels(width, height)?;
+
+    let mut decoder = ImageReader::with_format(Cursor::new(bytes), detected)
         .into_decoder()
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     let orientation = decoder
@@ -565,35 +746,70 @@ pub fn decode(bytes: &[u8]) -> Result<Picture, ImageError> {
         .map_err(|error| ImageError::Undecodable(error.to_string()))?;
     image.apply_orientation(orientation);
 
-    // Transparency is composited onto the same white paper the renderer
-    // clears to. Discarding alpha first turns a transparent black logo into a
-    // black rectangle. Luminance uses perceptual channel weights rather than
-    // an average, which keeps coloured title lettering distinguishable once
-    // the panel has no colour left to show.
-    //
-    // Reduced to luminance before compositing rather than after, which is the
-    // same number (luminance is an affine combination whose weights sum to
-    // one, so compositing commutes with it) at half the peak memory. A source
-    // at `MAX_PIXELS` is twenty-five megabytes as RGBA and twelve as grey with
-    // alpha, on a device with no swap.
-    let luma = image.to_luma_alpha8();
-    let mut grey = Vec::with_capacity(luma.width() as usize * luma.height() as usize);
-    for pixel in luma.pixels() {
-        let alpha = u32::from(pixel[1]);
-        let on_paper = (u32::from(pixel[0]) * alpha + 255 * (255 - alpha) + 127) / 255;
-        grey.push(u8::try_from(on_paper).unwrap_or(255));
+    match format {
+        PictureFormat::Gray8 => {
+            let luma = image.to_luma_alpha8();
+            let mut grey = Vec::with_capacity(
+                PictureFormat::Gray8
+                    .byte_len(luma.width(), luma.height())
+                    .ok_or_else(|| {
+                        ImageError::Undecodable(
+                            "the decoded picture byte length does not fit this platform".to_owned(),
+                        )
+                    })?,
+            );
+            for pixel in luma.pixels() {
+                grey.push(over_white(pixel[0], pixel[1]));
+            }
+            Picture::from_pixels(
+                luma.width(),
+                luma.height(),
+                PicturePixels::Gray8(grey),
+            )
+        }
+        PictureFormat::Rgb8 => {
+            let rgba = image.to_rgba8();
+            let mut rgb = Vec::with_capacity(
+                PictureFormat::Rgb8
+                    .byte_len(rgba.width(), rgba.height())
+                    .ok_or_else(|| {
+                        ImageError::Undecodable(
+                            "the decoded picture byte length does not fit this platform".to_owned(),
+                        )
+                    })?,
+            );
+            for pixel in rgba.pixels() {
+                rgb.push(over_white(pixel[0], pixel[3]));
+                rgb.push(over_white(pixel[1], pixel[3]));
+                rgb.push(over_white(pixel[2], pixel[3]));
+            }
+            Picture::from_pixels(rgba.width(), rgba.height(), PicturePixels::Rgb8(rgb))
+        }
     }
-    Picture::from_grey(luma.width(), luma.height(), grey)
+}
+
+fn over_white(channel: u8, alpha: u8) -> u8 {
+    let a = u16::from(alpha);
+    u8::try_from((u16::from(channel) * a + 255 * (255 - a) + 127) / 255)
+        .expect("white composite is one byte")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, fitted_size, size, width_scaled_size, FitMode, ImageError, Picture,
-        MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
+        decode, decode_webp, encode_png, fitted_size, size, width_scaled_size, AxisSample, FitMode,
+        ImageError, Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
     };
     use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
+    use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
     use std::io::Cursor;
+
+    fn gray(picture: &Picture) -> &[u8] {
+        let PicturePixelsRef::Gray8(gray) = picture.pixels() else {
+            panic!("test fixture unexpectedly became RGB");
+        };
+        gray
+    }
 
     /// A real four by four JPEG, so the decoder is exercised against a file
     /// rather than against a mock of one.
@@ -650,6 +866,23 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn rgba_webp(width: u32, height: u32, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let rgba = pixels
+            .iter()
+            .flat_map(|pixel| pixel.iter().copied())
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(
+                &rgba,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode WebP fixture");
+        bytes
+    }
+
     fn oriented_jpeg() -> Vec<u8> {
         let image = RgbImage::from_raw(2, 1, vec![255, 0, 0, 0, 0, 0]).expect("rgb fixture");
         let mut encoded = Cursor::new(Vec::new());
@@ -671,25 +904,206 @@ mod tests {
     }
 
     #[test]
+    fn rgb_decode_preserves_color_and_composites_alpha_on_white() {
+        let webp = rgba_webp(2, 1, &[[255, 0, 0, 255], [0, 0, 255, 128]]);
+        let picture = decode_webp(&webp, PictureFormat::Rgb8).expect("RGB WebP");
+        assert_eq!(
+            picture.pixels(),
+            PicturePixelsRef::Rgb8(&[255, 0, 0, 127, 127, 255])
+        );
+    }
+
+    #[test]
+    fn generic_decode_remains_perceptual_gray_with_alpha_on_white() {
+        let webp = rgba_webp(2, 1, &[[255, 0, 0, 255], [0, 0, 255, 128]]);
+        let picture = decode(&webp).expect("generic WebP");
+        assert_eq!(picture.format(), PictureFormat::Gray8);
+        assert_eq!(picture.pixels(), PicturePixelsRef::Gray8(&[54, 136]));
+    }
+
+    #[test]
+    fn rgb_scaling_uses_exact_endpoint_aligned_bilinear_output() {
+        let picture = Picture::from_pixels(
+            2,
+            2,
+            PicturePixels::Rgb8(vec![
+                255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,
+            ]),
+        )
+        .expect("RGB source");
+        let scaled = picture.scale_to_width(3).expect("scale");
+        assert_eq!((scaled.width(), scaled.height()), (3, 3));
+        assert_eq!(
+            scaled.pixels(),
+            PicturePixelsRef::Rgb8(&[
+                255, 0, 0, 128, 128, 0, 0, 255, 0, 128, 0, 128, 128, 128, 128, 128, 255, 128,
+                0, 0, 255, 128, 128, 255, 255, 255, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn constant_color_survives_enlarging_and_reducing_in_both_formats() {
+        for pixels in [
+            PicturePixels::Gray8(vec![73; 16]),
+            PicturePixels::Rgb8([11, 97, 203].repeat(16)),
+        ] {
+            let format = pixels.format();
+            let reduced = Picture::from_pixels(4, 4, pixels)
+                .expect("constant source")
+                .scale_to_width(2)
+                .expect("reduce");
+            let enlarged = reduced.scale_to_width(8).expect("enlarge");
+            let expected = match format {
+                PictureFormat::Gray8 => PicturePixelsRef::Gray8(&[73; 64]),
+                PictureFormat::Rgb8 => {
+                    let expected = [11, 97, 203].repeat(64);
+                    assert_eq!(enlarged.pixels(), PicturePixelsRef::Rgb8(&expected));
+                    continue;
+                }
+            };
+            assert_eq!(enlarged.pixels(), expected);
+        }
+    }
+
+    #[test]
+    fn same_width_scaling_reuses_the_owned_pixel_allocation() {
+        let picture = Picture::from_pixels(
+            2,
+            1,
+            PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .expect("RGB source");
+        let before = match picture.pixels() {
+            PicturePixelsRef::Rgb8(bytes) => bytes.as_ptr(),
+            PicturePixelsRef::Gray8(_) => panic!("RGB source changed format"),
+        };
+        let unchanged = picture.scale_to_width(2).expect("same width");
+        let after = match unchanged.pixels() {
+            PicturePixelsRef::Rgb8(bytes) => bytes.as_ptr(),
+            PicturePixelsRef::Gray8(_) => panic!("RGB result changed format"),
+        };
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn typed_webp_decode_refuses_png_even_when_it_is_decodable() {
+        let png = png(1, 1, vec![1, 2, 3, 255]);
+        assert!(decode_webp(&png, PictureFormat::Gray8).is_err());
+        assert!(decode_webp(&png, PictureFormat::Rgb8).is_err());
+    }
+
+    #[test]
+    fn scaler_handles_every_supported_panel_width_from_1080() {
+        let picture = Picture::from_pixels(
+            1080,
+            1,
+            PicturePixels::Rgb8(
+                (0..1080)
+                    .flat_map(|x| {
+                        let value = u8::try_from(x % 256).unwrap_or(0);
+                        [value, 255 - value, value / 2]
+                    })
+                    .collect(),
+            ),
+        )
+        .expect("RGB source");
+        for width in [1072, 1264, 1404] {
+            let scaled = picture.clone().scale_to_width(width).expect("scale");
+            assert_eq!((scaled.width(), scaled.height()), (width, 1));
+            let PicturePixelsRef::Rgb8(bytes) = scaled.pixels() else {
+                panic!("RGB scale changed format");
+            };
+            assert_eq!(
+                bytes.len(),
+                usize::try_from(width).expect("panel width") * 3
+            );
+        }
+    }
+
+    #[test]
+    fn consuming_scaler_rejects_zero_width_and_oversized_output() {
+        let source = Picture::from_grey(1, 1, vec![0]).expect("source");
+        assert_eq!(
+            source.clone().scale_to_width(0),
+            Err(ImageError::EmptyBox)
+        );
+        let tall = Picture::from_grey(1, 7_000_000, vec![0; 7_000_000]).expect("tall source");
+        assert!(matches!(
+            tall.scale_to_width(2),
+            Err(ImageError::TooManyPixels { .. })
+        ));
+    }
+
+    #[test]
+    fn maximum_width_thin_image_keeps_axis_scratch_bounded() {
+        assert_eq!(
+            std::mem::size_of::<AxisSample>() * AXIS_SAMPLE_CHUNK,
+            24_576
+        );
+        let picture =
+            Picture::from_grey(6_999_999, 1, vec![19; 6_999_999]).expect("thin source");
+        let scaled = picture.scale_to_width(7_000_000).expect("boundary scale");
+        assert_eq!((scaled.width(), scaled.height()), (7_000_000, 1));
+        assert_eq!(
+            scaled.pixels(),
+            PicturePixelsRef::Gray8(&vec![19; 7_000_000])
+        );
+    }
+
+    #[test]
+    fn rgb_dithering_is_refused_without_changing_pixels() {
+        let mut picture =
+            Picture::from_pixels(1, 1, PicturePixels::Rgb8(vec![1, 2, 3])).expect("RGB source");
+        assert!(picture.dither(PANEL_GREYS).is_err());
+        assert_eq!(picture.pixels(), PicturePixelsRef::Rgb8(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn png_evidence_preserves_typed_pixels_and_checks_lengths() {
+        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[17, 231])).expect("gray PNG");
+        assert_eq!(
+            image::load_from_memory_with_format(&gray, ImageFormat::Png)
+                .expect("read gray PNG")
+                .to_luma8()
+                .into_raw(),
+            vec![17, 231]
+        );
+
+        let rgb =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[255, 0, 0, 0, 255, 7])).expect("RGB PNG");
+        assert_eq!(
+            image::load_from_memory_with_format(&rgb, ImageFormat::Png)
+                .expect("read RGB PNG")
+                .to_rgb8()
+                .into_raw(),
+            vec![255, 0, 0, 0, 255, 7]
+        );
+
+        assert!(encode_png(2, 1, PicturePixelsRef::Gray8(&[0])).is_err());
+        assert!(encode_png(2, 1, PicturePixelsRef::Rgb8(&[0; 5])).is_err());
+    }
+
+    #[test]
     fn a_real_jpeg_decodes_to_grey_bytes() {
         let picture = decode(&tiny_jpeg()).expect("decode the jpeg");
         assert_eq!(picture.width(), 4);
         assert_eq!(picture.height(), 4);
-        assert_eq!(picture.grey().len(), 16);
+        assert_eq!(gray(&picture).len(), 16);
     }
 
     #[test]
     fn a_real_lossy_webp_decodes_to_grey_bytes() {
         let picture = decode(&tiny_lossy_webp()).expect("decode the WebP");
         assert_eq!((picture.width(), picture.height()), (1, 1));
-        assert_eq!(picture.grey(), &[234]);
+        assert_eq!(gray(&picture), &[234]);
     }
 
     #[test]
     fn transparent_webp_pixels_are_composited_onto_paper() {
         let picture = decode(&transparent_lossless_webp()).expect("decode the WebP");
         assert_eq!((picture.width(), picture.height()), (2, 1));
-        assert_eq!(picture.grey(), &[255, 0]);
+        assert_eq!(gray(&picture), &[255, 0]);
     }
 
     #[test]
@@ -706,7 +1120,7 @@ mod tests {
     #[test]
     fn transparent_pixels_are_composited_onto_paper() {
         let picture = decode(&png(2, 1, vec![0, 0, 0, 0, 0, 0, 0, 255])).expect("png");
-        assert_eq!(picture.grey(), &[255, 0]);
+        assert_eq!(gray(&picture), &[255, 0]);
     }
 
     #[test]
@@ -719,7 +1133,8 @@ mod tests {
             vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
         ))
         .expect("png");
-        let [red, green, blue] = <[u8; 3]>::try_from(picture.grey()).expect("three pixels");
+        let [red, green, blue] =
+            <[u8; 3]>::try_from(gray(&picture)).expect("three pixels");
         assert!(green > red && red > blue, "{red} {green} {blue}");
     }
 
@@ -727,8 +1142,8 @@ mod tests {
     fn a_half_transparent_pixel_lands_between_its_colour_and_the_paper() {
         let opaque = decode(&png(1, 1, vec![0, 0, 0, 255])).expect("png");
         let half = decode(&png(1, 1, vec![0, 0, 0, 128])).expect("png");
-        assert_eq!(opaque.grey(), &[0]);
-        assert_eq!(half.grey(), &[127]);
+        assert_eq!(gray(&opaque), &[0]);
+        assert_eq!(gray(&half), &[127]);
     }
 
     #[test]
@@ -808,7 +1223,7 @@ mod tests {
         let fitted = picture.fit(120, 120).expect("fit");
         assert_eq!(fitted.height(), 120, "the tall edge is the one that binds");
         assert_eq!(fitted.width(), 76, "190/300 of 120, kept exactly");
-        assert_eq!(fitted.grey().len(), 76 * 120);
+        assert_eq!(gray(&fitted).len(), 76 * 120);
     }
 
     #[test]
@@ -817,7 +1232,7 @@ mod tests {
             Picture::from_grey(4, 2, vec![10, 20, 30, 40, 10, 20, 30, 40]).expect("build");
         let covered = picture.prepare(2, 2, FitMode::Cover).expect("cover");
         assert_eq!((covered.width(), covered.height()), (2, 2));
-        assert_eq!(covered.grey(), &[20, 30, 20, 30]);
+        assert_eq!(gray(&covered), &[20, 30, 20, 30]);
     }
 
     #[test]
@@ -834,7 +1249,7 @@ mod tests {
         let picture = Picture::from_grey(20, 30, vec![7; 600]).expect("build");
         let fitted = picture.fit(400, 400).expect("fit");
         assert_eq!((fitted.width(), fitted.height()), (20, 30));
-        assert_eq!(fitted.grey(), picture.grey(), "and not resampled either");
+        assert_eq!(gray(&fitted), gray(&picture), "and not resampled either");
     }
 
     /// The defect this exists for: a Gutenberg cover is 190 by 300, a portrait
@@ -846,7 +1261,7 @@ mod tests {
         let filled = picture.fit_enlarging(480, 660).expect("fit");
         assert_eq!(filled.height(), 660, "the tall edge is the one that binds");
         assert_eq!(filled.width(), 418, "190/300 of 660, kept exactly");
-        assert_eq!(filled.grey().len(), 418 * 660);
+        assert_eq!(gray(&filled).len(), 418 * 660);
     }
 
     #[test]
@@ -919,11 +1334,11 @@ mod tests {
         // A gradient, which is exactly what bands when it is simply rounded.
         let grey = (0..=255_u8).collect::<Vec<_>>();
         let mut picture = Picture::from_grey(16, 16, grey).expect("build");
-        picture.dither(PANEL_GREYS);
+        picture.dither(PANEL_GREYS).expect("dither Gray8");
         let allowed = (0..u32::from(PANEL_GREYS))
             .map(|step| u8::try_from((step * 255 + 7) / 15).unwrap_or(255))
             .collect::<Vec<_>>();
-        for value in picture.grey() {
+        for value in gray(&picture) {
             assert!(
                 allowed.contains(value),
                 "{value} is not one of the {PANEL_GREYS} greys: {allowed:?}"
@@ -940,10 +1355,10 @@ mod tests {
             .map(|index| u8::try_from(index % 256).unwrap_or(0))
             .collect::<Vec<_>>();
         let picture = Picture::from_grey(32, 32, grey).expect("build");
-        let before = average(picture.grey());
+        let before = average(gray(&picture));
         let mut dithered = picture.clone();
-        dithered.dither(PANEL_GREYS);
-        let after = average(dithered.grey());
+        dithered.dither(PANEL_GREYS).expect("dither Gray8");
+        let after = average(gray(&dithered));
         assert!(
             (before - after).abs() < 3.0,
             "brightness moved from {before} to {after}"
@@ -953,8 +1368,8 @@ mod tests {
     #[test]
     fn one_grey_is_not_a_picture_so_the_floor_is_two() {
         let mut picture = Picture::from_grey(4, 4, vec![90; 16]).expect("build");
-        picture.dither(0);
-        for value in picture.grey() {
+        picture.dither(0).expect("dither Gray8");
+        for value in gray(&picture) {
             assert!(
                 *value == 0 || *value == 255,
                 "{value} is not black or white"

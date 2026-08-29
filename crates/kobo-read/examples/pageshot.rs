@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use kobo_read::{Memory, Reader};
 use kobo_ui::{
-    Chrome, DisplayMetrics, PictureCache, PictureFormat, PictureHandle, PicturePixels, Surface,
+    Chrome, DisplayMetrics, PictureCache, PictureFormat, PictureHandle, Surface,
 };
 
 fn main() {
@@ -87,10 +87,10 @@ fn main() {
             &mut surface,
             None,
         );
-        let png = kobo_image::encode_png_grey(
+        let png = kobo_image::encode_png(
             u32::try_from(surface.width).unwrap(),
             u32::try_from(surface.height).unwrap(),
-            &surface.pixels,
+            surface.pixels(),
         )
         .expect("a page");
         std::fs::write(format!("/tmp/page_{page}.png"), png).unwrap();
@@ -141,14 +141,16 @@ fn decode_pictures(
                 continue;
             }
         };
-        fitted.dither(16);
+        if let Err(error) = fitted.dither(16) {
+            println!("  {name}: will not dither: {error}");
+            continue;
+        }
         let handle = PictureHandle(next);
         next += 1;
         // The fit preserves the picture's shape, so what came back is the
         // size to declare, not the box it was asked to fit into.
         let (width, height) = (fitted.width(), fitted.height());
-        let grey = fitted.into_grey();
-        if cache.put(handle, width, height, PicturePixels::Gray8(grey)) {
+        if cache.put(handle, width, height, fitted.into_pixels()) {
             tiles.insert(
                 name.clone(),
                 kobo_ui::TilePicture::new(handle, width, height),

@@ -4,7 +4,7 @@ mod parse;
 
 use kobo_image::{Picture, PANEL_GREYS};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, PicturePixels,
+    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, PicturePixelsRef,
     ReadingChrome, Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
 };
 use model::{display_text, Comic, Episode, EpisodeImage, RecentEntry};
@@ -517,12 +517,7 @@ impl Bomtoon {
         let width = slice.width();
         let height = slice.height();
         let picture = context
-            .put_picture(
-                handle,
-                width,
-                height,
-                PicturePixels::Gray8(slice.into_grey()),
-            )
+            .put_picture(handle, width, height, slice.into_pixels())
             .ok_or_else(|| "The comic slice could not be uploaded.".to_owned())?;
         let old = {
             let reader = self
@@ -622,7 +617,9 @@ impl Bomtoon {
             let mut scaled = decoded
                 .scale_to_width(panel_width)
                 .map_err(|error| error.to_string())?;
-            scaled.dither(PANEL_GREYS);
+            scaled
+                .dither(PANEL_GREYS)
+                .map_err(|error| error.to_string())?;
             Ok(scaled)
         })();
         match scaled {
@@ -1140,8 +1137,10 @@ fn slice_rows(source: &Picture, slice: usize, panel_height: u32) -> Result<Pictu
     let source_end = source_start
         .checked_add(copied_len)
         .ok_or_else(|| "The comic page offset is too large.".to_owned())?;
-    let source_rows = source
-        .grey()
+    let PicturePixelsRef::Gray8(grey) = source.pixels() else {
+        return Err("this operation requires a grayscale picture".to_owned());
+    };
+    let source_rows = grey
         .get(source_start..source_end)
         .ok_or_else(|| "The comic pixels do not match their dimensions.".to_owned())?;
     let mut grey = vec![255; output_len];
@@ -1579,8 +1578,14 @@ mod tests {
         let source = Picture::from_grey(2, 5, (0..10).collect()).expect("source");
         let first = slice_rows(&source, 0, 3).expect("first");
         let second = slice_rows(&source, 1, 3).expect("second");
-        assert_eq!(first.grey(), &[0, 1, 2, 3, 4, 5]);
-        assert_eq!(second.grey(), &[6, 7, 8, 9, 255, 255]);
+        assert_eq!(
+            first.pixels(),
+            PicturePixelsRef::Gray8(&[0, 1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            second.pixels(),
+            PicturePixelsRef::Gray8(&[6, 7, 8, 9, 255, 255])
+        );
     }
 
     #[test]
