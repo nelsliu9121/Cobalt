@@ -98,6 +98,32 @@ impl PageBuild {
     }
 }
 
+const MAX_READER_DECODED_PIXELS: usize = 7_000_000;
+const MAX_READER_COMPRESSED_BYTES: usize = 4_194_304;
+const ELIPSA_THREE_GRAY8_PAGES_BYTES: usize = 1_404 * 1_872 * 3;
+const LARGEST_RGB8_PAGE_BYTES: usize = 1_264 * 1_680 * 3;
+const MODELED_READER_ALLOCATION_LIMIT_BYTES: usize = 96 * 1024 * 1024;
+
+const fn gray8_conservative_bytes() -> usize {
+    11 * MAX_READER_DECODED_PIXELS
+        + MAX_READER_COMPRESSED_BYTES
+        + MAX_READER_DECODED_PIXELS
+        + ELIPSA_THREE_GRAY8_PAGES_BYTES
+}
+
+const fn rgb8_conservative_bytes() -> usize {
+    11 * MAX_READER_DECODED_PIXELS
+        + MAX_READER_COMPRESSED_BYTES
+        + 2 * LARGEST_RGB8_PAGE_BYTES
+}
+
+const _: () = {
+    assert!(gray8_conservative_bytes() == 96_079_168);
+    assert!(rgb8_conservative_bytes() == 93_935_424);
+    assert!(gray8_conservative_bytes() <= MODELED_READER_ALLOCATION_LIMIT_BYTES);
+    assert!(rgb8_conservative_bytes() <= MODELED_READER_ALLOCATION_LIMIT_BYTES);
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReaderLimits {
     pages: usize,
@@ -484,36 +510,31 @@ impl Bomtoon {
             .build()
     }
 
-    fn invalidate_reader_tasks(&mut self, context: &mut Context) {
+    fn cancel_reader(&mut self, context: &mut Context) {
         self.reader_generation = self.reader_generation.wrapping_add(1);
         for task in std::mem::take(&mut self.reader_tasks).into_keys() {
             context.cancel(task);
         }
         self.foreground_reader_task = None;
-        if let Some(reader) = self.reader.as_mut() {
-            reader.generation = self.reader_generation;
-            reader.source_fetches.clear();
-            reader.maintenance_task = None;
-            reader.refresh_task = None;
-            reader.refresh_waiters.clear();
-            reader.refresh_attempted.clear();
-            reader.source_failures.clear();
-        }
-    }
-
-    fn clear_account_data(&mut self, context: &mut Context) {
-        self.invalidate_reader_tasks(context);
         let picture = self
             .reader
             .take()
             .and_then(|reader| reader.picture)
             .map(|picture| picture.handle);
+        if let Some(handle) = picture {
+            context.drop_picture(handle);
+        }
+    }
+
+    fn clear_account_data(&mut self, context: &mut Context) {
+        self.cancel_reader(context);
         self.comics.clear();
         self.recent.clear();
         self.episodes.clear();
         self.selected_content_alias.clear();
         self.selected_title.clear();
         self.reader_selection = None;
+        self.problem = None;
         self.retry = Retry::Restart;
         self.page = 0;
         self.library_view_page = 0;
@@ -524,9 +545,6 @@ impl Bomtoon {
         self.total_recent_titles = 0;
         self.library_loaded = false;
         self.recent_loaded = false;
-        if let Some(handle) = picture {
-            context.drop_picture(handle);
-        }
     }
 
     fn restart(&mut self, context: &mut Context) {
@@ -599,15 +617,7 @@ impl Bomtoon {
             self.fail_reader(Retry::Manifest, "The panel width is not supported.");
             return;
         }
-        self.invalidate_reader_tasks(context);
-        let old = self
-            .reader
-            .take()
-            .and_then(|reader| reader.picture)
-            .map(|picture| picture.handle);
-        if let Some(handle) = old {
-            context.drop_picture(handle);
-        }
+        self.cancel_reader(context);
         self.retry = Retry::Manifest;
         if self
             .spawn_reader(
@@ -1653,20 +1663,12 @@ impl Bomtoon {
     }
 
     fn leave_reader(&mut self, context: &mut Context) {
-        self.invalidate_reader_tasks(context);
-        let old = self
-            .reader
-            .take()
-            .and_then(|reader| reader.picture)
-            .map(|picture| picture.handle);
         self.reader_selection = None;
         self.problem = None;
         self.retry = Retry::Restart;
         self.view = View::Episodes;
         self.show(context);
-        if let Some(handle) = old {
-            context.drop_picture(handle);
-        }
+        self.cancel_reader(context);
     }
 
     fn take_ready_page(&mut self, page: usize) -> Option<Picture> {
@@ -1938,6 +1940,26 @@ impl KoboApp for Bomtoon {
         self.show(context);
     }
 
+    fn on_suspend(&mut self, context: &mut Context) {
+        if self.view == View::Reader
+            || self.reader_selection.is_some()
+            || self.reader.is_some()
+            || !self.reader_tasks.is_empty()
+        {
+            self.reader_selection = None;
+            self.problem = None;
+            self.retry = Retry::Restart;
+            if self.view == View::Reader {
+                self.view = View::Episodes;
+            }
+            self.cancel_reader(context);
+        }
+    }
+
+    fn on_exit(&mut self, context: &mut Context) {
+        self.on_suspend(context);
+    }
+
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
         let can_leave_reader = self.account == AccountState::Active && self.view == View::Reader;
         if action == ActionId::BACK && can_leave_reader {
@@ -2037,6 +2059,10 @@ impl KoboApp for Bomtoon {
                     .as_ref()
                     .is_some_and(|reader| reader.generation == entry.generation)
             {
+                return;
+            }
+            if matches!(&outcome, TaskOutcome::Failed(TaskError::Offline)) {
+                self.leave_reader(context);
                 return;
             }
             let shown = match (entry.purpose, outcome) {
@@ -2650,6 +2676,10 @@ mod tests {
     const TINY_WEBP: &[u8] = &[
         82, 73, 70, 70, 36, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 24, 0, 0, 0, 48, 1, 0, 157, 1,
         42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
+    ];
+    const RED_1X1_WEBP: &[u8] = &[
+        82, 73, 70, 70, 26, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 14, 0, 0, 0, 47, 0,
+        0, 0, 16, 205, 85, 32, 34, 2, 209, 255, 136, 4,
     ];
     const BLACK_1X3_WEBP: &[u8] = &[
         82, 73, 70, 70, 68, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 56, 0, 0, 0, 47, 0,
@@ -3386,6 +3416,153 @@ mod tests {
         )
     }
 
+    fn fully_populated_reader(
+        format: PictureFormat,
+    ) -> (AppRunner<Bomtoon>, [TaskId; 4]) {
+        let metrics = reader_metrics(format, 2);
+        let mut runner = seeded_reader_with_metrics(metrics, 5, 0, true);
+        let foreground = TaskId(41);
+        let prefetch = TaskId(42);
+        let maintenance = TaskId(43);
+        let refresh = TaskId(44);
+        let tasks = [foreground, prefetch, maintenance, refresh];
+        {
+            let app = runner.app_mut();
+            app.pending = Some(Pending::Content(99));
+            app.task = Some(TaskId(99));
+            app.problem = Some("reader failure".to_owned());
+            app.retry = Retry::Page(0);
+            app.reader_tasks = BTreeMap::from([
+                (
+                    foreground,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::ForegroundSource { source: 0, page: 0 },
+                    },
+                ),
+                (
+                    prefetch,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::PrefetchSource { source: 1 },
+                    },
+                ),
+                (
+                    maintenance,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::Maintenance,
+                    },
+                ),
+                (
+                    refresh,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::ManifestRefresh,
+                    },
+                ),
+            ]);
+            app.foreground_reader_task = Some(foreground);
+            let reader = app.reader.as_mut().expect("reader");
+            reader.source_fetches = BTreeMap::from([(0, foreground), (1, prefetch)]);
+            reader.maintenance_task = Some(maintenance);
+            reader.refresh_task = Some(refresh);
+            reader
+                .refresh_waiters
+                .insert(3, FetchIntent::Foreground { page: 3 });
+            reader
+                .refresh_attempted
+                .insert(3, FetchIntent::Prefetch);
+            reader.source_failures.insert(
+                4,
+                SourceFailure {
+                    advice: "prefetch failed".to_owned(),
+                },
+            );
+            let source_pixels = match format {
+                PictureFormat::Gray8 => PicturePixels::Gray8(vec![63; 2]),
+                PictureFormat::Rgb8 => PicturePixels::Rgb8(vec![63; 6]),
+            };
+            reader.source_cache.insert(
+                2,
+                Picture::from_pixels(1, 2, source_pixels).expect("cached source"),
+            );
+            let ready_pixels = match format {
+                PictureFormat::Gray8 => PicturePixels::Gray8(vec![127; 2]),
+                PictureFormat::Rgb8 => PicturePixels::Rgb8(vec![127; 6]),
+            };
+            reader.window = VecDeque::from([
+                PageEntry::Ready {
+                    page: 1,
+                    picture: Picture::from_pixels(1, 2, ready_pixels).expect("ready page"),
+                },
+                PageEntry::Building(
+                    PageBuild::new(2, format, 1, 2).expect("building page"),
+                ),
+            ]);
+        }
+        (runner, tasks)
+    }
+
+    fn assert_reader_cleanup(
+        runner: &mut AppRunner<Bomtoon>,
+        commands: &[Command],
+        tasks: [TaskId; 4],
+        settled: Option<TaskId>,
+        non_reader_pending: Option<Pending>,
+        non_reader_task: Option<TaskId>,
+    ) {
+        let app = runner.app();
+        assert_eq!(app.reader_generation, 2);
+        assert!(app.reader_tasks.is_empty());
+        assert!(app.foreground_reader_task.is_none());
+        assert!(app.reader.is_none());
+        assert!(app.reader_selection.is_none());
+        assert!(app.problem.is_none());
+        assert_eq!(app.retry, Retry::Restart);
+        assert_eq!(app.pending, non_reader_pending);
+        assert_eq!(app.task, non_reader_task);
+
+        let cancelled = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Cancel(task) => Some(*task),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_cancelled = tasks
+            .into_iter()
+            .filter(|task| Some(*task) != settled)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cancelled, expected_cancelled);
+        assert_eq!(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::DropPicture(handle) => Some(*handle),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![PictureHandle(7)]
+        );
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+
+        let generation = runner.app().reader_generation;
+        for task in tasks {
+            let commands = runner.task_outcome(task, TaskOutcome::Cancelled);
+            assert!(commands.is_empty());
+            let app = runner.app();
+            assert_eq!(app.reader_generation, generation);
+            assert!(app.reader_tasks.is_empty());
+            assert!(app.reader.is_none());
+            assert!(app.reader_selection.is_none());
+            assert_eq!(app.pending, non_reader_pending);
+            assert_eq!(app.task, non_reader_task);
+        }
+    }
+
     fn prepared_reader(format: PictureFormat) -> AppRunner<Bomtoon> {
         let metrics = reader_metrics(format, 1);
         let (mut runner, manifest_task, _) =
@@ -3426,6 +3603,52 @@ mod tests {
             assert_reader_bounds(runner.app());
         }
         panic!("reader preparation did not settle");
+    }
+
+    fn reader_task_completion(purpose: ReaderTaskPurpose) -> Vec<u8> {
+        match purpose {
+            ReaderTaskPurpose::ForegroundSource { .. }
+            | ReaderTaskPurpose::PrefetchSource { .. } => RED_1X1_WEBP.to_vec(),
+            ReaderTaskPurpose::Manifest
+            | ReaderTaskPurpose::ManifestRefresh
+            | ReaderTaskPurpose::Maintenance => Vec::new(),
+        }
+    }
+
+    fn uploaded_picture(commands: &[Command]) -> (u32, u32, PicturePixels) {
+        let uploads = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::PutPicture {
+                    width,
+                    height,
+                    pixels,
+                    ..
+                } => Some((
+                    *width,
+                    *height,
+                    match pixels {
+                        PicturePixels::Gray8(bytes) => PicturePixels::Gray8(bytes.clone()),
+                        PicturePixels::Rgb8(bytes) => PicturePixels::Rgb8(bytes.clone()),
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uploads.len(), 1, "expected exactly one picture upload");
+        uploads.into_iter().next().expect("picture upload")
+    }
+
+    fn strict_picture_png(width: u32, height: u32, pixels: &PicturePixels) -> Vec<u8> {
+        let pixels_ref = match pixels {
+            PicturePixels::Gray8(bytes) => PicturePixelsRef::Gray8(bytes),
+            PicturePixels::Rgb8(bytes) => PicturePixelsRef::Rgb8(bytes),
+        };
+        let png = kobo_image::encode_png(width, height, pixels_ref).expect("encode evidence PNG");
+        let decoded = kobo_image::decode_png(&png).expect("strictly decode evidence PNG");
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert_eq!(decoded.pixels(), pixels_ref);
+        png
     }
 
     fn seam_previous_reader(
@@ -3873,6 +4096,288 @@ mod tests {
     }
 
     #[test]
+    fn both_format_simulator_flow_is_typed_seamless_retryable_and_bounded() {
+        let evidence_dir = std::env::var_os("BOMTOON_TASK7_EVIDENCE_DIR")
+            .map(std::path::PathBuf::from);
+        if let Some(directory) = &evidence_dir {
+            std::fs::create_dir_all(directory).expect("create simulator evidence directory");
+        }
+        let mut evidence_log = Vec::new();
+
+        for (format, width, height, label) in [
+            (PictureFormat::Gray8, 1_072, 1_448, "gray8"),
+            (PictureFormat::Rgb8, 1_264, 1_680, "rgb8"),
+        ] {
+            let metrics = DisplayMetrics {
+                width,
+                height,
+                picture_format: format,
+                ..CLARA_BW_METRICS
+            };
+            let (mut runner, manifest_task, _) =
+                reader_waiting_for_manifest_with_metrics(metrics);
+            runner.task_outcome(
+                manifest_task,
+                TaskOutcome::Completed(image_manifest_sources(6)),
+            );
+
+            let first_page_commands = (0..16)
+                .find_map(|_| {
+                    let (&task, entry) = runner
+                        .app()
+                        .reader_tasks
+                        .iter()
+                        .next()
+                        .expect("first page reader work");
+                    let commands = runner.task_outcome(
+                        task,
+                        TaskOutcome::Completed(reader_task_completion(entry.purpose)),
+                    );
+                    assert_reader_bounds(runner.app());
+                    commands.iter().any(|command| {
+                        matches!(
+                            command,
+                            Command::SetScreen(screen) if screen.reading_surface.is_some()
+                        )
+                    })
+                    .then_some(commands)
+                })
+                .expect("first page before maintenance");
+            let first_put = first_page_commands
+                .iter()
+                .position(|command| matches!(command, Command::PutPicture { .. }))
+                .expect("first page upload");
+            let first_screen = first_page_commands
+                .iter()
+                .position(|command| {
+                    matches!(
+                        command,
+                        Command::SetScreen(screen) if screen.reading_surface.is_some()
+                    )
+                })
+                .expect("first reader screen");
+            let first_maintenance = first_page_commands
+                .iter()
+                .position(|command| {
+                    matches!(
+                        command,
+                        Command::Spawn {
+                            work: Task::Sleep { seconds: 0 },
+                            ..
+                        }
+                    )
+                })
+                .expect("first maintenance");
+            assert!(first_put < first_screen && first_screen < first_maintenance);
+            let reader = runner.app().reader.as_ref().expect("first page reader");
+            assert_eq!(reader.page, 0);
+            assert!(reader.window.is_empty(), "maintenance ran before first paint");
+            let (page_width, page_height, first_pixels) =
+                uploaded_picture(&first_page_commands);
+            assert_eq!((page_width, page_height), (width as u32, height as u32));
+            let first_png = strict_picture_png(page_width, page_height, &first_pixels);
+
+            let limits = reader_limits(format);
+            for _ in 0..64 {
+                let settled = {
+                    let app = runner.app();
+                    let reader = app.reader.as_ref().expect("lookahead reader");
+                    let expected = limits.pages.min(reader.plans.len().saturating_sub(1));
+                    reader.window.len() == expected
+                        && reader
+                            .window
+                            .iter()
+                            .all(|entry| matches!(entry, PageEntry::Ready { .. }))
+                        && app.reader_tasks.is_empty()
+                };
+                if settled {
+                    break;
+                }
+                let (&task, entry) = runner
+                    .app()
+                    .reader_tasks
+                    .iter()
+                    .next()
+                    .expect("lookahead reader work");
+                runner.task_outcome(
+                    task,
+                    TaskOutcome::Completed(reader_task_completion(entry.purpose)),
+                );
+                assert_reader_bounds(runner.app());
+            }
+            let reader = runner.app().reader.as_ref().expect("prepared lookahead");
+            assert_eq!(reader.window.len(), limits.pages);
+            assert!(reader
+                .window
+                .iter()
+                .all(|entry| matches!(entry, PageEntry::Ready { .. })));
+            assert!(runner.app().reader_tasks.is_empty());
+
+            let next_commands = runner.action(action_id(READER_NEXT));
+            assert_eq!(runner.app().reader.as_ref().expect("next reader").page, 1);
+            assert!(next_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::SetScreen(screen) if screen.reading_surface.is_some()
+                )
+            }));
+            assert!(!next_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Spawn {
+                        work: Task::Fetch { .. },
+                        ..
+                    }
+                )
+            }));
+            let (next_width, next_height, next_pixels) = uploaded_picture(&next_commands);
+            assert_eq!((next_width, next_height), (page_width, page_height));
+            let channels = if format == PictureFormat::Gray8 { 1 } else { 3 };
+            let seam_row = usize::try_from(
+                2_u32
+                    .checked_mul(page_width)
+                    .and_then(|boundary| boundary.checked_sub(page_height))
+                    .expect("seam row"),
+            )
+            .expect("seam row fits");
+            let stride = usize::try_from(page_width)
+                .expect("page width fits")
+                .checked_mul(channels)
+                .expect("row stride");
+            let next_bytes = match &next_pixels {
+                PicturePixels::Gray8(bytes) | PicturePixels::Rgb8(bytes) => bytes,
+            };
+            match (format, &next_pixels) {
+                (PictureFormat::Gray8, PicturePixels::Gray8(_)) => {}
+                (PictureFormat::Rgb8, PicturePixels::Rgb8(bytes)) => {
+                    assert!(bytes.chunks_exact(3).all(|pixel| pixel == [255, 0, 0]));
+                }
+                _ => panic!("{format:?} simulator upload used the wrong pixel type"),
+            }
+            for row in seam_row.saturating_sub(1)..=seam_row {
+                let start = row.checked_mul(stride).expect("row offset");
+                assert!(
+                    next_bytes[start..start + stride]
+                        .iter()
+                        .any(|sample| *sample != u8::MAX),
+                    "{format:?} left a white row at the source seam"
+                );
+            }
+            let next_png = strict_picture_png(next_width, next_height, &next_pixels);
+
+            let chrome_commands = runner.action(action_id(READER_CHROME));
+            assert_eq!(
+                last_screen(&chrome_commands)
+                    .reading_surface
+                    .expect("reader chrome surface")
+                    .chrome,
+                ReadingChrome::Overlay
+            );
+            assert_eq!(
+                runner.app().reader.as_ref().expect("chrome reader").page,
+                1
+            );
+
+            let previous_commands = runner.action(action_id(READER_PREVIOUS));
+            assert!(last_screen(&previous_commands).reading_surface.is_none());
+            let failed_source = runner
+                .app()
+                .foreground_reader_task
+                .expect("Previous foreground source");
+            let failure_commands =
+                runner.task_outcome(failed_source, TaskOutcome::Failed(TaskError::TimedOut));
+            assert!(!failure_commands
+                .iter()
+                .any(|command| matches!(command, Command::Spawn { .. })));
+            assert!(runner.app().problem.is_some());
+            assert_eq!(runner.app().retry, Retry::Page(0));
+
+            let mut retry_commands = runner.action(action_id(RETRY));
+            assert!(retry_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Spawn {
+                        work: Task::Fetch { .. },
+                        ..
+                    }
+                )
+            }));
+            let previous_upload = (0..16)
+                .find_map(|_| {
+                    if retry_commands
+                        .iter()
+                        .any(|command| matches!(command, Command::PutPicture { .. }))
+                    {
+                        return Some(uploaded_picture(&retry_commands));
+                    }
+                    let task = runner
+                        .app()
+                        .foreground_reader_task
+                        .or_else(|| runner.app().reader_tasks.keys().next().copied())
+                        .expect("retry reader work");
+                    let purpose = runner
+                        .app()
+                        .reader_tasks
+                        .get(&task)
+                        .expect("retry task entry")
+                        .purpose;
+                    retry_commands = runner.task_outcome(
+                        task,
+                        TaskOutcome::Completed(reader_task_completion(purpose)),
+                    );
+                    assert_reader_bounds(runner.app());
+                    None
+                })
+                .expect("Previous page after retry");
+            assert_eq!(previous_upload.0, page_width);
+            assert_eq!(previous_upload.1, page_height);
+            assert_eq!(previous_upload.2, first_pixels);
+            assert_eq!(
+                runner.app().reader.as_ref().expect("Previous reader").page,
+                0
+            );
+            let previous_png =
+                strict_picture_png(previous_upload.0, previous_upload.1, &previous_upload.2);
+
+            let back_commands = runner.action(ActionId::BACK);
+            assert_eq!(runner.app().view, View::Episodes);
+            assert!(runner.app().reader.is_none());
+            assert_eq!(
+                back_commands
+                    .iter()
+                    .filter(|command| matches!(command, Command::DropPicture(_)))
+                    .count(),
+                1
+            );
+
+            if let Some(directory) = &evidence_dir {
+                for (name, png) in [
+                    (format!("{label}-page1-before-maintenance.png"), first_png),
+                    (format!("{label}-seam-next.png"), next_png),
+                    (format!("{label}-previous-after-retry.png"), previous_png),
+                ] {
+                    std::fs::write(directory.join(name), png)
+                        .expect("write simulator screenshot");
+                }
+            }
+            evidence_log.push(format!(
+                "{label} {width}x{height} {format:?}: page1-before-maintenance; \
+                 prepared seam Next without fetch/loading; chrome Overlay at page 2; \
+                 Previous fetch failed; app retry restored \
+                 exact page 1 pixels; Back dropped one picture"
+            ));
+        }
+
+        if let Some(directory) = evidence_dir {
+            std::fs::write(
+                directory.join("task-7-simulator.log"),
+                format!("{}\n", evidence_log.join("\n")),
+            )
+            .expect("write simulator log");
+        }
+    }
+
+    #[test]
     fn page_turn_miss_promotes_prefetch_and_retains_displayed_page_while_loading() {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let metrics = reader_metrics(format, 1);
@@ -4284,6 +4789,86 @@ mod tests {
     }
 
     #[test]
+    fn reader_cleanup_back_clears_every_populated_reader_collection_once() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, tasks) = fully_populated_reader(format);
+            let commands = runner.action(ActionId::BACK);
+            assert_eq!(runner.app().view, View::Episodes);
+            let set = commands
+                .iter()
+                .position(|command| matches!(command, Command::SetScreen(_)))
+                .expect("episode screen");
+            let drop = commands
+                .iter()
+                .position(|command| matches!(command, Command::DropPicture(_)))
+                .expect("reader picture drop");
+            assert!(set < drop);
+            assert_reader_cleanup(
+                &mut runner,
+                &commands,
+                tasks,
+                None,
+                Some(Pending::Content(99)),
+                Some(TaskId(99)),
+            );
+        }
+    }
+
+    #[test]
+    fn reader_cleanup_suspend_and_link_loss_clear_only_reader_work() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            for exit in [false, true] {
+                let (mut runner, tasks) = fully_populated_reader(format);
+                let commands = if exit {
+                    runner.exit()
+                } else {
+                    runner.suspend()
+                };
+                assert_eq!(runner.app().view, View::Episodes);
+                assert_reader_cleanup(
+                    &mut runner,
+                    &commands,
+                    tasks,
+                    None,
+                    Some(Pending::Content(99)),
+                    Some(TaskId(99)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reader_cleanup_offline_ignores_every_late_outcome() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, tasks) = fully_populated_reader(format);
+            let settled = tasks[0];
+            let commands =
+                runner.task_outcome(settled, TaskOutcome::Failed(TaskError::Offline));
+            assert_eq!(runner.app().view, View::Episodes);
+            assert_reader_cleanup(
+                &mut runner,
+                &commands,
+                tasks,
+                Some(settled),
+                Some(Pending::Content(99)),
+                Some(TaskId(99)),
+            );
+        }
+    }
+
+    #[test]
+    fn reader_cleanup_logout_clears_populated_reader_after_singleton_settles() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, tasks) = fully_populated_reader(format);
+            runner.app_mut().pending = Some(Pending::Logout);
+            runner.app_mut().task = Some(TaskId(77));
+            let commands = runner.task_outcome(TaskId(77), TaskOutcome::Completed(Vec::new()));
+            assert_eq!(runner.app().account, AccountState::SignedOut);
+            assert_reader_cleanup(&mut runner, &commands, tasks, None, None, None);
+        }
+    }
+
+    #[test]
     fn image_failure_retry_stays_on_selected_episode() {
         let (mut runner, image_task) = reader_waiting_for_first_image();
         runner.task_outcome(image_task, TaskOutcome::Completed(vec![0, 1, 2, 3]));
@@ -4617,6 +5202,16 @@ mod tests {
         assert!(!should_load_recent(0, 1));
         assert!(!should_load_recent(1, 0));
     }
+    #[test]
+    fn modeled_reader_memory_bounds_are_byte_exact() {
+        assert_eq!(gray8_conservative_bytes(), 96_079_168);
+        assert_eq!(rgb8_conservative_bytes(), 93_935_424);
+        assert!(gray8_conservative_bytes() <= 96 * 1024 * 1024);
+        assert!(rgb8_conservative_bytes() <= 96 * 1024 * 1024);
+        assert_eq!(LARGEST_RGB8_PAGE_BYTES, 1_264 * 1_680 * 3);
+        assert_eq!(LARGEST_RGB8_PAGE_BYTES, 6_370_560);
+    }
+
     #[test]
     fn format_bounded_reader_window_limits_are_exact() {
         assert_eq!(
