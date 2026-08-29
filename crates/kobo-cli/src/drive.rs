@@ -341,7 +341,10 @@ impl Driver {
     /// Returns an error when the simulator cannot be reached, or answers with
     /// something other than an eight-bit Gray8/RGB8 PNG of the simulated panel.
     pub fn frame_png(&self) -> Result<Vec<u8>, String> {
-        let png = self.get(if self.ideal { "/ideal-frame" } else { "/frame" })?;
+        let png = self.get_bounded(
+            if self.ideal { "/ideal-frame" } else { "/frame" },
+            kobo_image::MAX_SOURCE_BYTES,
+        )?;
         validate_frame_png(&png, FRAME_WIDTH, FRAME_HEIGHT)?;
         Ok(png)
     }
@@ -396,11 +399,15 @@ impl Driver {
     }
 
     fn get(&self, path: &str) -> Result<Vec<u8>, String> {
-        self.request("GET", path, "")
+        self.request("GET", path, "", None)
+    }
+
+    fn get_bounded(&self, path: &str, max_body_bytes: usize) -> Result<Vec<u8>, String> {
+        self.request("GET", path, "", Some(max_body_bytes))
     }
 
     fn post(&self, path: &str, body: &str) -> Result<(), String> {
-        self.request("POST", path, body).map(|_| ())
+        self.request("POST", path, body, None).map(|_| ())
     }
 
     /// One HTTP request, spoken by hand.
@@ -409,7 +416,13 @@ impl Driver {
     /// and the whole conversation is four verbs against a server in this same
     /// workspace; pulling in an async runtime to say `GET /frame` would be a
     /// worse trade than eighty lines of `write!`.
-    fn request(&self, method: &str, path: &str, body: &str) -> Result<Vec<u8>, String> {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        max_body_bytes: Option<usize>,
+    ) -> Result<Vec<u8>, String> {
         let mut stream = TcpStream::connect(&self.address).map_err(|error| {
             format!(
                 "connect to the simulator at {}: {error}\n\
@@ -439,6 +452,9 @@ impl Driver {
         stream
             .write_all(request.as_bytes())
             .map_err(|error| format!("send {method} {path}: {error}"))?;
+        if let Some(max_body_bytes) = max_body_bytes {
+            return read_bounded_response(&mut stream, path, max_body_bytes);
+        }
         let mut answer = Vec::new();
         stream
             .read_to_end(&mut answer)
@@ -557,6 +573,60 @@ fn base64_decode(line: &str) -> Result<Vec<u8>, String> {
         decoded.extend_from_slice(&triple[..3 - padding]);
     }
     Ok(decoded)
+}
+
+/// Reads a frame response without allowing either its header or PNG body to
+/// grow an unbounded buffer. The extra body byte distinguishes an exact-bound
+/// response from overflow, and no bytes after that sentinel are read.
+fn read_bounded_response(
+    reader: &mut impl Read,
+    path: &str,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+
+    let mut head = Vec::with_capacity(512);
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() == MAX_RESPONSE_HEAD_BYTES {
+            return Err(format!(
+                "{path}: the simulator response header exceeds {MAX_RESPONSE_HEAD_BYTES} bytes"
+            ));
+        }
+        let mut byte = [0];
+        let read = reader
+            .read(&mut byte)
+            .map_err(|error| format!("read the answer to GET {path}: {error}"))?;
+        if read == 0 {
+            return Err(format!("{path}: the simulator sent no complete response"));
+        }
+        head.push(byte[0]);
+    }
+
+    let status = String::from_utf8_lossy(&head)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("{path}: the simulator sent no status"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("{path}: the simulator answered {status}"));
+    }
+
+    let overflow_limit = max_body_bytes
+        .checked_add(1)
+        .ok_or_else(|| format!("{path}: the frame byte bound does not fit this platform"))?;
+    let overflow_limit = u64::try_from(overflow_limit)
+        .map_err(|_| format!("{path}: the frame byte bound does not fit this platform"))?;
+    let mut body = Vec::new();
+    reader
+        .take(overflow_limit)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("read the answer to GET {path}: {error}"))?;
+    if body.len() > max_body_bytes {
+        return Err(format!(
+            "{path}: the simulator frame exceeds the {max_body_bytes}-byte source bound"
+        ));
+    }
+    Ok(body)
 }
 
 /// The body of an HTTP response, with the status checked.
@@ -753,10 +823,25 @@ fn parse_point(text: &str) -> Result<(i32, i32), String> {
 mod tests {
     use super::{
         base64_decode, decode_capture, json_array, json_field, json_number, json_objects,
-        json_point, split_response, validate_frame_png,
+        json_point, read_bounded_response, split_response, validate_frame_png,
     };
+    use std::io::Cursor;
 
     const BODY: &str = r#"{"nodes":[{"kind":"Button","x":10,"y":20,"width":30,"height":40,"centre":{"x":25,"y":40},"action":77,"lines":["Search","for a \"book\""]},{"kind":"Divider","x":0,"y":1,"width":2,"height":3,"centre":{"x":1,"y":2},"action":null,"lines":[]}]}"#;
+
+    fn high_entropy_rgb(width: u32, height: u32) -> Vec<u8> {
+        let length = usize::try_from(u64::from(width) * u64::from(height) * 3)
+            .expect("RGB fixture length");
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
 
     #[test]
     fn the_layout_reader_finds_every_node_and_its_words() {
@@ -844,6 +929,52 @@ mod tests {
         assert!(validate_frame_png(&gray, 2, 1).is_ok());
         assert!(validate_frame_png(&rgb, 2, 1).is_ok());
         assert!(validate_frame_png(&gray, 1, 2).is_err());
+    }
+
+    #[test]
+    fn frame_validation_accepts_a_high_entropy_rgb_panel_png() {
+        const WIDTH: u32 = 1_072;
+        const HEIGHT: u32 = 1_448;
+        let pixels = high_entropy_rgb(WIDTH, HEIGHT);
+        let png = kobo_image::encode_png(
+            WIDTH,
+            HEIGHT,
+            kobo_image::PicturePixelsRef::Rgb8(&pixels),
+        )
+        .expect("encode high-entropy RGB panel PNG");
+        assert!(png.len() > 4 * 1024 * 1024, "fixture must cover the regression");
+        assert!(validate_frame_png(&png, WIDTH, HEIGHT).is_ok());
+    }
+
+    #[test]
+    fn frame_response_reader_refuses_cap_plus_one_without_reading_more() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n";
+        let mut response = Vec::with_capacity(
+            head.len()
+                .checked_add(kobo_image::MAX_SOURCE_BYTES)
+                .and_then(|bytes| bytes.checked_add(8))
+                .expect("bounded response fixture length"),
+        );
+        response.extend_from_slice(head);
+        response.resize(
+            head.len() + kobo_image::MAX_SOURCE_BYTES + 8,
+            0xa5,
+        );
+        let mut reader = Cursor::new(response);
+
+        let error = read_bounded_response(
+            &mut reader,
+            "/frame",
+            kobo_image::MAX_SOURCE_BYTES,
+        )
+        .expect_err("cap-plus-one frame response");
+        assert!(error.contains("exceeds"));
+        assert_eq!(
+            reader.position(),
+            u64::try_from(head.len() + kobo_image::MAX_SOURCE_BYTES + 1)
+                .expect("fixture position"),
+            "the reader must stop after the one overflow byte"
+        );
     }
 
     #[test]

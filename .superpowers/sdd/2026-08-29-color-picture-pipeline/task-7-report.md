@@ -200,3 +200,38 @@ None.
 ### Concerns
 
 None.
+
+## Review Fix Round 5
+
+### Changes
+
+- Replaced the incompatible 4 MiB image source ceiling with a checked 32 MiB finite ceiling. Its documented derivation starts at `MAX_PIXELS * 4` for worst-case RGB8 scanlines plus one filter byte per non-empty row, reserves a conservative additional one eighth for deflate overhead and 1 MiB for zlib/PNG container overhead, and compile-time proves the 32 MiB ceiling exceeds the resulting 32,548,576-byte requirement.
+- Kept the strict PNG chunk subset and metadata rejection unchanged. The larger finite ceiling is shared with CLI frame transport rather than duplicated, and the PNG decoder still adds source and exact output limits with checked arithmetic.
+- Changed `Driver::frame_png` to read a bounded HTTP header and at most the shared source ceiling plus one body byte. A larger response is rejected immediately after the overflow sentinel without reading or retaining the rest.
+- Added deterministic high-entropy 1072×1448 RGB8 round-trip and CLI validation regressions, plus an exact cap-plus-one transport regression that proves the reader stops before later bytes.
+
+### RED Evidence
+
+- `cargo test -p kobo-image decode_png_round_trips_a_high_entropy_rgb_panel_frame -- --nocapture` encoded the deterministic frame to 4,658,639 bytes and failed because that valid repository-generated PNG exceeded the old 4,194,304-byte ceiling.
+- `cargo test -p kobo-cli frame_response_reader_refuses_cap_plus_one_without_reading_more -- --nocapture` initially failed to compile because the bounded response reader did not exist.
+
+### Verification
+
+- `cargo test -p kobo-image decode_png_` — 19 passed, 0 failed.
+- `cargo test -p kobo-image` — 60 passed, 0 failed.
+- `cargo test -p kobo-cli frame_validation_` — 3 passed, 0 failed.
+- `cargo test -p kobo-cli frame_response_` — 1 passed, 0 failed.
+- `cargo test -p kobo-cli` — 250 passed, 0 failed.
+- `cargo check -p kobo-image --target armv7-linux-androideabi` — passed, proving the derived constants and decoder arithmetic compile on a 32-bit target.
+- `cargo run -p kobo-cli -- shot --address 127.0.0.1:8881 --out target/task7-review5-simulator-shot.png` — the actual built-in simulator screenshot passed the bounded response read and strict decode and was saved at 1072×1448.
+
+### Self-review
+
+- The maximum filtered stream calculation uses `u64::checked_mul` and checked additions; the public 32 MiB value and its one-byte CLI overflow sentinel fit 32-bit `usize`, while runtime additions remain checked.
+- The CLI frame path can retain no more than 64 KiB of response header and 32 MiB plus one byte of body before refusal. Generic non-frame HTTP behavior is unchanged.
+- The structural PNG validator still rejects every previously unsupported metadata, palette, transparency, animation, interlace, ordering, CRC, and checksum case.
+- No runtime, simulator, real profile capability, BOMTOON implementation, todo tracker, formatter, linter, or workspace-wide suite was touched or run.
+
+### Concerns
+
+- A full `kobo-cli` Android cross-check remains unavailable because the existing `kobo-abi` crate does not define several PTY constants for Android; the directly affected `kobo-image` crate passed its 32-bit build, and the CLI sentinel arithmetic is checked before conversion to `u64`.

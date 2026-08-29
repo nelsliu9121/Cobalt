@@ -17,18 +17,33 @@ pub use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
 use std::fmt;
 use std::io::Cursor;
 
-/// The most compressed bytes a picture may arrive as.
-///
-/// Comfortably above a book cover or a photograph at panel size, and far below
-/// anything worth streaming to a device like this.
-pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
-
 /// The most pixels a picture may decode to, whatever its header claims.
 ///
 /// BOMTOON episodes have been observed at up to 6,553,600 pixels. The
 /// 7,000,000-pixel boundary admits those tall sources with measured headroom
 /// while still refusing hostile dimensions before a buffer is allocated.
 pub const MAX_PIXELS: u64 = 7_000_000;
+
+/// The most compressed bytes a picture or screenshot may arrive as.
+///
+/// A worst-case RGB8 PNG scanline stream needs three channel bytes per pixel
+/// plus one filter byte per row. Because every non-empty row has at least one
+/// pixel, `4 * MAX_PIXELS` is a conservative scanline ceiling. Reserving a
+/// further one eighth for deflate overhead and 1 MiB for the zlib wrapper, PNG
+/// signature, chunk framing, and CRCs gives 32,548,576 bytes. The simple 32 MiB
+/// ceiling is above that derived requirement, remains finite, and fits `usize`
+/// and `u32` on 32-bit targets.
+const MAX_PNG_SCANLINE_BYTES: u64 = MAX_PIXELS
+    .checked_mul(4)
+    .expect("the maximum PNG scanline byte count must fit in u64");
+const MAX_PNG_DEFLATE_BOUND_BYTES: u64 = MAX_PNG_SCANLINE_BYTES
+    .checked_add(MAX_PNG_SCANLINE_BYTES / 8)
+    .expect("the conservative PNG deflate bound must fit in u64");
+const MAX_PNG_DERIVED_BYTES: u64 = MAX_PNG_DEFLATE_BOUND_BYTES
+    .checked_add(1024 * 1024)
+    .expect("the derived PNG source byte bound must fit in u64");
+pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const _: () = assert!(MAX_PNG_DERIVED_BYTES <= MAX_SOURCE_BYTES as u64);
 
 /// How far [`Picture::fit_enlarging`] will blow a small picture up.
 ///
@@ -1090,6 +1105,20 @@ mod tests {
         gray
     }
 
+    fn high_entropy_rgb(width: u32, height: u32) -> Vec<u8> {
+        let length = usize::try_from(u64::from(width) * u64::from(height) * 3)
+            .expect("RGB fixture length");
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
     fn png_crc(bytes: &[u8]) -> u32 {
         let mut crc = u32::MAX;
         for byte in bytes {
@@ -1441,6 +1470,23 @@ mod tests {
             rgb.pixels(),
             PicturePixelsRef::Rgb8(&[255, 0, 0, 0, 255, 7])
         );
+    }
+
+    #[test]
+    fn decode_png_round_trips_a_high_entropy_rgb_panel_frame() {
+        const WIDTH: u32 = 1_072;
+        const HEIGHT: u32 = 1_448;
+        let pixels = high_entropy_rgb(WIDTH, HEIGHT);
+        let png = encode_png(WIDTH, HEIGHT, PicturePixelsRef::Rgb8(&pixels))
+            .expect("encode high-entropy RGB panel PNG");
+        assert!(
+            png.len() <= MAX_SOURCE_BYTES,
+            "repository encoder produced {} bytes above the supported {MAX_SOURCE_BYTES}-byte bound",
+            png.len()
+        );
+
+        let decoded = decode_png(&png).expect("decode high-entropy RGB panel PNG");
+        assert_eq!(decoded.pixels(), PicturePixelsRef::Rgb8(&pixels));
     }
 
     #[test]
