@@ -343,7 +343,7 @@ impl Driver {
     pub fn frame_png(&self) -> Result<Vec<u8>, String> {
         let png = self.get_bounded(
             if self.ideal { "/ideal-frame" } else { "/frame" },
-            kobo_image::MAX_SOURCE_BYTES,
+            kobo_image::MAX_PNG_SOURCE_BYTES,
         )?;
         validate_frame_png(&png, FRAME_WIDTH, FRAME_HEIGHT)?;
         Ok(png)
@@ -936,8 +936,12 @@ mod tests {
             kobo_image::encode_png(WIDTH, HEIGHT, kobo_image::PicturePixelsRef::Rgb8(&pixels))
                 .expect("encode high-entropy RGB panel PNG");
         assert!(
-            png.len() > 4 * 1024 * 1024,
-            "fixture must cover the regression"
+            png.len() > kobo_image::MAX_SOURCE_BYTES,
+            "fixture must exceed the generic image source bound"
+        );
+        assert!(
+            png.len() <= kobo_image::MAX_PNG_SOURCE_BYTES,
+            "fixture must remain within the PNG frame bound"
         );
         assert!(validate_frame_png(&png, WIDTH, HEIGHT).is_ok());
     }
@@ -947,20 +951,21 @@ mod tests {
         let head = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n";
         let mut response = Vec::with_capacity(
             head.len()
-                .checked_add(kobo_image::MAX_SOURCE_BYTES)
+                .checked_add(kobo_image::MAX_PNG_SOURCE_BYTES)
                 .and_then(|bytes| bytes.checked_add(8))
                 .expect("bounded response fixture length"),
         );
         response.extend_from_slice(head);
-        response.resize(head.len() + kobo_image::MAX_SOURCE_BYTES + 8, 0xa5);
+        response.resize(head.len() + kobo_image::MAX_PNG_SOURCE_BYTES + 8, 0xa5);
         let mut reader = Cursor::new(response);
 
-        let error = read_bounded_response(&mut reader, "/frame", kobo_image::MAX_SOURCE_BYTES)
+        let error = read_bounded_response(&mut reader, "/frame", kobo_image::MAX_PNG_SOURCE_BYTES)
             .expect_err("cap-plus-one frame response");
         assert!(error.contains("exceeds"));
         assert_eq!(
             reader.position(),
-            u64::try_from(head.len() + kobo_image::MAX_SOURCE_BYTES + 1).expect("fixture position"),
+            u64::try_from(head.len() + kobo_image::MAX_PNG_SOURCE_BYTES + 1)
+                .expect("fixture position"),
             "the reader must stop after the one overflow byte"
         );
     }

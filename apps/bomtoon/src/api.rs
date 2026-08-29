@@ -271,10 +271,10 @@ mod tests {
         };
         assert!(url == signed_url, "image URL mismatch");
         assert_eq!(offset, 0);
+        assert_eq!(kobo_image::MAX_SOURCE_BYTES, 4 * 1024 * 1024);
         assert_eq!(
             max_bytes,
-            u32::try_from(kobo_image::MAX_SOURCE_BYTES)
-                .expect("the test image source byte limit must fit in u32")
+            u32::try_from(4 * 1024 * 1024).expect("the BOMTOON image limit fits in u32")
         );
         assert_eq!(credential, None);
         assert_eq!(

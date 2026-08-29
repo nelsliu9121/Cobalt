@@ -9265,11 +9265,10 @@ impl FramePlanner {
         let (region, waveform, gray_dirty, color_dirty, was_chromatic) = if self.started {
             let difference = self.changed(surface)?;
             let entering_or_leaving_color = self.was_chromatic != difference.current_chromatic;
-            let color_budget = self.color_dirty.saturating_add(difference.color_changed);
+            let color_clean_due =
+                difference.color_changed > 0 && self.color_dirty >= self.color_clean_after();
 
-            if entering_or_leaving_color
-                || (difference.color_changed > 0 && color_budget >= self.color_clean_after())
-            {
+            if entering_or_leaving_color || color_clean_due {
                 (
                     whole,
                     PanelWaveform::Gcc16,
@@ -9282,7 +9281,7 @@ impl FramePlanner {
                     difference.region,
                     PanelWaveform::Glrc16,
                     self.gray_dirty.saturating_add(difference.gray_changed),
-                    color_budget,
+                    self.color_dirty.saturating_add(difference.color_changed),
                     difference.current_chromatic,
                 )
             } else if self.gray_dirty >= self.gray_clean_after() {
@@ -13821,7 +13820,7 @@ mod tests {
     }
 
     #[test]
-    fn color_frame_planner_cleans_on_the_fourth_panel_equivalent_and_retries_failure() {
+    fn color_frame_planner_cleans_after_four_panel_equivalents_and_retries_failure() {
         let mut planner = FramePlanner::new_in(1, 1, PictureFormat::Rgb8);
         let mut frame = Surface::new_in(1, 1, PictureFormat::Rgb8);
         frame.pixels.copy_from_slice(&[255, 0, 0]);
@@ -13829,7 +13828,7 @@ mod tests {
         assert_eq!(first.waveform, PanelWaveform::Gcc16);
         assert!(planner.commit(&frame, first));
 
-        for (index, rgb) in [[0, 255, 0], [0, 0, 255], [255, 255, 0]]
+        for (index, rgb) in [[0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255]]
             .into_iter()
             .enumerate()
         {
@@ -13844,8 +13843,10 @@ mod tests {
             assert!(planner.commit(&frame, partial));
         }
 
-        frame.pixels.copy_from_slice(&[255, 0, 255]);
-        let cleaning = planner.plan(&frame).expect("fourth chromatic repaint");
+        frame.pixels.copy_from_slice(&[0, 255, 255]);
+        let cleaning = planner
+            .plan(&frame)
+            .expect("update after four panel equivalents");
         assert_eq!(cleaning.waveform, PanelWaveform::Gcc16);
         assert!(cleaning.full);
         assert_eq!(
@@ -13855,7 +13856,7 @@ mod tests {
         );
         assert!(planner.commit(&frame, cleaning));
 
-        frame.pixels.copy_from_slice(&[0, 255, 255]);
+        frame.pixels.copy_from_slice(&[255, 128, 0]);
         assert_eq!(
             planner.plan(&frame).expect("cadence restarted").waveform,
             PanelWaveform::Glrc16

@@ -24,7 +24,13 @@ use std::io::Cursor;
 /// while still refusing hostile dimensions before a buffer is allocated.
 pub const MAX_PIXELS: u64 = 7_000_000;
 
-/// The most compressed bytes a picture or screenshot may arrive as.
+/// The most compressed bytes an untrusted source picture may contain.
+///
+/// Generic format detection, WebP decoding, and their network consumers use
+/// this deliberately small bound.
+pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most bytes a strict screenshot or frame-transport PNG may contain.
 ///
 /// A worst-case RGB8 PNG scanline stream needs three channel bytes per pixel
 /// plus one filter byte per row. Because every non-empty row has at least one
@@ -42,8 +48,8 @@ const MAX_PNG_DEFLATE_BOUND_BYTES: u64 = MAX_PNG_SCANLINE_BYTES
 const MAX_PNG_DERIVED_BYTES: u64 = MAX_PNG_DEFLATE_BOUND_BYTES
     .checked_add(1024 * 1024)
     .expect("the derived PNG source byte bound must fit in u64");
-pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const _: () = assert!(MAX_PNG_DERIVED_BYTES <= MAX_SOURCE_BYTES as u64);
+pub const MAX_PNG_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const _: () = assert!(MAX_PNG_DERIVED_BYTES <= MAX_PNG_SOURCE_BYTES as u64);
 
 /// How far [`Picture::fit_enlarging`] will blow a small picture up.
 ///
@@ -198,8 +204,11 @@ fn png_chunk_at(bytes: &[u8], at: usize) -> Result<PngChunk<'_>, ImageError> {
 fn validate_png_structure(bytes: &[u8]) -> Result<ValidatedPng, ImageError> {
     const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
-    if bytes.len() > MAX_SOURCE_BYTES {
-        return Err(ImageError::TooManyBytes { bytes: bytes.len() });
+    if bytes.len() > MAX_PNG_SOURCE_BYTES {
+        return Err(ImageError::TooManyBytes {
+            bytes: bytes.len(),
+            maximum: MAX_PNG_SOURCE_BYTES,
+        });
     }
     if bytes.get(..SIGNATURE.len()) != Some(SIGNATURE) {
         return Err(ImageError::Undecodable(
@@ -313,7 +322,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
         .ok_or_else(|| {
             ImageError::Undecodable("the PNG byte length does not fit this platform".to_owned())
         })?;
-    let decoder_bytes = expected.checked_add(MAX_SOURCE_BYTES).ok_or_else(|| {
+    let decoder_bytes = expected.checked_add(MAX_PNG_SOURCE_BYTES).ok_or_else(|| {
         ImageError::Undecodable("the PNG allocation bound does not fit this platform".to_owned())
     })?;
     let mut decoder = png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options());
@@ -393,8 +402,8 @@ pub enum FitMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageError {
-    /// More compressed bytes than [`MAX_SOURCE_BYTES`].
-    TooManyBytes { bytes: usize },
+    /// More compressed bytes than the entry point's documented source bound.
+    TooManyBytes { bytes: usize, maximum: usize },
     /// More pixels than [`MAX_PIXELS`].
     TooManyPixels { pixels: u64 },
     /// Nothing here recognises this as a picture.
@@ -410,9 +419,9 @@ pub enum ImageError {
 impl fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooManyBytes { bytes } => write!(
+            Self::TooManyBytes { bytes, maximum } => write!(
                 formatter,
-                "the picture is {bytes} bytes, and {MAX_SOURCE_BYTES} is the most that is read"
+                "the picture is {bytes} bytes, and {maximum} is the most that is read"
             ),
             Self::TooManyPixels { pixels } => write!(
                 formatter,
@@ -910,7 +919,10 @@ fn nearest_level(value: i32, levels: u32) -> i32 {
 /// it.
 pub fn size(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
     if bytes.len() > MAX_SOURCE_BYTES {
-        return Err(ImageError::TooManyBytes { bytes: bytes.len() });
+        return Err(ImageError::TooManyBytes {
+            bytes: bytes.len(),
+            maximum: MAX_SOURCE_BYTES,
+        });
     }
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -1022,7 +1034,10 @@ fn decode_picture(
     required: Option<image::ImageFormat>,
 ) -> Result<Picture, ImageError> {
     if bytes.len() > MAX_SOURCE_BYTES {
-        return Err(ImageError::TooManyBytes { bytes: bytes.len() });
+        return Err(ImageError::TooManyBytes {
+            bytes: bytes.len(),
+            maximum: MAX_SOURCE_BYTES,
+        });
     }
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -1097,7 +1112,8 @@ mod tests {
     use super::{
         decode, decode_png, decode_webp, encode_png, fitted_size, picture_clone_count,
         reset_picture_clone_count, size, width_scaled_size, AxisSample, FitMode, ImageError,
-        Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, MAX_SOURCE_BYTES, PANEL_GREYS,
+        Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, MAX_PNG_SOURCE_BYTES,
+        MAX_SOURCE_BYTES, PANEL_GREYS,
     };
     use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
     use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
@@ -1464,9 +1480,16 @@ mod tests {
         let pixels = high_entropy_rgb(WIDTH, HEIGHT);
         let png = encode_png(WIDTH, HEIGHT, PicturePixelsRef::Rgb8(&pixels))
             .expect("encode high-entropy RGB panel PNG");
+        assert_eq!(MAX_SOURCE_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_PNG_SOURCE_BYTES, 32 * 1024 * 1024);
         assert!(
-            png.len() <= MAX_SOURCE_BYTES,
-            "repository encoder produced {} bytes above the supported {MAX_SOURCE_BYTES}-byte bound",
+            png.len() > MAX_SOURCE_BYTES,
+            "fixture must exceed the generic {MAX_SOURCE_BYTES}-byte source bound"
+        );
+        assert!(
+            png.len() <= MAX_PNG_SOURCE_BYTES,
+            "repository encoder produced {} bytes above the supported \
+             {MAX_PNG_SOURCE_BYTES}-byte PNG bound",
             png.len()
         );
 
@@ -1495,11 +1518,32 @@ mod tests {
     }
 
     #[test]
-    fn decode_png_refuses_sources_over_the_compressed_byte_bound() {
+    fn generic_image_paths_refuse_sources_over_the_untrusted_byte_bound() {
         let oversized = vec![0; MAX_SOURCE_BYTES + 1];
         assert!(matches!(
+            size(&oversized),
+            Err(ImageError::TooManyBytes { bytes, maximum })
+                if bytes == oversized.len() && maximum == MAX_SOURCE_BYTES
+        ));
+        assert!(matches!(
+            decode(&oversized),
+            Err(ImageError::TooManyBytes { bytes, maximum })
+                if bytes == oversized.len() && maximum == MAX_SOURCE_BYTES
+        ));
+        assert!(matches!(
+            decode_webp(&oversized, PictureFormat::Rgb8),
+            Err(ImageError::TooManyBytes { bytes, maximum })
+                if bytes == oversized.len() && maximum == MAX_SOURCE_BYTES
+        ));
+    }
+
+    #[test]
+    fn decode_png_refuses_sources_over_the_png_byte_bound() {
+        let oversized = vec![0; MAX_PNG_SOURCE_BYTES + 1];
+        assert!(matches!(
             decode_png(&oversized),
-            Err(ImageError::TooManyBytes { bytes }) if bytes == oversized.len()
+            Err(ImageError::TooManyBytes { bytes, maximum })
+                if bytes == oversized.len() && maximum == MAX_PNG_SOURCE_BYTES
         ));
     }
 
