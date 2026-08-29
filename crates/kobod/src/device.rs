@@ -2970,7 +2970,6 @@ fn text_hold_for(
     layout.hit_text(x, y).map(|hit| (action, hit))
 }
 
-
 fn put_session_picture(
     pictures: &mut PictureCache,
     accepted: PictureFormat,
@@ -3677,14 +3676,7 @@ mod tests {
         );
 
         let gray_only = picture_screen(&[(gray, (2, 1))]);
-        render_screen_surface(
-            &gray_only,
-            &metrics,
-            &chrome,
-            &pictures,
-            &mut surface,
-            None,
-        );
+        render_screen_surface(&gray_only, &metrics, &chrome, &pictures, &mut surface, None);
         assert_eq!(surface.format, PictureFormat::Gray8);
         assert!(
             surface.bytes().contains(&31) && surface.bytes().contains(&223),
@@ -3692,17 +3684,13 @@ mod tests {
         );
 
         let composed = picture_screen(&[(gray, (2, 1)), (rgb, (2, 1))]);
-        render_screen_surface(
-            &composed,
-            &metrics,
-            &chrome,
-            &pictures,
-            &mut surface,
-            None,
-        );
+        render_screen_surface(&composed, &metrics, &chrome, &pictures, &mut surface, None);
         assert_eq!(surface.format, PictureFormat::Rgb8);
         assert!(
-            surface.bytes().chunks_exact(3).any(|pixel| pixel == [31; 3])
+            surface
+                .bytes()
+                .chunks_exact(3)
+                .any(|pixel| pixel == [31; 3])
                 && surface
                     .bytes()
                     .chunks_exact(3)
@@ -3713,15 +3701,10 @@ mod tests {
 
     #[test]
     fn rgb_picture_region_reaches_profile_lowering_without_losing_channels() {
-        let surface = Surface::from_pixels(
-            2,
-            1,
-            kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
-        )
-        .expect("valid typed surface");
-        let transition = FramePlanner::new(2, 1)
-            .plan(&surface)
-            .expect("first frame");
+        let surface =
+            Surface::from_pixels(2, 1, kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]))
+                .expect("valid typed surface");
+        let transition = FramePlanner::new(2, 1).plan(&surface).expect("first frame");
         let pixels = extract_region_pixels(&surface, transition.region).expect("typed region");
         let color = kobo_profile::ColorPanel {
             red: kobo_profile::ChannelField {
@@ -3768,12 +3751,9 @@ mod tests {
 
     #[test]
     fn rgb_picture_failed_output_does_not_commit_the_planner() {
-        let surface = Surface::from_pixels(
-            2,
-            1,
-            kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
-        )
-        .expect("valid typed surface");
+        let surface =
+            Surface::from_pixels(2, 1, kobo_ui::PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]))
+                .expect("valid typed surface");
         let mut painter = Painter::new(2, 1);
         assert!(painter
             .paint_with(&surface, |_| Err("write failed".to_owned()))

@@ -1578,10 +1578,7 @@ mod tests {
         let source = Picture::from_grey(2, 5, (0..10).collect()).expect("source");
         let first = slice_rows(&source, 0, 3).expect("first");
         let second = slice_rows(&source, 1, 3).expect("second");
-        assert_eq!(
-            first.pixels(),
-            PicturePixelsRef::Gray8(&[0, 1, 2, 3, 4, 5])
-        );
+        assert_eq!(first.pixels(), PicturePixelsRef::Gray8(&[0, 1, 2, 3, 4, 5]));
         assert_eq!(
             second.pixels(),
             PicturePixelsRef::Gray8(&[6, 7, 8, 9, 255, 255])

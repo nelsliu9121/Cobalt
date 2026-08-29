@@ -739,9 +739,7 @@ mod tests {
         beats, encode, glyph, letter_at, paint, Beat, Morse, AGAIN, CODE, MAX_MESSAGE, STOP,
         TOGGLE_LIGHT,
     };
-    use kobo_sdk::{
-        action_id, AppRunner, Command, DeviceRequest, PicturePixels, TaskOutcome,
-    };
+    use kobo_sdk::{action_id, AppRunner, Command, DeviceRequest, PicturePixels, TaskOutcome};
     use kobo_ui::{tone, Chrome, CLARA_BW_METRICS};
 
     /// Renders a run of beats as the light would show it, so a test can state

@@ -574,12 +574,7 @@ mod tests {
             height: 1,
         };
         assert!(matches!(
-            RegionSnapshot::from_pixels(
-                geometry,
-                region,
-                PicturePixelsRef::Rgb8(&[1, 2, 3]),
-                None,
-            ),
+            RegionSnapshot::from_pixels(geometry, region, PicturePixelsRef::Rgb8(&[1, 2, 3]), None,),
             Err(SurfaceError::UnsupportedPixelFormat)
         ));
 
@@ -703,12 +698,7 @@ mod tests {
         };
 
         assert!(matches!(
-            RegionSnapshot::from_pixels(
-                geometry,
-                region,
-                PicturePixelsRef::Gray8(&[1]),
-                None,
-            ),
+            RegionSnapshot::from_pixels(geometry, region, PicturePixelsRef::Gray8(&[1]), None,),
             Err(SurfaceError::RegionMismatch)
         ));
     }
@@ -881,10 +871,7 @@ mod tests {
         drop(file);
         std::fs::remove_file(&path).expect("remove fixture");
 
-        assert_eq!(
-            snapshot.inverted_rgb().pixels(),
-            &[0xef, 0xdf, 0xcf, 0x7f]
-        );
+        assert_eq!(snapshot.inverted_rgb().pixels(), &[0xef, 0xdf, 0xcf, 0x7f]);
     }
 
     #[test]

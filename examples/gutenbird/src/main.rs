@@ -2142,8 +2142,7 @@ impl Gutenbird {
         }
         let handle = PictureHandle(u32::try_from(index).unwrap_or(0));
         let (width, height) = (picture.width(), picture.height());
-        let Some(reference) =
-            context.put_picture(handle, width, height, picture.into_pixels())
+        let Some(reference) = context.put_picture(handle, width, height, picture.into_pixels())
         else {
             return false;
         };
@@ -2277,14 +2276,12 @@ impl Gutenbird {
         let Ok(padded) = on_paper(&picture, width, height) else {
             return false;
         };
-        let Some(reference) =
-            context.put_picture(
-                OPEN_COVER_HANDLE,
-                width,
-                height,
-                PicturePixels::Gray8(padded),
-            )
-        else {
+        let Some(reference) = context.put_picture(
+            OPEN_COVER_HANDLE,
+            width,
+            height,
+            PicturePixels::Gray8(padded),
+        ) else {
             return false;
         };
         self.open_cover = Some(reference);
@@ -2318,12 +2315,9 @@ impl Gutenbird {
         if grey.is_empty() {
             return;
         }
-        if let Some(reference) = context.put_picture(
-            OPEN_COVER_HANDLE,
-            width,
-            height,
-            PicturePixels::Gray8(grey),
-        ) {
+        if let Some(reference) =
+            context.put_picture(OPEN_COVER_HANDLE, width, height, PicturePixels::Gray8(grey))
+        {
             self.open_cover = Some(reference);
         }
     }
@@ -2766,11 +2760,7 @@ fn cover_key(url: &str) -> String {
 /// A picture larger than the sheet in either direction is cropped rather than
 /// scaled: callers fit before they get here, and silently resampling would
 /// disagree with what was measured.
-fn on_paper(
-    picture: &kobo_image::Picture,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, String> {
+fn on_paper(picture: &kobo_image::Picture, width: u32, height: u32) -> Result<Vec<u8>, String> {
     let sheet_width = usize::try_from(width).unwrap_or(0);
     let sheet_height = usize::try_from(height).unwrap_or(0);
     let mut sheet = vec![u8::MAX; sheet_width * sheet_height];

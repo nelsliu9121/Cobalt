@@ -413,7 +413,8 @@ mod tests {
         action_id, AppInfo, AppRunner, Command, DeviceRequest, DeviceResult, Glyph, Lifecycle,
     };
     use kobo_ui::{
-        Chrome, DisplayMetrics, LayoutKind, Node, TextScale, TileState, CLARA_BW_METRICS,
+        Chrome, DisplayMetrics, LayoutKind, Node, PictureFormat, TextScale, TileState,
+        CLARA_BW_METRICS,
     };
 
     const PANELS: [(&str, DisplayMetrics); 3] = [
@@ -424,6 +425,7 @@ mod tests {
                 width: 758,
                 height: 1024,
                 pixels_per_inch: 212,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),
@@ -433,6 +435,7 @@ mod tests {
                 width: 1440,
                 height: 1920,
                 pixels_per_inch: 300,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),

@@ -559,32 +559,24 @@ fn serve_application(
                 width,
                 height,
                 pixels,
-            } => match pictures.put_report_for(
-                metrics.picture_format,
-                handle,
-                width,
-                height,
-                pixels,
-            ) {
-                None => println!("picture {} refused", handle.0),
-                Some(evicted) if !evicted.is_empty() => {
-                    println!("picture {} evicted {evicted:?}", handle.0);
+            } => {
+                match pictures.put_report_for(metrics.picture_format, handle, width, height, pixels)
+                {
+                    None => println!("picture {} refused", handle.0),
+                    Some(evicted) if !evicted.is_empty() => {
+                        println!("picture {} evicted {evicted:?}", handle.0);
+                    }
+                    Some(_) => {}
                 }
-                Some(_) => {}
-            },
+            }
             Message::BeginPicture {
                 handle,
                 width,
                 height,
                 format,
             } => {
-                if !pictures.begin_upload_for(
-                    metrics.picture_format,
-                    handle,
-                    width,
-                    height,
-                    format,
-                ) {
+                if !pictures.begin_upload_for(metrics.picture_format, handle, width, height, format)
+                {
                     println!("picture {} upload refused", handle.0);
                 }
             }
@@ -1014,10 +1006,8 @@ mod tests {
                 framed: false,
             }],
         );
-        let path = std::env::temp_dir().join(format!(
-            "kobod-host-color-frame-{}.png",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("kobod-host-color-frame-{}.png", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         super::write_screen(

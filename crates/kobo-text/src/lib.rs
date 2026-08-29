@@ -1091,6 +1091,7 @@ mod tests {
         width: 1072,
         height: 1448,
         pixels_per_inch: 300,
+        picture_format: kobo_ui::PictureFormat::Gray8,
         text_scale: TextScale::Default,
     };
 
@@ -1820,7 +1821,7 @@ mod tests {
         for y in top..bottom {
             for x in from..width {
                 assert_eq!(
-                    surface.pixels[y * width + x],
+                    surface.bytes()[y * width + x],
                     kobo_ui::tone::PAPER,
                     "the title drew ink at {x},{y}, past its own right edge at {right}"
                 );
@@ -1873,7 +1874,9 @@ mod tests {
                 .min(height);
             let half = width / 2;
             (0..half)
-                .filter(|x| (0..band).any(|y| surface.pixels[y * width + x] < kobo_ui::tone::PAPER))
+                .filter(|x| {
+                    (0..band).any(|y| surface.bytes()[y * width + x] < kobo_ui::tone::PAPER)
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -1969,7 +1972,7 @@ mod tests {
             for y in top..bottom {
                 for x in from..until {
                     assert_eq!(
-                        surface.pixels[y * width + x],
+                        surface.bytes()[y * width + x],
                         kobo_ui::tone::PAPER,
                         "rank {rank} drew ink at {x},{y}, past its column ending at {right}"
                     );

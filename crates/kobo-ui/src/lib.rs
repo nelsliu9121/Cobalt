@@ -8838,6 +8838,11 @@ impl Surface {
         Self::new_in(width, height, PictureFormat::Gray8)
     }
 
+    /// Allocates a blank surface in the requested pixel format.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the formatted surface dimensions exceed addressable memory.
     #[must_use]
     pub fn new_in(width: usize, height: usize, format: PictureFormat) -> Self {
         let byte_len = width
@@ -8872,7 +8877,6 @@ impl Surface {
             pixels: pixels.into_bytes(),
         })
     }
-
 
     #[must_use]
     pub fn pixels(&self) -> PicturePixelsRef<'_> {
@@ -9220,6 +9224,11 @@ impl FramePlanner {
         Self::new_in(width, height, PictureFormat::Gray8)
     }
 
+    /// Starts a frame planner for the requested pixel format.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the formatted frame dimensions exceed addressable memory.
     #[must_use]
     pub fn new_in(width: usize, height: usize, format: PictureFormat) -> Self {
         let byte_len = width
@@ -9255,15 +9264,11 @@ impl FramePlanner {
         let whole = self.whole()?;
         let (region, waveform, gray_dirty, color_dirty, was_chromatic) = if self.started {
             let difference = self.changed(surface)?;
-            let entering_or_leaving_color =
-                self.was_chromatic != difference.current_chromatic;
-            let color_budget = self
-                .color_dirty
-                .saturating_add(difference.color_changed);
+            let entering_or_leaving_color = self.was_chromatic != difference.current_chromatic;
+            let color_budget = self.color_dirty.saturating_add(difference.color_changed);
 
             if entering_or_leaving_color
-                || (difference.color_changed > 0
-                    && color_budget >= self.color_clean_after())
+                || (difference.color_changed > 0 && color_budget >= self.color_clean_after())
             {
                 (
                     whole,
@@ -9276,8 +9281,7 @@ impl FramePlanner {
                 (
                     difference.region,
                     PanelWaveform::Glrc16,
-                    self.gray_dirty
-                        .saturating_add(difference.gray_changed),
+                    self.gray_dirty.saturating_add(difference.gray_changed),
                     color_budget,
                     difference.current_chromatic,
                 )
@@ -9301,8 +9305,7 @@ impl FramePlanner {
                 (
                     difference.region,
                     PanelWaveform::Gl16,
-                    self.gray_dirty
-                        .saturating_add(difference.gray_changed),
+                    self.gray_dirty.saturating_add(difference.gray_changed),
                     self.color_dirty,
                     difference.current_chromatic,
                 )
@@ -9310,8 +9313,7 @@ impl FramePlanner {
                 (
                     difference.region,
                     PanelWaveform::Du,
-                    self.gray_dirty
-                        .saturating_add(difference.gray_changed),
+                    self.gray_dirty.saturating_add(difference.gray_changed),
                     self.color_dirty,
                     difference.current_chromatic,
                 )
@@ -10522,7 +10524,7 @@ impl PictureCache {
         while self
             .held
             .checked_add(byte_count)
-            .map_or(true, |held| held > self.budget)
+            .is_none_or(|held| held > self.budget)
         {
             let Some(oldest) = self
                 .entries
@@ -10799,9 +10801,7 @@ fn draw_picture(
                         let base = sample_y * source_width;
                         for sample_x in from_x..to_x.min(source_width) {
                             let start = (base + sample_x) * 3;
-                            for (total, channel) in
-                                totals.iter_mut().zip(&rgb[start..start + 3])
-                            {
+                            for (total, channel) in totals.iter_mut().zip(&rgb[start..start + 3]) {
                                 *total += u64::from(*channel);
                             }
                             counted += 1;
@@ -13797,7 +13797,9 @@ mod tests {
         let mut frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
         frame.pixels[0..3].copy_from_slice(&[255, 0, 0]);
 
-        let first = planner.plan(&frame).expect("first chromatic frame refreshes");
+        let first = planner
+            .plan(&frame)
+            .expect("first chromatic frame refreshes");
         assert_eq!(first.waveform, PanelWaveform::Gcc16);
         assert!(first.full);
         assert!(planner.commit(&frame, first));
@@ -13953,7 +13955,9 @@ mod tests {
     fn frame_planner_uses_gray_waveform_for_every_tone_in_the_refresh_region() {
         let mut planner = FramePlanner::new(3, 1);
         let mut frame = Surface::new(3, 1);
-        frame.pixels.copy_from_slice(&[tone::INK, tone::MUTED, tone::INK]);
+        frame
+            .pixels
+            .copy_from_slice(&[tone::INK, tone::MUTED, tone::INK]);
         let first = planner.plan(&frame).expect("first frame");
         assert!(planner.commit(&frame, first));
 
@@ -16643,19 +16647,9 @@ mod prose_tests {
     #[test]
     fn the_cache_refuses_a_picture_whose_size_does_not_match_its_bytes() {
         let mut cache = PictureCache::default();
-        assert!(!cache.put(
-            PictureHandle(1),
-            10,
-            10,
-            PicturePixels::Gray8(vec![0; 99]),
-        ));
+        assert!(!cache.put(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![0; 99]),));
         assert!(cache.get(PictureHandle(1)).is_none());
-        assert!(cache.put(
-            PictureHandle(1),
-            10,
-            10,
-            PicturePixels::Gray8(vec![0; 100]),
-        ));
+        assert!(cache.put(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![0; 100]),));
         assert!(matches!(
             cache.get(PictureHandle(1)),
             Some(PicturePixelsRef::Gray8(bytes)) if bytes.len() == 100
@@ -16665,26 +16659,11 @@ mod prose_tests {
     #[test]
     fn the_cache_evicts_what_was_drawn_longest_ago() {
         let mut cache = PictureCache::new(200);
-        assert!(cache.put(
-            PictureHandle(1),
-            10,
-            10,
-            PicturePixels::Gray8(vec![1; 100]),
-        ));
-        assert!(cache.put(
-            PictureHandle(2),
-            10,
-            10,
-            PicturePixels::Gray8(vec![2; 100]),
-        ));
+        assert!(cache.put(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![1; 100]),));
+        assert!(cache.put(PictureHandle(2), 10, 10, PicturePixels::Gray8(vec![2; 100]),));
         // Drawing the first one makes the second the older of the two.
         assert!(cache.get(PictureHandle(1)).is_some());
-        assert!(cache.put(
-            PictureHandle(3),
-            10,
-            10,
-            PicturePixels::Gray8(vec![3; 100]),
-        ));
+        assert!(cache.put(PictureHandle(3), 10, 10, PicturePixels::Gray8(vec![3; 100]),));
         assert!(cache.get(PictureHandle(1)).is_some(), "still on screen");
         assert!(
             cache.get(PictureHandle(2)).is_none(),
@@ -16698,21 +16677,11 @@ mod prose_tests {
     fn cache_evictions_are_reported_to_the_runtime() {
         let mut cache = PictureCache::new(150);
         assert_eq!(
-            cache.put_report(
-                PictureHandle(1),
-                10,
-                10,
-                PicturePixels::Gray8(vec![1; 100]),
-            ),
+            cache.put_report(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![1; 100]),),
             Some(Vec::new())
         );
         assert_eq!(
-            cache.put_report(
-                PictureHandle(2),
-                10,
-                10,
-                PicturePixels::Gray8(vec![2; 100]),
-            ),
+            cache.put_report(PictureHandle(2), 10, 10, PicturePixels::Gray8(vec![2; 100]),),
             Some(vec![PictureHandle(1)])
         );
     }
@@ -16745,18 +16714,8 @@ mod prose_tests {
     #[test]
     fn replacing_a_picture_does_not_double_count_it() {
         let mut cache = PictureCache::new(300);
-        assert!(cache.put(
-            PictureHandle(1),
-            10,
-            10,
-            PicturePixels::Gray8(vec![0; 100]),
-        ));
-        assert!(cache.put(
-            PictureHandle(1),
-            10,
-            10,
-            PicturePixels::Gray8(vec![9; 100]),
-        ));
+        assert!(cache.put(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![0; 100]),));
+        assert!(cache.put(PictureHandle(1), 10, 10, PicturePixels::Gray8(vec![9; 100]),));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.bytes_held(), 100);
         assert!(matches!(
@@ -16877,12 +16836,7 @@ mod prose_tests {
     #[test]
     fn rgb_picture_is_refused_on_a_gray_surface() {
         let mut cache = PictureCache::default();
-        assert!(cache.put(
-            PictureHandle(1),
-            1,
-            1,
-            PicturePixels::Rgb8(vec![1, 2, 3]),
-        ));
+        assert!(cache.put(PictureHandle(1), 1, 1, PicturePixels::Rgb8(vec![1, 2, 3]),));
         let mut surface = Surface::new(1, 1);
         surface.clear(tone::PAPER);
         draw_picture(
@@ -16908,19 +16862,9 @@ mod prose_tests {
     #[test]
     fn rgb_picture_bytes_count_against_the_cache_budget() {
         let mut cache = PictureCache::new(12);
-        assert!(cache.put(
-            PictureHandle(1),
-            2,
-            2,
-            PicturePixels::Rgb8(vec![1; 12]),
-        ));
+        assert!(cache.put(PictureHandle(1), 2, 2, PicturePixels::Rgb8(vec![1; 12]),));
         assert_eq!(cache.bytes_held(), 12);
-        assert!(cache.put(
-            PictureHandle(2),
-            2,
-            2,
-            PicturePixels::Rgb8(vec![2; 12]),
-        ));
+        assert!(cache.put(PictureHandle(2), 2, 2, PicturePixels::Rgb8(vec![2; 12]),));
         assert!(cache.get(PictureHandle(1)).is_none());
         assert!(matches!(
             cache.get(PictureHandle(2)),

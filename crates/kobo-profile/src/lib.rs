@@ -2783,7 +2783,7 @@ mod tests {
         }
     }
 
-    fn assert_color_capability_rejected(profile: DeviceProfile) {
+    fn assert_color_capability_rejected(profile: &DeviceProfile) {
         let report = profile.validate(&clara_panel_snapshot(clara_bw_identity()));
         assert_eq!(report.readiness, Readiness::Rejected);
         assert!(
@@ -2822,7 +2822,7 @@ mod tests {
 
     #[test]
     fn color_is_rejected_on_a_non_hwtcon_controller() {
-        assert_color_capability_rejected(DeviceProfile {
+        assert_color_capability_rejected(&DeviceProfile {
             framebuffer_controller: FramebufferController::MxcfbV2,
             ..valid_color_profile()
         });
@@ -2844,7 +2844,7 @@ mod tests {
                 ..VALID_COLOR_PANEL
             },
         ] {
-            assert_color_capability_rejected(DeviceProfile {
+            assert_color_capability_rejected(&DeviceProfile {
                 color: Some(color),
                 ..CLARA_BW_391
             });
@@ -2853,7 +2853,7 @@ mod tests {
 
     #[test]
     fn color_is_rejected_without_cfa_flags() {
-        assert_color_capability_rejected(DeviceProfile {
+        assert_color_capability_rejected(&DeviceProfile {
             color: Some(ColorPanel {
                 cfa_flags: 0,
                 ..VALID_COLOR_PANEL
@@ -2865,7 +2865,7 @@ mod tests {
     #[test]
     fn color_is_rejected_without_the_four_update_cleaning_interval() {
         for clean_interval in [0, 3, 5] {
-            assert_color_capability_rejected(DeviceProfile {
+            assert_color_capability_rejected(&DeviceProfile {
                 color: Some(ColorPanel {
                     clean_interval,
                     ..VALID_COLOR_PANEL
@@ -2887,10 +2887,7 @@ mod tests {
                 ..VALID_COLOR_PANEL
             },
             ColorPanel {
-                green: ChannelField {
-                    offset: 8,
-                    ..short
-                },
+                green: ChannelField { offset: 8, ..short },
                 ..VALID_COLOR_PANEL
             },
             ColorPanel {
@@ -2908,7 +2905,7 @@ mod tests {
                 ..VALID_COLOR_PANEL
             },
         ] {
-            assert_color_capability_rejected(DeviceProfile {
+            assert_color_capability_rejected(&DeviceProfile {
                 color: Some(color),
                 ..CLARA_BW_391
             });
@@ -2917,7 +2914,7 @@ mod tests {
 
     #[test]
     fn color_is_rejected_when_channels_overlap() {
-        assert_color_capability_rejected(DeviceProfile {
+        assert_color_capability_rejected(&DeviceProfile {
             color: Some(ColorPanel {
                 green: ChannelField {
                     offset: 0,
@@ -2931,7 +2928,7 @@ mod tests {
 
     #[test]
     fn color_is_rejected_when_a_channel_extends_past_bit_31() {
-        assert_color_capability_rejected(DeviceProfile {
+        assert_color_capability_rejected(&DeviceProfile {
             color: Some(ColorPanel {
                 transparency: ChannelField {
                     offset: 25,

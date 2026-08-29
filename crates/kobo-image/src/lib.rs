@@ -76,16 +76,12 @@ pub fn encode_png(
 ) -> Result<Vec<u8>, ImageError> {
     checked_pixels(width, height)?;
     let (bytes, format, color_type) = match pixels {
-        PicturePixelsRef::Gray8(bytes) => (
-            bytes,
-            PictureFormat::Gray8,
-            image::ExtendedColorType::L8,
-        ),
-        PicturePixelsRef::Rgb8(bytes) => (
-            bytes,
-            PictureFormat::Rgb8,
-            image::ExtendedColorType::Rgb8,
-        ),
+        PicturePixelsRef::Gray8(bytes) => {
+            (bytes, PictureFormat::Gray8, image::ExtendedColorType::L8)
+        }
+        PicturePixelsRef::Rgb8(bytes) => {
+            (bytes, PictureFormat::Rgb8, image::ExtendedColorType::Rgb8)
+        }
     };
     let expected = format.byte_len(width, height).ok_or_else(|| {
         ImageError::Undecodable("the picture byte length does not fit this platform".to_owned())
@@ -144,6 +140,59 @@ fn validate_png_text(data: &[u8]) -> Result<(), ImageError> {
     Ok(())
 }
 
+struct PngChunk<'a> {
+    kind: &'a [u8],
+    data: &'a [u8],
+    end: usize,
+}
+
+fn png_chunk_at(bytes: &[u8], at: usize) -> Result<PngChunk<'_>, ImageError> {
+    let chunk_header_end = at.checked_add(8).ok_or_else(|| {
+        ImageError::Undecodable("the PNG chunk header overflows this platform".to_owned())
+    })?;
+    let chunk_header = bytes
+        .get(at..chunk_header_end)
+        .ok_or_else(|| ImageError::Undecodable("the PNG ends inside a chunk header".to_owned()))?;
+    let length = usize::try_from(u32::from_be_bytes(
+        chunk_header[..4]
+            .try_into()
+            .expect("four-byte PNG chunk length"),
+    ))
+    .map_err(|_| {
+        ImageError::Undecodable("the PNG chunk length does not fit this platform".to_owned())
+    })?;
+    let kind = &chunk_header[4..8];
+    let data_end = chunk_header_end.checked_add(length).ok_or_else(|| {
+        ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
+    })?;
+    let chunk_end = data_end.checked_add(4).ok_or_else(|| {
+        ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
+    })?;
+    let data = bytes
+        .get(chunk_header_end..data_end)
+        .ok_or_else(|| ImageError::Undecodable("the PNG ends inside a chunk".to_owned()))?;
+    let stored_crc = u32::from_be_bytes(
+        bytes
+            .get(data_end..chunk_end)
+            .ok_or_else(|| ImageError::Undecodable("the PNG ends inside a chunk CRC".to_owned()))?
+            .try_into()
+            .expect("four-byte PNG chunk CRC"),
+    );
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(kind);
+    crc.update(data);
+    if crc.finalize() != stored_crc {
+        return Err(ImageError::Undecodable(format!(
+            "the PNG chunk {kind:?} has a corrupt CRC"
+        )));
+    }
+    Ok(PngChunk {
+        kind,
+        data,
+        end: chunk_end,
+    })
+}
+
 /// Validates the complete, deliberately small screenshot PNG subset without
 /// asking a general PNG parser to retain or decompress metadata.
 fn validate_png_structure(bytes: &[u8]) -> Result<ValidatedPng, ImageError> {
@@ -163,47 +212,12 @@ fn validate_png_structure(bytes: &[u8]) -> Result<ValidatedPng, ImageError> {
     let mut saw_idat = false;
     let mut idat_ended = false;
     loop {
-        let chunk_header_end = at.checked_add(8).ok_or_else(|| {
-            ImageError::Undecodable("the PNG chunk header overflows this platform".to_owned())
-        })?;
-        let chunk_header = bytes.get(at..chunk_header_end).ok_or_else(|| {
-            ImageError::Undecodable("the PNG ends inside a chunk header".to_owned())
-        })?;
-        let length = usize::try_from(u32::from_be_bytes(
-            chunk_header[..4]
-                .try_into()
-                .expect("four-byte PNG chunk length"),
-        ))
-        .map_err(|_| {
-            ImageError::Undecodable("the PNG chunk length does not fit this platform".to_owned())
-        })?;
-        let kind = &chunk_header[4..8];
-        let data_end = chunk_header_end.checked_add(length).ok_or_else(|| {
-            ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
-        })?;
-        let chunk_end = data_end.checked_add(4).ok_or_else(|| {
-            ImageError::Undecodable("the PNG chunk length overflows this platform".to_owned())
-        })?;
-        let data = bytes
-            .get(chunk_header_end..data_end)
-            .ok_or_else(|| ImageError::Undecodable("the PNG ends inside a chunk".to_owned()))?;
-        let stored_crc = u32::from_be_bytes(
-            bytes
-                .get(data_end..chunk_end)
-                .ok_or_else(|| {
-                    ImageError::Undecodable("the PNG ends inside a chunk CRC".to_owned())
-                })?
-                .try_into()
-                .expect("four-byte PNG chunk CRC"),
-        );
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(kind);
-        crc.update(data);
-        if crc.finalize() != stored_crc {
-            return Err(ImageError::Undecodable(format!(
-                "the PNG chunk {kind:?} has a corrupt CRC"
-            )));
-        }
+        let PngChunk {
+            kind,
+            data,
+            end: chunk_end,
+        } = png_chunk_at(bytes, at)?;
+        let length = data.len();
 
         match kind {
             b"IHDR" => {
@@ -212,12 +226,9 @@ fn validate_png_structure(bytes: &[u8]) -> Result<ValidatedPng, ImageError> {
                         "IHDR must be the first chunk, exactly once, with length 13".to_owned(),
                     ));
                 }
-                let width = u32::from_be_bytes(
-                    data[..4].try_into().expect("four-byte PNG width"),
-                );
-                let height = u32::from_be_bytes(
-                    data[4..8].try_into().expect("four-byte PNG height"),
-                );
+                let width = u32::from_be_bytes(data[..4].try_into().expect("four-byte PNG width"));
+                let height =
+                    u32::from_be_bytes(data[4..8].try_into().expect("four-byte PNG height"));
                 let format = match (data[8], data[9]) {
                     (8, 0) => PictureFormat::Gray8,
                     (8, 2) => PictureFormat::Rgb8,
@@ -305,8 +316,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<Picture, ImageError> {
     let decoder_bytes = expected.checked_add(MAX_SOURCE_BYTES).ok_or_else(|| {
         ImageError::Undecodable("the PNG allocation bound does not fit this platform".to_owned())
     })?;
-    let mut decoder =
-        png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options());
+    let mut decoder = png::Decoder::new_with_options(Cursor::new(bytes), strict_png_options());
     decoder.set_limits(png::Limits {
         bytes: decoder_bytes,
     });
@@ -462,11 +472,7 @@ impl Picture {
     /// Returns [`ImageError::TooManyPixels`] when the dimensions exceed
     /// [`MAX_PIXELS`], and [`ImageError::Undecodable`] when the byte length
     /// does not match the dimensions and format.
-    pub fn from_pixels(
-        width: u32,
-        height: u32,
-        pixels: PicturePixels,
-    ) -> Result<Self, ImageError> {
+    pub fn from_pixels(width: u32, height: u32, pixels: PicturePixels) -> Result<Self, ImageError> {
         checked_pixels(width, height)?;
         let format = pixels.format();
         let expected = format.byte_len(width, height).ok_or_else(|| {
@@ -621,14 +627,7 @@ impl Picture {
         };
         let left = (scaled_width - width) / 2;
         let top = (scaled_height - height) / 2;
-        self.resample_region(
-            width,
-            height,
-            scaled_width,
-            scaled_height,
-            left,
-            top,
-        )
+        self.resample_region(width, height, scaled_width, scaled_height, left, top)
     }
 
     fn scaled_to(&self, width: u32, height: u32) -> Result<Self, ImageError> {
@@ -636,7 +635,14 @@ impl Picture {
         if target_width == 0 || target_height == 0 {
             return Err(ImageError::EmptyBox);
         }
-        self.resample_region(target_width, target_height, target_width, target_height, 0, 0)
+        self.resample_region(
+            target_width,
+            target_height,
+            target_width,
+            target_height,
+            0,
+            0,
+        )
     }
 
     fn resample(self, width: u32, height: u32) -> Result<Self, ImageError> {
@@ -790,6 +796,7 @@ fn resample_bytes<const CHANNELS: usize>(
     let horizontal_denominator = axis_denominator(mapped_width);
     let vertical_denominator = axis_denominator(mapped_height);
     let denominator = horizontal_denominator * vertical_denominator;
+    let sample_chunk = u32::try_from(AXIS_SAMPLE_CHUNK).expect("axis sample chunk fits in a u32");
 
     for y in 0..height {
         let vertical = axis_sample(top + y, source_height, mapped_height);
@@ -797,7 +804,7 @@ fn resample_bytes<const CHANNELS: usize>(
         let lower_y = vertical_denominator - upper_y;
         for chunk_start in (0..width).step_by(AXIS_SAMPLE_CHUNK) {
             horizontal.clear();
-            let chunk_len = (width - chunk_start).min(AXIS_SAMPLE_CHUNK as u32);
+            let chunk_len = (width - chunk_start).min(sample_chunk);
             for offset in 0..chunk_len {
                 horizontal.push(axis_sample(
                     left + chunk_start + offset,
@@ -809,34 +816,41 @@ fn resample_bytes<const CHANNELS: usize>(
                 let upper_x = u64::from(sample.upper_weight);
                 let lower_x = horizontal_denominator - upper_x;
                 for channel in 0..CHANNELS {
-                    let upper_left = u64::from(source[source_index::<CHANNELS>(
-                        source_width,
-                        sample.low,
-                        vertical.low,
-                        channel,
-                    )]);
-                    let upper_right = u64::from(source[source_index::<CHANNELS>(
-                        source_width,
-                        sample.high,
-                        vertical.low,
-                        channel,
-                    )]);
-                    let lower_left = u64::from(source[source_index::<CHANNELS>(
-                        source_width,
-                        sample.low,
-                        vertical.high,
-                        channel,
-                    )]);
-                    let lower_right = u64::from(source[source_index::<CHANNELS>(
-                        source_width,
-                        sample.high,
-                        vertical.high,
-                        channel,
-                    )]);
+                    let upper_left = u64::from(
+                        source[source_index::<CHANNELS>(
+                            source_width,
+                            sample.low,
+                            vertical.low,
+                            channel,
+                        )],
+                    );
+                    let upper_right = u64::from(
+                        source[source_index::<CHANNELS>(
+                            source_width,
+                            sample.high,
+                            vertical.low,
+                            channel,
+                        )],
+                    );
+                    let lower_left = u64::from(
+                        source[source_index::<CHANNELS>(
+                            source_width,
+                            sample.low,
+                            vertical.high,
+                            channel,
+                        )],
+                    );
+                    let lower_right = u64::from(
+                        source[source_index::<CHANNELS>(
+                            source_width,
+                            sample.high,
+                            vertical.high,
+                            channel,
+                        )],
+                    );
                     let upper = upper_left * lower_x + upper_right * upper_x;
                     let lower = lower_left * lower_x + lower_right * upper_x;
-                    let value = (upper * lower_y + lower * upper_y + denominator / 2)
-                        / denominator;
+                    let value = (upper * lower_y + lower * upper_y + denominator / 2) / denominator;
                     output.push(u8::try_from(value).expect("interpolation stays in one byte"));
                 }
             }
@@ -846,12 +860,7 @@ fn resample_bytes<const CHANNELS: usize>(
     output
 }
 
-fn source_index<const CHANNELS: usize>(
-    width: u32,
-    x: u32,
-    y: u32,
-    channel: usize,
-) -> usize {
+fn source_index<const CHANNELS: usize>(width: u32, x: u32, y: u32, channel: usize) -> usize {
     let pixel = u64::from(y) * u64::from(width) + u64::from(x);
     usize::try_from(pixel)
         .expect("bounded source index fits usize")
@@ -1054,11 +1063,7 @@ fn decode_picture(
             for pixel in luma.pixels() {
                 grey.push(over_white(pixel[0], pixel[1]));
             }
-            Picture::from_pixels(
-                luma.width(),
-                luma.height(),
-                PicturePixels::Gray8(grey),
-            )
+            Picture::from_pixels(luma.width(), luma.height(), PicturePixels::Gray8(grey))
         }
         PictureFormat::Rgb8 => {
             let rgba = image.to_rgba8();
@@ -1106,15 +1111,15 @@ mod tests {
     }
 
     fn high_entropy_rgb(width: u32, height: u32) -> Vec<u8> {
-        let length = usize::try_from(u64::from(width) * u64::from(height) * 3)
-            .expect("RGB fixture length");
+        let length =
+            usize::try_from(u64::from(width) * u64::from(height) * 3).expect("RGB fixture length");
         let mut state = 0x4d59_5df4_d0f3_3173_u64;
         (0..length)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                state as u8
+                state.to_le_bytes()[0]
             })
             .collect()
     }
@@ -1134,7 +1139,7 @@ mod tests {
         !crc
     }
 
-    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    fn png_chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
         let mut chunk = Vec::with_capacity(data.len() + 12);
         chunk.extend_from_slice(
             &u32::try_from(data.len())
@@ -1147,7 +1152,7 @@ mod tests {
         chunk
     }
 
-    fn chunk_start(png: &[u8], target: &[u8; 4]) -> usize {
+    fn chunk_start(png: &[u8], target: &[u8]) -> usize {
         let mut at = 8;
         loop {
             let length = usize::try_from(u32::from_be_bytes(
@@ -1162,12 +1167,7 @@ mod tests {
         }
     }
 
-    fn with_chunk_before(
-        png: &[u8],
-        before: &[u8; 4],
-        kind: &[u8; 4],
-        data: &[u8],
-    ) -> Vec<u8> {
+    fn with_chunk_before(png: &[u8], before: &[u8], kind: &[u8], data: &[u8]) -> Vec<u8> {
         let at = chunk_start(png, before);
         let chunk = png_chunk(kind, data);
         let mut joined = Vec::with_capacity(png.len() + chunk.len());
@@ -1177,9 +1177,9 @@ mod tests {
         joined
     }
 
-    fn with_post_idat_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let png = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
-            .expect("RGB PNG fixture");
+    fn with_post_idat_chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
+        let png =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])).expect("RGB PNG fixture");
         with_chunk_before(&png, b"IEND", kind, data)
     }
 
@@ -1245,12 +1245,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut bytes = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
-            .encode(
-                &rgba,
-                width,
-                height,
-                image::ExtendedColorType::Rgba8,
-            )
+            .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
             .expect("encode WebP fixture");
         bytes
     }
@@ -1298,9 +1293,7 @@ mod tests {
         let picture = Picture::from_pixels(
             2,
             2,
-            PicturePixels::Rgb8(vec![
-                255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,
-            ]),
+            PicturePixels::Rgb8(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]),
         )
         .expect("RGB source");
         let scaled = picture.scale_to_width(3).expect("scale");
@@ -1308,8 +1301,8 @@ mod tests {
         assert_eq!(
             scaled.pixels(),
             PicturePixelsRef::Rgb8(&[
-                255, 0, 0, 128, 128, 0, 0, 255, 0, 128, 0, 128, 128, 128, 128, 128, 255, 128,
-                0, 0, 255, 128, 128, 255, 255, 255, 255,
+                255, 0, 0, 128, 128, 0, 0, 255, 0, 128, 0, 128, 128, 128, 128, 128, 255, 128, 0, 0,
+                255, 128, 128, 255, 255, 255, 255,
             ])
         );
     }
@@ -1340,12 +1333,8 @@ mod tests {
 
     #[test]
     fn same_width_scaling_reuses_the_owned_pixel_allocation() {
-        let picture = Picture::from_pixels(
-            2,
-            1,
-            PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
-        )
-        .expect("RGB source");
+        let picture = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]))
+            .expect("RGB source");
         let before = match picture.pixels() {
             PicturePixelsRef::Rgb8(bytes) => bytes.as_ptr(),
             PicturePixelsRef::Gray8(_) => panic!("RGB source changed format"),
@@ -1396,10 +1385,7 @@ mod tests {
     #[test]
     fn consuming_scaler_rejects_zero_width_and_oversized_output() {
         let source = Picture::from_grey(1, 1, vec![0]).expect("source");
-        assert_eq!(
-            source.clone().scale_to_width(0),
-            Err(ImageError::EmptyBox)
-        );
+        assert_eq!(source.clone().scale_to_width(0), Err(ImageError::EmptyBox));
         let tall = Picture::from_grey(1, 7_000_000, vec![0; 7_000_000]).expect("tall source");
         assert!(matches!(
             tall.scale_to_width(2),
@@ -1413,8 +1399,7 @@ mod tests {
             std::mem::size_of::<AxisSample>() * AXIS_SAMPLE_CHUNK,
             24_576
         );
-        let picture =
-            Picture::from_grey(6_999_999, 1, vec![19; 6_999_999]).expect("thin source");
+        let picture = Picture::from_grey(6_999_999, 1, vec![19; 6_999_999]).expect("thin source");
         let scaled = picture.scale_to_width(7_000_000).expect("boundary scale");
         assert_eq!((scaled.width(), scaled.height()), (7_000_000, 1));
         assert_eq!(
@@ -1458,8 +1443,8 @@ mod tests {
 
     #[test]
     fn decode_png_accepts_generated_gray8_and_rgb8_artifacts() {
-        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[17, 231]))
-            .expect("generated Gray8 PNG");
+        let gray =
+            encode_png(2, 1, PicturePixelsRef::Gray8(&[17, 231])).expect("generated Gray8 PNG");
         let gray = decode_png(&gray).expect("decode generated Gray8 PNG");
         assert_eq!(gray.pixels(), PicturePixelsRef::Gray8(&[17, 231]));
 
@@ -1491,21 +1476,15 @@ mod tests {
 
     #[test]
     fn decode_png_accepts_bounded_text_before_and_after_image_data() {
-        let base = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
-            .expect("RGB PNG fixture");
+        let base =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])).expect("RGB PNG fixture");
         let before = with_chunk_before(&base, b"IDAT", b"tEXt", b"Note\0before");
         let before = decode_png(&before).expect("bounded pre-IDAT tEXt");
-        assert_eq!(
-            before.pixels(),
-            PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])
-        );
+        assert_eq!(before.pixels(), PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]));
 
         let after = with_post_idat_chunk(b"tEXt", b"Note\0after");
         let after = decode_png(&after).expect("bounded post-IDAT tEXt");
-        assert_eq!(
-            after.pixels(),
-            PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])
-        );
+        assert_eq!(after.pixels(), PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]));
     }
 
     #[test]
@@ -1553,15 +1532,14 @@ mod tests {
         let compressed = with_post_idat_chunk(b"zTXt", b"Note\0\0not-zlib");
         assert!(decode_png(&compressed).is_err());
 
-        let international =
-            with_post_idat_chunk(b"iTXt", b"Note\0\x01\0\0\0not-zlib");
+        let international = with_post_idat_chunk(b"iTXt", b"Note\0\x01\0\0\0not-zlib");
         assert!(decode_png(&international).is_err());
     }
 
     #[test]
     fn decode_png_refuses_malformed_icc_profiles() {
-        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
-            .expect("RGB PNG fixture");
+        let rgb =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])).expect("RGB PNG fixture");
         let png = with_chunk_before(&rgb, b"IDAT", b"iCCP", b"Profile\0\0not-zlib");
         assert!(decode_png(&png).is_err());
 
@@ -1573,13 +1551,12 @@ mod tests {
 
     #[test]
     fn decode_png_refuses_illegal_and_malformed_palettes() {
-        let gray =
-            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
         let illegal = with_chunk_before(&gray, b"IDAT", b"PLTE", &[1, 2, 3]);
         assert!(decode_png(&illegal).is_err());
 
-        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
-            .expect("RGB PNG fixture");
+        let rgb =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])).expect("RGB PNG fixture");
         let malformed = with_chunk_before(&rgb, b"IDAT", b"PLTE", &[1, 2]);
         assert!(decode_png(&malformed).is_err());
 
@@ -1589,23 +1566,20 @@ mod tests {
 
     #[test]
     fn decode_png_refuses_wrong_length_transparency() {
-        let gray =
-            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
         let malformed = with_chunk_before(&gray, b"IDAT", b"tRNS", &[1]);
         assert!(decode_png(&malformed).is_err());
     }
 
     #[test]
     fn decode_png_refuses_transparency_even_with_exact_payload_lengths() {
-        let gray =
-            encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
+        let gray = encode_png(2, 1, PicturePixelsRef::Gray8(&[1, 2])).expect("Gray8 PNG fixture");
         let gray_transparency = with_chunk_before(&gray, b"IDAT", b"tRNS", &[0, 1]);
         assert!(decode_png(&gray_transparency).is_err());
 
-        let rgb = encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6]))
-            .expect("RGB PNG fixture");
-        let rgb_transparency =
-            with_chunk_before(&rgb, b"IDAT", b"tRNS", &[0, 1, 0, 2, 0, 3]);
+        let rgb =
+            encode_png(2, 1, PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6])).expect("RGB PNG fixture");
+        let rgb_transparency = with_chunk_before(&rgb, b"IDAT", b"tRNS", &[0, 1, 0, 2, 0, 3]);
         assert!(decode_png(&rgb_transparency).is_err());
     }
 
@@ -1707,8 +1681,7 @@ mod tests {
             vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
         ))
         .expect("png");
-        let [red, green, blue] =
-            <[u8; 3]>::try_from(gray(&picture)).expect("three pixels");
+        let [red, green, blue] = <[u8; 3]>::try_from(gray(&picture)).expect("three pixels");
         assert!(green > red && red > blue, "{red} {green} {blue}");
     }
 
@@ -1812,8 +1785,7 @@ mod tests {
     #[test]
     fn borrowed_fit_paths_do_not_clone_source_ownership() {
         reset_picture_clone_count();
-        let cover =
-            Picture::from_grey(4, 2, vec![10, 20, 30, 40, 10, 20, 30, 40]).expect("cover");
+        let cover = Picture::from_grey(4, 2, vec![10, 20, 30, 40, 10, 20, 30, 40]).expect("cover");
         let fit = Picture::from_grey(4, 4, vec![91; 16]).expect("fit");
         let enlarging = Picture::from_grey(2, 2, vec![173; 4]).expect("enlarging");
 

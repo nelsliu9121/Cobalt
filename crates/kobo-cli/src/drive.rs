@@ -830,15 +830,15 @@ mod tests {
     const BODY: &str = r#"{"nodes":[{"kind":"Button","x":10,"y":20,"width":30,"height":40,"centre":{"x":25,"y":40},"action":77,"lines":["Search","for a \"book\""]},{"kind":"Divider","x":0,"y":1,"width":2,"height":3,"centre":{"x":1,"y":2},"action":null,"lines":[]}]}"#;
 
     fn high_entropy_rgb(width: u32, height: u32) -> Vec<u8> {
-        let length = usize::try_from(u64::from(width) * u64::from(height) * 3)
-            .expect("RGB fixture length");
+        let length =
+            usize::try_from(u64::from(width) * u64::from(height) * 3).expect("RGB fixture length");
         let mut state = 0x4d59_5df4_d0f3_3173_u64;
         (0..length)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                state as u8
+                state.to_le_bytes()[0]
             })
             .collect()
     }
@@ -913,12 +913,8 @@ mod tests {
 
     #[test]
     fn frame_validation_accepts_complete_gray8_and_rgb8_pngs() {
-        let gray = kobo_image::encode_png(
-            2,
-            1,
-            kobo_image::PicturePixelsRef::Gray8(&[10, 20]),
-        )
-        .expect("encode Gray8 PNG");
+        let gray = kobo_image::encode_png(2, 1, kobo_image::PicturePixelsRef::Gray8(&[10, 20]))
+            .expect("encode Gray8 PNG");
         let rgb = kobo_image::encode_png(
             2,
             1,
@@ -936,13 +932,13 @@ mod tests {
         const WIDTH: u32 = 1_072;
         const HEIGHT: u32 = 1_448;
         let pixels = high_entropy_rgb(WIDTH, HEIGHT);
-        let png = kobo_image::encode_png(
-            WIDTH,
-            HEIGHT,
-            kobo_image::PicturePixelsRef::Rgb8(&pixels),
-        )
-        .expect("encode high-entropy RGB panel PNG");
-        assert!(png.len() > 4 * 1024 * 1024, "fixture must cover the regression");
+        let png =
+            kobo_image::encode_png(WIDTH, HEIGHT, kobo_image::PicturePixelsRef::Rgb8(&pixels))
+                .expect("encode high-entropy RGB panel PNG");
+        assert!(
+            png.len() > 4 * 1024 * 1024,
+            "fixture must cover the regression"
+        );
         assert!(validate_frame_png(&png, WIDTH, HEIGHT).is_ok());
     }
 
@@ -956,23 +952,15 @@ mod tests {
                 .expect("bounded response fixture length"),
         );
         response.extend_from_slice(head);
-        response.resize(
-            head.len() + kobo_image::MAX_SOURCE_BYTES + 8,
-            0xa5,
-        );
+        response.resize(head.len() + kobo_image::MAX_SOURCE_BYTES + 8, 0xa5);
         let mut reader = Cursor::new(response);
 
-        let error = read_bounded_response(
-            &mut reader,
-            "/frame",
-            kobo_image::MAX_SOURCE_BYTES,
-        )
-        .expect_err("cap-plus-one frame response");
+        let error = read_bounded_response(&mut reader, "/frame", kobo_image::MAX_SOURCE_BYTES)
+            .expect_err("cap-plus-one frame response");
         assert!(error.contains("exceeds"));
         assert_eq!(
             reader.position(),
-            u64::try_from(head.len() + kobo_image::MAX_SOURCE_BYTES + 1)
-                .expect("fixture position"),
+            u64::try_from(head.len() + kobo_image::MAX_SOURCE_BYTES + 1).expect("fixture position"),
             "the reader must stop after the one overflow byte"
         );
     }

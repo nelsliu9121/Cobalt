@@ -57,6 +57,13 @@ impl Backend {
     /// Grayscale constants belong to each backend ABI. Color constants never
     /// come from this crate: they are accepted only from a verified HWTCON
     /// [`ColorPanel`] capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefreshError::ColorCapabilityMissing`] when a color intent
+    /// has no verified color capability, or
+    /// [`RefreshError::ColorBackendUnsupported`] when this backend cannot
+    /// perform color updates.
     pub fn waveform(
         self,
         intent: RefreshIntent,
@@ -77,15 +84,9 @@ impl Backend {
             flags: 0,
         };
         match (self, intent) {
-            (Self::Hwtcon, RefreshIntent::FastFeedback) => {
-                Ok(grayscale(hwtcon::WAVEFORM_DU))
-            }
-            (Self::Hwtcon, RefreshIntent::TextContent) => {
-                Ok(grayscale(hwtcon::WAVEFORM_GL16))
-            }
-            (Self::Hwtcon, RefreshIntent::QualityContent) => {
-                Ok(grayscale(hwtcon::WAVEFORM_GC16))
-            }
+            (Self::Hwtcon, RefreshIntent::FastFeedback) => Ok(grayscale(hwtcon::WAVEFORM_DU)),
+            (Self::Hwtcon, RefreshIntent::TextContent) => Ok(grayscale(hwtcon::WAVEFORM_GL16)),
+            (Self::Hwtcon, RefreshIntent::QualityContent) => Ok(grayscale(hwtcon::WAVEFORM_GC16)),
             (Self::Mxcfb, RefreshIntent::FastFeedback) => Ok(grayscale(mxcfb::WAVEFORM_DU)),
             (Self::Mxcfb, RefreshIntent::TextContent) => Ok(grayscale(mxcfb::WAVEFORM_GL16)),
             (Self::Mxcfb, RefreshIntent::QualityContent) => Ok(grayscale(mxcfb::WAVEFORM_GC16)),
@@ -218,6 +219,11 @@ impl RefreshPlan {
     }
 
     /// The waveform number `backend` uses for this plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan requests color without a verified color
+    /// capability or on a backend that cannot perform color updates.
     pub fn waveform(
         self,
         backend: Backend,
@@ -226,6 +232,12 @@ impl RefreshPlan {
         backend.waveform(self.intent, color)
     }
 
+    /// Lowers this plan to a `MediaTek` HWTCON update request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefreshError::ColorCapabilityMissing`] when the plan requests
+    /// color without a verified color capability.
     pub fn hwtcon_update_data(
         self,
         marker: u32,
@@ -257,6 +269,11 @@ impl RefreshPlan {
     /// every other consumer of this interface sends and the only value here
     /// that is not simply zero. Dithering is left off and the alternate buffer
     /// unused: updates come from the framebuffer itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RefreshError::ColorBackendUnsupported`] when the plan
+    /// requests a color update, which the i.MX6 EPDC cannot perform.
     pub fn mxcfb_update_data(
         self,
         marker: u32,
@@ -453,44 +470,26 @@ mod tests {
             width: 32,
             height: 48,
         };
-        let grayscale = RefreshPlan::new(
-            region,
-            RefreshIntent::TextContent,
-            false,
-            1264,
-            1680,
-        )
-        .expect("grayscale region")
-        .hwtcon_update_data(0x4000_0000, Some(COLOR_PANEL))
-        .expect("grayscale update");
+        let grayscale = RefreshPlan::new(region, RefreshIntent::TextContent, false, 1264, 1680)
+            .expect("grayscale region")
+            .hwtcon_update_data(0x4000_0000, Some(COLOR_PANEL))
+            .expect("grayscale update");
         assert_eq!(grayscale.waveform_mode, hwtcon::WAVEFORM_GL16);
         assert_eq!(grayscale.update_mode, hwtcon::UPDATE_MODE_PARTIAL);
         assert_eq!(grayscale.flags, 0);
 
-        let regal = RefreshPlan::new(
-            region,
-            RefreshIntent::ColorContent,
-            true,
-            1264,
-            1680,
-        )
-        .expect("color region")
-        .hwtcon_update_data(0x4000_0001, Some(COLOR_PANEL))
-        .expect("verified color update");
+        let regal = RefreshPlan::new(region, RefreshIntent::ColorContent, true, 1264, 1680)
+            .expect("color region")
+            .hwtcon_update_data(0x4000_0001, Some(COLOR_PANEL))
+            .expect("verified color update");
         assert_eq!(regal.waveform_mode, COLOR_PANEL.regal_waveform);
         assert_eq!(regal.update_mode, hwtcon::UPDATE_MODE_PARTIAL);
         assert_eq!(regal.flags, COLOR_PANEL.cfa_flags);
 
-        let clean = RefreshPlan::new(
-            region,
-            RefreshIntent::ColorQuality,
-            false,
-            1264,
-            1680,
-        )
-        .expect("color region")
-        .hwtcon_update_data(0x4000_0002, Some(COLOR_PANEL))
-        .expect("verified color clean");
+        let clean = RefreshPlan::new(region, RefreshIntent::ColorQuality, false, 1264, 1680)
+            .expect("color region")
+            .hwtcon_update_data(0x4000_0002, Some(COLOR_PANEL))
+            .expect("verified color clean");
         assert_eq!(clean.waveform_mode, COLOR_PANEL.clean_waveform);
         assert_eq!(clean.update_mode, hwtcon::UPDATE_MODE_FULL);
         assert_eq!(clean.flags, COLOR_PANEL.cfa_flags);

@@ -678,12 +678,7 @@ impl BookView {
                 let (drawn_width, drawn_height) = (picture.width(), picture.height());
                 if let Some(reserved) = self.handed(&name) {
                     if context
-                        .put_picture(
-                            reserved,
-                            drawn_width,
-                            drawn_height,
-                            picture.into_pixels(),
-                        )
+                        .put_picture(reserved, drawn_width, drawn_height, picture.into_pixels())
                         .is_some()
                         && showing.contains(&name)
                     {

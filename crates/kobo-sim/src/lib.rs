@@ -198,11 +198,7 @@ impl PanelPreview {
     }
 
     fn rgba_frame(&self, ideal: bool) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(
-            self.width
-                .saturating_mul(self.height)
-                .saturating_mul(4),
-        );
+        let mut rgba = Vec::with_capacity(self.width.saturating_mul(self.height).saturating_mul(4));
         match self.frame(ideal) {
             PicturePixelsRef::Gray8(gray) => {
                 for tone in gray {
@@ -373,8 +369,7 @@ impl Simulator {
     fn update_panel(&mut self) {
         let metrics = profile_metrics();
         let format = kobo_ui::surface_format_for(&self.screen, &metrics, &());
-        let mut surface =
-            Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
+        let mut surface = Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
         kobo_ui::render_with(
             &self.screen,
             &metrics,
@@ -898,7 +893,6 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
     }
 }
 
-
 fn picture_result(
     handle: kobo_ui::PictureHandle,
     result: Option<Vec<kobo_ui::PictureHandle>>,
@@ -1174,8 +1168,7 @@ impl AppState {
 
 fn render_app_panel(state: &mut AppState) {
     let metrics = profile_metrics();
-    let format =
-        kobo_ui::surface_format_for(&state.screen, &metrics, state.active_pictures());
+    let format = kobo_ui::surface_format_for(&state.screen, &metrics, state.active_pictures());
     let mut surface = Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
     kobo_ui::render_all(
         &state.screen,
@@ -1237,7 +1230,6 @@ impl AppSession {
         state.logs.push(format!("lifecycle: {lifecycle:?}"));
         Ok(())
     }
-
 
     fn render_png(&self, ideal: bool) -> Result<Vec<u8>, String> {
         let mut state = self
@@ -3090,12 +3082,8 @@ mod tests {
     #[test]
     fn color_buffers_convert_gray8_and_rgb8_to_exact_rgba() {
         let mut gray_panel = PanelPreview::new(2, 1);
-        let gray = Surface::from_pixels(
-            2,
-            1,
-            kobo_ui::PicturePixels::Gray8(vec![0x20, 0x80]),
-        )
-        .expect("valid Gray8 surface");
+        let gray = Surface::from_pixels(2, 1, kobo_ui::PicturePixels::Gray8(vec![0x20, 0x80]))
+            .expect("valid Gray8 surface");
         gray_panel.update(&gray);
         assert_eq!(
             gray_panel.frame(true),
@@ -3146,13 +3134,10 @@ mod tests {
             panel.last.expect("first transition").waveform,
             PanelWaveform::Gcc16
         );
-        assert!(simulation_json(
-            &panel,
-            Scenario::Normal,
-            Lifecycle::Foreground,
-            None
-        )
-        .contains("\"waveform\":\"GCC16\""));
+        assert!(
+            simulation_json(&panel, Scenario::Normal, Lifecycle::Foreground, None)
+                .contains("\"waveform\":\"GCC16\"")
+        );
 
         let second = Surface::from_pixels(
             2,
@@ -3170,13 +3155,10 @@ mod tests {
             PicturePixelsRef::Rgb8(&[28, 20, 11, 40, 50, 60]),
             "ghosting was not applied independently per channel"
         );
-        assert!(simulation_json(
-            &panel,
-            Scenario::Normal,
-            Lifecycle::Foreground,
-            None
-        )
-        .contains("\"waveform\":\"GLRC16\""));
+        assert!(
+            simulation_json(&panel, Scenario::Normal, Lifecycle::Foreground, None)
+                .contains("\"waveform\":\"GLRC16\"")
+        );
 
         panel.update(&second);
         assert!(panel.last.is_none(), "an equal RGB frame refreshed");

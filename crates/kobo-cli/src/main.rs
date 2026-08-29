@@ -3899,8 +3899,8 @@ fn run_simulation(arguments: &[String]) -> Result<(), String> {
             "simulation failed: app={app_status}, daemon={daemon_status}"
         ));
     }
-    let frame = fs::read(&simulation.frame)
-        .map_err(|error| format!("read rendered frame: {error}"))?;
+    let frame =
+        fs::read(&simulation.frame).map_err(|error| format!("read rendered frame: {error}"))?;
     let decoded = kobo_image::decode_png(&frame)
         .map_err(|error| format!("validate rendered frame: {error}"))?;
     if (decoded.width(), decoded.height()) != drive::SIMULATED_PANEL {
@@ -4414,12 +4414,8 @@ fn shot_command(arguments: &[String]) -> Result<(), String> {
     let (width, height, png) = if let Some(host) = host {
         let transcript = capture_remote_fixed_artifact(&host, &RemoteArtifact::capture())?;
         let (width, height, gray) = drive::decode_capture(&transcript)?;
-        let png = kobo_image::encode_png(
-            width,
-            height,
-            kobo_image::PicturePixelsRef::Gray8(&gray),
-        )
-        .map_err(|error| format!("encode the panel: {error}"))?;
+        let png = kobo_image::encode_png(width, height, kobo_image::PicturePixelsRef::Gray8(&gray))
+            .map_err(|error| format!("encode the panel: {error}"))?;
         (width, height, png)
     } else {
         let driver = drive::Driver::new(&address, Path::new(".")).ideal(ideal);
@@ -4576,9 +4572,7 @@ fn decode_recording(raw: &[u8]) -> Result<(u32, u32, Vec<RecordedFrame>), String
         let millis = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
         frames.push(RecordedFrame {
             millis,
-            pixels: kobo_image::PicturePixels::Gray8(
-                raw[at + 4..at + 4 + pixels].to_vec(),
-            ),
+            pixels: kobo_image::PicturePixels::Gray8(raw[at + 4..at + 4 + pixels].to_vec()),
         });
         at += 4 + pixels;
     }
@@ -5564,10 +5558,7 @@ mod tests {
         let ramp: Vec<u8> = (0..=255_u8).step_by(1).take(256).collect();
         raw.extend_from_slice(&ramp);
         let (_, _, frames) = super::decode_recording(&raw).expect("decode");
-        assert_eq!(
-            frames[0].pixels,
-            kobo_image::PicturePixels::Gray8(ramp)
-        );
+        assert_eq!(frames[0].pixels, kobo_image::PicturePixels::Gray8(ramp));
     }
 
     #[test]

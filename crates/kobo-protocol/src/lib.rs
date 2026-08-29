@@ -2127,6 +2127,27 @@ fn encoded_task_len(work: &Task) -> Result<usize, ProtocolError> {
     Ok(length)
 }
 
+fn inline_picture_len(
+    width: u32,
+    height: u32,
+    pixels: &PicturePixels,
+) -> Result<usize, ProtocolError> {
+    // The declared size and the bytes must agree before anything is allocated
+    // on the strength of either, or a decoder reading by dimension would run
+    // off the end of a short payload.
+    let expected = pixels
+        .format()
+        .byte_len(width, height)
+        .ok_or(ProtocolError::FrameTooLarge)?;
+    if expected != pixels.byte_count() {
+        return Err(ProtocolError::InvalidValue("picture size"));
+    }
+    if expected > MAX_INLINE_PICTURE_BYTES {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    Ok(13 + expected)
+}
+
 fn encoded_message_layout(message: &Message) -> Result<(u8, usize), ProtocolError> {
     match message {
         Message::Hello { name } => Ok((1, encoded_string_len(name)?)),
@@ -2182,22 +2203,7 @@ fn encoded_message_layout(message: &Message) -> Result<(u8, usize), ProtocolErro
             height,
             pixels,
             ..
-        } => {
-            // The declared size and the bytes must agree before anything is
-            // allocated on the strength of either, or a decoder reading by
-            // dimension would run off the end of a short payload.
-            let expected = pixels
-                .format()
-                .byte_len(*width, *height)
-                .ok_or(ProtocolError::FrameTooLarge)?;
-            if expected != pixels.byte_count() {
-                return Err(ProtocolError::InvalidValue("picture size"));
-            }
-            if expected > MAX_INLINE_PICTURE_BYTES {
-                return Err(ProtocolError::FrameTooLarge);
-            }
-            Ok((18, 13 + expected))
-        }
+        } => Ok((18, inline_picture_len(*width, *height, pixels)?)),
         Message::DropPicture { .. } => Ok((19, 4)),
         Message::BeginPicture {
             width,
@@ -8567,7 +8573,10 @@ mod picture_tests {
                 pixels: PicturePixels::Gray8(vec![0, 32, 64, 96, 128, 160]),
             },
         };
-        assert_eq!(decode(&encode(&frame).expect("encode")).expect("decode"), frame);
+        assert_eq!(
+            decode(&encode(&frame).expect("encode")).expect("decode"),
+            frame
+        );
     }
 
     #[test]
@@ -8581,7 +8590,10 @@ mod picture_tests {
                 pixels: PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
             },
         };
-        assert_eq!(decode(&encode(&frame).expect("encode")).expect("decode"), frame);
+        assert_eq!(
+            decode(&encode(&frame).expect("encode")).expect("decode"),
+            frame
+        );
     }
 
     #[test]
@@ -8661,7 +8673,11 @@ mod picture_tests {
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
         bytes.push(kind);
-        bytes.extend_from_slice(&u32::try_from(payload_len).expect("payload fits").to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(payload_len)
+                .expect("payload fits")
+                .to_be_bytes(),
+        );
         bytes.extend_from_slice(&1_u32.to_be_bytes());
         bytes.extend_from_slice(&4_u32.to_be_bytes());
         bytes.extend_from_slice(&width.to_be_bytes());
@@ -8678,10 +8694,7 @@ mod picture_tests {
             (&[1, 2, 3, 4, 5, 6, 7][..], ProtocolError::LengthMismatch),
         ] {
             let mut reader = Reader::new(body);
-            assert_eq!(
-                take_exact_picture_body(&mut reader, 6),
-                Err(error.clone())
-            );
+            assert_eq!(take_exact_picture_body(&mut reader, 6), Err(error.clone()));
             assert_eq!(decode(&raw_picture_frame(18, 2, 1, 1, body)), Err(error));
         }
     }

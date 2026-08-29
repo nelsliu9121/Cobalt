@@ -6,9 +6,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use kobo_read::{Memory, Reader};
-use kobo_ui::{
-    Chrome, DisplayMetrics, PictureCache, PictureFormat, PictureHandle, Surface,
-};
+use kobo_ui::{Chrome, DisplayMetrics, PictureCache, PictureFormat, PictureHandle, Surface};
 
 fn main() {
     let mut args = std::env::args().skip(1);
