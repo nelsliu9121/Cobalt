@@ -2,7 +2,7 @@
 
 ## Status
 
-Design sections approved. Written specification awaits final approval; implementation has not started.
+Approved design, including the bounded-scaler memory revision. Implementation has not started.
 
 ## Goal
 
@@ -29,6 +29,7 @@ Loading is also serialized around source boundaries. `turn_reader` drops the sca
 - Maintain a sliding lookahead of at most three rendered pages.
 - Keep forward page turns inside the prepared window free of network requests, decoding, scaling, dithering, and loading screens.
 - Bound decoded-source, rendered-page, compressed-response, runtime-picture, and task state independently of episode length.
+- Accept only WebP source bodies and keep modeled BOMTOON live allocations at or below 96 MiB.
 - Preserve exact manifest-dimension validation, signed URL refresh, retry, Back, stale-outcome, picture-handle ordering, and reader-chrome behavior.
 - Continue to reject scrambled episodes and unsupported image dimensions.
 
@@ -74,7 +75,9 @@ An image seam exactly on a global page boundary produces no mixed page: one page
 
 The manifest request uses the current reader panel width as `imageWidth` instead of the fixed value `1080`. The width is converted and validated before the request is built. Existing content and episode alias validation, bearer credential, response ceiling, Balcony headers, and exact viewer referer remain unchanged.
 
-The response remains authoritative. Planning uses the dimensions returned by the manifest, and decoded dimensions must equal those values. If BOMTOON returns the requested panel width, the decoded grayscale picture becomes a source directly and no full-source resize or same-size clone occurs. If the returned width differs, the app retains the existing checked width scaling as a compatibility fallback.
+The response remains authoritative. Planning uses the dimensions returned by the manifest, and decoded dimensions must equal those values. BOMTOON has been observed to ignore `imageWidth` and return 1080-pixel-wide sources, so width mismatch is the normal compatibility path rather than a reason to fail.
+
+`kobo_image::decode_webp` rejects a non-WebP body before generic image decoding. `Picture::scale_to_width` consumes the decoded grayscale picture. A same-width source returns unchanged with its allocation intact. A different width uses direct fixed-point bilinear resampling into the final grayscale target whose dimensions come from `width_scaled_size`; it allocates no full-source clone, floating-point image, or full-sized intermediate.
 
 Requesting panel-width assets is an optimization, not a validation shortcut. A server response with different declared and decoded dimensions still fails closed.
 
@@ -82,7 +85,7 @@ Requesting panel-width assets is an optimization, not a validation shortcut. A s
 
 A rendered page is a panel-width, panel-height grayscale `Picture`. Rendering starts with a white buffer and copies every planned segment into its destination rows. The app does not dither source images in advance. It dithers the assembled page once after all segments have been copied, so error diffusion crosses an image seam naturally and no segment boundary receives separate quantization treatment.
 
-Prepared lookahead pages remain application-side grayscale pictures. They are not uploaded under runtime handles until selected. A page turn therefore uploads exactly one new picture, installs the new screen, then drops the previous handle in the existing safe order. The runtime holds only the displayed reader picture.
+Prepared lookahead pages remain application-side grayscale pictures. They are not uploaded under runtime handles until selected. A page turn therefore uploads exactly one new picture, installs the new screen, then drops the previous handle in the existing safe order. At steady state the runtime holds only the displayed reader picture; during atomic replacement the old held picture and one bounded pending/new picture may coexist with bounded upload-chunk and protocol copies.
 
 The page cache contains at most three entries after the current page. Entries are consecutive global page numbers. Navigating Next consumes the first cached page and starts replenishment at the far end. Navigating Previous may rerender from retained source data; it does not grow a second backward cache.
 
@@ -90,18 +93,25 @@ The page cache contains at most three entries after the current page. Entries ar
 
 Rendering a page may require one or more manifest sources. Source bodies are fetched independently, decoded, dimension-checked, and scaled only when necessary. A source is retained only while it is needed to finish the current page or one of the three planned lookahead pages.
 
-The implementation enforces these independent bounds:
+The implementation enforces these bounds:
 
-- one uploaded runtime picture handle for the displayed page
+- one uploaded runtime picture handle for the displayed page at steady state
+- one old held picture plus one pending/new full page during atomic replacement
 - three application-side lookahead page buffers, whether complete or in progress
-- at most two decoded or panel-width-scaled source pictures at once
+- two combined source slots, each either an active image fetch or one decoded/panel-width-scaled source picture
 - at most two image fetches at once
-- one transient compressed response per completed task callback
-- the existing SDK-wide maximum of four tasks in flight
+- at most two reader image outcomes queued in the runtime, within the existing SDK-wide maximum of four tasks
+- one completed response body in an application callback, with separately bounded runtime queue, outcome/payload/frame, application frame/outcome, socket, and upload-chunk copies
 
 If a page spans more sources than the decoded-source bound, the renderer copies a completed source's segments into the page buffer and releases that source before decoding the next. Episode length and manifest image count therefore do not multiply decoded-image memory.
 
 A source can contribute to several page buffers before eviction. The source cache is derived from page-plan references rather than managed by an unbounded general-purpose cache. No new caching dependency is introduced.
+
+The conservative cross-profile app model uses `M = 7,000,000` decoded pixels, `C = 4,194,304` compressed bytes, and the Elipsa three-page total `3P = 7,884,864` bytes. An oriented 8-bit WebP decode may transiently hold two RGBA images, luma-alpha, and gray (`11M`); with the callback body and one older cached gray source, `11M + C + M + 3P = 96,079,168` bytes (91.63 MiB). The bounded scaler's source, final target, older cached source, three pages, callback body, and width metadata are lower. Allocator arenas, stacks, libraries, and other unmodeled process memory are covered by the separate on-device high-water gate.
+The repository supports the exact profiles in `kobo_profile::SUPPORTED_PROFILES`. An upstream Clara HD device tree maps 512 MiB, but installed RAM across the fleet, post-reservation Linux `MemTotal`, and per-app allowance remain unproven. The memory release gates are therefore policy, not a claim that an app owns device RAM: modeled BOMTOON live allocations must stay at or below 96 MiB, on-device BOMTOON `VmHWM` must stay at or below 128 MiB, and system `MemAvailable` must not fall below 128 MiB during the worst reader scenario.
+
+The same-width WebP path, not lookahead pages, dominates ordinary peak memory. The former Lanczos compatibility fallback is forbidden because `image` creates a full `Rgba32F` scaling intermediate; a valid near-panel-width source can exceed the modeled allocation budget before runtime and allocator overhead.
+The evidence, buffer accounting, and measurement procedure behind these limits are recorded in `docs/research/2026-08-29-kobo-memory-limits.md`.
 
 ## First paint and lookahead scheduling
 
@@ -168,9 +178,12 @@ Account clearing and application exit release the same state. The runtime's exis
 
 - Segment copying preserves every source row exactly once before dithering.
 - Dithering runs on the assembled page, including across a source seam.
-- Panel-width decoded sources avoid full-source scaling.
-- A mismatched but valid source width uses the checked scaling fallback.
-- A decoded dimension mismatch is rejected before any segment copy.
+- WebP source bodies are validated before decode.
+- A same-width decoded source keeps its original grayscale allocation.
+- Fixed-point bilinear scaling produces exact pinned pixels for a small matrix and preserves a constant image.
+- Scaling to Clara, Libra, and Elipsa panel widths agrees with `width_scaled_size`.
+- A mismatched valid source width allocates only the source grayscale buffer, final target buffer, and width-bounded axis metadata.
+- A decoded dimension mismatch is rejected before scaling or segment copy.
 
 ### Loading and caching
 
@@ -181,6 +194,14 @@ Account clearing and application exit release the same state. The runtime's exis
 - Consuming a page queues replenishment for exactly the new far-edge page.
 - Very short sources render through the two-source bound by copying and evicting sequentially.
 - Previous rerenders correctly without creating an unbounded backward cache.
+
+### Memory and delivery
+
+- Source-cache plus active-fetch slots never exceed two.
+- Two simultaneous maximum image completions stay within the response queue and protocol-copy accounting.
+- Page replacement permits one old runtime picture and one pending/new picture only until the new screen is selected.
+- The bounded bilinear path stays below the 96 MiB modeled app-allocation gate.
+- On-device high-water and available-memory measurements satisfy the release gates on the lowest-`MemTotal` supported profile.
 
 ### Failure and lifecycle
 
@@ -211,6 +232,8 @@ Browser simulator:
 
 Repeat the same reading path in the runtime simulator. Capture timing for episode selection to first `SetScreen`, and for prepared Next action to its `SetScreen`, before and after the change. These timings are diagnostic evidence, not brittle test thresholds.
 
+On the lowest-`MemTotal` available supported device, capture `/proc/meminfo` and BOMTOON/kobod `/proc/<pid>/status` at reader open, two fetches in flight, two completions queued, decode, 1080-to-panel scaling, three pages ready, pending upload, new-picture commit, and old-handle drop. Exercise near-seven-million-pixel WebP sources and simultaneous maximum compressed responses. Release requires BOMTOON `VmHWM <= 128 MiB`, system `MemAvailable >= 128 MiB`, no swap growth, and no allocation failure or OOM.
+
 ## Focused verification commands
 
 ```sh
@@ -229,5 +252,6 @@ Implementation should remain focused in:
 
 - `apps/bomtoon/src/api.rs`
 - `apps/bomtoon/src/main.rs`
+- `crates/kobo-image/src/lib.rs`
 
-`crates/kobo-image/src/lib.rs` changes only if implementation proves a reusable checked row-copy or no-clone scaling operation is required. Tests remain beside affected Rust code. No new dependency, fixture asset, protocol type, SDK API, or UI layout change is planned.
+Tests remain beside affected Rust code. No new dependency, fixture asset, protocol type, SDK API, or UI layout change is planned.

@@ -4,7 +4,7 @@
 
 **Goal:** Render plain BOMTOON episodes as discrete screen-sized pages over one logical continuous vertical image strip, with first-page priority and a bounded three-page forward lookahead.
 
-**Architecture:** Manifest metadata produces global page plans whose segments may cross source-image seams. `Bomtoon` owns a generation-scoped reader task registry, up to three application-side page builds, up to two decoded sources, and up to two image fetches; only the selected page is uploaded to the runtime. Existing non-reader requests keep their single foreground `task`/`pending` flow.
+**Architecture:** Manifest metadata produces global page plans whose segments may cross source-image seams. `kobo-image` validates WebP and consumes grayscale pictures through a direct fixed-point bilinear scaler whose live image storage is only source plus final target. `Bomtoon` owns a generation-scoped reader task registry, up to three application-side page builds, two combined decoded-or-fetching source slots, and up to two image fetches; only the selected page is uploaded to the runtime. Existing non-reader requests keep their single foreground `task`/`pending` flow.
 
 **Tech Stack:** Rust 2021, `kobo-sdk` task/runtime APIs, `kobo-image::Picture`, in-module Rust unit tests, `AppRunner` command assertions, browser simulator, runtime simulator.
 
@@ -12,12 +12,13 @@
 
 - The reader remains discretely paginated through the existing Previous/Next tap interactions; no scrolling, scroll offset, or scroll gesture is added.
 - Display page 1 before preparing pages 2 through 4.
-- Keep no more than three application-side page buffers, two decoded or panel-width-scaled sources, two image fetches, one uploaded runtime reader picture, and four SDK tasks in flight.
+- Keep no more than three application-side page buffers, two combined decoded-or-fetching source slots, two image fetches, one uploaded runtime reader picture at steady state, and four SDK tasks in flight.
+- Accept only WebP reader bodies, keep modeled BOMTOON live allocations at or below 96 MiB, and require on-device `VmHWM <= 128 MiB` with system `MemAvailable >= 128 MiB` in the worst reader scenario.
 - Keep signed URL validation, exact declared/decoded dimension checks, bearer-account transitions, retry, Back, reader chrome, and `PutPicture` → `SetScreen` → `DropPicture` ordering.
 - Refresh signed URLs only when image count, order, dimensions, and validated paths are unchanged; each source may use at most one manifest refresh retry.
 - Reject scrambled episodes, unsupported dimensions, cumulative-height overflow, page-count overflow, and stale task outcomes.
 - Do not add a dependency, persisted image cache, fixture asset, protocol type, SDK API, or UI layout.
-- Keep implementation in `apps/bomtoon/src/api.rs` and `apps/bomtoon/src/main.rs`; use `Picture::grey()` for checked row copies and move same-width decoded pictures directly, so `crates/kobo-image/src/lib.rs` does not need modification.
+- Keep implementation in `apps/bomtoon/src/api.rs`, `apps/bomtoon/src/main.rs`, and `crates/kobo-image/src/lib.rs`; use `Picture::grey()` for checked row copies, validate WebP before decode, and use a consuming fixed-point bilinear width scaler.
 
 ---
 
@@ -70,7 +71,7 @@ pub fn images(content: &str, episode: &str, panel_width: u32) -> Task {
 }
 ```
 
-At both initial-manifest and refresh call sites, convert `context.metrics().width` with `u32::try_from`, reject zero, and only then call `api::images`. Initial conversion failure uses `Retry::Manifest`; refresh conversion failure keeps the existing `Retry::Image(target)` until Task 3 replaces source/slice retries with global-page retries.
+At both initial-manifest and refresh call sites, convert `context.metrics().width` with `u32::try_from`, reject zero, and only then call `api::images`. Initial conversion failure uses `Retry::Manifest`; refresh conversion failure keeps the existing `Retry::Image(target)` until Task 4 replaces source/slice retries with global-page retries.
 
 - [ ] **Step 4: Add a runner assertion for the Clara panel width**
 
@@ -97,7 +98,154 @@ git commit -m "perf(bomtoon): request panel-width images"
 
 ---
 
-### Task 2: Plan and Assemble Continuous Global Pages
+### Task 2: Bound WebP Decode and Width Scaling
+
+**Files:**
+- Modify: `crates/kobo-image/src/lib.rs:92-208,537-587,589-969`
+- Modify: `apps/bomtoon/src/main.rs:602-638`
+- Test: `crates/kobo-image/src/lib.rs`
+- Test: `apps/bomtoon/src/main.rs`
+
+**Interfaces:**
+- Consumes: compressed BOMTOON image bytes, decoded grayscale ownership, and `width_scaled_size`.
+- Produces: WebP-only decode and one consuming bounded scaler:
+
+```rust
+pub fn decode_webp(bytes: &[u8]) -> Result<Picture, ImageError>;
+
+pub fn scale_to_width(self, target_width: u32) -> Result<Self, ImageError>;
+```
+
+`ImageError` gains `UnexpectedFormat { expected: &'static str }`. The existing generic `decode` remains available to other callers.
+
+- [ ] **Step 1: Add WebP and allocation-shape tests**
+
+Add these contracts before changing implementation:
+
+```rust
+#[test]
+fn webp_only_decode_rejects_a_png() {
+    let png = encode_png_grey(1, 1, &[127]).expect("png");
+    assert!(matches!(
+        decode_webp(&png),
+        Err(ImageError::UnexpectedFormat { expected: "WebP" })
+    ));
+}
+
+#[test]
+fn same_width_scaling_reuses_the_grey_allocation() {
+    let source = Picture::from_grey(2, 2, vec![0, 64, 128, 255]).expect("source");
+    let pointer = source.grey().as_ptr();
+    let scaled = source.scale_to_width(2).expect("same width");
+    assert_eq!(scaled.grey().as_ptr(), pointer);
+}
+
+#[test]
+fn fixed_point_bilinear_pixels_are_pinned() {
+    let source = Picture::from_grey(2, 2, vec![0, 64, 128, 255]).expect("source");
+    let scaled = source.scale_to_width(3).expect("scale");
+    assert_eq!(
+        scaled.grey(),
+        &[0, 32, 64, 64, 112, 160, 128, 192, 255]
+    );
+}
+```
+
+Also update the existing real-lossy-WebP test to call `decode_webp`. Add tests that a constant picture remains constant when enlarged and reduced, target height matches `width_scaled_size`, zero width fails with `EmptyBox`, a target above `MAX_PIXELS` fails before allocation, and 1080-pixel sources scale to widths 1072, 1264, and 1404.
+
+- [ ] **Step 2: Run the new image tests and verify they fail**
+
+Run: `cargo test -p kobo-image webp_only_decode`
+
+Run: `cargo test -p kobo-image fixed_point_bilinear`
+
+Expected: compilation fails because `decode_webp`, the consuming scaler, and the format error do not exist.
+
+- [ ] **Step 3: Add WebP-only decoding behind the existing decode module**
+
+Refactor `decode` through one private implementation that accepts an optional expected `image::ImageFormat`. After `with_guessed_format`, require `ImageFormat::WebP` for `decode_webp` before reading dimensions or creating the decoder. Keep `MAX_SOURCE_BYTES`, `MAX_PIXELS`, orientation, luma/alpha conversion, white-paper compositing, and generic `decode` behavior unchanged.
+
+```rust
+pub fn decode(bytes: &[u8]) -> Result<Picture, ImageError> {
+    decode_format(bytes, None)
+}
+
+pub fn decode_webp(bytes: &[u8]) -> Result<Picture, ImageError> {
+    decode_format(bytes, Some((image::ImageFormat::WebP, "WebP")))
+}
+```
+
+Add the new error's `Display` arm:
+
+```rust
+Self::UnexpectedFormat { expected } => {
+    write!(formatter, "this picture is not in the required {expected} format")
+}
+```
+
+- [ ] **Step 4: Replace Lanczos width scaling with consuming fixed-point bilinear**
+
+Change `scale_to_width` from `&self` to `self`. Call `width_scaled_size` first. If target dimensions equal the source dimensions, return `Ok(self)`.
+
+For a mismatch, allocate only the checked final `Vec<u8>`. Precompute one horizontal axis entry per target column:
+
+```rust
+#[derive(Clone, Copy)]
+struct AxisSample {
+    low: u32,
+    high: u32,
+    upper_weight: u32,
+    denominator: u32,
+}
+```
+
+Map endpoints exactly with:
+
+```rust
+let denominator = target_len.saturating_sub(1);
+let numerator = u64::from(target_index) * u64::from(source_len.saturating_sub(1));
+let low = u32::try_from(numerator / u64::from(denominator)).expect("axis is bounded");
+let upper_weight =
+    u32::try_from(numerator % u64::from(denominator)).expect("weight is bounded");
+let high = low.saturating_add(1).min(source_len - 1);
+```
+Special-case `source_len == 1 || target_len == 1` as `{ low: 0, high: 0, upper_weight: 0, denominator: 1 }`. Compute one vertical sample per output row. For each pixel, multiply the four neighboring grayscale bytes by the exact lower/upper horizontal and vertical integer weights, sum in checked `u64`, divide once by the denominator product, and round to nearest. `MAX_PIXELS` bounds that product. Store directly into the final output; do not call `image::imageops::resize`, construct `GrayImage`, allocate `Rgba32FImage`, or allocate a full-sized intermediate.
+
+- [ ] **Step 5: Update BOMTOON to use the deep image interface**
+
+Replace generic decode and the borrowed scaler with:
+
+```rust
+let decoded = kobo_image::decode_webp(bytes).map_err(|error| error.to_string())?;
+if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
+    return Err("BOMTOON returned different comic image dimensions.".to_owned());
+}
+let mut scaled = decoded
+    .scale_to_width(panel_width)
+    .map_err(|error| error.to_string())?;
+scaled.dither(PANEL_GREYS);
+```
+
+Keep dithering here until Task 4 moves it to the assembled global page.
+
+- [ ] **Step 6: Run image and BOMTOON scaling contracts**
+
+Run: `cargo test -p kobo-image`
+
+Run: `cargo test -p kobo-bomtoon image`
+
+Expected: WebP is enforced, exact bilinear pixels pass, same-width allocation is reused, and current reader behavior remains passing.
+
+- [ ] **Step 7: Commit the bounded image path**
+
+```bash
+git add crates/kobo-image/src/lib.rs apps/bomtoon/src/main.rs
+git commit -m "fix(bomtoon): bound source image scaling"
+```
+
+---
+
+### Task 3: Plan and Assemble Continuous Global Pages
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs:61-65,1051-1155,1197-1697`
@@ -241,14 +389,14 @@ git commit -m "feat(bomtoon): plan continuous reader pages"
 
 ---
 
-### Task 3: Install Page 1 Through a Reader Task Registry
+### Task 4: Install Page 1 Through a Reader Task Registry
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs:42-128,141-157,350-374,376-640,702-829,936-1049,1197-1815`
 - Test: `apps/bomtoon/src/main.rs`
 
 **Interfaces:**
-- Consumes: Task 2's `Vec<PagePlan>`, `PageBuild`, copying, and finishing functions.
+- Consumes: Task 3's `Vec<PagePlan>`, `PageBuild`, copying, and finishing functions.
 - Produces: generation-scoped reader task dispatch, a zero-based global reader page, and foreground page rendering.
 
 ```rust
@@ -299,9 +447,9 @@ Update reader fixtures to seed `ReaderState::page` instead of `PageLocation`. Ad
 - page chrome reports `(1, total_pages)`;
 - an upload refusal selects `Retry::Page(0)` and preserves the reader selection;
 - a foreground source callback with declared/decoded dimension mismatch never issues `PutPicture`;
-- a decoded source already at `panel_width` is moved directly, while a different valid width follows the checked `scale_to_width` fallback.
+- decoded source dimensions are validated before the consuming bounded scaler runs.
 
-Generate small deterministic PNG bodies with `kobo_image::encode_png_grey` inside tests; no fixture file is added.
+Use the existing in-module `TINY_WEBP` for successful source callbacks and `encode_png_grey` only to prove the WebP-only callback fails closed. Feed `Picture::from_grey` values directly to pure planning/copying helpers when exact multi-row pixels are required; no fixture file is added.
 
 - [ ] **Step 2: Run the first-page tests and verify they fail**
 
@@ -330,17 +478,13 @@ On success, insert `ReaderTaskEntry { generation: self.reader_generation, purpos
 `accept_manifest` must parse, plan, store the panel dimensions and generation, create one `PageBuild` for page 0, and request its first segment's source. The source callback must remove its task entry first, then:
 
 ```rust
-let decoded = kobo_image::decode(bytes).map_err(|error| error.to_string())?;
+let decoded = kobo_image::decode_webp(bytes).map_err(|error| error.to_string())?;
 if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
     return Err("BOMTOON returned different comic image dimensions.".to_owned());
 }
-let source = if decoded.width() == reader.panel_width {
-    decoded
-} else {
-    decoded
-        .scale_to_width(reader.panel_width)
-        .map_err(|error| error.to_string())?
-};
+let source = decoded
+    .scale_to_width(reader.panel_width)
+    .map_err(|error| error.to_string())?;
 ```
 
 Validate the scaled dimensions against `width_scaled_size`, copy its segment into every relevant build, and drop it before fetching a later source when the page spans more than two sources. Once page 0 is complete, call `finish_build` and install it.
@@ -392,19 +536,19 @@ git commit -m "refactor(bomtoon): key reader work by task"
 
 ---
 
-### Task 4: Prepare a Bounded Three-Page Lookahead
+### Task 5: Prepare a Bounded Three-Page Lookahead
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs`
 - Test: `apps/bomtoon/src/main.rs`
 
 **Interfaces:**
-- Consumes: Task 3's reader registry, global plans, and `install_page`.
+- Consumes: Task 4's reader registry, global plans, and `install_page`.
 - Produces: bounded page/source/fetch state and zero-second maintenance callbacks.
 
 ```rust
 const LOOKAHEAD_PAGES: usize = 3;
-const MAX_DECODED_SOURCES: usize = 2;
+const MAX_SOURCE_SLOTS: usize = 2;
 const MAX_IMAGE_FETCHES: usize = 2;
 
 enum PageEntry {
@@ -420,7 +564,7 @@ enum ReaderTaskPurpose {
 }
 ```
 
-Replace Task 3's foreground-only `builds` queue with `window` and add these bounded collections:
+Replace Task 4's foreground-only `builds` queue with `window` and add these bounded collections:
 
 ```rust
 window: VecDeque<PageEntry>,
@@ -443,9 +587,9 @@ Add scheduler-state tests that seed many pages and many one-row sources, repeate
 
 ```rust
 assert!(reader.window.len() <= LOOKAHEAD_PAGES);
-assert!(reader.source_cache.len() <= MAX_DECODED_SOURCES);
+assert!(reader.source_cache.len() <= MAX_SOURCE_SLOTS);
 assert!(reader.source_fetches.len() <= MAX_IMAGE_FETCHES);
-assert!(reader.source_cache.len() + reader.source_fetches.len() <= MAX_DECODED_SOURCES);
+assert!(reader.source_cache.len() + reader.source_fetches.len() <= MAX_SOURCE_SLOTS);
 assert!(app.reader_tasks.len() <= 4);
 ```
 
@@ -509,7 +653,7 @@ entry.generation == self.reader_generation
     && self.reader.as_ref().is_some_and(|reader| reader.window_references(source))
 ```
 
-Remove the exact source from `source_fetches` first. The combined cache/fetch slot bound guarantees room for this callback; decode, validate, and scale at most one body, insert it into `source_cache`, then run `maintain_reader` immediately. An irrelevant completion is dropped without decoding.
+Remove the exact source from `source_fetches` first. The combined cache/fetch slot bound guarantees room for this callback; call `decode_webp`, validate declared dimensions, consume the picture through `scale_to_width`, insert at most one resulting source into `source_cache`, then run `maintain_reader` immediately. An irrelevant completion is dropped without decoding.
 
 - [ ] **Step 6: Prove sequential copying handles very short sources**
 
@@ -532,14 +676,14 @@ git commit -m "perf(bomtoon): prefetch three reader pages"
 
 ---
 
-### Task 5: Turn Pages Through the Prepared Window
+### Task 6: Turn Pages Through the Prepared Window
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs:350-374,776-829,896-918,942-1024`
 - Test: `apps/bomtoon/src/main.rs`
 
 **Interfaces:**
-- Consumes: Task 4's consecutive `window` and maintenance scheduler.
+- Consumes: Task 5's consecutive `window` and maintenance scheduler.
 - Produces: `request_reader_page`, synchronous prepared Next, foreground misses, and rerendered Previous.
 
 ```rust
@@ -611,7 +755,7 @@ git commit -m "feat(bomtoon): turn prepared global pages"
 
 ---
 
-### Task 6: Coordinate Signed URL Refresh and Reader Failures
+### Task 7: Coordinate Signed URL Refresh and Reader Failures
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs:43-74,443-491,574-640,832-894,1026-1049`
@@ -708,7 +852,7 @@ git commit -m "fix(bomtoon): bound reader URL refresh"
 
 ---
 
-### Task 7: Cancel Reader Generations and Release Every Resource
+### Task 8: Cancel Reader Generations and Release Every Resource
 
 **Files:**
 - Modify: `apps/bomtoon/src/main.rs:376-410,734-774,936-1049`
@@ -782,14 +926,13 @@ git commit -m "fix(bomtoon): invalidate reader generations"
 
 ---
 
-### Task 8: Run Quality Gates and Simulator Verification
+### Task 9: Run Quality Gates and Simulator Verification
 
 **Files:**
-- Modify only if required by formatter or a verified failure: `apps/bomtoon/src/api.rs`, `apps/bomtoon/src/main.rs`
-- Verify: `crates/kobo-image/src/lib.rs` remains unchanged
+- Modify only if required by formatter or a verified failure: `apps/bomtoon/src/api.rs`, `apps/bomtoon/src/main.rs`, `crates/kobo-image/src/lib.rs`
 
 **Interfaces:**
-- Consumes: completed implementation from Tasks 1–7.
+- Consumes: completed implementation from Tasks 1–8.
 - Produces: focused build evidence, repository-wide gate evidence, and browser/runtime simulator observations.
 
 - [ ] **Step 1: Run formatting and focused host gates**
@@ -840,9 +983,33 @@ From the repository root, run:
 cargo run -p kobo-cli -- run --sim --app bomtoon
 ```
 
-Repeat the exact reading path and record the same two timings. Confirm the reader is page-turn controlled and exposes no scrolling behavior.
+Repeat the exact reading path and record the same two timings. Confirm the reader is page-turn controlled and exposes no scrolling behavior. Exercise an observed 1080-pixel-wide source on Clara, Libra, and Elipsa geometries and confirm the bounded scaler preserves readable line art.
 
-- [ ] **Step 5: Run repository-wide required gates**
+- [ ] **Step 5: Measure on-device memory high-water marks**
+
+First record the conservative modeled app peak: `11 × 7,000,000 + 4,194,304 + 7,000,000 + 7,884,864 = 96,079,168` bytes (91.63 MiB), covering an oriented 8-bit WebP decode, one callback body, one older cached source, and three maximum-profile pages. Confirm the scaler phase remains lower because it holds only source gray, final target gray, one older source, three pages, one callback body, and width-bounded metadata.
+
+On the supported device with the lowest measured `MemTotal`, capture:
+
+```sh
+BOMTOON_PID="$(pidof kobo-bomtoon)"
+KOBOD_PID="$(pidof kobod)"
+cat /proc/meminfo
+cat "/proc/$BOMTOON_PID/limits"
+cat "/proc/$BOMTOON_PID/status"
+if [ -r "/proc/$BOMTOON_PID/smaps_rollup" ]; then
+    cat "/proc/$BOMTOON_PID/smaps_rollup"
+fi
+cat "/proc/$KOBOD_PID/status"
+if [ -r "/proc/$KOBOD_PID/smaps_rollup" ]; then
+    cat "/proc/$KOBOD_PID/smaps_rollup"
+fi
+```
+Repeat the status and `smaps_rollup` captures at reader open, two fetches in flight, two completions queued, WebP decode, 1080-to-panel scaling, three pages ready, pending upload, new-picture commit, and old-handle drop. Use near-seven-million-pixel WebP bodies and simultaneous 4 MiB responses. Reconcile observed phases against `docs/research/2026-08-29-kobo-memory-limits.md`. Pass only when modeled BOMTOON live allocations are at most 96 MiB, BOMTOON `VmHWM <= 128 MiB`, system `MemAvailable >= 128 MiB`, swap does not grow, and no allocation failure or OOM occurs.
+
+- [ ] **Step 6: Run repository-wide required gates**
+
+Run:
 
 ```bash
 cargo test --workspace --all-targets --all-features
@@ -851,11 +1018,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Expected: every workspace test passes and Clippy emits no warnings.
 
-- [ ] **Step 6: Commit only verified formatter or gate fixes**
+- [ ] **Step 7: Commit only verified formatter or gate fixes**
 
-If Tasks 1–7 already left the tree unchanged after all gates, do not create an empty commit. If a gate required a source correction, stage only the affected BOMTOON files and use:
+If Tasks 1–8 already left the tree unchanged after all gates, do not create an empty commit. If a gate required a source correction, stage only the affected files and use:
 
 ```bash
-git add apps/bomtoon/src/api.rs apps/bomtoon/src/main.rs
+git add apps/bomtoon/src/api.rs apps/bomtoon/src/main.rs crates/kobo-image/src/lib.rs
 git commit -m "fix(bomtoon): satisfy reader quality gates"
 ```
