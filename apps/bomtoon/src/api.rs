@@ -45,14 +45,14 @@ pub fn content(alias: &str) -> Task {
     )
 }
 
-pub fn images(content: &str, episode: &str) -> Task {
+pub fn images(content: &str, episode: &str, panel_width: u32) -> Task {
     let mut headers = balcony_headers();
     headers.push(Header::new(
         "x-referer",
         format!("https://www.bomtoon.tw/viewer/{content}/{episode}"),
     ));
     fetch(
-        format!("{IMAGES_URL}{content}/{episode}?imageWidth=1080"),
+        format!("{IMAGES_URL}{content}/{episode}?imageWidth={panel_width}"),
         IMAGE_MANIFEST_BYTES,
         Credential::bearer("bomtoon-access-token"),
         headers,
@@ -231,13 +231,13 @@ mod tests {
             max_bytes,
             credential,
             headers,
-        } = images("hunter_q", "ep-1")
+        } = images("hunter_q", "ep-1", 1072)
         else {
             panic!("expected manifest fetch");
         };
         assert_eq!(
             url,
-            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080"
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1072"
         );
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 512 * 1024);

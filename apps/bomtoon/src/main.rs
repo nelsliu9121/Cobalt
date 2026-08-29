@@ -432,11 +432,19 @@ impl Bomtoon {
             self.retry = Retry::Restart;
             return;
         };
+        let Ok(panel_width) = u32::try_from(context.metrics().width) else {
+            self.fail_reader(Retry::Manifest, "The panel width is not supported.");
+            return;
+        };
+        if panel_width == 0 {
+            self.fail_reader(Retry::Manifest, "The panel width is not supported.");
+            return;
+        }
         self.retry = Retry::Manifest;
         self.spawn(
             context,
             Pending::Manifest,
-            api::images(&content_alias, &episode_alias),
+            api::images(&content_alias, &episode_alias, panel_width),
         );
     }
 
@@ -455,11 +463,19 @@ impl Bomtoon {
             );
             return;
         };
+        let Ok(panel_width) = u32::try_from(context.metrics().width) else {
+            self.fail_reader(Retry::Image(target), "The panel width is not supported.");
+            return;
+        };
+        if panel_width == 0 {
+            self.fail_reader(Retry::Image(target), "The panel width is not supported.");
+            return;
+        }
         self.retry = Retry::Image(target);
         self.spawn(
             context,
             Pending::ManifestRefresh(target),
-            api::images(&content_alias, &episode_alias),
+            api::images(&content_alias, &episode_alias, panel_width),
         );
     }
 
@@ -1202,8 +1218,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use kobo_sdk::{
-        AppRunner, Chrome, Command, Credential, Node, PictureHandle, ReadingChrome, SecretHeader,
-        Task, TilePicture, CLARA_BW_METRICS,
+        AppRunner, Chrome, Command, Credential, DisplayMetrics, Node, PictureFormat, PictureHandle,
+        ReadingChrome, SecretHeader, Task, TilePicture, CLARA_BW_METRICS,
     };
 
     const LIBRARY_RESPONSE: &[u8] = br#"{
@@ -1305,16 +1321,25 @@ mod tests {
         assert_fits(screen);
     }
 
-    fn loaded_library() -> (AppRunner<Bomtoon>, Vec<Command>) {
-        let (mut runner, commands) = started();
+    fn loaded_library_with_metrics(
+        metrics: DisplayMetrics,
+    ) -> (AppRunner<Bomtoon>, Vec<Command>) {
+        let mut runner = AppRunner::with_metrics(Bomtoon::default(), metrics);
+        let commands = runner.start();
         let (task, _) = only_spawn(&commands);
         let commands = runner.task_outcome(task, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         assert_eq!(runner.app().view, View::Library);
         (runner, commands)
     }
 
-    fn reader_waiting_for_manifest() -> (AppRunner<Bomtoon>, TaskId, Vec<Command>) {
-        let (mut runner, _) = loaded_library();
+    fn loaded_library() -> (AppRunner<Bomtoon>, Vec<Command>) {
+        loaded_library_with_metrics(CLARA_BW_METRICS)
+    }
+
+    fn reader_waiting_for_manifest_with_metrics(
+        metrics: DisplayMetrics,
+    ) -> (AppRunner<Bomtoon>, TaskId, Vec<Command>) {
+        let (mut runner, _) = loaded_library_with_metrics(metrics);
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
         runner.task_outcome(
@@ -1324,6 +1349,10 @@ mod tests {
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
         (runner, manifest_task, commands)
+    }
+
+    fn reader_waiting_for_manifest() -> (AppRunner<Bomtoon>, TaskId, Vec<Command>) {
+        reader_waiting_for_manifest_with_metrics(CLARA_BW_METRICS)
     }
 
     fn reader_waiting_for_first_image() -> (AppRunner<Bomtoon>, TaskId) {
@@ -1504,6 +1533,27 @@ mod tests {
     }
 
     #[test]
+    fn image_manifest_uses_active_panel_width() {
+        let libra_colour_metrics = DisplayMetrics {
+            width: 1264,
+            height: 1680,
+            picture_format: PictureFormat::Rgb8,
+            ..CLARA_BW_METRICS
+        };
+        for (metrics, panel_width) in [
+            (CLARA_BW_METRICS, 1072),
+            (libra_colour_metrics, 1264),
+        ] {
+            let (_, _, commands) = reader_waiting_for_manifest_with_metrics(metrics);
+            let (_, manifest_work) = only_spawn(&commands);
+            assert_eq!(
+                manifest_work,
+                api::images("hunter_q", "ep-1", panel_width)
+            );
+        }
+    }
+
+    #[test]
     fn owned_episode_opens_full_screen_reader_with_hidden_chrome() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
@@ -1517,7 +1567,7 @@ mod tests {
 
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, manifest_work) = only_spawn(&commands);
-        assert_eq!(manifest_work, api::images("hunter_q", "ep-1"));
+        assert_eq!(manifest_work, api::images("hunter_q", "ep-1", 1072));
         let commands = runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest("/tw/ep/one.webp", "p1")),
@@ -1549,7 +1599,7 @@ mod tests {
             runner.task_outcome(image_task, TaskOutcome::Failed(TaskError::Unauthorized));
         assert_eq!(runner.app().account, AccountState::Active);
         let (refresh_task, refresh_work) = only_spawn(&commands);
-        assert_eq!(refresh_work, api::images("hunter_q", "ep-1"));
+        assert_eq!(refresh_work, api::images("hunter_q", "ep-1", 1072));
 
         let commands = runner.task_outcome(
             refresh_task,
