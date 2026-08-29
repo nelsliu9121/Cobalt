@@ -2,14 +2,14 @@
 
 ## Status
 
-Approved continuous-reader design. The color-picture extension is specified in `2026-08-29-color-picture-pipeline-design.md` and awaits written review. Implementation has not started.
+Approved continuous-reader design. The approved color-picture extension is specified in `2026-08-29-color-picture-pipeline-design.md`; its platform plan and this reader's dependent implementation plan are regenerated. Implementation has not started.
 
 ## Goal
 
 Make a plain BOMTOON episode paginate over one logical continuous vertical strip while keeping the reader responsive on Kobo-class hardware.
 “Continuous” describes how source rows are packed into discrete display pages. It does not introduce scrolling, a scroll position, or scroll gestures.
 
-The first page should appear without preparing the entire episode. Once it is visible, the reader prepares up to three following Gray8 pages or two following Rgb8 pages so ordinary forward page turns, including turns across source-image boundaries, do not show a loading screen.
+The first page should appear without preparing the entire episode. Once it is visible, the reader maintains a three-page Gray8 window or a two-page Rgb8 window so ordinary forward page turns, including turns across source-image boundaries, do not show a loading screen while the next page is prepared.
 
 This design follows and revises the image preparation, reader state, navigation, loading, and error decisions in `2026-08-28-bomtoon-episode-reader-design.md`. `2026-08-29-color-picture-pipeline-design.md` further revises picture format, color-capability, color scheduling, refresh, memory, and device-evidence behavior. Authentication, episode eligibility, signed URL validation, reading chrome, and network policy remain unchanged unless either revision says otherwise.
 

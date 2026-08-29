@@ -2,9 +2,9 @@
 
 ## Status
 
-Design approved in discussion. Written specification awaiting review.
+Written specification approved for implementation planning.
 
-This specification adds a platform color-picture capability and revises the color-handling portions of `2026-08-29-bomtoon-continuous-reader-design.md`. The continuous-reader implementation plan must not be executed until it has been regenerated against this specification.
+This specification adds a platform color-picture capability and revises the color-handling portions of `2026-08-29-bomtoon-continuous-reader-design.md`. Implementation is split between `../plans/2026-08-29-color-picture-pipeline.md` and the dependent `../plans/2026-08-29-bomtoon-continuous-reader.md`.
 
 ## Goal
 
@@ -266,6 +266,7 @@ Repository profile comments remain authoritative about Cobalt's present support 
 
 Platform work is expected in:
 
+- `crates/kobo-pixels` as the dependency-free shared pixel-format and ownership types
 - `crates/kobo-profile`
 - `crates/kobo-image`
 - `crates/kobo-sdk`
