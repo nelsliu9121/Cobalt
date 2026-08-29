@@ -1,0 +1,12 @@
+[package]
+name = "kobo-pixels"
+version.workspace = true
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency-free typed pixel ownership for Cobalt pictures"
+
+[lints]
+workspace = true

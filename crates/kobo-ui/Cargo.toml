@@ -12,4 +12,5 @@ description = "Declarative E Ink UI, layout, and rendering primitives for Kobo a
 workspace = true
 
 [dependencies]
+kobo-pixels = { path = "../kobo-pixels" }
 unicode-segmentation = "1.13.3"

@@ -819,6 +819,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kobo-pixels"
+version = "0.3.0"
+
+[[package]]
 name = "kobo-policy"
 version = "0.3.0"
 dependencies = [
@@ -1002,6 +1006,7 @@ dependencies = [
 name = "kobo-ui"
 version = "0.3.0"
 dependencies = [
+ "kobo-pixels",
  "unicode-segmentation",
 ]
 

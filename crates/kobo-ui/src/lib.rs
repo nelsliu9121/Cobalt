@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use unicode_segmentation::UnicodeSegmentation;
 
+pub use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
+
 pub const DISPLAY_WIDTH: i32 = 1072;
 pub const DISPLAY_HEIGHT: i32 = 1448;
 const MAX_LAYOUT_NODES: usize = 512;
@@ -306,6 +308,7 @@ pub struct DisplayMetrics {
     pub width: i32,
     pub height: i32,
     pub pixels_per_inch: i32,
+    pub picture_format: PictureFormat,
     /// The reader's preferred text size, supplied by the runtime.
     pub text_scale: TextScale,
 }
@@ -439,6 +442,7 @@ pub const CLARA_BW_METRICS: DisplayMetrics = DisplayMetrics {
     width: 1072,
     height: 1448,
     pixels_per_inch: 300,
+    picture_format: PictureFormat::Gray8,
     text_scale: TextScale::Default,
 };
 
@@ -8824,38 +8828,55 @@ fn corner_inset(radius: i32, from_edge: i32) -> i32 {
 pub struct Surface {
     pub width: usize,
     pub height: usize,
-    pub pixels: Vec<u8>,
+    pub format: PictureFormat,
+    pixels: Vec<u8>,
 }
 
 impl Surface {
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
+        Self::new_in(width, height, PictureFormat::Gray8)
+    }
+
+    #[must_use]
+    pub fn new_in(width: usize, height: usize, format: PictureFormat) -> Self {
+        let byte_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel()))
+            .expect("surface dimensions exceed addressable memory");
         Self {
             width,
             height,
-            pixels: vec![tone::PAPER; width.saturating_mul(height)],
+            format,
+            pixels: vec![tone::PAPER; byte_len],
         }
     }
 
+    #[must_use]
+    pub fn pixels(&self) -> PicturePixelsRef<'_> {
+        match self.format {
+            PictureFormat::Gray8 => PicturePixelsRef::Gray8(&self.pixels),
+            PictureFormat::Rgb8 => PicturePixelsRef::Rgb8(&self.pixels),
+        }
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.pixels
+    }
+
     pub fn clear(&mut self, value: u8) {
-        self.pixels.fill(value);
+        self.fill_gray(value);
     }
 
     pub fn fill_rect(&mut self, rect: Rect, value: u8) {
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: i32::try_from(self.width).unwrap_or(i32::MAX),
-            height: i32::try_from(self.height).unwrap_or(i32::MAX),
-        };
+        let bounds = self.bounds();
         if let Some(clipped) = rect.intersection(bounds) {
             for y in clipped.y..clipped.y + clipped.height {
                 let row = usize::try_from(y).unwrap_or(0).saturating_mul(self.width);
                 for x in clipped.x..clipped.x + clipped.width {
                     let index = row.saturating_add(usize::try_from(x).unwrap_or(0));
-                    if let Some(pixel) = self.pixels.get_mut(index) {
-                        *pixel = value;
-                    }
+                    self.set_gray(index, value);
                 }
             }
         }
@@ -8869,20 +8890,13 @@ impl Surface {
     /// being done again. [`Surface::invert_press`] is what a touched control
     /// uses; this is the square, full-bleed form.
     pub fn invert_rect(&mut self, rect: Rect) {
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: i32::try_from(self.width).unwrap_or(i32::MAX),
-            height: i32::try_from(self.height).unwrap_or(i32::MAX),
-        };
+        let bounds = self.bounds();
         if let Some(clipped) = rect.intersection(bounds) {
             for y in clipped.y..clipped.y + clipped.height {
                 let row = usize::try_from(y).unwrap_or(0).saturating_mul(self.width);
                 for x in clipped.x..clipped.x + clipped.width {
                     let index = row.saturating_add(usize::try_from(x).unwrap_or(0));
-                    if let Some(pixel) = self.pixels.get_mut(index) {
-                        *pixel = u8::MAX - *pixel;
-                    }
+                    self.invert_pixel(index);
                 }
             }
         }
@@ -8895,12 +8909,7 @@ impl Surface {
     /// is drawn by inverting a finished surface rather than by laying the
     /// control out twice.
     pub fn invert_rounded(&mut self, rect: Rect, radius: i32) {
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: i32::try_from(self.width).unwrap_or(i32::MAX),
-            height: i32::try_from(self.height).unwrap_or(i32::MAX),
-        };
+        let bounds = self.bounds();
         let radius = radius.clamp(0, min(rect.width, rect.height) / 2);
         for row in 0..rect.height {
             let inset = corner_inset(radius, min(row, rect.height - 1 - row));
@@ -8918,9 +8927,7 @@ impl Surface {
                 .saturating_mul(self.width);
             for x in clipped.x..clipped.x + clipped.width {
                 let index = start.saturating_add(usize::try_from(x).unwrap_or(0));
-                if let Some(pixel) = self.pixels.get_mut(index) {
-                    *pixel = u8::MAX - *pixel;
-                }
+                self.invert_pixel(index);
             }
         }
     }
@@ -8972,23 +8979,20 @@ impl Surface {
     /// panel resolves sixteen grey levels, so stair-stepped text is visibly
     /// worse than blended text at no extra refresh cost.
     pub fn blend(&mut self, x: i32, y: i32, value: u8, coverage: u8) {
-        if x < 0 || y < 0 {
-            return;
-        }
-        let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+        let Some(index) = self.pixel_index(x, y) else {
             return;
         };
-        if x >= self.width {
-            return;
-        }
-        let Some(index) = y.checked_mul(self.width).and_then(|row| row.checked_add(x)) else {
-            return;
-        };
-        if let Some(pixel) = self.pixels.get_mut(index) {
-            let destination = i32::from(*pixel);
-            let ink = i32::from(value);
-            let mixed = destination + (ink - destination) * i32::from(coverage) / 255;
-            *pixel = u8::try_from(mixed.clamp(0, 255)).unwrap_or(*pixel);
+        match self.format {
+            PictureFormat::Gray8 => {
+                let destination = self.pixels[index];
+                self.pixels[index] = Self::blended(destination, value, coverage);
+            }
+            PictureFormat::Rgb8 => {
+                let start = index * 3;
+                for destination in &mut self.pixels[start..start + 3] {
+                    *destination = Self::blended(*destination, value, coverage);
+                }
+            }
         }
     }
 
@@ -9029,6 +9033,65 @@ impl Surface {
             },
             value,
         );
+    }
+
+    fn bounds(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: i32::try_from(self.width).unwrap_or(i32::MAX),
+            height: i32::try_from(self.height).unwrap_or(i32::MAX),
+        }
+    }
+
+    fn pixel_index(&self, x: i32, y: i32) -> Option<usize> {
+        let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+            return None;
+        };
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        y.checked_mul(self.width)?.checked_add(x)
+    }
+
+    fn fill_gray(&mut self, gray: u8) {
+        self.pixels.fill(gray);
+    }
+
+    fn set_gray(&mut self, index: usize, gray: u8) {
+        match self.format {
+            PictureFormat::Gray8 => self.pixels[index] = gray,
+            PictureFormat::Rgb8 => {
+                let start = index * 3;
+                self.pixels[start..start + 3].fill(gray);
+            }
+        }
+    }
+
+    fn set_rgb(&mut self, index: usize, rgb: [u8; 3]) {
+        if self.format == PictureFormat::Rgb8 {
+            let start = index * 3;
+            self.pixels[start..start + 3].copy_from_slice(&rgb);
+        }
+    }
+
+    fn invert_pixel(&mut self, index: usize) {
+        match self.format {
+            PictureFormat::Gray8 => self.pixels[index] = u8::MAX - self.pixels[index],
+            PictureFormat::Rgb8 => {
+                let start = index * 3;
+                for channel in &mut self.pixels[start..start + 3] {
+                    *channel = u8::MAX - *channel;
+                }
+            }
+        }
+    }
+
+    fn blended(destination: u8, ink: u8, coverage: u8) -> u8 {
+        let destination = i32::from(destination);
+        let ink = i32::from(ink);
+        let mixed = destination + (ink - destination) * i32::from(coverage) / 255;
+        u8::try_from(mixed.clamp(0, 255)).unwrap_or(0)
     }
 }
 
@@ -9258,14 +9321,6 @@ impl FramePlanner {
     }
 }
 
-/// Eight-bit grey pixels, row major, `width * height` of them.
-#[derive(Clone, Copy, Debug)]
-pub struct PicturePixels<'a> {
-    pub width: u32,
-    pub height: u32,
-    pub grey: &'a [u8],
-}
-
 /// Where the renderer finds the pictures an application handed over.
 ///
 /// Pictures are looked up at paint time rather than travelling with the
@@ -9273,7 +9328,12 @@ pub struct PicturePixels<'a> {
 /// refused) is a normal condition and answers `None`. Nothing is drawn in that
 /// case, which is why a tile keeps its glyph as well as its picture.
 pub trait Pictures {
-    fn get(&self, handle: PictureHandle) -> Option<PicturePixels<'_>>;
+    fn get(&self, handle: PictureHandle) -> Option<PicturePixelsRef<'_>>;
+
+    /// Returns the dimensions declared when this picture entered the source.
+    fn dimensions(&self, _handle: PictureHandle) -> Option<(u32, u32)> {
+        None
+    }
 
     /// Checks availability without marking the picture recently drawn.
     fn contains(&self, handle: PictureHandle) -> bool {
@@ -9283,7 +9343,7 @@ pub trait Pictures {
 
 /// A source holding nothing, for the many callers that draw no pictures.
 impl Pictures for () {
-    fn get(&self, _handle: PictureHandle) -> Option<PicturePixels<'_>> {
+    fn get(&self, _handle: PictureHandle) -> Option<PicturePixelsRef<'_>> {
         None
     }
 }
@@ -10121,7 +10181,7 @@ struct HeldPicture {
     handle: PictureHandle,
     width: u32,
     height: u32,
-    grey: Vec<u8>,
+    pixels: PicturePixels,
     used: std::cell::Cell<u64>,
 }
 
@@ -10130,7 +10190,8 @@ struct PendingPicture {
     width: u32,
     height: u32,
     expected: usize,
-    grey: Vec<u8>,
+    format: PictureFormat,
+    bytes: Vec<u8>,
 }
 
 /// The pictures one application has handed over, bounded by total size.
@@ -10181,8 +10242,14 @@ impl PictureCache {
     /// Returns `false` when the declared size does not match the bytes, or when
     /// one picture alone exceeds the whole budget. Both are refusals rather
     /// than truncations: a half-stored picture would draw as garbage.
-    pub fn put(&mut self, handle: PictureHandle, width: u32, height: u32, grey: Vec<u8>) -> bool {
-        self.put_report(handle, width, height, grey).is_some()
+    pub fn put(
+        &mut self,
+        handle: PictureHandle,
+        width: u32,
+        height: u32,
+        pixels: PicturePixels,
+    ) -> bool {
+        self.put_report(handle, width, height, pixels).is_some()
     }
 
     /// Stores a complete picture and reports any handles evicted to make room.
@@ -10195,20 +10262,20 @@ impl PictureCache {
         handle: PictureHandle,
         width: u32,
         height: u32,
-        grey: Vec<u8>,
+        pixels: PicturePixels,
     ) -> Option<Vec<PictureHandle>> {
-        let expected = usize::try_from(width).ok().and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|h| width.checked_mul(h))
-        });
-        let expected = expected?;
-        if expected == 0 || expected != grey.len() || grey.len() > self.budget {
+        let byte_count = pixels.byte_count();
+        let expected = pixels.format().byte_len(width, height)?;
+        if expected == 0 || expected != byte_count || byte_count > self.budget {
             return None;
         }
         self.remove(handle);
         let mut evicted = Vec::new();
-        while self.held + grey.len() > self.budget {
+        while self
+            .held
+            .checked_add(byte_count)
+            .map_or(true, |held| held > self.budget)
+        {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -10219,16 +10286,16 @@ impl PictureCache {
                 break;
             };
             evicted.push(self.entries[oldest].handle);
-            self.held -= self.entries[oldest].grey.len();
+            self.held -= self.entries[oldest].pixels.byte_count();
             self.entries.remove(oldest);
         }
-        self.held += grey.len();
+        self.held = self.held.checked_add(byte_count)?;
         self.clock.set(self.clock.get() + 1);
         self.entries.push(HeldPicture {
             handle,
             width,
             height,
-            grey,
+            pixels,
             used: std::cell::Cell::new(self.clock.get()),
         });
         Some(evicted)
@@ -10238,13 +10305,14 @@ impl PictureCache {
     ///
     /// Starting another upload cancels the incomplete one. The previous live
     /// value under `handle` remains drawable until [`Self::commit_upload`].
-    pub fn begin_upload(&mut self, handle: PictureHandle, width: u32, height: u32) -> bool {
-        let expected = usize::try_from(width).ok().and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        });
-        let Some(expected) = expected else {
+    pub fn begin_upload(
+        &mut self,
+        handle: PictureHandle,
+        width: u32,
+        height: u32,
+        format: PictureFormat,
+    ) -> bool {
+        let Some(expected) = format.byte_len(width, height) else {
             self.pending = None;
             return false;
         };
@@ -10257,7 +10325,8 @@ impl PictureCache {
             width,
             height,
             expected,
-            grey: Vec::with_capacity(expected),
+            format,
+            bytes: Vec::with_capacity(expected),
         });
         true
     }
@@ -10268,13 +10337,13 @@ impl PictureCache {
             return false;
         };
         if pending.handle != handle
-            || offset != pending.grey.len()
-            || pending.grey.len().saturating_add(bytes.len()) > pending.expected
+            || offset != pending.bytes.len()
+            || pending.bytes.len().saturating_add(bytes.len()) > pending.expected
         {
             self.pending = None;
             return false;
         }
-        pending.grey.extend_from_slice(bytes);
+        pending.bytes.extend_from_slice(bytes);
         true
     }
 
@@ -10284,15 +10353,19 @@ impl PictureCache {
     /// mismatched upload.
     pub fn commit_upload(&mut self, handle: PictureHandle) -> Option<Vec<PictureHandle>> {
         let pending = self.pending.take()?;
-        if pending.handle != handle || pending.grey.len() != pending.expected {
+        if pending.handle != handle || pending.bytes.len() != pending.expected {
             return None;
         }
-        self.put_report(pending.handle, pending.width, pending.height, pending.grey)
+        let pixels = match pending.format {
+            PictureFormat::Gray8 => PicturePixels::Gray8(pending.bytes),
+            PictureFormat::Rgb8 => PicturePixels::Rgb8(pending.bytes),
+        };
+        self.put_report(pending.handle, pending.width, pending.height, pixels)
     }
 
     pub fn remove(&mut self, handle: PictureHandle) {
         if let Some(index) = self.entries.iter().position(|entry| entry.handle == handle) {
-            self.held -= self.entries[index].grey.len();
+            self.held -= self.entries[index].pixels.byte_count();
             self.entries.remove(index);
         }
     }
@@ -10320,17 +10393,20 @@ impl PictureCache {
 }
 
 impl Pictures for PictureCache {
-    fn get(&self, handle: PictureHandle) -> Option<PicturePixels<'_>> {
+    fn get(&self, handle: PictureHandle) -> Option<PicturePixelsRef<'_>> {
         let entry = self.entries.iter().find(|entry| entry.handle == handle)?;
         // Drawing counts as use, so a cover on the current screen outlives one
         // that was loaded later and never shown.
         self.clock.set(self.clock.get() + 1);
         entry.used.set(self.clock.get());
-        Some(PicturePixels {
-            width: entry.width,
-            height: entry.height,
-            grey: &entry.grey,
-        })
+        Some(entry.pixels.as_ref())
+    }
+
+    fn dimensions(&self, handle: PictureHandle) -> Option<(u32, u32)> {
+        self.entries
+            .iter()
+            .find(|entry| entry.handle == handle)
+            .map(|entry| (entry.width, entry.height))
     }
 
     fn contains(&self, handle: PictureHandle) -> bool {
@@ -10356,39 +10432,104 @@ pub fn render(screen: &Screen, surface: &mut Surface, dirty: Option<Rect>) {
 /// halftoned image produces moire, which on a sixteen-grey panel looks like
 /// damage. An application that fitted the picture before handing it over lands
 /// in the exact-size path and pays nothing.
-fn draw_picture(surface: &mut Surface, rect: Rect, pixels: PicturePixels<'_>, clip: Rect) {
-    let Some(visible) = rect.intersection(clip) else {
+fn draw_picture(
+    surface: &mut Surface,
+    rect: Rect,
+    source: (u32, u32),
+    pixels: PicturePixelsRef<'_>,
+    clip: Rect,
+) {
+    let Some(visible) = rect
+        .intersection(clip)
+        .and_then(|visible| visible.intersection(surface.bounds()))
+    else {
         return;
     };
-    let source_width = pixels.width as usize;
-    let source_height = pixels.height as usize;
-    if rect.width <= 0 || rect.height <= 0 || source_width == 0 || source_height == 0 {
+    let (Ok(source_width), Ok(source_height)) =
+        (usize::try_from(source.0), usize::try_from(source.1))
+    else {
         return;
-    }
-    if pixels.grey.len() < source_width * source_height {
+    };
+    if rect.width <= 0 || rect.height <= 0 || source_width == 0 || source_height == 0 {
         return;
     }
     let target_width = rect.width as usize;
     let target_height = rect.height as usize;
-    for y in visible.y..visible.y + visible.height {
-        let row = (y - rect.y) as usize;
-        let from_y = row * source_height / target_height;
-        let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
-        for x in visible.x..visible.x + visible.width {
-            let column = (x - rect.x) as usize;
-            let from_x = column * source_width / target_width;
-            let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
-            let mut total = 0u32;
-            let mut counted = 0u32;
-            for sample_y in from_y..to_y.min(source_height) {
-                let base = sample_y * source_width;
-                for sample_x in from_x..to_x.min(source_width) {
-                    total += u32::from(pixels.grey[base + sample_x]);
-                    counted += 1;
+    match pixels {
+        PicturePixelsRef::Gray8(gray) => {
+            let Some(expected) = PictureFormat::Gray8.byte_len(source.0, source.1) else {
+                return;
+            };
+            if gray.len() < expected {
+                return;
+            }
+            for y in visible.y..visible.y + visible.height {
+                let row = (y - rect.y) as usize;
+                let from_y = row * source_height / target_height;
+                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                for x in visible.x..visible.x + visible.width {
+                    let column = (x - rect.x) as usize;
+                    let from_x = column * source_width / target_width;
+                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let mut total = 0u64;
+                    let mut counted = 0u64;
+                    for sample_y in from_y..to_y.min(source_height) {
+                        let base = sample_y * source_width;
+                        for sample_x in from_x..to_x.min(source_width) {
+                            total += u64::from(gray[base + sample_x]);
+                            counted += 1;
+                        }
+                    }
+                    if let (Some(mean), Some(index)) =
+                        (total.checked_div(counted), surface.pixel_index(x, y))
+                    {
+                        surface.set_gray(index, u8::try_from(mean).unwrap_or(u8::MAX));
+                    }
                 }
             }
-            if let Some(mean) = total.checked_div(counted) {
-                surface.blend(x, y, u8::try_from(mean).unwrap_or(u8::MAX), 255);
+        }
+        PicturePixelsRef::Rgb8(rgb) => {
+            if surface.format != PictureFormat::Rgb8 {
+                return;
+            }
+            let Some(expected) = PictureFormat::Rgb8.byte_len(source.0, source.1) else {
+                return;
+            };
+            if rgb.len() < expected {
+                return;
+            }
+            for y in visible.y..visible.y + visible.height {
+                let row = (y - rect.y) as usize;
+                let from_y = row * source_height / target_height;
+                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                for x in visible.x..visible.x + visible.width {
+                    let column = (x - rect.x) as usize;
+                    let from_x = column * source_width / target_width;
+                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let mut totals = [0u64; 3];
+                    let mut counted = 0u64;
+                    for sample_y in from_y..to_y.min(source_height) {
+                        let base = sample_y * source_width;
+                        for sample_x in from_x..to_x.min(source_width) {
+                            let start = (base + sample_x) * 3;
+                            for (total, channel) in
+                                totals.iter_mut().zip(&rgb[start..start + 3])
+                            {
+                                *total += u64::from(*channel);
+                            }
+                            counted += 1;
+                        }
+                    }
+                    if let Some(index) = surface.pixel_index(x, y) {
+                        let mean = totals.map(|total| {
+                            total
+                                .checked_div(counted)
+                                .and_then(|mean| u8::try_from(mean).ok())
+                                .unwrap_or(u8::MAX)
+                        });
+                        surface.set_rgb(index, mean);
+                    }
+                }
             }
         }
     }
@@ -11215,16 +11356,20 @@ fn render_all_with_selected_font(
             // Bare, because a formula is part of a sentence and a rule round
             // one would read as a box drawn in the middle of the words.
             LayoutKind::Picture(handle) => {
-                if let Some(pixels) = pictures.get(handle) {
-                    draw_picture(surface, node.rect, pixels, clip);
+                if let Some(source) = pictures.dimensions(handle) {
+                    if let Some(pixels) = pictures.get(handle) {
+                        draw_picture(surface, node.rect, source, pixels, clip);
+                    }
                 }
             }
             // Outlined, because a cover or a plate with pale edges on white
             // paper has no boundary at all and reads as text floating in
             // space.
             LayoutKind::FramedPicture(handle) => {
-                if let Some(pixels) = pictures.get(handle) {
-                    draw_picture(surface, node.rect, pixels, clip);
+                if let Some(source) = pictures.dimensions(handle) {
+                    if let Some(pixels) = pictures.get(handle) {
+                        draw_picture(surface, node.rect, source, pixels, clip);
+                    }
                 }
                 stroke_clipped(
                     surface,
@@ -11731,6 +11876,9 @@ fn draw_row_lead(
         // until every thumbnail has decoded is a shelf of empty squares.
         RowLead::Picture(picture, glyph) => match pictures.get(picture.handle) {
             Some(pixels) => {
+                let source = pictures
+                    .dimensions(picture.handle)
+                    .unwrap_or(picture.source);
                 let (width, height) = fit_within(picture.source, rect.width, rect.height);
                 let fitted = Rect {
                     x: rect.x + (rect.width - width) / 2,
@@ -11738,7 +11886,7 @@ fn draw_row_lead(
                     width,
                     height,
                 };
-                draw_picture(surface, fitted, pixels, clip);
+                draw_picture(surface, fitted, source, pixels, clip);
                 stroke_clipped(surface, fitted, tone::RULE, 1, clip);
             }
             None => draw_glyph_icon(surface, glyph, rect, clip),
@@ -13028,6 +13176,7 @@ mod tests {
                 width: 758,
                 height: 1024,
                 pixels_per_inch: 212,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),
@@ -13037,6 +13186,7 @@ mod tests {
                 width: 1264,
                 height: 1680,
                 pixels_per_inch: 300,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),
@@ -13046,6 +13196,7 @@ mod tests {
                 width: 1440,
                 height: 1920,
                 pixels_per_inch: 300,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),
@@ -13055,6 +13206,7 @@ mod tests {
                 width: 1404,
                 height: 1872,
                 pixels_per_inch: 227,
+                picture_format: PictureFormat::Gray8,
                 text_scale: TextScale::Default,
             },
         ),
@@ -15964,22 +16116,71 @@ mod prose_tests {
     }
 
     #[test]
+    fn picture_formats_compute_checked_byte_lengths() {
+        assert_eq!(PictureFormat::Gray8.byte_len(3, 2), Some(6));
+        assert_eq!(PictureFormat::Rgb8.byte_len(3, 2), Some(18));
+        assert_eq!(PictureFormat::Rgb8.byte_len(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn rgb_surface_draws_gray_chrome_with_equal_channels() {
+        let mut surface = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        surface.clear(64);
+        assert_eq!(surface.bytes(), &[64, 64, 64, 64, 64, 64]);
+    }
+
+    #[test]
+    fn picture_cache_rejects_wrong_typed_lengths() {
+        let mut cache = PictureCache::default();
+        assert!(!cache.put(PictureHandle(1), 2, 2, PicturePixels::Rgb8(vec![0; 11])));
+        assert!(cache.put(PictureHandle(1), 2, 2, PicturePixels::Rgb8(vec![0; 12])));
+    }
+
+    #[test]
     fn the_cache_refuses_a_picture_whose_size_does_not_match_its_bytes() {
         let mut cache = PictureCache::default();
-        assert!(!cache.put(PictureHandle(1), 10, 10, vec![0; 99]));
+        assert!(!cache.put(
+            PictureHandle(1),
+            10,
+            10,
+            PicturePixels::Gray8(vec![0; 99]),
+        ));
         assert!(cache.get(PictureHandle(1)).is_none());
-        assert!(cache.put(PictureHandle(1), 10, 10, vec![0; 100]));
-        assert_eq!(cache.get(PictureHandle(1)).map(|p| p.width), Some(10));
+        assert!(cache.put(
+            PictureHandle(1),
+            10,
+            10,
+            PicturePixels::Gray8(vec![0; 100]),
+        ));
+        assert!(matches!(
+            cache.get(PictureHandle(1)),
+            Some(PicturePixelsRef::Gray8(bytes)) if bytes.len() == 100
+        ));
     }
 
     #[test]
     fn the_cache_evicts_what_was_drawn_longest_ago() {
         let mut cache = PictureCache::new(200);
-        assert!(cache.put(PictureHandle(1), 10, 10, vec![1; 100]));
-        assert!(cache.put(PictureHandle(2), 10, 10, vec![2; 100]));
+        assert!(cache.put(
+            PictureHandle(1),
+            10,
+            10,
+            PicturePixels::Gray8(vec![1; 100]),
+        ));
+        assert!(cache.put(
+            PictureHandle(2),
+            10,
+            10,
+            PicturePixels::Gray8(vec![2; 100]),
+        ));
         // Drawing the first one makes the second the older of the two.
         assert!(cache.get(PictureHandle(1)).is_some());
-        assert!(cache.put(PictureHandle(3), 10, 10, vec![3; 100]));
+        assert!(cache.put(
+            PictureHandle(3),
+            10,
+            10,
+            PicturePixels::Gray8(vec![3; 100]),
+        ));
         assert!(cache.get(PictureHandle(1)).is_some(), "still on screen");
         assert!(
             cache.get(PictureHandle(2)).is_none(),
@@ -15993,11 +16194,21 @@ mod prose_tests {
     fn cache_evictions_are_reported_to_the_runtime() {
         let mut cache = PictureCache::new(150);
         assert_eq!(
-            cache.put_report(PictureHandle(1), 10, 10, vec![1; 100]),
+            cache.put_report(
+                PictureHandle(1),
+                10,
+                10,
+                PicturePixels::Gray8(vec![1; 100]),
+            ),
             Some(Vec::new())
         );
         assert_eq!(
-            cache.put_report(PictureHandle(2), 10, 10, vec![2; 100]),
+            cache.put_report(
+                PictureHandle(2),
+                10,
+                10,
+                PicturePixels::Gray8(vec![2; 100]),
+            ),
             Some(vec![PictureHandle(1)])
         );
     }
@@ -16005,7 +16216,7 @@ mod prose_tests {
     #[test]
     fn chunked_picture_becomes_live_only_after_a_complete_commit() {
         let mut cache = PictureCache::new(300);
-        assert!(cache.begin_upload(PictureHandle(7), 10, 10));
+        assert!(cache.begin_upload(PictureHandle(7), 10, 10, PictureFormat::Gray8));
         assert!(cache.upload_chunk(PictureHandle(7), 0, &[3; 40]));
         assert!(
             cache.get(PictureHandle(7)).is_none(),
@@ -16013,13 +16224,16 @@ mod prose_tests {
         );
         assert!(cache.upload_chunk(PictureHandle(7), 40, &[3; 60]));
         assert_eq!(cache.commit_upload(PictureHandle(7)), Some(Vec::new()));
-        assert_eq!(cache.get(PictureHandle(7)).map(|p| p.grey[0]), Some(3));
+        assert!(matches!(
+            cache.get(PictureHandle(7)),
+            Some(PicturePixelsRef::Gray8(bytes)) if bytes.first() == Some(&3)
+        ));
     }
 
     #[test]
     fn an_out_of_order_chunk_cancels_the_upload() {
         let mut cache = PictureCache::new(300);
-        assert!(cache.begin_upload(PictureHandle(7), 10, 10));
+        assert!(cache.begin_upload(PictureHandle(7), 10, 10, PictureFormat::Gray8));
         assert!(!cache.upload_chunk(PictureHandle(7), 1, &[3; 40]));
         assert_eq!(cache.commit_upload(PictureHandle(7)), None);
     }
@@ -16027,17 +16241,35 @@ mod prose_tests {
     #[test]
     fn replacing_a_picture_does_not_double_count_it() {
         let mut cache = PictureCache::new(300);
-        assert!(cache.put(PictureHandle(1), 10, 10, vec![0; 100]));
-        assert!(cache.put(PictureHandle(1), 10, 10, vec![9; 100]));
+        assert!(cache.put(
+            PictureHandle(1),
+            10,
+            10,
+            PicturePixels::Gray8(vec![0; 100]),
+        ));
+        assert!(cache.put(
+            PictureHandle(1),
+            10,
+            10,
+            PicturePixels::Gray8(vec![9; 100]),
+        ));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.bytes_held(), 100);
-        assert_eq!(cache.get(PictureHandle(1)).map(|p| p.grey[0]), Some(9));
+        assert!(matches!(
+            cache.get(PictureHandle(1)),
+            Some(PicturePixelsRef::Gray8(bytes)) if bytes.first() == Some(&9)
+        ));
     }
 
     #[test]
     fn a_picture_is_drawn_where_it_was_placed_and_nowhere_else() {
         let mut cache = PictureCache::default();
-        assert!(cache.put(PictureHandle(1), 2, 2, vec![0, 0, 0, 0]));
+        assert!(cache.put(
+            PictureHandle(1),
+            2,
+            2,
+            PicturePixels::Gray8(vec![0, 0, 0, 0]),
+        ));
         let mut surface = Surface::new(8, 8);
         surface.clear(tone::PAPER);
         let rect = Rect {
@@ -16055,6 +16287,7 @@ mod prose_tests {
         draw_picture(
             &mut surface,
             rect,
+            (2, 2),
             cache.get(PictureHandle(1)).expect("held"),
             clip,
         );
@@ -16077,7 +16310,12 @@ mod prose_tests {
         // Half the source is black and half white. Sampling would give one or
         // the other; averaging gives the grey that is actually there.
         let mut cache = PictureCache::default();
-        assert!(cache.put(PictureHandle(1), 2, 2, vec![0, 255, 0, 255]));
+        assert!(cache.put(
+            PictureHandle(1),
+            2,
+            2,
+            PicturePixels::Gray8(vec![0, 255, 0, 255]),
+        ));
         let mut surface = Surface::new(4, 4);
         surface.clear(tone::PAPER);
         let rect = Rect {
@@ -16089,6 +16327,7 @@ mod prose_tests {
         draw_picture(
             &mut surface,
             rect,
+            (2, 2),
             cache.get(PictureHandle(1)).expect("held"),
             Rect {
                 x: 0,
@@ -16098,6 +16337,104 @@ mod prose_tests {
             },
         );
         assert_eq!(surface.pixels[0], 127);
+    }
+
+    #[test]
+    fn rgb_picture_blits_three_channels_per_pixel() {
+        let mut cache = PictureCache::default();
+        assert!(cache.put(
+            PictureHandle(1),
+            2,
+            1,
+            PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+        ));
+        let mut surface = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        surface.clear(tone::PAPER);
+        draw_picture(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            (2, 1),
+            cache.get(PictureHandle(1)).expect("held"),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+        );
+        assert_eq!(surface.bytes(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn rgb_picture_is_refused_on_a_gray_surface() {
+        let mut cache = PictureCache::default();
+        assert!(cache.put(
+            PictureHandle(1),
+            1,
+            1,
+            PicturePixels::Rgb8(vec![1, 2, 3]),
+        ));
+        let mut surface = Surface::new(1, 1);
+        surface.clear(tone::PAPER);
+        draw_picture(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            (1, 1),
+            cache.get(PictureHandle(1)).expect("held"),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        );
+        assert_eq!(surface.bytes(), &[tone::PAPER]);
+    }
+
+    #[test]
+    fn rgb_picture_bytes_count_against_the_cache_budget() {
+        let mut cache = PictureCache::new(12);
+        assert!(cache.put(
+            PictureHandle(1),
+            2,
+            2,
+            PicturePixels::Rgb8(vec![1; 12]),
+        ));
+        assert_eq!(cache.bytes_held(), 12);
+        assert!(cache.put(
+            PictureHandle(2),
+            2,
+            2,
+            PicturePixels::Rgb8(vec![2; 12]),
+        ));
+        assert!(cache.get(PictureHandle(1)).is_none());
+        assert!(matches!(
+            cache.get(PictureHandle(2)),
+            Some(PicturePixelsRef::Rgb8(bytes)) if bytes == [2; 12]
+        ));
+    }
+
+    #[test]
+    fn rgb_chunked_picture_preserves_its_format() {
+        let mut cache = PictureCache::new(12);
+        assert!(cache.begin_upload(PictureHandle(7), 2, 2, PictureFormat::Rgb8));
+        assert!(cache.upload_chunk(PictureHandle(7), 0, &[3; 5]));
+        assert!(cache.upload_chunk(PictureHandle(7), 5, &[3; 7]));
+        assert_eq!(cache.commit_upload(PictureHandle(7)), Some(Vec::new()));
+        assert!(matches!(
+            cache.get(PictureHandle(7)),
+            Some(PicturePixelsRef::Rgb8(bytes)) if bytes == [3; 12]
+        ));
     }
 
     fn a_byline(fold: Option<Fold>) -> Screen {
@@ -17181,7 +17518,12 @@ mod prose_tests {
         let empty = PictureCache::default();
         assert!(inked(&empty) > 0, "a row with no cover yet drew nothing");
         let mut cache = PictureCache::default();
-        assert!(cache.put(PictureHandle(7), 19, 30, vec![0; 19 * 30]));
+        assert!(cache.put(
+            PictureHandle(7),
+            19,
+            30,
+            PicturePixels::Gray8(vec![0; 19 * 30]),
+        ));
         assert!(
             inked(&cache) > inked(&empty),
             "the cover was not drawn once it had arrived"
