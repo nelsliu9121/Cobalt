@@ -124,8 +124,20 @@ fn reader_limits(format: PictureFormat) -> ReaderLimits {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchIntent {
+    Foreground { page: usize },
+    Prefetch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceFailure {
+    advice: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReaderTaskPurpose {
     Manifest,
+    ManifestRefresh,
     ForegroundSource { source: usize, page: usize },
     PrefetchSource { source: usize },
     Maintenance,
@@ -170,6 +182,10 @@ struct ReaderState {
     source_cache: BTreeMap<usize, Picture>,
     source_fetches: BTreeMap<usize, TaskId>,
     maintenance_task: Option<TaskId>,
+    refresh_task: Option<TaskId>,
+    refresh_waiters: BTreeMap<usize, FetchIntent>,
+    refresh_attempted: BTreeMap<usize, FetchIntent>,
+    source_failures: BTreeMap<usize, SourceFailure>,
     picture: Option<TilePicture>,
     chrome_visible: bool,
 }
@@ -234,7 +250,9 @@ impl Bomtoon {
             .and_then(|task| self.reader_tasks.get(&task))
         {
             let message = match entry.purpose {
-                ReaderTaskPurpose::Manifest => "Loading comic pages",
+                ReaderTaskPurpose::Manifest | ReaderTaskPurpose::ManifestRefresh => {
+                    "Loading comic pages"
+                }
                 ReaderTaskPurpose::ForegroundSource { .. } => "Loading comic image",
                 ReaderTaskPurpose::PrefetchSource { .. } | ReaderTaskPurpose::Maintenance => {
                     "Loading comic pages"
@@ -476,6 +494,10 @@ impl Bomtoon {
             reader.generation = self.reader_generation;
             reader.source_fetches.clear();
             reader.maintenance_task = None;
+            reader.refresh_task = None;
+            reader.refresh_waiters.clear();
+            reader.refresh_attempted.clear();
+            reader.source_failures.clear();
         }
     }
 
@@ -623,6 +645,344 @@ impl Bomtoon {
         Some(task)
     }
 
+    fn intent_relevant(&self, source: usize, intent: FetchIntent) -> bool {
+        let Some(reader) = self.reader.as_ref() else {
+            return false;
+        };
+        match intent {
+            FetchIntent::Foreground { page } => reader.plans.get(page).is_some_and(|plan| {
+                plan.segments
+                    .iter()
+                    .any(|segment| segment.source == source)
+            }),
+            FetchIntent::Prefetch => {
+                source_relevant_to_window(source, &reader.plans, &reader.window)
+                    || match self.retry {
+                        Retry::Page(page) => source_relevant_to_page_window(
+                            source,
+                            &reader.plans,
+                            page,
+                            reader.limits.pages,
+                        ),
+                        Retry::Restart | Retry::Manifest => false,
+                    }
+            }
+        }
+    }
+
+    fn record_source_failure(
+        &mut self,
+        source: usize,
+        intent: FetchIntent,
+        advice: impl Into<String>,
+    ) {
+        if !self.intent_relevant(source, intent) {
+            return;
+        }
+        let advice = advice.into();
+        match intent {
+            FetchIntent::Foreground { page } => self.fail_reader(Retry::Page(page), advice),
+            FetchIntent::Prefetch => {
+                if let Some(reader) = self.reader.as_mut() {
+                    reader
+                        .source_failures
+                        .insert(source, SourceFailure { advice });
+                }
+            }
+        }
+    }
+
+    fn fail_manifest_refresh(&mut self, advice: impl Into<String>) {
+        let advice = advice.into();
+        let waiters = self.reader.as_mut().map(|reader| {
+            reader.refresh_task = None;
+            std::mem::take(&mut reader.refresh_waiters)
+        });
+        let Some(waiters) = waiters else {
+            return;
+        };
+        let mut foreground = None;
+        for (source, intent) in waiters {
+            match intent {
+                FetchIntent::Foreground { page } if foreground.is_none() => {
+                    foreground = Some(page);
+                }
+                FetchIntent::Foreground { .. } | FetchIntent::Prefetch => {
+                    self.record_source_failure(source, FetchIntent::Prefetch, advice.clone());
+                }
+            }
+        }
+        if let Some(page) = foreground {
+            self.fail_reader(Retry::Page(page), advice);
+        }
+    }
+
+    fn request_manifest_refresh(
+        &mut self,
+        context: &mut Context,
+        source: usize,
+        intent: FetchIntent,
+    ) {
+        let attempted = self
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_attempted.get(&source).copied());
+        if let Some(original) = attempted {
+            self.record_source_failure(
+                source,
+                original,
+                Failure::of(TaskError::Unauthorized).advice,
+            );
+            return;
+        }
+        let existing = {
+            let Some(reader) = self.reader.as_mut() else {
+                return;
+            };
+            reader.refresh_attempted.insert(source, intent);
+            reader.refresh_waiters.insert(source, intent);
+            reader.refresh_task
+        };
+        if let Some(refresh) = existing {
+            if matches!(intent, FetchIntent::Foreground { .. })
+                && self.foreground_reader_task.is_none()
+            {
+                self.foreground_reader_task = Some(refresh);
+            }
+            return;
+        }
+        let Some((content_alias, episode_alias, panel_width)) =
+            self.reader_selection.as_ref().and_then(|selection| {
+                self.reader.as_ref().map(|reader| {
+                    (
+                        selection.content_alias.clone(),
+                        selection.episode_alias.clone(),
+                        reader.panel_width,
+                    )
+                })
+            })
+        else {
+            self.fail_manifest_refresh("The selected episode is no longer available.");
+            return;
+        };
+        let foreground = matches!(intent, FetchIntent::Foreground { .. });
+        let Some(task) = self.spawn_reader(
+            context,
+            ReaderTaskPurpose::ManifestRefresh,
+            api::images(&content_alias, &episode_alias, panel_width),
+            foreground,
+        ) else {
+            self.fail_manifest_refresh("The comic image URLs could not be refreshed.");
+            return;
+        };
+        if let Some(reader) = self.reader.as_mut() {
+            reader.refresh_task = Some(task);
+        }
+    }
+
+    fn drain_refresh_waiters(&mut self, context: &mut Context) -> Result<(), String> {
+        let desired_page = match self.retry {
+            Retry::Page(page) => Some(page),
+            Retry::Restart | Retry::Manifest => None,
+        };
+        let foreground_available = self.foreground_reader_task.is_none();
+        let available_tasks = self.reader.as_ref().map_or(0, |reader| {
+            reader
+                .limits
+                .tasks
+                .saturating_sub(self.reader_tasks.len())
+        });
+        let candidates = {
+            let Some(reader) = self.reader.as_mut() else {
+                return Ok(());
+            };
+            if reader.refresh_task.is_some() {
+                return Ok(());
+            }
+            let stale = reader
+                .refresh_waiters
+                .iter()
+                .filter_map(|(&source, &intent)| {
+                    let relevant = match intent {
+                        FetchIntent::Foreground { page } => {
+                            reader.plans.get(page).is_some_and(|plan| {
+                                plan.segments
+                                    .iter()
+                                    .any(|segment| segment.source == source)
+                            })
+                        }
+                        FetchIntent::Prefetch => {
+                            source_relevant_to_window(source, &reader.plans, &reader.window)
+                                || desired_page.is_some_and(|page| {
+                                    source_relevant_to_page_window(
+                                        source,
+                                        &reader.plans,
+                                        page,
+                                        reader.limits.pages,
+                                    )
+                                })
+                        }
+                    };
+                    (!relevant
+                        || reader.source_cache.contains_key(&source)
+                        || reader.source_fetches.contains_key(&source))
+                    .then_some(source)
+                })
+                .collect::<Vec<_>>();
+            for source in stale {
+                reader.refresh_waiters.remove(&source);
+            }
+            let source_capacity = reader.limits.source_slots.saturating_sub(
+                reader
+                    .source_cache
+                    .len()
+                    .saturating_add(reader.source_fetches.len()),
+            );
+            let fetch_capacity = reader
+                .limits
+                .fetches
+                .saturating_sub(reader.source_fetches.len());
+            let mut capacity = available_tasks.min(source_capacity).min(fetch_capacity);
+            if !foreground_available
+                && reader
+                    .refresh_waiters
+                    .values()
+                    .any(|intent| matches!(intent, FetchIntent::Foreground { .. }))
+            {
+                capacity = 0;
+            }
+            let mut candidates = Vec::new();
+            if foreground_available && capacity > 0 {
+                for (&source, &intent) in &reader.refresh_waiters {
+                    if !matches!(intent, FetchIntent::Foreground { .. }) {
+                        continue;
+                    }
+                    candidates.push((source, intent));
+                    capacity = capacity.saturating_sub(1);
+                    break;
+                }
+            }
+            if capacity > 0 {
+                for (&source, &intent) in &reader.refresh_waiters {
+                    if !matches!(intent, FetchIntent::Prefetch) {
+                        continue;
+                    }
+                    candidates.push((source, intent));
+                    capacity -= 1;
+                    if capacity == 0 {
+                        break;
+                    }
+                }
+            }
+            candidates
+        };
+        for (source, intent) in candidates {
+            let purpose = match intent {
+                FetchIntent::Foreground { page } => {
+                    ReaderTaskPurpose::ForegroundSource { source, page }
+                }
+                FetchIntent::Prefetch => ReaderTaskPurpose::PrefetchSource { source },
+            };
+            let foreground = matches!(intent, FetchIntent::Foreground { .. });
+            if self
+                .start_reader_source(context, source, purpose, foreground)
+                .is_none()
+            {
+                return Err("The refreshed comic image request could not be started.".to_owned());
+            }
+            if let Some(reader) = self.reader.as_mut() {
+                reader.refresh_waiters.remove(&source);
+                reader.source_failures.remove(&source);
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_manifest_refresh(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        bytes: &[u8],
+    ) {
+        let current = self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.refresh_task == Some(task));
+        if !current {
+            return;
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            reader.refresh_task = None;
+        }
+        let refreshed = match parse::images(bytes) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                self.fail_manifest_refresh(error.to_string());
+                return;
+            }
+        };
+        let matches = self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| same_assets(&reader.images, &refreshed));
+        if !matches {
+            self.fail_manifest_refresh("BOMTOON returned different comic image metadata.");
+            return;
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            for (current, replacement) in reader.images.iter_mut().zip(refreshed) {
+                current.url = replacement.url;
+            }
+        }
+        if let Err(error) = self.maintain_reader(context, true, None) {
+            self.fail_manifest_refresh(error);
+        }
+    }
+
+    fn handle_source_failure(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        source: usize,
+        intent: FetchIntent,
+        error: TaskError,
+    ) {
+        if let Some(reader) = self.reader.as_mut() {
+            if reader.source_fetches.get(&source) == Some(&task) {
+                reader.source_fetches.remove(&source);
+            }
+        }
+        match error {
+            TaskError::Unauthorized => self.request_manifest_refresh(context, source, intent),
+            error => self.record_source_failure(source, intent, Failure::of(error).advice),
+        }
+        if self.problem.is_none() {
+            if let Err(error) = self.maintain_reader(context, true, None) {
+                self.record_source_failure(source, intent, error);
+            }
+        }
+    }
+
+    fn handle_source_cancelled(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        source: usize,
+        intent: FetchIntent,
+    ) {
+        if let Some(reader) = self.reader.as_mut() {
+            if reader.source_fetches.get(&source) == Some(&task) {
+                reader.source_fetches.remove(&source);
+            }
+        }
+        self.record_source_failure(source, intent, "The request was cancelled.");
+        if self.problem.is_none() {
+            if let Err(error) = self.maintain_reader(context, true, None) {
+                self.record_source_failure(source, intent, error);
+            }
+        }
+    }
+
     fn fail_reader(&mut self, retry: Retry, message: impl Into<String>) {
         self.problem = Some(message.into());
         self.retry = retry;
@@ -743,6 +1103,10 @@ impl Bomtoon {
                     source_cache: BTreeMap::new(),
                     source_fetches: BTreeMap::new(),
                     maintenance_task: None,
+                    refresh_task: None,
+                    refresh_waiters: BTreeMap::new(),
+                    refresh_attempted: BTreeMap::new(),
+                    source_failures: BTreeMap::new(),
                     picture: None,
                     chrome_visible: false,
                 });
@@ -775,6 +1139,7 @@ impl Bomtoon {
         extend_window: bool,
         install_target: Option<usize>,
     ) -> Result<bool, String> {
+        self.drain_refresh_waiters(context)?;
         let available_tasks = self
             .reader
             .as_ref()
@@ -782,6 +1147,7 @@ impl Bomtoon {
             .saturating_sub(self.reader_tasks.len());
         let mut planned_spawns = Vec::new();
         let mut planned_promotion = None;
+        let mut planned_refresh_promotion = None;
         let mut ready_to_install = None;
         {
             let reader = self
@@ -805,6 +1171,29 @@ impl Bomtoon {
                         reader.panel_height,
                     )?));
                 }
+            }
+            let desired_page = match self.retry {
+                Retry::Page(page) => Some(page),
+                Retry::Restart | Retry::Manifest => None,
+            };
+            let stale_failures = reader
+                .source_failures
+                .keys()
+                .copied()
+                .filter(|source| {
+                    !source_relevant_to_window(*source, &reader.plans, &reader.window)
+                        && !desired_page.is_some_and(|page| {
+                            source_relevant_to_page_window(
+                                *source,
+                                &reader.plans,
+                                page,
+                                reader.limits.pages,
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            for source in stale_failures {
+                reader.source_failures.remove(&source);
             }
 
             {
@@ -926,7 +1315,15 @@ impl Bomtoon {
                         PageEntry::Building(_) | PageEntry::Ready { .. } => None,
                     });
                     if let Some(source) = missing {
-                        if let Some(&task) = reader.source_fetches.get(&source) {
+                        if let Some(failure) = reader.source_failures.get(&source) {
+                            return Err(failure.advice.clone());
+                        }
+                        if reader.refresh_waiters.contains_key(&source) {
+                            let intent = FetchIntent::Foreground { page };
+                            reader.refresh_waiters.insert(source, intent);
+                            reader.refresh_attempted.insert(source, intent);
+                            planned_refresh_promotion = reader.refresh_task;
+                        } else if let Some(&task) = reader.source_fetches.get(&source) {
                             planned_promotion = Some((task, source, page));
                         } else if !reader.source_cache.contains_key(&source) && spawn_limit > 0 {
                             let url = reader
@@ -945,7 +1342,9 @@ impl Bomtoon {
                             ));
                         }
                     }
-                } else if spawn_limit > 0 {
+                } else if spawn_limit > 0
+                    && (reader.refresh_task.is_some() || reader.refresh_waiters.is_empty())
+                {
                     'pages: for entry in &reader.window {
                         let PageEntry::Building(build) = entry else {
                             continue;
@@ -956,6 +1355,12 @@ impl Bomtoon {
                             .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
                         for segment in &plan.segments[build.next_segment..] {
                             let source = segment.source;
+                            if reader.source_failures.contains_key(&source) {
+                                break 'pages;
+                            }
+                            if reader.refresh_waiters.contains_key(&source) {
+                                continue;
+                            }
                             if reader.source_cache.contains_key(&source)
                                 || reader.source_fetches.contains_key(&source)
                                 || planned_spawns
@@ -997,6 +1402,19 @@ impl Bomtoon {
             entry.purpose = ReaderTaskPurpose::ForegroundSource { source, page };
             self.foreground_reader_task = Some(task);
         }
+        if let Some(task) = planned_refresh_promotion {
+            let entry = self.reader_tasks.get(&task).ok_or_else(|| {
+                "The comic image URL refresh registry changed unexpectedly.".to_owned()
+            })?;
+            if entry.generation != self.reader_generation
+                || entry.purpose != ReaderTaskPurpose::ManifestRefresh
+            {
+                return Err(
+                    "The comic image URL refresh generation changed unexpectedly.".to_owned(),
+                );
+            }
+            self.foreground_reader_task = Some(task);
+        }
 
         if let Some((page, picture)) = ready_to_install {
             self.install_page(context, page, picture)?;
@@ -1014,6 +1432,7 @@ impl Bomtoon {
                 .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
             reader.source_fetches.insert(source, task);
         }
+        self.drain_refresh_waiters(context)?;
         Ok(false)
     }
 
@@ -1022,18 +1441,17 @@ impl Bomtoon {
         context: &mut Context,
         task: TaskId,
         source: usize,
-        install_target: Option<usize>,
+        intent: FetchIntent,
         bytes: &[u8],
     ) -> bool {
         let desired_page = match self.retry {
             Retry::Page(page) => Some(page),
             Retry::Restart | Retry::Manifest => None,
         };
-        let page = install_target.or(desired_page).unwrap_or_else(|| {
-            self.reader.as_ref().map_or(0, |reader| {
-                reader.page.checked_add(1).unwrap_or(reader.page)
-            })
-        });
+        let install_target = match intent {
+            FetchIntent::Foreground { page } => Some(page),
+            FetchIntent::Prefetch => None,
+        };
         let foreground_active = self.foreground_reader_task.is_some();
         let (relevant, defer_maintenance) = {
             let Some(reader) = self.reader.as_mut() else {
@@ -1055,59 +1473,62 @@ impl Bomtoon {
             });
             (
                 relevant_to_window || relevant_to_desired,
-                install_target.is_none() && (foreground_active || !relevant_to_window),
+                matches!(intent, FetchIntent::Prefetch)
+                    && (foreground_active || !relevant_to_window),
             )
         };
         if !relevant {
             return false;
         }
-        let decoded = {
-            let Some(reader) = self.reader.as_ref() else {
-                return false;
-            };
-            let Some(expected) = reader.images.get(source) else {
-                self.fail_reader(
-                    Retry::Page(page),
-                    "The selected comic image is no longer available.",
-                );
-                return false;
-            };
-            decode_reader_source(bytes, expected, reader.format, reader.panel_width)
-        };
+        let decoded = self.reader.as_ref().map_or_else(
+            || Err("The selected episode is no longer available.".to_owned()),
+            |reader| {
+                reader.images.get(source).map_or_else(
+                    || Err("The selected comic image is no longer available.".to_owned()),
+                    |expected| {
+                        decode_reader_source(bytes, expected, reader.format, reader.panel_width)
+                    },
+                )
+            },
+        );
         let source_picture = match decoded {
             Ok(picture) => picture,
             Err(error) => {
-                self.fail_reader(Retry::Page(page), error);
+                self.record_source_failure(source, intent, error);
                 return false;
             }
         };
-        let Some(reader) = self.reader.as_mut() else {
-            return false;
-        };
-        if reader
-            .source_cache
-            .len()
-            .saturating_add(reader.source_fetches.len())
-            >= reader.limits.source_slots
-        {
-            self.fail_reader(
-                Retry::Page(page),
+        let source_limit_reached = self.reader.as_ref().is_none_or(|reader| {
+            reader
+                .source_cache
+                .len()
+                .saturating_add(reader.source_fetches.len())
+                >= reader.limits.source_slots
+        });
+        if source_limit_reached {
+            self.record_source_failure(
+                source,
+                intent,
                 "The comic source window exceeded its format limit.",
             );
             return false;
         }
+        let Some(reader) = self.reader.as_mut() else {
+            return false;
+        };
         reader.source_cache.insert(source, source_picture);
+        reader.source_failures.remove(&source);
         if defer_maintenance {
             return false;
         }
         match self.maintain_reader(
             context,
-            install_target.is_none(),
+            matches!(intent, FetchIntent::Prefetch),
             install_target,
         ) {
             Ok(shown) => shown,
             Err(error) => {
-                self.fail_reader(Retry::Page(page), error);
+                self.record_source_failure(source, intent, error);
                 false
             }
         }
@@ -1348,7 +1769,14 @@ impl Bomtoon {
             }
         };
 
-        let kept_tasks = kept_fetches.values().copied().collect::<BTreeSet<_>>();
+        let mut kept_tasks = kept_fetches.values().copied().collect::<BTreeSet<_>>();
+        if let Some(refresh) = self
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_task)
+        {
+            kept_tasks.insert(refresh);
+        }
         let cancelled = self
             .reader_tasks
             .keys()
@@ -1411,7 +1839,21 @@ impl Bomtoon {
         match retry {
             Retry::Restart => self.restart(context),
             Retry::Manifest => self.start_manifest(context),
-            Retry::Page(page) => self.rebase_window(context, page),
+            Retry::Page(page) => {
+                if let Some(reader) = self.reader.as_mut() {
+                    let failed = reader
+                        .plans
+                        .get(page)
+                        .into_iter()
+                        .flat_map(|plan| &plan.segments)
+                        .map(|segment| segment.source)
+                        .collect::<BTreeSet<_>>();
+                    reader
+                        .source_failures
+                        .retain(|source, _| !failed.contains(source));
+                }
+                self.rebase_window(context, page);
+            }
         }
         false
     }
@@ -1594,14 +2036,30 @@ impl KoboApp for Bomtoon {
                     self.accept_manifest(context, &bytes);
                     false
                 }
+                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Completed(bytes)) => {
+                    self.accept_manifest_refresh(context, task, &bytes);
+                    false
+                }
                 (
                     ReaderTaskPurpose::ForegroundSource { source, page },
                     TaskOutcome::Completed(bytes),
-                ) => self.accept_reader_source(context, task, source, Some(page), &bytes),
+                ) => self.accept_reader_source(
+                    context,
+                    task,
+                    source,
+                    FetchIntent::Foreground { page },
+                    &bytes,
+                ),
                 (
                     ReaderTaskPurpose::PrefetchSource { source },
                     TaskOutcome::Completed(bytes),
-                ) => self.accept_reader_source(context, task, source, None, &bytes),
+                ) => self.accept_reader_source(
+                    context,
+                    task,
+                    source,
+                    FetchIntent::Prefetch,
+                    &bytes,
+                ),
                 (ReaderTaskPurpose::Maintenance, TaskOutcome::Completed(_)) => {
                     if let Some(reader) = self.reader.as_mut() {
                         if reader.maintenance_task == Some(task) {
@@ -1630,29 +2088,51 @@ impl KoboApp for Bomtoon {
                     }
                     false
                 }
+                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Failed(error)) => {
+                    if let Some(reader) = self.reader.as_mut() {
+                        if reader.refresh_task == Some(task) {
+                            reader.refresh_task = None;
+                        }
+                    }
+                    match error {
+                        TaskError::NoCredential => {
+                            self.clear_account_data(context);
+                            self.account = AccountState::SignedOut;
+                            self.problem = None;
+                        }
+                        TaskError::Unauthorized => {
+                            self.clear_account_data(context);
+                            self.account = AccountState::Expired;
+                            self.problem = None;
+                        }
+                        error => self.fail_manifest_refresh(Failure::of(error).advice),
+                    }
+                    false
+                }
                 (
                     ReaderTaskPurpose::ForegroundSource { source, page },
                     TaskOutcome::Failed(error),
                 ) => {
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.source_fetches.get(&source) == Some(&task) {
-                            reader.source_fetches.remove(&source);
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), Failure::of(error).advice);
+                    self.handle_source_failure(
+                        context,
+                        task,
+                        source,
+                        FetchIntent::Foreground { page },
+                        error,
+                    );
                     false
                 }
                 (
                     ReaderTaskPurpose::PrefetchSource { source },
                     TaskOutcome::Failed(error),
                 ) => {
-                    let page = self.reader.as_ref().map_or(0, |reader| reader.page);
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.source_fetches.get(&source) == Some(&task) {
-                            reader.source_fetches.remove(&source);
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), Failure::of(error).advice);
+                    self.handle_source_failure(
+                        context,
+                        task,
+                        source,
+                        FetchIntent::Prefetch,
+                        error,
+                    );
                     false
                 }
                 (ReaderTaskPurpose::Maintenance, TaskOutcome::Failed(error)) => {
@@ -1669,29 +2149,37 @@ impl KoboApp for Bomtoon {
                     self.fail_reader(Retry::Manifest, "The request was cancelled.");
                     false
                 }
+                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Cancelled) => {
+                    if let Some(reader) = self.reader.as_mut() {
+                        if reader.refresh_task == Some(task) {
+                            reader.refresh_task = None;
+                        }
+                    }
+                    self.fail_manifest_refresh("The request was cancelled.");
+                    false
+                }
                 (
                     ReaderTaskPurpose::ForegroundSource { source, page },
                     TaskOutcome::Cancelled,
                 ) => {
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.source_fetches.get(&source) == Some(&task) {
-                            reader.source_fetches.remove(&source);
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), "The request was cancelled.");
+                    self.handle_source_cancelled(
+                        context,
+                        task,
+                        source,
+                        FetchIntent::Foreground { page },
+                    );
                     false
                 }
                 (
                     ReaderTaskPurpose::PrefetchSource { source },
                     TaskOutcome::Cancelled,
                 ) => {
-                    let page = self.reader.as_ref().map_or(0, |reader| reader.page);
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.source_fetches.get(&source) == Some(&task) {
-                            reader.source_fetches.remove(&source);
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), "The request was cancelled.");
+                    self.handle_source_cancelled(
+                        context,
+                        task,
+                        source,
+                        FetchIntent::Prefetch,
+                    );
                     false
                 }
                 (ReaderTaskPurpose::Maintenance, TaskOutcome::Cancelled) => {
@@ -2054,6 +2542,16 @@ fn decode_reader_source(
     Ok(source)
 }
 
+fn same_assets(current: &[EpisodeImage], refreshed: &[EpisodeImage]) -> bool {
+    current.len() == refreshed.len()
+        && current.iter().zip(refreshed).all(|(old, new)| {
+            old.order == new.order
+                && old.width == new.width
+                && old.height == new.height
+                && old.path == new.path
+        })
+}
+
 
 fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usize) {
     let start = page.saturating_mul(items_per_page).min(count);
@@ -2165,10 +2663,14 @@ mod tests {
         .into_bytes()
     }
     fn image_manifest_sources(count: usize) -> Vec<u8> {
+        image_manifest_sources_with_policy(count, "p")
+    }
+
+    fn image_manifest_sources_with_policy(count: usize, policy: &str) -> Vec<u8> {
         let images = (0..count)
             .map(|source| {
                 format!(
-                    "{{\"orderNo\":{},\"width\":1,\"height\":1,\"imagePath\":\"https://image.balcony.studio/tw/ep/{source}.webp?Policy=p{source}&Signature=s&Key-Pair-Id=k\",\"line\":null,\"point\":null}}",
+                    "{{\"orderNo\":{},\"width\":1,\"height\":1,\"imagePath\":\"https://image.balcony.studio/tw/ep/{source}.webp?Policy={policy}{source}&Signature=s&Key-Pair-Id=k\",\"line\":null,\"point\":null}}",
                     source + 1
                 )
             })
@@ -2849,6 +3351,10 @@ mod tests {
                     source_cache: BTreeMap::new(),
                     source_fetches: BTreeMap::new(),
                     maintenance_task: None,
+                    refresh_task: None,
+                    refresh_waiters: BTreeMap::new(),
+                    refresh_attempted: BTreeMap::new(),
+                    source_failures: BTreeMap::new(),
                     picture: Some(TilePicture::new(PictureHandle(7), width, panel_height)),
                     chrome_visible,
                 }),
@@ -2904,7 +3410,9 @@ mod tests {
             let bytes = match entry.purpose {
                 ReaderTaskPurpose::ForegroundSource { .. }
                 | ReaderTaskPurpose::PrefetchSource { .. } => TINY_WEBP.to_vec(),
-                ReaderTaskPurpose::Manifest | ReaderTaskPurpose::Maintenance => Vec::new(),
+                ReaderTaskPurpose::Manifest
+                | ReaderTaskPurpose::ManifestRefresh
+                | ReaderTaskPurpose::Maintenance => Vec::new(),
             };
             runner.task_outcome(task, TaskOutcome::Completed(bytes));
             assert_reader_bounds(runner.app());
@@ -2982,6 +3490,10 @@ mod tests {
                     source_cache: BTreeMap::new(),
                     source_fetches,
                     maintenance_task: Some(maintenance_task),
+                    refresh_task: None,
+                    refresh_waiters: BTreeMap::new(),
+                    refresh_attempted: BTreeMap::new(),
+                    source_failures: BTreeMap::new(),
                     picture: Some(picture),
                     chrome_visible: false,
                 }),
@@ -4141,7 +4653,9 @@ mod tests {
                 let bytes = match purpose {
                     ReaderTaskPurpose::ForegroundSource { .. }
                     | ReaderTaskPurpose::PrefetchSource { .. } => TINY_WEBP.to_vec(),
-                    ReaderTaskPurpose::Manifest | ReaderTaskPurpose::Maintenance => Vec::new(),
+                    ReaderTaskPurpose::Manifest
+                    | ReaderTaskPurpose::ManifestRefresh
+                    | ReaderTaskPurpose::Maintenance => Vec::new(),
                 };
                 runner.task_outcome(task, TaskOutcome::Completed(bytes));
                 assert_reader_bounds(runner.app());
@@ -4356,5 +4870,489 @@ mod tests {
         assert_eq!(reader.maintenance_task, None);
         assert_eq!(reader.window.len(), reader.limits.pages);
         assert_reader_bounds(app);
+    }
+    fn reader_with_source_task(
+        format: PictureFormat,
+        intent: FetchIntent,
+    ) -> (AppRunner<Bomtoon>, TaskId) {
+        let mut runner =
+            seeded_reader_with_metrics(reader_metrics(format, 1), 5, 0, false);
+        let source_task = TaskId(41);
+        {
+            let app = runner.app_mut();
+            let reader = app.reader.as_mut().expect("reader");
+            reader.window.clear();
+            for page in 1..=reader.limits.pages {
+                reader.window.push_back(PageEntry::Building(
+                    PageBuild::new(page, format, 1, 1).expect("source page build"),
+                ));
+            }
+            reader.source_fetches.insert(1, source_task);
+            app.reader_tasks.insert(
+                source_task,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: match intent {
+                        FetchIntent::Foreground { page } => {
+                            ReaderTaskPurpose::ForegroundSource { source: 1, page }
+                        }
+                        FetchIntent::Prefetch => ReaderTaskPurpose::PrefetchSource { source: 1 },
+                    },
+                },
+            );
+            if matches!(intent, FetchIntent::Foreground { .. }) {
+                app.foreground_reader_task = Some(source_task);
+            }
+        }
+        (runner, source_task)
+    }
+
+    fn active_reader_source(app: &Bomtoon, source: usize) -> Option<(TaskId, FetchIntent)> {
+        app.reader_tasks.iter().find_map(|(task, entry)| {
+            let intent = match entry.purpose {
+                ReaderTaskPurpose::ForegroundSource {
+                    source: task_source,
+                    page,
+                } if task_source == source => FetchIntent::Foreground { page },
+                ReaderTaskPurpose::PrefetchSource {
+                    source: task_source,
+                } if task_source == source => FetchIntent::Prefetch,
+                ReaderTaskPurpose::Manifest
+                | ReaderTaskPurpose::ManifestRefresh
+                | ReaderTaskPurpose::Maintenance
+                | ReaderTaskPurpose::ForegroundSource { .. }
+                | ReaderTaskPurpose::PrefetchSource { .. } => return None,
+            };
+            Some((*task, intent))
+        })
+    }
+
+    #[test]
+    fn prefetch_failure_stays_interactive_and_retry_resumes_the_exact_requested_page() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, prefetch) = reader_with_source_task(format, FetchIntent::Prefetch);
+
+            let commands =
+                runner.task_outcome(prefetch, TaskOutcome::Failed(TaskError::TimedOut));
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert!(app.problem.is_none(), "{format:?} exposed a background error");
+            assert!(app.foreground_reader_task.is_none());
+            assert_eq!(reader.page, 0);
+            assert_eq!(
+                reader.picture.map(|picture| picture.handle),
+                Some(PictureHandle(7))
+            );
+            assert!(reader.source_failures.contains_key(&1));
+            assert!(last_screen(&commands).reading_surface.is_some());
+            assert_reader_bounds(app);
+
+            let commands = runner.action(action_id(READER_NEXT));
+            let app = runner.app();
+            assert!(app.problem.is_some());
+            assert_eq!(app.retry, Retry::Page(1));
+            assert_eq!(
+                app.reader
+                    .as_ref()
+                    .and_then(|reader| reader.picture)
+                    .map(|picture| picture.handle),
+                Some(PictureHandle(7))
+            );
+            assert!(last_screen(&commands).reading_surface.is_none());
+
+            let commands = runner.action(action_id(RETRY));
+            let (retry_task, work) = only_spawn(&commands);
+            assert!(matches!(work, Task::Fetch { credential: None, .. }));
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert!(app.problem.is_none());
+            assert_eq!(app.retry, Retry::Page(1));
+            assert_eq!(
+                app.reader_tasks.get(&retry_task).map(|entry| entry.purpose),
+                Some(ReaderTaskPurpose::ForegroundSource { source: 1, page: 1 })
+            );
+            assert!(!reader.source_failures.contains_key(&1));
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
+    fn concurrent_unauthorized_sources_share_one_bounded_manifest_refresh() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, first_source_task) =
+                reader_with_source_task(format, FetchIntent::Prefetch);
+
+            let first_commands = runner.task_outcome(
+                first_source_task,
+                TaskOutcome::Failed(TaskError::Unauthorized),
+            );
+            let refresh = runner
+                .app()
+                .reader
+                .as_ref()
+                .and_then(|reader| reader.refresh_task)
+                .expect("shared refresh");
+            assert!(runner.app().problem.is_none());
+            assert!(runner.app().foreground_reader_task.is_none());
+            assert_eq!(runner.app().account, AccountState::Active);
+            assert!(runner.app().screen().reading_surface.is_some());
+            let manifest_spawns = first_commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        Command::Spawn {
+                            work: Task::Fetch {
+                                credential: Some(credential),
+                                ..
+                            },
+                            ..
+                        } if credential.header == SecretHeader::Bearer
+                    )
+                })
+                .count();
+            assert_eq!(manifest_spawns, 1);
+            let second_source_task = active_reader_source(runner.app(), 2)
+                .map(|(task, _)| task)
+                .expect("later source scheduled while refresh is pending");
+
+            let second_commands = runner.task_outcome(
+                second_source_task,
+                TaskOutcome::Failed(TaskError::Unauthorized),
+            );
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert_eq!(reader.refresh_task, Some(refresh));
+            assert_eq!(
+                reader.refresh_waiters.keys().copied().collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(
+                reader.refresh_attempted.keys().copied().collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert!(!second_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Spawn {
+                        work: Task::Fetch {
+                            credential: Some(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            }));
+            assert_reader_bounds(runner.app());
+
+            runner.task_outcome(
+                refresh,
+                TaskOutcome::Completed(image_manifest_sources_with_policy(5, "r")),
+            );
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert!(reader
+                .images
+                .iter()
+                .enumerate()
+                .all(|(source, image)| image.url.contains(&format!("Policy=r{source}"))));
+            assert_eq!(
+                active_reader_source(runner.app(), 1).map(|(_, intent)| intent),
+                Some(FetchIntent::Prefetch),
+                "{format:?} did not retry the lowest source first"
+            );
+            assert!(reader.refresh_waiters.contains_key(&2));
+            assert_reader_bounds(runner.app());
+
+            let retry = active_reader_source(runner.app(), 1)
+                .map(|(task, _)| task)
+                .expect("source one retry");
+            let commands =
+                runner.task_outcome(retry, TaskOutcome::Failed(TaskError::Unauthorized));
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert!(reader.refresh_task.is_none());
+            assert!(reader.source_failures.contains_key(&1));
+            assert!(!commands.iter().any(|command| {
+                matches!(
+                    command,
+                    Command::Spawn {
+                        work: Task::Fetch {
+                            credential: Some(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            }));
+            assert_reader_bounds(runner.app());
+
+            runner.action(action_id(READER_NEXT));
+            assert!(runner.app().problem.is_some());
+            assert_eq!(runner.app().retry, Retry::Page(1));
+            runner.action(action_id(RETRY));
+            let reader = runner.app().reader.as_ref().expect("reader");
+            assert_eq!(
+                reader.refresh_attempted.get(&1),
+                Some(&FetchIntent::Prefetch)
+            );
+            assert_eq!(
+                active_reader_source(runner.app(), 1).map(|(_, intent)| intent),
+                Some(FetchIntent::Foreground { page: 1 })
+            );
+            assert!(reader.refresh_task.is_none());
+            assert_reader_bounds(runner.app());
+        }
+    }
+
+    #[test]
+    fn manifest_refresh_drains_foreground_before_lower_prefetch_with_format_bounds() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, _) = reader_with_source_task(format, FetchIntent::Prefetch);
+            let refresh = TaskId(42);
+            {
+                let app = runner.app_mut();
+                app.reader_tasks.clear();
+                app.foreground_reader_task = Some(refresh);
+                app.reader_tasks.insert(
+                    refresh,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::ManifestRefresh,
+                    },
+                );
+                let reader = app.reader.as_mut().expect("reader");
+                reader.source_fetches.clear();
+                reader.refresh_task = Some(refresh);
+                reader.refresh_waiters = BTreeMap::from([
+                    (1, FetchIntent::Prefetch),
+                    (2, FetchIntent::Foreground { page: 2 }),
+                ]);
+                reader.refresh_attempted = reader.refresh_waiters.clone();
+            }
+
+            runner.task_outcome(
+                refresh,
+                TaskOutcome::Completed(image_manifest_sources_with_policy(5, "f")),
+            );
+            let app = runner.app();
+            let reader = app.reader.as_ref().expect("reader");
+            assert_eq!(
+                active_reader_source(app, 2).map(|(_, intent)| intent),
+                Some(FetchIntent::Foreground { page: 2 })
+            );
+            if format == PictureFormat::Gray8 {
+                assert_eq!(
+                    active_reader_source(app, 1).map(|(_, intent)| intent),
+                    Some(FetchIntent::Prefetch)
+                );
+            } else {
+                assert!(reader.refresh_waiters.contains_key(&1));
+            }
+            assert_eq!(
+                app.foreground_reader_task,
+                active_reader_source(app, 2).map(|pair| pair.0)
+            );
+            assert_reader_bounds(app);
+        }
+    }
+
+    #[test]
+    fn manifest_refresh_does_not_drain_prefetch_ahead_of_a_busy_foreground() {
+        let format = PictureFormat::Gray8;
+        let (mut runner, _) = reader_with_source_task(format, FetchIntent::Prefetch);
+        let refresh = TaskId(42);
+        let active_foreground = TaskId(43);
+        {
+            let app = runner.app_mut();
+            app.reader_tasks.clear();
+            app.foreground_reader_task = Some(active_foreground);
+            app.reader_tasks.insert(
+                refresh,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::ManifestRefresh,
+                },
+            );
+            app.reader_tasks.insert(
+                active_foreground,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::ForegroundSource { source: 3, page: 3 },
+                },
+            );
+            let reader = app.reader.as_mut().expect("reader");
+            reader.source_fetches = BTreeMap::from([(3, active_foreground)]);
+            reader.refresh_task = Some(refresh);
+            reader.refresh_waiters = BTreeMap::from([
+                (1, FetchIntent::Prefetch),
+                (2, FetchIntent::Foreground { page: 2 }),
+            ]);
+            reader.refresh_attempted = reader.refresh_waiters.clone();
+        }
+
+        runner.task_outcome(
+            refresh,
+            TaskOutcome::Completed(image_manifest_sources_with_policy(5, "q")),
+        );
+        let app = runner.app();
+        let reader = app.reader.as_ref().expect("reader");
+        assert!(active_reader_source(app, 1).is_none());
+        assert_eq!(
+            reader.refresh_waiters.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(app.foreground_reader_task, Some(active_foreground));
+        assert_reader_bounds(app);
+    }
+
+    #[test]
+    fn manifest_refresh_drain_respects_a_saturated_rgb_source_bound() {
+        let format = PictureFormat::Rgb8;
+        let (mut runner, _) = reader_with_source_task(format, FetchIntent::Prefetch);
+        let refresh = TaskId(42);
+        {
+            let app = runner.app_mut();
+            app.reader_tasks.clear();
+            app.foreground_reader_task = Some(refresh);
+            app.reader_tasks.insert(
+                refresh,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::ManifestRefresh,
+                },
+            );
+            let active_source = TaskId(43);
+            app.reader_tasks.insert(
+                active_source,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::PrefetchSource { source: 1 },
+                },
+            );
+            let reader = app.reader.as_mut().expect("reader");
+            reader.source_fetches = BTreeMap::from([(1, active_source)]);
+            reader.refresh_task = Some(refresh);
+            reader
+                .refresh_waiters
+                .insert(2, FetchIntent::Foreground { page: 2 });
+            reader
+                .refresh_attempted
+                .insert(2, FetchIntent::Foreground { page: 2 });
+        }
+
+        runner.task_outcome(
+            refresh,
+            TaskOutcome::Completed(image_manifest_sources_with_policy(5, "b")),
+        );
+        let app = runner.app();
+        let reader = app.reader.as_ref().expect("reader");
+        assert!(active_reader_source(app, 2).is_none());
+        assert_eq!(
+            reader.refresh_waiters.get(&2),
+            Some(&FetchIntent::Foreground { page: 2 })
+        );
+        assert_reader_bounds(app);
+    }
+
+    #[test]
+    fn refresh_failure_maps_foreground_to_page_and_prefetch_to_source_failure() {
+        let (mut background, source_task) =
+            reader_with_source_task(PictureFormat::Gray8, FetchIntent::Prefetch);
+        background.task_outcome(
+            source_task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        let refresh = background
+            .app()
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_task)
+            .expect("background refresh");
+        let commands =
+            background.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
+        let app = background.app();
+        assert!(app.problem.is_none());
+        assert!(app
+            .reader
+            .as_ref()
+            .expect("reader")
+            .source_failures
+            .contains_key(&1));
+        assert!(app.screen().reading_surface.is_some());
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::SetScreen(_))));
+
+        let (mut foreground, source_task) = reader_with_source_task(
+            PictureFormat::Gray8,
+            FetchIntent::Foreground { page: 1 },
+        );
+        foreground.task_outcome(
+            source_task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        let refresh = foreground
+            .app()
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_task)
+            .expect("foreground refresh");
+        let commands =
+            foreground.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
+        assert!(foreground.app().problem.is_some());
+        assert_eq!(foreground.app().retry, Retry::Page(1));
+        assert!(last_screen(&commands).reading_surface.is_none());
+    }
+
+    #[test]
+    fn same_assets_accepts_url_changes_only_and_rejects_every_identity_change() {
+        let current = vec![episode_image(0, 1, 2), episode_image(1, 3, 4)];
+        let mut refreshed = current.clone();
+        refreshed[0].url.push_str("?Policy=new");
+        refreshed[1].url.push_str("?Policy=new");
+        assert!(same_assets(&current, &refreshed));
+
+        let mut changed_count = refreshed.clone();
+        changed_count.pop();
+        assert!(!same_assets(&current, &changed_count));
+        for mutate in [
+            |image: &mut EpisodeImage| image.order += 1,
+            |image: &mut EpisodeImage| image.width += 1,
+            |image: &mut EpisodeImage| image.height += 1,
+            |image: &mut EpisodeImage| image.path.push_str(".changed"),
+        ] {
+            let mut changed = refreshed.clone();
+            mutate(&mut changed[0]);
+            assert!(!same_assets(&current, &changed));
+        }
+        let mut reordered = refreshed;
+        reordered.swap(0, 1);
+        assert!(!same_assets(&current, &reordered));
+    }
+
+    #[test]
+    fn manifest_credentials_on_refresh_preserve_account_transitions() {
+        for (error, expected) in [
+            (TaskError::NoCredential, AccountState::SignedOut),
+            (TaskError::Unauthorized, AccountState::Expired),
+        ] {
+            let (mut runner, _) =
+                reader_with_source_task(PictureFormat::Gray8, FetchIntent::Prefetch);
+            let refresh = TaskId(42);
+            {
+                let app = runner.app_mut();
+                app.reader_tasks.clear();
+                app.reader_tasks.insert(
+                    refresh,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::ManifestRefresh,
+                    },
+                );
+                app.reader.as_mut().expect("reader").refresh_task = Some(refresh);
+            }
+
+            runner.task_outcome(refresh, TaskOutcome::Failed(error));
+            assert_eq!(runner.app().account, expected);
+            assert_all_account_data_cleared(runner.app());
+        }
     }
 }
