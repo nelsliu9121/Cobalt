@@ -57,8 +57,10 @@ pub struct ColorPanel {
 
 impl ColorPanel {
     const fn is_valid_for(self, profile: &DeviceProfile) -> bool {
-        if !matches!(profile.framebuffer_controller, FramebufferController::Hwtcon)
-            || self.clean_waveform == 0
+        if !matches!(
+            profile.framebuffer_controller,
+            FramebufferController::Hwtcon
+        ) || self.clean_waveform == 0
             || self.regal_waveform == 0
             || self.clean_waveform == self.regal_waveform
             || self.cfa_flags == 0
@@ -2866,11 +2868,7 @@ mod tests {
             ..valid_color_profile()
         };
         let mut snapshot = clara_panel_snapshot(clara_bw_identity());
-        snapshot
-            .framebuffer
-            .as_mut()
-            .expect("framebuffer")
-            .red = profile.red;
+        snapshot.framebuffer.as_mut().expect("framebuffer").red = profile.red;
 
         let report = profile.validate(&snapshot);
 
