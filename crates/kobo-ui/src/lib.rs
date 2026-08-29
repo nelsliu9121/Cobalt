@@ -9152,7 +9152,7 @@ pub struct FrameTransition {
 pub struct FramePlanner {
     width: usize,
     height: usize,
-    previous: Vec<u8>,
+    previous: PicturePixels,
     dirty: u64,
     refreshes: u64,
     started: bool,
@@ -9161,10 +9161,24 @@ pub struct FramePlanner {
 impl FramePlanner {
     #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
+        Self::new_in(width, height, PictureFormat::Gray8)
+    }
+
+    #[must_use]
+    pub fn new_in(width: usize, height: usize, format: PictureFormat) -> Self {
+        let byte_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel()))
+            .expect("frame dimensions exceed addressable memory");
+        let bytes = vec![tone::INK; byte_len];
+        let previous = match format {
+            PictureFormat::Gray8 => PicturePixels::Gray8(bytes),
+            PictureFormat::Rgb8 => PicturePixels::Rgb8(bytes),
+        };
         Self {
             width,
             height,
-            previous: vec![tone::INK; width.saturating_mul(height)],
+            previous,
             dirty: 0,
             refreshes: 0,
             started: false,
@@ -9177,10 +9191,7 @@ impl FramePlanner {
     /// changed. Call [`Self::commit`] only after the update succeeds.
     #[must_use]
     pub fn plan(&self, surface: &Surface) -> Option<FrameTransition> {
-        if surface.width != self.width
-            || surface.height != self.height
-            || surface.pixels.len() != self.previous.len()
-        {
+        if !self.accepts(surface) {
             return None;
         }
         let whole = Rect {
@@ -9224,14 +9235,16 @@ impl FramePlanner {
 
     /// Records a successfully applied transition.
     pub fn commit(&mut self, surface: &Surface, transition: FrameTransition) -> bool {
-        if surface.width != self.width
-            || surface.height != self.height
-            || surface.pixels.len() != self.previous.len()
-            || transition.refresh != self.refreshes.saturating_add(1)
-        {
+        if !self.accepts(surface) || transition.refresh != self.refreshes.saturating_add(1) {
             return false;
         }
-        self.previous.copy_from_slice(&surface.pixels);
+        match (&mut self.previous, surface.pixels()) {
+            (PicturePixels::Gray8(previous), PicturePixelsRef::Gray8(current))
+            | (PicturePixels::Rgb8(previous), PicturePixelsRef::Rgb8(current)) => {
+                previous.copy_from_slice(current);
+            }
+            _ => return false,
+        }
         self.dirty = transition.dirty;
         self.refreshes = transition.refresh;
         self.started = true;
@@ -9249,6 +9262,19 @@ impl FramePlanner {
         self.dirty
     }
 
+    fn accepts(&self, surface: &Surface) -> bool {
+        if surface.width != self.width || surface.height != self.height {
+            return false;
+        }
+        match (surface.pixels(), self.previous.as_ref()) {
+            (PicturePixelsRef::Gray8(current), PicturePixelsRef::Gray8(previous))
+            | (PicturePixelsRef::Rgb8(current), PicturePixelsRef::Rgb8(previous)) => {
+                current.len() == previous.len()
+            }
+            _ => false,
+        }
+    }
+
     /// The box enclosing every changed pixel, and how many actually changed.
     ///
     /// Both come out of one pass because the count is what the cleaning budget
@@ -9258,13 +9284,20 @@ impl FramePlanner {
     /// the panel while the pixels that moved are a rounding error. Charging the
     /// box would put typing back where it started.
     fn changed(&self, surface: &Surface) -> Option<(Rect, u64)> {
+        let (current, previous) = match (surface.pixels(), self.previous.as_ref()) {
+            (PicturePixelsRef::Gray8(current), PicturePixelsRef::Gray8(previous))
+            | (PicturePixelsRef::Rgb8(current), PicturePixelsRef::Rgb8(previous)) => {
+                (current, previous)
+            }
+            _ => return None,
+        };
+        let bytes_per_pixel = surface.format.bytes_per_pixel();
         let (mut left, mut right) = (usize::MAX, 0usize);
         let (mut top, mut bottom) = (usize::MAX, 0usize);
         let mut flipped = 0_u64;
-        for (index, _) in surface
-            .pixels
-            .iter()
-            .zip(self.previous.iter())
+        for (index, _) in current
+            .chunks_exact(bytes_per_pixel)
+            .zip(previous.chunks_exact(bytes_per_pixel))
             .enumerate()
             .filter(|(_, (current, previous))| current != previous)
         {
@@ -9308,11 +9341,14 @@ impl FramePlanner {
         let Ok(height) = usize::try_from(region.height) else {
             return false;
         };
+        let bytes_per_pixel = surface.format.bytes_per_pixel();
         (top..top.saturating_add(height)).any(|y| {
             let start = y.saturating_mul(surface.width).saturating_add(left);
             let end = start.saturating_add(width);
+            let start = start.saturating_mul(bytes_per_pixel);
+            let end = end.saturating_mul(bytes_per_pixel);
             surface
-                .pixels
+                .bytes()
                 .get(start..end)
                 .unwrap_or(&[])
                 .iter()
@@ -13502,6 +13538,40 @@ mod tests {
         frame.pixels[0] = tone::INK;
         let grey_outside_change = planner.plan(&frame).expect("black pixel changed");
         assert_eq!(grey_outside_change.waveform, PanelWaveform::Du);
+    }
+
+    #[test]
+    fn rgb_frame_planner_accepts_initial_plan_and_commit() {
+        let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
+        let frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        let first = planner.plan(&frame).expect("first RGB frame refreshes");
+        assert_eq!(first.waveform, PanelWaveform::Gc16);
+        assert!(first.full);
+        assert!(planner.commit(&frame, first));
+        assert!(planner.plan(&frame).is_none(), "unchanged RGB frame refreshes");
+    }
+
+    #[test]
+    fn rgb_frame_planner_counts_one_logical_pixel_across_channels() {
+        let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        let first = planner.plan(&frame).expect("first RGB frame refreshes");
+        assert!(planner.commit(&frame, first));
+
+        frame.pixels[3..6].copy_from_slice(&[tone::INK, tone::MUTED, tone::PAPER]);
+        let changed = planner.plan(&frame).expect("one RGB pixel changed");
+        assert_eq!(
+            changed.region,
+            Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            }
+        );
+        assert_eq!(changed.dirty, 1);
+        assert_eq!(changed.waveform, PanelWaveform::Gl16);
+        assert!(planner.commit(&frame, changed));
     }
 
     #[test]
