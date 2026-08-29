@@ -285,7 +285,7 @@ git commit -m "fix(bomtoon): bound source image scaling"
 
 **Interfaces:**
 - Consumes: `EpisodeImage { width, height, order, path, url }`, panel width, and panel height.
-- Produces: `PageSegment`, `PagePlan`, `PageBuild`, `page_plan`, `copy_source_into_builds`, and `finish_build` with the exact shapes below.
+- Produces: `PageSegment`, `PagePlan`, `PageBuild`, temporary `continuous_page_plan`, `copy_source_into_builds`, and `finish_build` with the exact shapes below.
 
 ```rust
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,7 +308,7 @@ struct PageBuild {
     next_segment: usize,
 }
 
-fn page_plan(
+fn continuous_page_plan(
     images: &[EpisodeImage],
     panel_width: u32,
     panel_height: u32,
@@ -339,7 +339,7 @@ Delete `row_slices_cover_source_once_and_pad_only_the_final_page`. Add table-dri
 #[test]
 fn short_sources_share_a_page_without_seam_padding() {
     let images = episode_images(&[(2, 2), (2, 2)]);
-    let (plans, total) = page_plan(&images, 2, 4).expect("continuous plan");
+    let (plans, total) = continuous_page_plan(&images, 2, 4).expect("continuous plan");
     assert_eq!(total, 1);
     assert_eq!(
         plans[0],
@@ -360,9 +360,11 @@ Add separate tests for seams at row 4, row 3, and row 5; several one-row sources
 
 Run: `cargo test -p kobo-bomtoon short_sources_share_a_page_without_seam_padding`
 
-Expected: failure because the current `page_plan` returns per-source slice counts.
+Expected: compilation fails because `continuous_page_plan` does not exist. The legacy `page_plan -> Vec<usize>` remains wired to `accept_manifest` throughout Task 3.
 
 - [ ] **Step 3: Implement checked global interval planning**
+
+Implement the new planner as `continuous_page_plan`. Do not change or remove the legacy `page_plan`, `ReaderState::pages_per_source`, or their current callers in this task; keeping the interfaces distinct makes the Task 3 commit independently compiling and passing.
 
 Build a cumulative `Vec<u32>` of source starts. Use `checked_add` for every scaled height so a total above `u32::MAX` fails closed; exercise this with 700 metadata-only sources whose panel-width scaled height is 7,000,000. Convert validated boundaries to `u64` for intersection arithmetic, calculate `u64::div_ceil(total_height.into(), panel_height.into())`, convert the page count through `u16::try_from`, and build each page from half-open intersections:
 
@@ -404,7 +406,7 @@ Initialize `PageBuild::grey` with checked `panel_width * panel_height` bytes set
 
 - [ ] **Step 6: Run planner and assembler contracts**
 
-Run: `cargo test -p kobo-bomtoon page_plan`
+Run: `cargo test -p kobo-bomtoon short_sources_share_a_page_without_seam_padding`
 
 Run: `cargo test -p kobo-bomtoon seam`
 
@@ -428,7 +430,7 @@ git commit -m "feat(bomtoon): plan continuous reader pages"
 - Test: `apps/bomtoon/src/main.rs`
 
 **Interfaces:**
-- Consumes: Task 3's `Vec<PagePlan>`, `PageBuild`, copying, and finishing functions.
+- Consumes: Task 3's `continuous_page_plan`, `Vec<PagePlan>`, `PageBuild`, copying, and finishing functions.
 - Produces: generation-scoped reader task dispatch, a zero-based global reader page, and foreground page rendering.
 
 ```rust
@@ -507,7 +509,7 @@ On success, insert `ReaderTaskEntry { generation: self.reader_generation, purpos
 
 - [ ] **Step 4: Replace the old manifest/image/slice pipeline with page work**
 
-`accept_manifest` must parse, plan, store the panel dimensions and generation, create one `PageBuild` for page 0, and request its first segment's source. The source callback must remove its task entry first, then:
+Start this step with one clean cutover: delete the legacy `page_plan -> Vec<usize>`, rename `continuous_page_plan` to `page_plan`, update the Task 3 planner tests to the final name, and migrate `accept_manifest` while replacing `ReaderState::pages_per_source` with the Task 4 global-plan fields in the same edit. `accept_manifest` must then parse, plan, store the panel dimensions and generation, create one `PageBuild` for page 0, and request its first segment's source. The source callback must remove its task entry first, then:
 
 ```rust
 let decoded = kobo_image::decode_webp(bytes).map_err(|error| error.to_string())?;
@@ -542,7 +544,7 @@ At the start of `on_task`, call `self.reader_tasks.remove(&task)`. If an entry e
 
 - [ ] **Step 7: Remove the per-source navigation model**
 
-Delete `PageLocation`, `pages_per_source`, `source`, `refreshed_current_image`, `global_page`, `slices_for`, `previous_location`, `next_location`, `slice_rows`, `install_slice`, and `Retry::Slice`. Replace reader retries with `Retry::Page(usize)`, and render page-position chrome with:
+Delete `PageLocation`, `source`, `refreshed_current_image`, `global_page`, `slices_for`, `previous_location`, `next_location`, `slice_rows`, `install_slice`, and `Retry::Slice`. Replace reader retries with `Retry::Page(usize)`, and render page-position chrome with:
 
 ```rust
 .page_position(
