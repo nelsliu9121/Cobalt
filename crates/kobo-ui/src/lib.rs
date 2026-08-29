@@ -9095,18 +9095,33 @@ impl Surface {
     }
 }
 
-/// How much repainting is permitted before the panel gets a cleaning refresh,
-/// counted in whole panels' worth of changed pixels.
-///
-/// This used to count *updates*, which charged a one-character edit and a whole
-/// page turn the same amount. Typing then bought a full-screen flash every
-/// eighth keystroke: the panel went black and back several times while somebody
-/// entered one address, which is the worst artefact E Ink has and it was being
-/// spent on the cheapest possible change. Residue accumulates where pixels
-/// flip, so that is what is counted now. A page turn repaints the panel and
-/// still cleans on the eighth, exactly as before; a keystroke repaints a word
-/// and a key, so hundreds fit in the same budget.
+/// How much grayscale repainting is permitted before the panel gets a cleaning
+/// refresh, counted in whole panels' worth of changed pixels.
 pub const PANEL_CLEAN_INTERVAL: u32 = 8;
+
+/// Chromatic changed-pixel budget between color cleaning refreshes.
+pub const PANEL_COLOR_CLEAN_INTERVAL: u32 = 4;
+
+/// Whether a changed logical pixel needs a chromatic waveform.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ColorChange {
+    Achromatic,
+    Chromatic,
+}
+
+impl ColorChange {
+    fn between(previous: [u8; 3], current: [u8; 3]) -> Self {
+        if Self::pixel_is_chromatic(previous) || Self::pixel_is_chromatic(current) {
+            Self::Chromatic
+        } else {
+            Self::Achromatic
+        }
+    }
+
+    const fn pixel_is_chromatic(pixel: [u8; 3]) -> bool {
+        pixel[0] != pixel[1] || pixel[1] != pixel[2]
+    }
+}
 
 /// The physical update strategy selected from a frame's changed pixels.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -9115,8 +9130,12 @@ pub enum PanelWaveform {
     Du,
     /// Sixteen-level partial refresh for text and images containing grey.
     Gl16,
-    /// Full sixteen-level refresh that clears accumulated residue.
+    /// Full sixteen-level refresh that clears accumulated grayscale residue.
     Gc16,
+    /// Partial color refresh using the profile's verified regal waveform.
+    Glrc16,
+    /// Full color refresh using the profile's verified cleaning waveform.
+    Gcc16,
 }
 
 impl PanelWaveform {
@@ -9126,6 +9145,8 @@ impl PanelWaveform {
             Self::Du => "DU",
             Self::Gl16 => "GL16",
             Self::Gc16 => "GC16",
+            Self::Glrc16 => "GLRC16",
+            Self::Gcc16 => "GCC16",
         }
     }
 }
@@ -9138,22 +9159,35 @@ pub struct FrameTransition {
     pub full: bool,
     /// One-based number of the refresh in this session.
     pub refresh: u64,
-    /// Pixels that will have been repainted since the last cleaning refresh,
-    /// once this transition has been applied. Zero directly after a clean.
+    /// Grayscale pixels repainted since the last grayscale cleaning refresh,
+    /// once this transition has been applied.
     pub dirty: u64,
+    color_dirty: u64,
+    was_chromatic: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameDifference {
+    region: Rect,
+    gray_changed: u64,
+    color_changed: u64,
+    has_gray_tone: bool,
+    current_chromatic: bool,
 }
 
 /// Shared state machine for choosing Kobo panel transitions.
 ///
-/// The device runtime and simulator both use this exact planner. Physics such
-/// as visible residue remains a simulator approximation, but the changed
-/// rectangle, waveform and cleaning cadence cannot drift from the device.
+/// Planning is side-effect free. The typed previous frame and both cleaning
+/// budgets advance only when [`FramePlanner::commit`] records a successful
+/// hardware refresh.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FramePlanner {
     width: usize,
     height: usize,
     previous: PicturePixels,
-    dirty: u64,
+    gray_dirty: u64,
+    color_dirty: u64,
+    was_chromatic: bool,
     refreshes: u64,
     started: bool,
 }
@@ -9179,7 +9213,9 @@ impl FramePlanner {
             width,
             height,
             previous,
-            dirty: 0,
+            gray_dirty: 0,
+            color_dirty: 0,
+            was_chromatic: false,
             refreshes: 0,
             started: false,
         }
@@ -9187,49 +9223,91 @@ impl FramePlanner {
 
     /// Plans the next update without changing planner state.
     ///
-    /// Returning `None` means the surface is the wrong size or no pixel has
+    /// Returning `None` means the surface is the wrong size or no logical pixel
     /// changed. Call [`Self::commit`] only after the update succeeds.
     #[must_use]
     pub fn plan(&self, surface: &Surface) -> Option<FrameTransition> {
         if !self.accepts(surface) {
             return None;
         }
-        let whole = Rect {
-            x: 0,
-            y: 0,
-            width: i32::try_from(self.width).ok()?,
-            height: i32::try_from(self.height).ok()?,
-        };
-        let (region, waveform, dirty) = if self.started {
-            let (changed, flipped) = self.changed(surface)?;
-            // The budget is checked before this update is added to it, so that
-            // a full panel's worth of repainting still buys exactly
-            // PANEL_CLEAN_INTERVAL updates before anything flashes, as it did
-            // when updates rather than pixels were being counted.
-            if self.dirty >= self.clean_after() {
-                (whole, PanelWaveform::Gc16, 0)
-            } else if Self::has_grey(surface, changed) {
+        let whole = self.whole()?;
+        let (region, waveform, gray_dirty, color_dirty, was_chromatic) = if self.started {
+            let difference = self.changed(surface)?;
+            let entering_or_leaving_color =
+                self.was_chromatic != difference.current_chromatic;
+            let color_budget = self
+                .color_dirty
+                .saturating_add(difference.color_changed);
+
+            if entering_or_leaving_color
+                || (difference.color_changed > 0
+                    && color_budget >= self.color_clean_after())
+            {
                 (
-                    changed,
+                    whole,
+                    PanelWaveform::Gcc16,
+                    0,
+                    0,
+                    difference.current_chromatic,
+                )
+            } else if difference.color_changed > 0 {
+                (
+                    difference.region,
+                    PanelWaveform::Glrc16,
+                    self.gray_dirty
+                        .saturating_add(difference.gray_changed),
+                    color_budget,
+                    difference.current_chromatic,
+                )
+            } else if self.gray_dirty >= self.gray_clean_after() {
+                (
+                    whole,
+                    PanelWaveform::Gc16,
+                    0,
+                    self.color_dirty,
+                    difference.current_chromatic,
+                )
+            } else if difference.has_gray_tone {
+                (
+                    difference.region,
                     PanelWaveform::Gl16,
-                    self.dirty.saturating_add(flipped),
+                    self.gray_dirty
+                        .saturating_add(difference.gray_changed),
+                    self.color_dirty,
+                    difference.current_chromatic,
                 )
             } else {
                 (
-                    changed,
+                    difference.region,
                     PanelWaveform::Du,
-                    self.dirty.saturating_add(flipped),
+                    self.gray_dirty
+                        .saturating_add(difference.gray_changed),
+                    self.color_dirty,
+                    difference.current_chromatic,
                 )
             }
         } else {
-            (whole, PanelWaveform::Gc16, 0)
+            let current_chromatic = Self::surface_is_chromatic(surface);
+            (
+                whole,
+                if current_chromatic {
+                    PanelWaveform::Gcc16
+                } else {
+                    PanelWaveform::Gc16
+                },
+                0,
+                0,
+                current_chromatic,
+            )
         };
         Some(FrameTransition {
             region,
             waveform,
-            full: waveform == PanelWaveform::Gc16,
+            full: matches!(waveform, PanelWaveform::Gc16 | PanelWaveform::Gcc16),
             refresh: self.refreshes.saturating_add(1),
-            dirty,
+            dirty: gray_dirty,
+            color_dirty,
+            was_chromatic,
         })
     }
 
@@ -9243,9 +9321,16 @@ impl FramePlanner {
             | (PicturePixels::Rgb8(previous), PicturePixelsRef::Rgb8(current)) => {
                 previous.copy_from_slice(current);
             }
-            _ => return false,
+            (_, PicturePixelsRef::Gray8(current)) => {
+                self.previous = PicturePixels::Gray8(current.to_vec());
+            }
+            (_, PicturePixelsRef::Rgb8(current)) => {
+                self.previous = PicturePixels::Rgb8(current.to_vec());
+            }
         }
-        self.dirty = transition.dirty;
+        self.gray_dirty = transition.dirty;
+        self.color_dirty = transition.color_dirty;
+        self.was_chromatic = transition.was_chromatic;
         self.refreshes = transition.refresh;
         self.started = true;
         true
@@ -9256,104 +9341,120 @@ impl FramePlanner {
         self.refreshes
     }
 
+    /// Grayscale pixels repainted since the last grayscale cleaning refresh.
     #[must_use]
-    /// Pixels repainted since the last cleaning refresh.
     pub const fn dirty(&self) -> u64 {
-        self.dirty
+        self.gray_dirty
     }
 
     fn accepts(&self, surface: &Surface) -> bool {
-        if surface.width != self.width || surface.height != self.height {
-            return false;
-        }
-        match (surface.pixels(), self.previous.as_ref()) {
-            (PicturePixelsRef::Gray8(current), PicturePixelsRef::Gray8(previous))
-            | (PicturePixelsRef::Rgb8(current), PicturePixelsRef::Rgb8(previous)) => {
-                current.len() == previous.len()
-            }
-            _ => false,
-        }
+        surface.width == self.width
+            && surface.height == self.height
+            && surface.bytes().len()
+                == self
+                    .width
+                    .checked_mul(self.height)
+                    .and_then(|pixels| pixels.checked_mul(surface.format.bytes_per_pixel()))
+                    .unwrap_or(usize::MAX)
     }
 
-    /// The box enclosing every changed pixel, and how many actually changed.
-    ///
-    /// Both come out of one pass because the count is what the cleaning budget
-    /// is spent from and the box is what the controller is asked to repaint.
-    /// They are deliberately different quantities: one keystroke changes a word
-    /// at the top and a key at the bottom, so the box between them is most of
-    /// the panel while the pixels that moved are a rounding error. Charging the
-    /// box would put typing back where it started.
-    fn changed(&self, surface: &Surface) -> Option<(Rect, u64)> {
-        let (current, previous) = match (surface.pixels(), self.previous.as_ref()) {
-            (PicturePixelsRef::Gray8(current), PicturePixelsRef::Gray8(previous))
-            | (PicturePixelsRef::Rgb8(current), PicturePixelsRef::Rgb8(previous)) => {
-                (current, previous)
-            }
-            _ => return None,
-        };
-        let bytes_per_pixel = surface.format.bytes_per_pixel();
+    fn whole(&self) -> Option<Rect> {
+        Some(Rect {
+            x: 0,
+            y: 0,
+            width: i32::try_from(self.width).ok()?,
+            height: i32::try_from(self.height).ok()?,
+        })
+    }
+
+    /// Compares logical pixels in one pass without converting either typed
+    /// buffer. Gray pixels are read as three equal channels.
+    fn changed(&self, surface: &Surface) -> Option<FrameDifference> {
+        let current = surface.pixels();
+        let previous = self.previous.as_ref();
+        let pixels = self.width.checked_mul(self.height)?;
         let (mut left, mut right) = (usize::MAX, 0usize);
         let (mut top, mut bottom) = (usize::MAX, 0usize);
-        let mut flipped = 0_u64;
-        for (index, _) in current
-            .chunks_exact(bytes_per_pixel)
-            .zip(previous.chunks_exact(bytes_per_pixel))
-            .enumerate()
-            .filter(|(_, (current, previous))| current != previous)
-        {
+        let mut gray_changed = 0_u64;
+        let mut color_changed = 0_u64;
+        let mut has_gray_tone = false;
+        let mut current_chromatic = false;
+
+        for index in 0..pixels {
+            let current_pixel = Self::logical_pixel(current, index)?;
+            current_chromatic |= ColorChange::pixel_is_chromatic(current_pixel);
+            let previous_pixel = Self::logical_pixel(previous, index)?;
+            if current_pixel == previous_pixel {
+                continue;
+            }
+
             let (x, y) = (index % self.width, index / self.width);
             left = left.min(x);
             right = right.max(x);
             top = top.min(y);
             bottom = bottom.max(y);
-            flipped = flipped.saturating_add(1);
+            match ColorChange::between(previous_pixel, current_pixel) {
+                ColorChange::Achromatic => {
+                    gray_changed = gray_changed.saturating_add(1);
+                    has_gray_tone |= current_pixel[0] != tone::INK
+                        && current_pixel[0] != tone::PAPER;
+                }
+                ColorChange::Chromatic => {
+                    color_changed = color_changed.saturating_add(1);
+                }
+            }
         }
-        (left <= right).then(|| {
-            (
-                Rect {
-                    x: i32::try_from(left).unwrap_or(i32::MAX),
-                    y: i32::try_from(top).unwrap_or(i32::MAX),
-                    width: i32::try_from(right - left + 1).unwrap_or(i32::MAX),
-                    height: i32::try_from(bottom - top + 1).unwrap_or(i32::MAX),
-                },
-                flipped,
-            )
+
+        (left <= right).then(|| FrameDifference {
+            region: Rect {
+                x: i32::try_from(left).unwrap_or(i32::MAX),
+                y: i32::try_from(top).unwrap_or(i32::MAX),
+                width: i32::try_from(right - left + 1).unwrap_or(i32::MAX),
+                height: i32::try_from(bottom - top + 1).unwrap_or(i32::MAX),
+            },
+            gray_changed,
+            color_changed,
+            has_gray_tone,
+            current_chromatic,
         })
     }
 
-    /// Changed pixels that may accumulate before the panel is cleaned.
-    fn clean_after(&self) -> u64 {
+    fn logical_pixel(pixels: PicturePixelsRef<'_>, index: usize) -> Option<[u8; 3]> {
+        match pixels {
+            PicturePixelsRef::Gray8(bytes) => {
+                let tone = *bytes.get(index)?;
+                Some([tone; 3])
+            }
+            PicturePixelsRef::Rgb8(bytes) => {
+                let start = index.checked_mul(3)?;
+                Some([
+                    *bytes.get(start)?,
+                    *bytes.get(start + 1)?,
+                    *bytes.get(start + 2)?,
+                ])
+            }
+        }
+    }
+
+    fn surface_is_chromatic(surface: &Surface) -> bool {
+        match surface.pixels() {
+            PicturePixelsRef::Gray8(_) => false,
+            PicturePixelsRef::Rgb8(bytes) => bytes
+                .chunks_exact(3)
+                .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+        }
+    }
+
+    fn gray_clean_after(&self) -> u64 {
         (self.width as u64)
             .saturating_mul(self.height as u64)
             .saturating_mul(u64::from(PANEL_CLEAN_INTERVAL))
     }
 
-    fn has_grey(surface: &Surface, region: Rect) -> bool {
-        let Ok(left) = usize::try_from(region.x) else {
-            return false;
-        };
-        let Ok(top) = usize::try_from(region.y) else {
-            return false;
-        };
-        let Ok(width) = usize::try_from(region.width) else {
-            return false;
-        };
-        let Ok(height) = usize::try_from(region.height) else {
-            return false;
-        };
-        let bytes_per_pixel = surface.format.bytes_per_pixel();
-        (top..top.saturating_add(height)).any(|y| {
-            let start = y.saturating_mul(surface.width).saturating_add(left);
-            let end = start.saturating_add(width);
-            let start = start.saturating_mul(bytes_per_pixel);
-            let end = end.saturating_mul(bytes_per_pixel);
-            surface
-                .bytes()
-                .get(start..end)
-                .unwrap_or(&[])
-                .iter()
-                .any(|tone| *tone != tone::INK && *tone != tone::PAPER)
-        })
+    fn color_clean_after(&self) -> u64 {
+        (self.width as u64)
+            .saturating_mul(self.height as u64)
+            .saturating_mul(u64::from(PANEL_COLOR_CLEAN_INTERVAL))
     }
 }
 
@@ -13541,25 +13642,20 @@ mod tests {
     }
 
     #[test]
-    fn rgb_frame_planner_accepts_initial_plan_and_commit() {
-        let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
-        let frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
-        let first = planner.plan(&frame).expect("first RGB frame refreshes");
-        assert_eq!(first.waveform, PanelWaveform::Gc16);
-        assert!(first.full);
-        assert!(planner.commit(&frame, first));
-        assert!(planner.plan(&frame).is_none(), "unchanged RGB frame refreshes");
-    }
-
-    #[test]
-    fn rgb_frame_planner_counts_one_logical_pixel_across_channels() {
+    fn color_frame_planner_uses_clean_then_regal_waveforms() {
         let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
         let mut frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
-        let first = planner.plan(&frame).expect("first RGB frame refreshes");
+        frame.pixels[0..3].copy_from_slice(&[255, 0, 0]);
+
+        let first = planner.plan(&frame).expect("first chromatic frame refreshes");
+        assert_eq!(first.waveform, PanelWaveform::Gcc16);
+        assert!(first.full);
         assert!(planner.commit(&frame, first));
 
-        frame.pixels[3..6].copy_from_slice(&[tone::INK, tone::MUTED, tone::PAPER]);
-        let changed = planner.plan(&frame).expect("one RGB pixel changed");
+        frame.pixels[3..6].copy_from_slice(&[0, 0, 255]);
+        let changed = planner.plan(&frame).expect("later chromatic change");
+        assert_eq!(changed.waveform, PanelWaveform::Glrc16);
+        assert!(!changed.full);
         assert_eq!(
             changed.region,
             Rect {
@@ -13569,9 +13665,138 @@ mod tests {
                 height: 1,
             }
         );
-        assert_eq!(changed.dirty, 1);
-        assert_eq!(changed.waveform, PanelWaveform::Gl16);
         assert!(planner.commit(&frame, changed));
+    }
+
+    #[test]
+    fn color_frame_planner_cleans_on_the_fourth_panel_equivalent_and_retries_failure() {
+        let mut planner = FramePlanner::new_in(1, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(1, 1, PictureFormat::Rgb8);
+        frame.pixels.copy_from_slice(&[255, 0, 0]);
+        let first = planner.plan(&frame).expect("first chromatic frame");
+        assert_eq!(first.waveform, PanelWaveform::Gcc16);
+        assert!(planner.commit(&frame, first));
+
+        for (index, rgb) in [[0, 255, 0], [0, 0, 255], [255, 255, 0]]
+            .into_iter()
+            .enumerate()
+        {
+            frame.pixels.copy_from_slice(&rgb);
+            let partial = planner.plan(&frame).expect("chromatic repaint");
+            assert_eq!(
+                partial.waveform,
+                PanelWaveform::Glrc16,
+                "repaint {} cleaned early",
+                index + 1
+            );
+            assert!(planner.commit(&frame, partial));
+        }
+
+        frame.pixels.copy_from_slice(&[255, 0, 255]);
+        let cleaning = planner.plan(&frame).expect("fourth chromatic repaint");
+        assert_eq!(cleaning.waveform, PanelWaveform::Gcc16);
+        assert!(cleaning.full);
+        assert_eq!(
+            planner.plan(&frame),
+            Some(cleaning),
+            "a failed refresh advanced planner state"
+        );
+        assert!(planner.commit(&frame, cleaning));
+
+        frame.pixels.copy_from_slice(&[0, 255, 255]);
+        assert_eq!(
+            planner.plan(&frame).expect("cadence restarted").waveform,
+            PanelWaveform::Glrc16
+        );
+    }
+
+    #[test]
+    fn color_frame_planner_counts_a_changed_pixel_when_either_side_is_chromatic() {
+        let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        frame.pixels.copy_from_slice(&[255, 0, 0, 0, 0, 255]);
+        let first = planner.plan(&frame).expect("first chromatic frame");
+        assert!(planner.commit(&frame, first));
+
+        frame.pixels[0..3].copy_from_slice(&[127, 127, 127]);
+        let changed = planner.plan(&frame).expect("red became gray");
+        assert_eq!(changed.waveform, PanelWaveform::Glrc16);
+        assert_eq!(changed.region.width, 1);
+        assert!(planner.commit(&frame, changed));
+    }
+
+    #[test]
+    fn color_frame_planner_cleans_immediately_when_color_appears_or_disappears() {
+        let mut planner = FramePlanner::new_in(1, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(1, 1, PictureFormat::Rgb8);
+        let first = planner.plan(&frame).expect("first achromatic frame");
+        assert_eq!(first.waveform, PanelWaveform::Gc16);
+        assert!(planner.commit(&frame, first));
+
+        frame.pixels.copy_from_slice(&[255, 0, 0]);
+        let entered = planner.plan(&frame).expect("color appeared");
+        assert_eq!(entered.waveform, PanelWaveform::Gcc16);
+        assert!(entered.full);
+        assert!(planner.commit(&frame, entered));
+
+        frame.pixels.copy_from_slice(&[127, 127, 127]);
+        let left = planner.plan(&frame).expect("color disappeared");
+        assert_eq!(left.waveform, PanelWaveform::Gcc16);
+        assert!(left.full);
+    }
+
+    #[test]
+    fn color_frame_planner_keeps_equal_channel_rgb_on_the_grayscale_policy() {
+        let mut planner = FramePlanner::new_in(1, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(1, 1, PictureFormat::Rgb8);
+        let first = planner.plan(&frame).expect("first achromatic frame");
+        assert_eq!(first.waveform, PanelWaveform::Gc16);
+        assert!(planner.commit(&frame, first));
+
+        frame.pixels.copy_from_slice(&[0, 0, 0]);
+        let black_and_white = planner.plan(&frame).expect("black");
+        assert_eq!(black_and_white.waveform, PanelWaveform::Du);
+        assert!(planner.commit(&frame, black_and_white));
+
+        frame.pixels.copy_from_slice(&[127, 127, 127]);
+        let gray = planner.plan(&frame).expect("gray");
+        assert_eq!(gray.waveform, PanelWaveform::Gl16);
+        assert!(planner.commit(&frame, gray));
+
+        frame.pixels.copy_from_slice(&[127, 126, 127]);
+        assert_eq!(
+            planner.plan(&frame).expect("color appeared").waveform,
+            PanelWaveform::Gcc16
+        );
+    }
+
+    #[test]
+    fn color_frame_planner_compares_formats_logically_and_commits_typed_previous_only_on_success() {
+        let mut planner = FramePlanner::new(2, 1);
+        let gray = Surface::new(2, 1);
+        let first = planner.plan(&gray).expect("first gray frame");
+        assert!(planner.commit(&gray, first));
+        assert!(planner.plan(&Surface::new(1, 2)).is_none());
+
+        let mut rgb = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        rgb.pixels[0..3].copy_from_slice(&[127, 127, 127]);
+        let typed = planner.plan(&rgb).expect("typed grayscale transition");
+        assert_eq!(typed.waveform, PanelWaveform::Gl16);
+        assert_eq!(typed.region.width, 1, "equal logical pixels were unchanged");
+        assert!(
+            planner.plan(&gray).is_none(),
+            "planning alone replaced the typed previous frame"
+        );
+        assert!(planner.commit(&rgb, typed));
+
+        rgb.pixels[0..3].copy_from_slice(&[255, 0, 0]);
+        let entered = planner.plan(&rgb).expect("typed color transition");
+        assert_eq!(entered.waveform, PanelWaveform::Gcc16);
+        assert!(planner.commit(&rgb, entered));
+
+        let gray_again = Surface::new(2, 1);
+        let exited = planner.plan(&gray_again).expect("typed color exit");
+        assert_eq!(exited.waveform, PanelWaveform::Gcc16);
     }
 
     #[test]

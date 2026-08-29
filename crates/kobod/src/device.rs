@@ -3149,6 +3149,8 @@ impl Painter {
             PanelWaveform::Du => RefreshIntent::FastFeedback,
             PanelWaveform::Gl16 => RefreshIntent::TextContent,
             PanelWaveform::Gc16 => RefreshIntent::QualityContent,
+            PanelWaveform::Glrc16 => RefreshIntent::ColorContent,
+            PanelWaveform::Gcc16 => RefreshIntent::ColorQuality,
         };
 
         let started = Instant::now();

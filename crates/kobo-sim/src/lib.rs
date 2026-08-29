@@ -173,7 +173,10 @@ impl PanelPreview {
                             kobo_ui::tone::PAPER
                         }
                     }
-                    PanelWaveform::Gl16 | PanelWaveform::Gc16 => target,
+                    PanelWaveform::Gl16
+                    | PanelWaveform::Gc16
+                    | PanelWaveform::Glrc16
+                    | PanelWaveform::Gcc16 => target,
                 };
                 // An LCD cannot reproduce electrophoretic residue. Retaining
                 // one sixteenth of the previous displayed value makes stale

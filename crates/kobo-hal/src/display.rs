@@ -13,7 +13,7 @@
 //! a default build contains no callable display-write code at all.
 
 use crate::probe::{probe_device, ProbeError};
-use crate::refresh::{Backend, Rect, RefreshPlan};
+use crate::refresh::{Backend, Rect, RefreshError, RefreshPlan};
 use crate::surface::{self, RegionSnapshot, SurfaceError, SurfaceGeometry};
 use kobo_abi::{hwtcon, mxcfb};
 use kobo_profile::{DeviceProfile, DeviceSnapshot, WRITE_EVIDENCE_PENDING};
@@ -121,6 +121,7 @@ pub enum DisplayError {
     Smoke(String),
     Probe(ProbeError),
     Surface(SurfaceError),
+    Refresh(RefreshError),
     Io(io::Error),
 }
 
@@ -143,6 +144,7 @@ impl fmt::Display for DisplayError {
             Self::Smoke(reason) => write!(formatter, "attended display smoke: {reason}"),
             Self::Probe(error) => write!(formatter, "read-only probe: {error}"),
             Self::Surface(error) => write!(formatter, "{error}"),
+            Self::Refresh(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "display io: {error}"),
         }
     }
@@ -153,6 +155,12 @@ impl std::error::Error for DisplayError {}
 impl From<SurfaceError> for DisplayError {
     fn from(error: SurfaceError) -> Self {
         Self::Surface(error)
+    }
+}
+
+impl From<RefreshError> for DisplayError {
+    fn from(error: RefreshError) -> Self {
+        Self::Refresh(error)
     }
 }
 
@@ -338,10 +346,10 @@ impl DisplaySession {
         // the interface, and a device whose wait struct grew a field would
         // otherwise be served a MediaTek ioctl through an i.MX session with
         // nothing in the code to make that visible.
-        let submitted_waveform = plan.waveform(self.backend);
+        let submitted_waveform = plan.waveform(self.backend, self.profile.color)?;
         let (translated_waveform, submit, wait) = match self.backend {
             Backend::Hwtcon => {
-                let mut update = plan.hwtcon_update_data(marker);
+                let mut update = plan.hwtcon_update_data(marker, self.profile.color)?;
                 let submit_started = Instant::now();
                 hwtcon::send_update(&self.framebuffer, &mut update)?;
                 let submit = submit_started.elapsed();
@@ -354,7 +362,7 @@ impl DisplaySession {
                 (update.waveform_mode, submit, wait_started.elapsed())
             }
             Backend::Mxcfb => {
-                let mut update = plan.mxcfb_update_data(marker);
+                let mut update = plan.mxcfb_update_data(marker, self.profile.color)?;
                 let submit_started = Instant::now();
                 mxcfb::send_update(&self.framebuffer, &mut update)?;
                 let submit = submit_started.elapsed();
@@ -879,7 +887,9 @@ mod tests {
                     .expect("fixed plan");
                     let (waveform, update_mode, partial) = match backend {
                         crate::refresh::Backend::Hwtcon => {
-                            let update = plan.hwtcon_update_data(0x4000_0001);
+                            let update = plan
+                                .hwtcon_update_data(0x4000_0001, profile.color)
+                                .expect("grayscale smoke update lowers");
                             (
                                 update.waveform_mode,
                                 update.update_mode,
@@ -887,7 +897,9 @@ mod tests {
                             )
                         }
                         crate::refresh::Backend::Mxcfb => {
-                            let update = plan.mxcfb_update_data(0x4000_0001);
+                            let update = plan
+                                .mxcfb_update_data(0x4000_0001, profile.color)
+                                .expect("grayscale smoke update lowers");
                             (
                                 update.waveform_mode,
                                 update.update_mode,
