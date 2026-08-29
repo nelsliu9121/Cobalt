@@ -28,9 +28,10 @@ Complete.
 
 ## Verification
 
-- `cargo test -p kobo-ui frame_planner` — 8 passed, 0 failed.
+- `cargo test -p kobo-ui frame_planner` — 10 passed, 0 failed.
 - `cargo test -p kobo-hal refresh` — 7 passed, 0 failed.
 - `cargo check -p kobod` — passed; existing dead-code warnings only.
+- `cargo test -p kobo-hal --features device-write refresh` — 7 passed, 0 failed; device-write display lowering and smoke code compiled.
 - `git diff --check` — passed.
 
 ## Self-review
@@ -40,6 +41,9 @@ Complete.
 - Cross-format coverage proves equal logical pixels are ignored, format replacement occurs only on commit, and the color-exit rule survives RGB8-to-Gray8.
 - Capability lowering tests use deliberately non-ABI waveform values (`10` and `11`) and CFA flags (`0x600`) so hard-coded guesses cannot pass.
 - Grayscale behavior remains separately covered by the pre-existing waveform, changed-pixel budget, sparse bounding-box, and typing tests.
+- Sparse changed endpoints now scan every current tone in their bounding refresh region before selecting DU, while only the two changed pixels charge the cleaning budget.
+- A due grayscale clean on a still-chromatic mixed frame is promoted to full GCC16, resets both budgets only on commit, and retries identically after an uncommitted failure.
+- Device-write smoke intent labeling is exhaustive for grayscale and color intents even though the attended smoke stage remains grayscale-only.
 
 ## Concerns
 

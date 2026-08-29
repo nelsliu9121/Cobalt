@@ -9262,9 +9262,17 @@ impl FramePlanner {
             } else if self.gray_dirty >= self.gray_clean_after() {
                 (
                     whole,
-                    PanelWaveform::Gc16,
+                    if difference.current_chromatic {
+                        PanelWaveform::Gcc16
+                    } else {
+                        PanelWaveform::Gc16
+                    },
                     0,
-                    self.color_dirty,
+                    if difference.current_chromatic {
+                        0
+                    } else {
+                        self.color_dirty
+                    },
                     difference.current_chromatic,
                 )
             } else if difference.has_gray_tone {
@@ -9377,7 +9385,6 @@ impl FramePlanner {
         let (mut top, mut bottom) = (usize::MAX, 0usize);
         let mut gray_changed = 0_u64;
         let mut color_changed = 0_u64;
-        let mut has_gray_tone = false;
         let mut current_chromatic = false;
 
         for index in 0..pixels {
@@ -9396,8 +9403,6 @@ impl FramePlanner {
             match ColorChange::between(previous_pixel, current_pixel) {
                 ColorChange::Achromatic => {
                     gray_changed = gray_changed.saturating_add(1);
-                    has_gray_tone |= current_pixel[0] != tone::INK
-                        && current_pixel[0] != tone::PAPER;
                 }
                 ColorChange::Chromatic => {
                     color_changed = color_changed.saturating_add(1);
@@ -9405,18 +9410,45 @@ impl FramePlanner {
             }
         }
 
-        (left <= right).then(|| FrameDifference {
-            region: Rect {
-                x: i32::try_from(left).unwrap_or(i32::MAX),
-                y: i32::try_from(top).unwrap_or(i32::MAX),
-                width: i32::try_from(right - left + 1).unwrap_or(i32::MAX),
-                height: i32::try_from(bottom - top + 1).unwrap_or(i32::MAX),
-            },
+        if left > right {
+            return None;
+        }
+        let region = Rect {
+            x: i32::try_from(left).unwrap_or(i32::MAX),
+            y: i32::try_from(top).unwrap_or(i32::MAX),
+            width: i32::try_from(right - left + 1).unwrap_or(i32::MAX),
+            height: i32::try_from(bottom - top + 1).unwrap_or(i32::MAX),
+        };
+        Some(FrameDifference {
+            region,
             gray_changed,
             color_changed,
-            has_gray_tone,
+            has_gray_tone: Self::region_has_gray_tone(current, region, self.width)?,
             current_chromatic,
         })
+    }
+
+    fn region_has_gray_tone(
+        pixels: PicturePixelsRef<'_>,
+        region: Rect,
+        stride: usize,
+    ) -> Option<bool> {
+        let left = usize::try_from(region.x).ok()?;
+        let top = usize::try_from(region.y).ok()?;
+        let width = usize::try_from(region.width).ok()?;
+        let height = usize::try_from(region.height).ok()?;
+        for y in top..top.checked_add(height)? {
+            for x in left..left.checked_add(width)? {
+                let pixel = Self::logical_pixel(pixels, y.checked_mul(stride)?.checked_add(x)?)?;
+                if pixel
+                    .iter()
+                    .any(|channel| *channel != tone::INK && *channel != tone::PAPER)
+                {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     fn logical_pixel(pixels: PicturePixelsRef<'_>, index: usize) -> Option<[u8; 3]> {
@@ -13797,6 +13829,65 @@ mod tests {
         let gray_again = Surface::new(2, 1);
         let exited = planner.plan(&gray_again).expect("typed color exit");
         assert_eq!(exited.waveform, PanelWaveform::Gcc16);
+    }
+
+    #[test]
+    fn frame_planner_uses_gray_waveform_for_every_tone_in_the_refresh_region() {
+        let mut planner = FramePlanner::new(3, 1);
+        let mut frame = Surface::new(3, 1);
+        frame.pixels.copy_from_slice(&[tone::INK, tone::MUTED, tone::INK]);
+        let first = planner.plan(&frame).expect("first frame");
+        assert!(planner.commit(&frame, first));
+
+        frame.pixels[0] = tone::PAPER;
+        frame.pixels[2] = tone::PAPER;
+        let sparse = planner.plan(&frame).expect("sparse endpoints changed");
+        assert_eq!(sparse.region.width, 3);
+        assert_eq!(sparse.dirty, 2);
+        assert_eq!(
+            sparse.waveform,
+            PanelWaveform::Gl16,
+            "DU would quantize the unchanged gray pixel inside the update region"
+        );
+    }
+
+    #[test]
+    fn color_frame_planner_uses_color_clean_when_gray_budget_expires_on_a_mixed_frame() {
+        let mut planner = FramePlanner::new_in(2, 1, PictureFormat::Rgb8);
+        let mut frame = Surface::new_in(2, 1, PictureFormat::Rgb8);
+        frame.pixels.copy_from_slice(&[255, 0, 0, 0, 0, 0]);
+        let first = planner.plan(&frame).expect("first mixed frame");
+        assert_eq!(first.waveform, PanelWaveform::Gcc16);
+        assert!(planner.commit(&frame, first));
+
+        for repaint in 0..PANEL_CLEAN_INTERVAL * 2 {
+            let tone = if repaint % 2 == 0 {
+                tone::PAPER
+            } else {
+                tone::INK
+            };
+            frame.pixels[3..6].fill(tone);
+            let partial = planner.plan(&frame).expect("achromatic repaint");
+            assert!(!partial.full, "repaint {repaint} cleaned early");
+            assert!(planner.commit(&frame, partial));
+        }
+
+        frame.pixels[3..6].fill(tone::MUTED);
+        let cleaning = planner.plan(&frame).expect("gray budget clean");
+        assert_eq!(cleaning.waveform, PanelWaveform::Gcc16);
+        assert!(cleaning.full);
+        assert_eq!(
+            planner.plan(&frame),
+            Some(cleaning),
+            "failed color clean consumed planner state"
+        );
+        assert!(planner.commit(&frame, cleaning));
+
+        frame.pixels[3..6].fill(tone::INK);
+        assert_eq!(
+            planner.plan(&frame).expect("budget restarted").waveform,
+            PanelWaveform::Du
+        );
     }
 
     #[test]
