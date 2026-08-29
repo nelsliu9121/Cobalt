@@ -287,14 +287,29 @@ fn bomtoon_content_url(url: &str) -> bool {
 
 fn bomtoon_images_url(url: &str) -> bool {
     const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
-    const SUFFIX: &str = "?imageWidth=1080";
 
-    url.strip_prefix(PREFIX)
-        .and_then(|rest| rest.strip_suffix(SUFFIX))
-        .and_then(|aliases| aliases.split_once('/'))
-        .is_some_and(|(content, episode)| {
-            !episode.contains('/') && bomtoon_alias(content) && bomtoon_alias(episode)
-        })
+    let Some((aliases, query)) = url
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.split_once('?'))
+    else {
+        return false;
+    };
+    let Some(width) = query.strip_prefix("imageWidth=") else {
+        return false;
+    };
+    if width.is_empty() || !width.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(width) = width.parse::<u16>() else {
+        return false;
+    };
+    if !(1..=4096).contains(&width) {
+        return false;
+    }
+
+    aliases.split_once('/').is_some_and(|(content, episode)| {
+        !episode.contains('/') && bomtoon_alias(content) && bomtoon_alias(episode)
+    })
 }
 
 fn bomtoon_library_url(url: &str) -> bool {
@@ -1489,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn bomtoon_image_manifest_requires_exact_get_bearer_aliases_and_query() {
+    fn bomtoon_image_manifest_requires_exact_get_bearer_aliases_and_bounded_width() {
         use kobo_protocol::Credential;
 
         let access = Credential::bearer("bomtoon-access-token");
@@ -1500,6 +1515,16 @@ mod tests {
             RequestMethod::Get,
             exact
         ));
+        for width in [1, 1072, 1264, 1404, 4096] {
+            assert!(super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                &format!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth={width}"
+                )
+            ));
+        }
 
         for url in [
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images//ep-1?imageWidth=1080",
@@ -1508,7 +1533,17 @@ mod tests {
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep/1?imageWidth=1080",
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/%2f?imageWidth=1080",
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1",
-            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=720",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=0",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=4097",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=18446744073709551616",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=+1080",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=-1080",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth= 1080",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080%20",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=%31%30%38%30",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=10.80",
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imagewidth=1080",
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080&extra=true",
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080&imageWidth=1080",
             "http://www.bomtoon.tw/api/balcony-api-v2/contents/images/hunter_q/ep-1?imageWidth=1080",
