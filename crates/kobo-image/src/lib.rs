@@ -148,11 +148,38 @@ impl fmt::Display for ImageError {
 impl std::error::Error for ImageError {}
 
 /// One typed picture, row-major from the top with no row padding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Picture {
     width: u32,
     height: u32,
     pixels: PicturePixels,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PICTURE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Clone for Picture {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        PICTURE_CLONES.with(|clones| clones.set(clones.get() + 1));
+        Self {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+fn reset_picture_clone_count() {
+    PICTURE_CLONES.with(|clones| clones.set(0));
+}
+
+#[cfg(test)]
+fn picture_clone_count() -> usize {
+    PICTURE_CLONES.with(std::cell::Cell::get)
 }
 
 impl Picture {
@@ -322,7 +349,7 @@ impl Picture {
         };
         let left = (scaled_width - width) / 2;
         let top = (scaled_height - height) / 2;
-        self.clone().resample_region(
+        self.resample_region(
             width,
             height,
             scaled_width,
@@ -337,7 +364,7 @@ impl Picture {
         if target_width == 0 || target_height == 0 {
             return Err(ImageError::EmptyBox);
         }
-        self.clone().resample(target_width, target_height)
+        self.resample_region(target_width, target_height, target_width, target_height, 0, 0)
     }
 
     fn resample(self, width: u32, height: u32) -> Result<Self, ImageError> {
@@ -348,7 +375,7 @@ impl Picture {
     }
 
     fn resample_region(
-        self,
+        &self,
         width: u32,
         height: u32,
         mapped_width: u32,
@@ -366,13 +393,11 @@ impl Picture {
         {
             return Err(ImageError::EmptyBox);
         }
-        let format = self.format();
         let source_width = self.width;
         let source_height = self.height;
-        let source = self.pixels.into_bytes();
-        let bytes = match format {
-            PictureFormat::Gray8 => resample_bytes::<1>(
-                &source,
+        let pixels = match self.pixels() {
+            PicturePixelsRef::Gray8(source) => PicturePixels::Gray8(resample_bytes::<1>(
+                source,
                 source_width,
                 source_height,
                 width,
@@ -381,9 +406,9 @@ impl Picture {
                 mapped_height,
                 left,
                 top,
-            ),
-            PictureFormat::Rgb8 => resample_bytes::<3>(
-                &source,
+            )),
+            PicturePixelsRef::Rgb8(source) => PicturePixels::Rgb8(resample_bytes::<3>(
+                source,
                 source_width,
                 source_height,
                 width,
@@ -392,11 +417,7 @@ impl Picture {
                 mapped_height,
                 left,
                 top,
-            ),
-        };
-        let pixels = match format {
-            PictureFormat::Gray8 => PicturePixels::Gray8(bytes),
-            PictureFormat::Rgb8 => PicturePixels::Rgb8(bytes),
+            )),
         };
         Self::from_pixels(width, height, pixels)
     }
@@ -797,8 +818,9 @@ fn over_white(channel: u8, alpha: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, decode_webp, encode_png, fitted_size, size, width_scaled_size, AxisSample, FitMode,
-        ImageError, Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
+        decode, decode_webp, encode_png, fitted_size, picture_clone_count,
+        reset_picture_clone_count, size, width_scaled_size, AxisSample, FitMode, ImageError,
+        Picture, AXIS_SAMPLE_CHUNK, MAX_ENLARGEMENT, MAX_PIXELS, PANEL_GREYS,
     };
     use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
     use kobo_pixels::{PictureFormat, PicturePixels, PicturePixelsRef};
@@ -1233,6 +1255,28 @@ mod tests {
         let covered = picture.prepare(2, 2, FitMode::Cover).expect("cover");
         assert_eq!((covered.width(), covered.height()), (2, 2));
         assert_eq!(gray(&covered), &[20, 30, 20, 30]);
+    }
+
+    #[test]
+    fn borrowed_fit_paths_do_not_clone_source_ownership() {
+        reset_picture_clone_count();
+        let cover =
+            Picture::from_grey(4, 2, vec![10, 20, 30, 40, 10, 20, 30, 40]).expect("cover");
+        let fit = Picture::from_grey(4, 4, vec![91; 16]).expect("fit");
+        let enlarging = Picture::from_grey(2, 2, vec![173; 4]).expect("enlarging");
+
+        let covered = cover.cover(2, 2).expect("cover result");
+        let fitted = fit.fit(2, 2).expect("fit result");
+        let enlarged = enlarging.fit_enlarging(4, 4).expect("enlarging result");
+
+        assert_eq!(gray(&covered), &[20, 30, 20, 30]);
+        assert_eq!(gray(&fitted), &[91; 4]);
+        assert_eq!(gray(&enlarged), &[173; 16]);
+        assert_eq!(
+            picture_clone_count(),
+            0,
+            "borrowed resampling must allocate only its final pixels"
+        );
     }
 
     #[test]
