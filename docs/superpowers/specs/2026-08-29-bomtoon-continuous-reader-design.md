@@ -77,7 +77,8 @@ The manifest request uses the current reader panel width as `imageWidth` instead
 
 The response remains authoritative. Planning uses the dimensions returned by the manifest, and decoded dimensions must equal those values. BOMTOON has been observed to ignore `imageWidth` and return 1080-pixel-wide sources, so width mismatch is the normal compatibility path rather than a reason to fail.
 
-`kobo_image::decode_webp` rejects a non-WebP body before generic image decoding. `Picture::scale_to_width` consumes the decoded grayscale picture. A same-width source returns unchanged with its allocation intact. A different width uses direct fixed-point bilinear resampling into the final grayscale target whose dimensions come from `width_scaled_size`; it allocates no full-source clone, floating-point image, or full-sized intermediate.
+`kobo_image::decode_webp` rejects a non-WebP body before generic image decoding. `Picture::scale_to_width` consumes the decoded grayscale picture. A same-width source returns unchanged with its allocation intact. A different width uses direct fixed-point bilinear resampling into the final grayscale target whose dimensions come from `width_scaled_size`; it allocates no full-source clone, floating-point image, or full-sized intermediate. Horizontal samples use an axis-global denominator and a reusable chunk of at most 2,048 three-`u32` entries (24,576 logical bytes), not one entry per target column. All supported panel widths fit in one chunk; wider generic outputs refill the same chunk while writing each row.
+`MAX_PIXELS` bounds target area, not either axis independently; a valid 7,000,000 × 1 target therefore makes per-column scratch unsafe even though its output buffer is only 7,000,000 bytes.
 
 Requesting panel-width assets is an optimization, not a validation shortcut. A server response with different declared and decoded dimensions still fails closed.
 
@@ -107,7 +108,7 @@ If a page spans more sources than the decoded-source bound, the renderer copies 
 
 A source can contribute to several page buffers before eviction. The source cache is derived from page-plan references rather than managed by an unbounded general-purpose cache. No new caching dependency is introduced.
 
-The conservative cross-profile app model uses `M = 7,000,000` decoded pixels, `C = 4,194,304` compressed bytes, and the Elipsa three-page total `3P = 7,884,864` bytes. An oriented 8-bit WebP decode may transiently hold two RGBA images, luma-alpha, and gray (`11M`); with the callback body and one older cached gray source, `11M + C + M + 3P = 96,079,168` bytes (91.63 MiB). The bounded scaler's source, final target, older cached source, three pages, callback body, and width metadata are lower. Allocator arenas, stacks, libraries, and other unmodeled process memory are covered by the separate on-device high-water gate.
+The conservative cross-profile app model uses `M = 7,000,000` decoded pixels, `C = 4,194,304` compressed bytes, and the Elipsa three-page total `3P = 7,884,864` bytes. An oriented 8-bit WebP decode may transiently hold two RGBA images, luma-alpha, and gray (`11M`); with the callback body and one older cached gray source, `11M + C + M + 3P = 96,079,168` bytes (91.63 MiB). The scaler's source, final target, older cached source, three pages, callback body, and fixed 24,576-byte logical sample scratch are lower. Allocator arenas, stacks, libraries, and other unmodeled process memory are covered by the separate on-device high-water gate.
 The repository supports the exact profiles in `kobo_profile::SUPPORTED_PROFILES`. An upstream Clara HD device tree maps 512 MiB, but installed RAM across the fleet, post-reservation Linux `MemTotal`, and per-app allowance remain unproven. The memory release gates are therefore policy, not a claim that an app owns device RAM: modeled BOMTOON live allocations must stay at or below 96 MiB, on-device BOMTOON `VmHWM` must stay at or below 128 MiB, and system `MemAvailable` must not fall below 128 MiB during the worst reader scenario.
 
 The same-width WebP path, not lookahead pages, dominates ordinary peak memory. The former Lanczos compatibility fallback is forbidden because `image` creates a full `Rgba32F` scaling intermediate; a valid near-panel-width source can exceed the modeled allocation budget before runtime and allocator overhead.
@@ -182,7 +183,8 @@ Account clearing and application exit release the same state. The runtime's exis
 - A same-width decoded source keeps its original grayscale allocation.
 - Fixed-point bilinear scaling produces exact pinned pixels for a small matrix and preserves a constant image.
 - Scaling to Clara, Libra, and Elipsa panel widths agrees with `width_scaled_size`.
-- A mismatched valid source width allocates only the source grayscale buffer, final target buffer, and width-bounded axis metadata.
+- A mismatched valid source width allocates only the source grayscale buffer, final target buffer, and at most 24,576 logical bytes of horizontal sample scratch.
+- Scaling a valid 6,999,999 × 1 source to the maximum 7,000,000 × 1 target keeps sample scratch at 2,048 entries rather than allocating per target column.
 - A decoded dimension mismatch is rejected before scaling or segment copy.
 
 ### Loading and caching

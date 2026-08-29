@@ -4,7 +4,7 @@
 
 **Goal:** Render plain BOMTOON episodes as discrete screen-sized pages over one logical continuous vertical image strip, with first-page priority and a bounded three-page forward lookahead.
 
-**Architecture:** Manifest metadata produces global page plans whose segments may cross source-image seams. `kobo-image` validates WebP and consumes grayscale pictures through a direct fixed-point bilinear scaler whose live image storage is only source plus final target. `Bomtoon` owns a generation-scoped reader task registry, up to three application-side page builds, two combined decoded-or-fetching source slots, and up to two image fetches; only the selected page is uploaded to the runtime. Existing non-reader requests keep their single foreground `task`/`pending` flow.
+**Architecture:** Manifest metadata produces global page plans whose segments may cross source-image seams. `kobo-image` validates WebP and consumes grayscale pictures through a direct fixed-point bilinear scaler whose live image storage is source plus final target and a reusable 24 KiB horizontal-sample chunk. `Bomtoon` owns a generation-scoped reader task registry, up to three application-side page builds, two combined decoded-or-fetching source slots, and up to two image fetches; only the selected page is uploaded to the runtime. Existing non-reader requests keep their single foreground `task`/`pending` flow.
 
 **Tech Stack:** Rust 2021, `kobo-sdk` task/runtime APIs, `kobo-image::Picture`, in-module Rust unit tests, `AppRunner` command assertions, browser simulator, runtime simulator.
 
@@ -149,9 +149,29 @@ fn fixed_point_bilinear_pixels_are_pinned() {
         &[0, 32, 64, 64, 112, 160, 128, 192, 255]
     );
 }
+
+#[test]
+fn maximum_width_thin_image_keeps_axis_scratch_bounded() {
+    let target_width = u32::try_from(MAX_PIXELS).expect("pixel limit fits u32");
+    let source_width = target_width - 1;
+    let source = Picture::from_grey(
+        source_width,
+        1,
+        vec![127; usize::try_from(source_width).expect("source length")],
+    )
+    .expect("maximum thin source");
+    let scaled = source.scale_to_width(target_width).expect("bounded scale");
+    assert_eq!((scaled.width(), scaled.height()), (target_width, 1));
+    assert_eq!(scaled.grey().len(), usize::try_from(MAX_PIXELS).expect("pixel limit"));
+    assert_eq!(axis_scratch_len(target_width), AXIS_SAMPLE_CHUNK);
+    assert_eq!(
+        axis_scratch_len(target_width) * std::mem::size_of::<AxisSample>(),
+        24_576
+    );
+}
 ```
 
-Also update the existing real-lossy-WebP test to call `decode_webp`. Add tests that a constant picture remains constant when enlarged and reduced, target height matches `width_scaled_size`, zero width fails with `EmptyBox`, a target above `MAX_PIXELS` fails before allocation, and 1080-pixel sources scale to widths 1072, 1264, and 1404.
+Also update the existing real-lossy-WebP test to call `decode_webp`. Add tests that a constant picture remains constant when enlarged and reduced, target height matches `width_scaled_size`, zero width fails with `EmptyBox`, a target above `MAX_PIXELS` fails before allocation, and 1080-pixel sources scale to widths 1072, 1264, and 1404. The maximum-width thin-image test is the regression contract for the generic `kobo-image` API: a valid 7,000,000 × 1 target must not allocate one sample per column.
 
 - [ ] **Step 2: Run the new image tests and verify they fail**
 
@@ -159,7 +179,9 @@ Run: `cargo test -p kobo-image webp_only_decode`
 
 Run: `cargo test -p kobo-image fixed_point_bilinear`
 
-Expected: compilation fails because `decode_webp`, the consuming scaler, and the format error do not exist.
+Run: `cargo test -p kobo-image maximum_width_thin_image`
+
+Expected: compilation fails because `decode_webp`, the consuming scaler, the bounded scratch helpers, and the format error do not exist.
 
 - [ ] **Step 3: Add WebP-only decoding behind the existing decode module**
 
@@ -186,30 +208,40 @@ Self::UnexpectedFormat { expected } => {
 - [ ] **Step 4: Replace Lanczos width scaling with consuming fixed-point bilinear**
 
 Change `scale_to_width` from `&self` to `self`. Call `width_scaled_size` first. If target dimensions equal the source dimensions, return `Ok(self)`.
+`MAX_PIXELS` bounds area rather than width, so a valid 7,000,000 × 1 output rules out any scratch allocation proportional to the target width.
 
-For a mismatch, allocate only the checked final `Vec<u8>`. Precompute one horizontal axis entry per target column:
+For a mismatch, allocate the checked final `Vec<u8>` and one reusable horizontal sample chunk:
 
 ```rust
+const AXIS_SAMPLE_CHUNK: usize = 2_048;
+
 #[derive(Clone, Copy)]
 struct AxisSample {
     low: u32,
     high: u32,
     upper_weight: u32,
-    denominator: u32,
+}
+
+fn axis_scratch_len(target_width: u32) -> usize {
+    usize::try_from(target_width)
+        .unwrap_or(usize::MAX)
+        .min(AXIS_SAMPLE_CHUNK)
 }
 ```
 
-Map endpoints exactly with:
+The horizontal denominator is global for the entire target axis: `target_width.saturating_sub(1).max(1)`. Map endpoints exactly with:
 
 ```rust
-let denominator = target_len.saturating_sub(1);
 let numerator = u64::from(target_index) * u64::from(source_len.saturating_sub(1));
 let low = u32::try_from(numerator / u64::from(denominator)).expect("axis is bounded");
 let upper_weight =
     u32::try_from(numerator % u64::from(denominator)).expect("weight is bounded");
 let high = low.saturating_add(1).min(source_len - 1);
 ```
-Special-case `source_len == 1 || target_len == 1` as `{ low: 0, high: 0, upper_weight: 0, denominator: 1 }`. Compute one vertical sample per output row. For each pixel, multiply the four neighboring grayscale bytes by the exact lower/upper horizontal and vertical integer weights, sum in checked `u64`, divide once by the denominator product, and round to nearest. `MAX_PIXELS` bounds that product. Store directly into the final output; do not call `image::imageops::resize`, construct `GrayImage`, allocate `Rgba32FImage`, or allocate a full-sized intermediate.
+
+Special-case `source_len == 1 || target_len == 1` as `{ low: 0, high: 0, upper_weight: 0 }`. Compute the vertical sample and its axis-global denominator once per output row. When `target_width <= AXIS_SAMPLE_CHUNK`, fill the scratch once and reuse it for every row; this covers every supported panel. For a wider generic target, refill the same scratch for consecutive horizontal chunks while writing each output row. Never allocate a `Vec<AxisSample>` proportional to `target_width`.
+
+For each pixel, multiply the four neighboring grayscale bytes by the exact lower/upper horizontal and vertical integer weights, sum in checked `u64`, divide once by the denominator product, and round to nearest. `MAX_PIXELS` bounds that product. Store directly into the final output; do not call `image::imageops::resize`, construct `GrayImage`, allocate `Rgba32FImage`, or allocate a full-sized intermediate.
 
 - [ ] **Step 5: Update BOMTOON to use the deep image interface**
 
@@ -987,7 +1019,7 @@ Repeat the exact reading path and record the same two timings. Confirm the reade
 
 - [ ] **Step 5: Measure on-device memory high-water marks**
 
-First record the conservative modeled app peak: `11 × 7,000,000 + 4,194,304 + 7,000,000 + 7,884,864 = 96,079,168` bytes (91.63 MiB), covering an oriented 8-bit WebP decode, one callback body, one older cached source, and three maximum-profile pages. Confirm the scaler phase remains lower because it holds only source gray, final target gray, one older source, three pages, one callback body, and width-bounded metadata.
+First record the conservative modeled app peak: `11 × 7,000,000 + 4,194,304 + 7,000,000 + 7,884,864 = 96,079,168` bytes (91.63 MiB), covering an oriented 8-bit WebP decode, one callback body, one older cached source, and three maximum-profile pages. Confirm the scaler phase remains lower because it holds only source gray, final target gray, one older source, three pages, one callback body, and at most 24,576 bytes of horizontal sample scratch.
 
 On the supported device with the lowest measured `MemTotal`, capture:
 
