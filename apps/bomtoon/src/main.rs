@@ -112,9 +112,7 @@ const fn gray8_conservative_bytes() -> usize {
 }
 
 const fn rgb8_conservative_bytes() -> usize {
-    11 * MAX_READER_DECODED_PIXELS
-        + MAX_READER_COMPRESSED_BYTES
-        + 2 * LARGEST_RGB8_PAGE_BYTES
+    11 * MAX_READER_DECODED_PIXELS + MAX_READER_COMPRESSED_BYTES + 2 * LARGEST_RGB8_PAGE_BYTES
 }
 
 const _: () = {
@@ -216,6 +214,27 @@ struct ReaderState {
     chrome_visible: bool,
 }
 
+struct PlannedReaderSpawn {
+    source: usize,
+    purpose: ReaderTaskPurpose,
+    foreground: bool,
+    url: String,
+}
+
+#[derive(Default)]
+struct ReaderMaintenancePlan {
+    spawns: Vec<PlannedReaderSpawn>,
+    promotion: Option<(TaskId, usize, usize)>,
+    refresh_promotion: Option<TaskId>,
+    ready: Option<(usize, Picture)>,
+}
+
+struct RebasedReaderWindow {
+    build: PageBuild,
+    cached_sources: BTreeSet<usize>,
+    fetches: BTreeMap<usize, TaskId>,
+}
+
 #[derive(Default)]
 struct Bomtoon {
     account: AccountState,
@@ -276,13 +295,11 @@ impl Bomtoon {
             .and_then(|task| self.reader_tasks.get(&task))
         {
             let message = match entry.purpose {
-                ReaderTaskPurpose::Manifest | ReaderTaskPurpose::ManifestRefresh => {
-                    "Loading comic pages"
-                }
                 ReaderTaskPurpose::ForegroundSource { .. } => "Loading comic image",
-                ReaderTaskPurpose::PrefetchSource { .. } | ReaderTaskPurpose::Maintenance => {
-                    "Loading comic pages"
-                }
+                ReaderTaskPurpose::Manifest
+                | ReaderTaskPurpose::ManifestRefresh
+                | ReaderTaskPurpose::PrefetchSource { .. }
+                | ReaderTaskPurpose::Maintenance => "Loading comic pages",
             };
             return ScreenBuilder::new("bomtoon-loading")
                 .top_bar(self.reader_title())
@@ -573,13 +590,11 @@ impl Bomtoon {
         work: kobo_sdk::Task,
         foreground: bool,
     ) -> Option<TaskId> {
-        let task_limit = self
-            .reader
-            .as_ref()
-            .map_or(1, |reader| reader.limits.tasks);
-        if self.reader_tasks.len() >= task_limit
-            || (foreground && self.foreground_reader_task.is_some())
-        {
+        let at_task_limit = self.reader.as_ref().map_or_else(
+            || !self.reader_tasks.is_empty(),
+            |reader| self.reader_tasks.len() >= reader.limits.tasks,
+        );
+        if at_task_limit || (foreground && self.foreground_reader_task.is_some()) {
             return None;
         }
         let task = context.spawn(work)?;
@@ -628,10 +643,7 @@ impl Bomtoon {
             )
             .is_none()
         {
-            self.fail_reader(
-                Retry::Manifest,
-                "Another reader request is still active.",
-            );
+            self.fail_reader(Retry::Manifest, "Another reader request is still active.");
         }
     }
 
@@ -642,13 +654,7 @@ impl Bomtoon {
         purpose: ReaderTaskPurpose,
         foreground: bool,
     ) -> Option<TaskId> {
-        let url = self
-            .reader
-            .as_ref()?
-            .images
-            .get(source)?
-            .url
-            .clone();
+        let url = self.reader.as_ref()?.images.get(source)?.url.clone();
         let task = self.spawn_reader(context, purpose, api::image(&url), foreground)?;
         let reader = self.reader.as_mut()?;
         reader.source_fetches.insert(source, task);
@@ -663,9 +669,7 @@ impl Bomtoon {
             FetchIntent::Foreground { page } => {
                 self.retry == Retry::Page(page)
                     && reader.plans.get(page).is_some_and(|plan| {
-                        plan.segments
-                            .iter()
-                            .any(|segment| segment.source == source)
+                        plan.segments.iter().any(|segment| segment.source == source)
                     })
             }
             FetchIntent::Prefetch => {
@@ -805,10 +809,7 @@ impl Bomtoon {
         };
         let foreground_available = self.foreground_reader_task.is_none();
         let available_tasks = self.reader.as_ref().map_or(0, |reader| {
-            reader
-                .limits
-                .tasks
-                .saturating_sub(self.reader_tasks.len())
+            reader.limits.tasks.saturating_sub(self.reader_tasks.len())
         });
         let candidates = {
             let Some(reader) = self.reader.as_mut() else {
@@ -817,83 +818,7 @@ impl Bomtoon {
             if reader.refresh_task.is_some() {
                 return Ok(());
             }
-            let stale = reader
-                .refresh_waiters
-                .iter()
-                .filter_map(|(&source, &intent)| {
-                    let relevant = match intent {
-                        FetchIntent::Foreground { page } => {
-                            desired_page == Some(page)
-                                && reader.plans.get(page).is_some_and(|plan| {
-                                    plan.segments
-                                        .iter()
-                                        .any(|segment| segment.source == source)
-                                })
-                        }
-                        FetchIntent::Prefetch => {
-                            source_relevant_to_window(source, &reader.plans, &reader.window)
-                                || desired_page.is_some_and(|page| {
-                                    source_relevant_to_page_window(
-                                        source,
-                                        &reader.plans,
-                                        page,
-                                        reader.limits.pages,
-                                    )
-                                })
-                        }
-                    };
-                    (!relevant
-                        || reader.source_cache.contains_key(&source)
-                        || reader.source_fetches.contains_key(&source))
-                    .then_some(source)
-                })
-                .collect::<Vec<_>>();
-            for source in stale {
-                reader.refresh_waiters.remove(&source);
-            }
-            let source_capacity = reader.limits.source_slots.saturating_sub(
-                reader
-                    .source_cache
-                    .len()
-                    .saturating_add(reader.source_fetches.len()),
-            );
-            let fetch_capacity = reader
-                .limits
-                .fetches
-                .saturating_sub(reader.source_fetches.len());
-            let mut capacity = available_tasks.min(source_capacity).min(fetch_capacity);
-            if !foreground_available
-                && reader
-                    .refresh_waiters
-                    .values()
-                    .any(|intent| matches!(intent, FetchIntent::Foreground { .. }))
-            {
-                capacity = 0;
-            }
-            let mut candidates = Vec::new();
-            if foreground_available && capacity > 0 {
-                for (&source, &intent) in &reader.refresh_waiters {
-                    if !matches!(intent, FetchIntent::Foreground { .. }) {
-                        continue;
-                    }
-                    candidates.push((source, intent));
-                    capacity = capacity.saturating_sub(1);
-                    break;
-                }
-            }
-            if capacity > 0 {
-                for (&source, &intent) in &reader.refresh_waiters {
-                    if !matches!(intent, FetchIntent::Prefetch) {
-                        continue;
-                    }
-                    candidates.push((source, intent));
-                    capacity -= 1;
-                    if capacity == 0 {
-                        break;
-                    }
-                }
-            }
-            candidates
+            refreshed_source_candidates(reader, desired_page, foreground_available, available_tasks)
         };
         for (source, intent) in candidates {
             let purpose = match intent {
@@ -917,12 +842,7 @@ impl Bomtoon {
         Ok(())
     }
 
-    fn accept_manifest_refresh(
-        &mut self,
-        context: &mut Context,
-        task: TaskId,
-        bytes: &[u8],
-    ) {
+    fn accept_manifest_refresh(&mut self, context: &mut Context, task: TaskId, bytes: &[u8]) {
         let current = self
             .reader
             .as_ref()
@@ -1098,14 +1018,13 @@ impl Bomtoon {
                     return;
                 };
                 let format = metrics.picture_format;
-                let first_build =
-                    match PageBuild::new(0, format, panel_width, panel_height) {
-                        Ok(build) => build,
-                        Err(error) => {
-                            self.fail_reader(Retry::Manifest, error);
-                            return;
-                        }
-                    };
+                let first_build = match PageBuild::new(0, format, panel_width, panel_height) {
+                    Ok(build) => build,
+                    Err(error) => {
+                        self.fail_reader(Retry::Manifest, error);
+                        return;
+                    }
+                };
                 let mut window = VecDeque::new();
                 window.push_back(PageEntry::Building(first_build));
                 self.reader = Some(ReaderState {
@@ -1164,263 +1083,39 @@ impl Bomtoon {
             .as_ref()
             .map_or(0, |reader| reader.limits.tasks)
             .saturating_sub(self.reader_tasks.len());
-        let mut planned_spawns = Vec::new();
-        let mut planned_promotion = None;
-        let mut planned_refresh_promotion = None;
-        let mut ready_to_install = None;
-        {
+        let desired_page = match self.retry {
+            Retry::Page(page) => Some(page),
+            Retry::Restart | Retry::Manifest => None,
+        };
+        let ReaderMaintenancePlan {
+            spawns,
+            promotion,
+            refresh_promotion,
+            ready,
+        } = {
             let reader = self
                 .reader
                 .as_mut()
                 .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-            if extend_window {
-                while reader.window.len() < reader.limits.pages {
-                    let next_page = reader
-                        .window
-                        .back()
-                        .map(entry_page)
-                        .map_or_else(|| reader.page.saturating_add(1), |page| page.saturating_add(1));
-                    if next_page >= reader.plans.len() {
-                        break;
-                    }
-                    reader.window.push_back(PageEntry::Building(PageBuild::new(
-                        next_page,
-                        reader.format,
-                        reader.panel_width,
-                        reader.panel_height,
-                    )?));
-                }
-            }
-            let desired_page = match self.retry {
-                Retry::Page(page) => Some(page),
-                Retry::Restart | Retry::Manifest => None,
-            };
-            let stale_failures = reader
-                .source_failures
-                .keys()
-                .copied()
-                .filter(|source| {
-                    !source_relevant_to_window(*source, &reader.plans, &reader.window)
-                        && !desired_page.is_some_and(|page| {
-                            source_relevant_to_page_window(
-                                *source,
-                                &reader.plans,
-                                page,
-                                reader.limits.pages,
-                            )
-                        })
-                })
-                .collect::<Vec<_>>();
-            for source in stale_failures {
-                reader.source_failures.remove(&source);
-            }
-
-            {
-                let ReaderState {
-                    source_cache,
-                    plans,
-                    window,
-                    panel_width,
-                    panel_height,
-                    ..
-                } = reader;
-                for (&source, picture) in source_cache.iter() {
-                    for entry in window.iter_mut() {
-                        if let PageEntry::Building(build) = entry {
-                            copy_source_into_builds(
-                                source,
-                                picture,
-                                plans,
-                                std::slice::from_mut(build),
-                                *panel_width,
-                                *panel_height,
-                            )?;
-                        }
-                    }
-                }
-            }
-
-            let mut index = 0;
-            while index < reader.window.len() {
-                let complete = match reader.window.get(index) {
-                    Some(PageEntry::Ready { .. }) => {
-                        index += 1;
-                        continue;
-                    }
-                    Some(PageEntry::Building(build)) => {
-                        let plan = reader
-                            .plans
-                            .get(build.page)
-                            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-                        build.next_segment == plan.segments.len()
-                    }
-                    None => break,
-                };
-                if !complete {
-                    break;
-                }
-                let Some(PageEntry::Building(build)) = reader.window.remove(index) else {
-                    return Err("The comic page window changed unexpectedly.".to_owned());
-                };
-                let page = build.page;
-                let plan = reader
-                    .plans
-                    .get(page)
-                    .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-                let picture = finish_build(
-                    build,
-                    plan,
-                    reader.panel_width,
-                    reader.panel_height,
-                )?;
-                reader
-                    .window
-                    .insert(index, PageEntry::Ready { page, picture });
-                index += 1;
-            }
-
-            {
-                let ReaderState {
-                    source_cache,
-                    plans,
-                    window,
-                    limits,
-                    ..
-                } = reader;
-                source_cache.retain(|source, _| {
-                    source_relevant_to_window(*source, plans, window)
-                        || install_target.is_some_and(|target| {
-                            source_relevant_to_following_page_window(
-                                *source,
-                                plans,
-                                target,
-                                limits.pages,
-                            )
-                        })
-                });
-            }
-
-            if let Some(target) = install_target {
-                let installable = matches!(
-                    reader.window.front(),
-                    Some(PageEntry::Ready { page, .. }) if *page == target
-                );
-                if installable {
-                    let Some(PageEntry::Ready { page, picture }) = reader.window.pop_front() else {
-                        return Err("The ready comic page changed unexpectedly.".to_owned());
-                    };
-                    ready_to_install = Some((page, picture));
-                }
-            }
-
-            if ready_to_install.is_none() {
-                let combined = reader
-                    .source_cache
-                    .len()
-                    .saturating_add(reader.source_fetches.len());
-                let available_slots = reader.limits.source_slots.saturating_sub(combined);
-                let available_fetches = reader
-                    .limits
-                    .fetches
-                    .saturating_sub(reader.source_fetches.len());
-                let spawn_limit = available_tasks.min(available_slots).min(available_fetches);
-                if let Some(page) = install_target {
-                    let missing = reader.window.iter().find_map(|entry| match entry {
-                        PageEntry::Building(build) if build.page == page => reader
-                            .plans
-                            .get(build.page)
-                            .and_then(|plan| plan.segments.get(build.next_segment))
-                            .map(|segment| segment.source),
-                        PageEntry::Building(_) | PageEntry::Ready { .. } => None,
-                    });
-                    if let Some(source) = missing {
-                        if let Some(failure) = reader.source_failures.get(&source) {
-                            return Err(failure.advice.clone());
-                        }
-                        if reader.refresh_waiters.contains_key(&source) {
-                            let intent = FetchIntent::Foreground { page };
-                            reader.refresh_waiters.insert(source, intent);
-                            planned_refresh_promotion = reader.refresh_task;
-                        } else if let Some(&task) = reader.source_fetches.get(&source) {
-                            planned_promotion = Some((task, source, page));
-                        } else if !reader.source_cache.contains_key(&source) && spawn_limit > 0 {
-                            let url = reader
-                                .images
-                                .get(source)
-                                .ok_or_else(|| {
-                                    "The selected comic image is no longer available.".to_owned()
-                                })?
-                                .url
-                                .clone();
-                            planned_spawns.push((
-                                source,
-                                ReaderTaskPurpose::ForegroundSource { source, page },
-                                true,
-                                url,
-                            ));
-                        }
-                    }
-                } else if spawn_limit > 0
-                    && (reader.refresh_task.is_some() || reader.refresh_waiters.is_empty())
-                {
-                    'pages: for entry in &reader.window {
-                        let PageEntry::Building(build) = entry else {
-                            continue;
-                        };
-                        let plan = reader
-                            .plans
-                            .get(build.page)
-                            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-                        for segment in &plan.segments[build.next_segment..] {
-                            let source = segment.source;
-                            if reader.source_failures.contains_key(&source) {
-                                break 'pages;
-                            }
-                            if reader.refresh_waiters.contains_key(&source) {
-                                continue;
-                            }
-                            if reader.source_cache.contains_key(&source)
-                                || reader.source_fetches.contains_key(&source)
-                                || planned_spawns
-                                    .iter()
-                                    .any(|(planned, _, _, _)| *planned == source)
-                            {
-                                continue;
-                            }
-                            let url = reader
-                                .images
-                                .get(source)
-                                .ok_or_else(|| {
-                                    "The selected comic image is no longer available.".to_owned()
-                                })?
-                                .url
-                                .clone();
-                            planned_spawns.push((
-                                source,
-                                ReaderTaskPurpose::PrefetchSource { source },
-                                false,
-                                url,
-                            ));
-                            if planned_spawns.len() == spawn_limit {
-                                break 'pages;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some((task, source, page)) = planned_promotion {
-            let entry = self
-                .reader_tasks
-                .get_mut(&task)
-                .ok_or_else(|| "The comic image request registry changed unexpectedly.".to_owned())?;
+            plan_reader_maintenance(
+                reader,
+                available_tasks,
+                extend_window,
+                install_target,
+                desired_page,
+            )?
+        };
+        if let Some((task, source, page)) = promotion {
+            let entry = self.reader_tasks.get_mut(&task).ok_or_else(|| {
+                "The comic image request registry changed unexpectedly.".to_owned()
+            })?;
             if entry.generation != self.reader_generation {
                 return Err("The comic image request generation changed unexpectedly.".to_owned());
             }
             entry.purpose = ReaderTaskPurpose::ForegroundSource { source, page };
             self.foreground_reader_task = Some(task);
         }
-        if let Some(task) = planned_refresh_promotion {
+        if let Some(task) = refresh_promotion {
             let entry = self.reader_tasks.get(&task).ok_or_else(|| {
                 "The comic image URL refresh registry changed unexpectedly.".to_owned()
             })?;
@@ -1433,22 +1128,24 @@ impl Bomtoon {
             }
             self.foreground_reader_task = Some(task);
         }
-
-        if let Some((page, picture)) = ready_to_install {
+        if let Some((page, picture)) = ready {
             self.install_page(context, page, picture)?;
             return Ok(true);
         }
-        for (source, purpose, foreground, url) in planned_spawns {
-            let Some(task) =
-                self.spawn_reader(context, purpose, api::image(&url), foreground)
-            else {
+        for spawn in spawns {
+            let Some(task) = self.spawn_reader(
+                context,
+                spawn.purpose,
+                api::image(&spawn.url),
+                spawn.foreground,
+            ) else {
                 return Err("The comic image request could not be started.".to_owned());
             };
             let reader = self
                 .reader
                 .as_mut()
                 .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-            reader.source_fetches.insert(source, task);
+            reader.source_fetches.insert(spawn.source, task);
         }
         self.drain_refresh_waiters(context)?;
         Ok(false)
@@ -1482,12 +1179,7 @@ impl Bomtoon {
             let relevant_to_window =
                 source_relevant_to_window(source, &reader.plans, &reader.window);
             let relevant_to_desired = desired_page.is_some_and(|target| {
-                source_relevant_to_page_window(
-                    source,
-                    &reader.plans,
-                    target,
-                    reader.limits.pages,
-                )
+                source_relevant_to_page_window(source, &reader.plans, target, reader.limits.pages)
             });
             (
                 relevant_to_window || relevant_to_desired,
@@ -1688,90 +1380,91 @@ impl Bomtoon {
         }
     }
 
+    fn prepare_rebased_window(&self, page: usize) -> Result<RebasedReaderWindow, String> {
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
+        let plan = reader
+            .plans
+            .get(page)
+            .ok_or_else(|| "The selected comic page is no longer available.".to_owned())?;
+        let required_source = plan
+            .segments
+            .first()
+            .ok_or_else(|| "The selected comic page is empty.".to_owned())?
+            .source;
+        let build = PageBuild::new(page, reader.format, reader.panel_width, reader.panel_height)?;
+        let is_active_source = |source: usize, task: TaskId| {
+            self.reader_tasks.get(&task).is_some_and(|entry| {
+                entry.generation == self.reader_generation
+                    && matches!(
+                        entry.purpose,
+                        ReaderTaskPurpose::ForegroundSource {
+                            source: task_source,
+                            ..
+                        } | ReaderTaskPurpose::PrefetchSource {
+                            source: task_source,
+                        } if task_source == source
+                    )
+            })
+        };
+        let required_cached = reader.source_cache.contains_key(&required_source);
+        let required_fetch = (!required_cached)
+            .then(|| reader.source_fetches.get(&required_source).copied())
+            .flatten()
+            .filter(|task| is_active_source(required_source, *task));
+        let required_retained = required_cached || required_fetch.is_some();
+        let retained_capacity = reader
+            .limits
+            .source_slots
+            .saturating_sub(usize::from(!required_retained));
+        let mut kept_sources = BTreeSet::new();
+        let mut kept_cache_sources = BTreeSet::new();
+        let mut kept_fetches = BTreeMap::new();
+        if required_cached {
+            kept_sources.insert(required_source);
+            kept_cache_sources.insert(required_source);
+        } else if let Some(task) = required_fetch {
+            kept_sources.insert(required_source);
+            kept_fetches.insert(required_source, task);
+        }
+        for &source in reader.source_cache.keys() {
+            if kept_sources.len() == retained_capacity {
+                break;
+            }
+            if source_relevant_to_page_window(source, &reader.plans, page, reader.limits.pages)
+                && kept_sources.insert(source)
+            {
+                kept_cache_sources.insert(source);
+            }
+        }
+        for (&source, &task) in &reader.source_fetches {
+            if kept_sources.len() == retained_capacity
+                || kept_fetches.len() == reader.limits.fetches
+            {
+                break;
+            }
+            if source_relevant_to_page_window(source, &reader.plans, page, reader.limits.pages)
+                && is_active_source(source, task)
+                && kept_sources.insert(source)
+            {
+                kept_fetches.insert(source, task);
+            }
+        }
+        Ok(RebasedReaderWindow {
+            build,
+            cached_sources: kept_cache_sources,
+            fetches: kept_fetches,
+        })
+    }
+
     fn rebase_window(&mut self, context: &mut Context, page: usize) {
-        let prepared = (|| {
-            let reader = self
-                .reader
-                .as_ref()
-                .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-            let plan = reader
-                .plans
-                .get(page)
-                .ok_or_else(|| "The selected comic page is no longer available.".to_owned())?;
-            plan.segments
-                .first()
-                .ok_or_else(|| "The selected comic page is empty.".to_owned())?;
-            let build =
-                PageBuild::new(page, reader.format, reader.panel_width, reader.panel_height)?;
-            let required_source = plan.segments[0].source;
-            let is_active_source = |source: usize, task: TaskId| {
-                self.reader_tasks.get(&task).is_some_and(|entry| {
-                    entry.generation == self.reader_generation
-                        && matches!(
-                            entry.purpose,
-                            ReaderTaskPurpose::ForegroundSource {
-                                source: task_source,
-                                ..
-                            } | ReaderTaskPurpose::PrefetchSource {
-                                source: task_source,
-                            } if task_source == source
-                        )
-                })
-            };
-            let required_cached = reader.source_cache.contains_key(&required_source);
-            let required_fetch = (!required_cached)
-                .then(|| reader.source_fetches.get(&required_source).copied())
-                .flatten()
-                .filter(|task| is_active_source(required_source, *task));
-            let required_retained = required_cached || required_fetch.is_some();
-            let retained_capacity = reader
-                .limits
-                .source_slots
-                .saturating_sub(usize::from(!required_retained));
-            let mut kept_sources = BTreeSet::new();
-            let mut kept_cache_sources = BTreeSet::new();
-            let mut kept_fetches = BTreeMap::new();
-            if required_cached {
-                kept_sources.insert(required_source);
-                kept_cache_sources.insert(required_source);
-            } else if let Some(task) = required_fetch {
-                kept_sources.insert(required_source);
-                kept_fetches.insert(required_source, task);
-            }
-            for &source in reader.source_cache.keys() {
-                if kept_sources.len() == retained_capacity {
-                    break;
-                }
-                if source_relevant_to_page_window(
-                    source,
-                    &reader.plans,
-                    page,
-                    reader.limits.pages,
-                ) && kept_sources.insert(source)
-                {
-                    kept_cache_sources.insert(source);
-                }
-            }
-            for (&source, &task) in &reader.source_fetches {
-                if kept_sources.len() == retained_capacity
-                    || kept_fetches.len() == reader.limits.fetches
-                {
-                    break;
-                }
-                if source_relevant_to_page_window(
-                    source,
-                    &reader.plans,
-                    page,
-                    reader.limits.pages,
-                ) && is_active_source(source, task)
-                    && kept_sources.insert(source)
-                {
-                    kept_fetches.insert(source, task);
-                }
-            }
-            Ok::<_, String>((build, kept_cache_sources, kept_fetches))
-        })();
-        let (build, kept_cache_sources, kept_fetches) = match prepared {
+        let RebasedReaderWindow {
+            build,
+            cached_sources: kept_cache_sources,
+            fetches: kept_fetches,
+        } = match self.prepare_rebased_window(page) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reader(Retry::Page(page), error);
@@ -1780,11 +1473,7 @@ impl Bomtoon {
         };
 
         let mut kept_tasks = kept_fetches.values().copied().collect::<BTreeSet<_>>();
-        if let Some(refresh) = self
-            .reader
-            .as_ref()
-            .and_then(|reader| reader.refresh_task)
-        {
+        if let Some(refresh) = self.reader.as_ref().and_then(|reader| reader.refresh_task) {
             kept_tasks.insert(refresh);
         }
         let cancelled = self
@@ -1928,6 +1617,171 @@ impl Bomtoon {
         }
     }
 
+    fn handle_manifest_outcome(&mut self, context: &mut Context, outcome: TaskOutcome) -> bool {
+        match outcome {
+            TaskOutcome::Completed(bytes) => self.accept_manifest(context, &bytes),
+            TaskOutcome::Failed(TaskError::NoCredential) => {
+                self.clear_account_data(context);
+                self.account = AccountState::SignedOut;
+                self.problem = None;
+            }
+            TaskOutcome::Failed(TaskError::Unauthorized) => {
+                self.clear_account_data(context);
+                self.account = AccountState::Expired;
+                self.problem = None;
+            }
+            TaskOutcome::Failed(error) => {
+                self.fail_reader(Retry::Manifest, Failure::of(error).advice);
+            }
+            TaskOutcome::Cancelled => {
+                self.fail_reader(Retry::Manifest, "The request was cancelled.");
+            }
+        }
+        false
+    }
+
+    fn clear_manifest_refresh(&mut self, task: TaskId) {
+        if let Some(reader) = self.reader.as_mut() {
+            if reader.refresh_task == Some(task) {
+                reader.refresh_task = None;
+            }
+        }
+    }
+
+    fn handle_manifest_refresh_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        outcome: TaskOutcome,
+    ) -> bool {
+        match outcome {
+            TaskOutcome::Completed(bytes) => self.accept_manifest_refresh(context, task, &bytes),
+            TaskOutcome::Failed(error) => {
+                self.clear_manifest_refresh(task);
+                match error {
+                    TaskError::NoCredential => {
+                        self.clear_account_data(context);
+                        self.account = AccountState::SignedOut;
+                        self.problem = None;
+                    }
+                    TaskError::Unauthorized => {
+                        self.clear_account_data(context);
+                        self.account = AccountState::Expired;
+                        self.problem = None;
+                    }
+                    error => self.fail_manifest_refresh(Failure::of(error).advice),
+                }
+            }
+            TaskOutcome::Cancelled => {
+                self.clear_manifest_refresh(task);
+                self.fail_manifest_refresh("The request was cancelled.");
+            }
+        }
+        false
+    }
+
+    fn handle_reader_source_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        source: usize,
+        intent: FetchIntent,
+        outcome: TaskOutcome,
+    ) -> bool {
+        match outcome {
+            TaskOutcome::Completed(bytes) => {
+                self.accept_reader_source(context, task, source, intent, &bytes)
+            }
+            TaskOutcome::Failed(error) => {
+                self.handle_source_failure(context, task, source, intent, error);
+                false
+            }
+            TaskOutcome::Cancelled => {
+                self.handle_source_cancelled(context, task, source, intent);
+                false
+            }
+        }
+    }
+
+    fn handle_maintenance_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        outcome: &TaskOutcome,
+    ) -> bool {
+        let page = self.reader.as_ref().map_or(0, |reader| reader.page);
+        if let Some(reader) = self.reader.as_mut() {
+            if reader.maintenance_task == Some(task) {
+                reader.maintenance_task = None;
+            }
+        }
+        match outcome {
+            TaskOutcome::Completed(_) => {
+                if let Err(error) = self.maintain_reader(context, true, None) {
+                    self.fail_reader(Retry::Page(page), error);
+                }
+            }
+            TaskOutcome::Failed(error) => {
+                self.fail_reader(Retry::Page(page), Failure::of(*error).advice);
+            }
+            TaskOutcome::Cancelled => {
+                self.fail_reader(Retry::Page(page), "The request was cancelled.");
+            }
+        }
+        false
+    }
+
+    fn handle_reader_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        entry: ReaderTaskEntry,
+        outcome: TaskOutcome,
+    ) {
+        if entry.generation != self.reader_generation {
+            return;
+        }
+        if !matches!(entry.purpose, ReaderTaskPurpose::Manifest)
+            && self
+                .reader
+                .as_ref()
+                .is_none_or(|reader| reader.generation != entry.generation)
+        {
+            return;
+        }
+        if matches!(&outcome, TaskOutcome::Failed(TaskError::Offline)) {
+            self.leave_reader(context);
+            return;
+        }
+        let shown = match entry.purpose {
+            ReaderTaskPurpose::Manifest => self.handle_manifest_outcome(context, outcome),
+            ReaderTaskPurpose::ManifestRefresh => {
+                self.handle_manifest_refresh_outcome(context, task, outcome)
+            }
+            ReaderTaskPurpose::ForegroundSource { source, page } => self
+                .handle_reader_source_outcome(
+                    context,
+                    task,
+                    source,
+                    FetchIntent::Foreground { page },
+                    outcome,
+                ),
+            ReaderTaskPurpose::PrefetchSource { source } => self.handle_reader_source_outcome(
+                context,
+                task,
+                source,
+                FetchIntent::Prefetch,
+                outcome,
+            ),
+            ReaderTaskPurpose::Maintenance => {
+                self.handle_maintenance_outcome(context, task, &outcome)
+            }
+        };
+        if !shown {
+            self.show(context);
+        }
+    }
+
     fn cancel_task(&mut self, _pending: Pending) {
         self.problem = Some("The request was cancelled.".to_owned());
         self.retry = Retry::Restart;
@@ -2050,186 +1904,7 @@ impl KoboApp for Bomtoon {
             if self.foreground_reader_task == Some(task) {
                 self.foreground_reader_task = None;
             }
-            if entry.generation != self.reader_generation {
-                return;
-            }
-            if !matches!(entry.purpose, ReaderTaskPurpose::Manifest)
-                && !self
-                    .reader
-                    .as_ref()
-                    .is_some_and(|reader| reader.generation == entry.generation)
-            {
-                return;
-            }
-            if matches!(&outcome, TaskOutcome::Failed(TaskError::Offline)) {
-                self.leave_reader(context);
-                return;
-            }
-            let shown = match (entry.purpose, outcome) {
-                (ReaderTaskPurpose::Manifest, TaskOutcome::Completed(bytes)) => {
-                    self.accept_manifest(context, &bytes);
-                    false
-                }
-                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Completed(bytes)) => {
-                    self.accept_manifest_refresh(context, task, &bytes);
-                    false
-                }
-                (
-                    ReaderTaskPurpose::ForegroundSource { source, page },
-                    TaskOutcome::Completed(bytes),
-                ) => self.accept_reader_source(
-                    context,
-                    task,
-                    source,
-                    FetchIntent::Foreground { page },
-                    &bytes,
-                ),
-                (
-                    ReaderTaskPurpose::PrefetchSource { source },
-                    TaskOutcome::Completed(bytes),
-                ) => self.accept_reader_source(
-                    context,
-                    task,
-                    source,
-                    FetchIntent::Prefetch,
-                    &bytes,
-                ),
-                (ReaderTaskPurpose::Maintenance, TaskOutcome::Completed(_)) => {
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.maintenance_task == Some(task) {
-                            reader.maintenance_task = None;
-                        }
-                    }
-                    if let Err(error) = self.maintain_reader(context, true, None) {
-                        let page = self.reader.as_ref().map_or(0, |reader| reader.page);
-                        self.fail_reader(Retry::Page(page), error);
-                    }
-                    false
-                }
-                (ReaderTaskPurpose::Manifest, TaskOutcome::Failed(error)) => {
-                    match error {
-                        TaskError::NoCredential => {
-                            self.clear_account_data(context);
-                            self.account = AccountState::SignedOut;
-                            self.problem = None;
-                        }
-                        TaskError::Unauthorized => {
-                            self.clear_account_data(context);
-                            self.account = AccountState::Expired;
-                            self.problem = None;
-                        }
-                        error => self.fail_reader(Retry::Manifest, Failure::of(error).advice),
-                    }
-                    false
-                }
-                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Failed(error)) => {
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.refresh_task == Some(task) {
-                            reader.refresh_task = None;
-                        }
-                    }
-                    match error {
-                        TaskError::NoCredential => {
-                            self.clear_account_data(context);
-                            self.account = AccountState::SignedOut;
-                            self.problem = None;
-                        }
-                        TaskError::Unauthorized => {
-                            self.clear_account_data(context);
-                            self.account = AccountState::Expired;
-                            self.problem = None;
-                        }
-                        error => self.fail_manifest_refresh(Failure::of(error).advice),
-                    }
-                    false
-                }
-                (
-                    ReaderTaskPurpose::ForegroundSource { source, page },
-                    TaskOutcome::Failed(error),
-                ) => {
-                    self.handle_source_failure(
-                        context,
-                        task,
-                        source,
-                        FetchIntent::Foreground { page },
-                        error,
-                    );
-                    false
-                }
-                (
-                    ReaderTaskPurpose::PrefetchSource { source },
-                    TaskOutcome::Failed(error),
-                ) => {
-                    self.handle_source_failure(
-                        context,
-                        task,
-                        source,
-                        FetchIntent::Prefetch,
-                        error,
-                    );
-                    false
-                }
-                (ReaderTaskPurpose::Maintenance, TaskOutcome::Failed(error)) => {
-                    let page = self.reader.as_ref().map_or(0, |reader| reader.page);
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.maintenance_task == Some(task) {
-                            reader.maintenance_task = None;
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), Failure::of(error).advice);
-                    false
-                }
-                (ReaderTaskPurpose::Manifest, TaskOutcome::Cancelled) => {
-                    self.fail_reader(Retry::Manifest, "The request was cancelled.");
-                    false
-                }
-                (ReaderTaskPurpose::ManifestRefresh, TaskOutcome::Cancelled) => {
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.refresh_task == Some(task) {
-                            reader.refresh_task = None;
-                        }
-                    }
-                    self.fail_manifest_refresh("The request was cancelled.");
-                    false
-                }
-                (
-                    ReaderTaskPurpose::ForegroundSource { source, page },
-                    TaskOutcome::Cancelled,
-                ) => {
-                    self.handle_source_cancelled(
-                        context,
-                        task,
-                        source,
-                        FetchIntent::Foreground { page },
-                    );
-                    false
-                }
-                (
-                    ReaderTaskPurpose::PrefetchSource { source },
-                    TaskOutcome::Cancelled,
-                ) => {
-                    self.handle_source_cancelled(
-                        context,
-                        task,
-                        source,
-                        FetchIntent::Prefetch,
-                    );
-                    false
-                }
-                (ReaderTaskPurpose::Maintenance, TaskOutcome::Cancelled) => {
-                    let page = self.reader.as_ref().map_or(0, |reader| reader.page);
-                    if let Some(reader) = self.reader.as_mut() {
-                        if reader.maintenance_task == Some(task) {
-                            reader.maintenance_task = None;
-                        }
-                    }
-                    self.fail_reader(Retry::Page(page), "The request was cancelled.");
-                    false
-                }
-            };
-            if !shown {
-                self.show(context);
-            }
+            self.handle_reader_outcome(context, task, entry, outcome);
             return;
         }
         if self.task != Some(task) {
@@ -2254,6 +1929,353 @@ impl KoboApp for Bomtoon {
             self.show(context);
         }
     }
+}
+
+fn extend_reader_window(reader: &mut ReaderState) -> Result<(), String> {
+    while reader.window.len() < reader.limits.pages {
+        let next_page = reader.window.back().map(entry_page).map_or_else(
+            || reader.page.saturating_add(1),
+            |page| page.saturating_add(1),
+        );
+        if next_page >= reader.plans.len() {
+            break;
+        }
+        reader.window.push_back(PageEntry::Building(PageBuild::new(
+            next_page,
+            reader.format,
+            reader.panel_width,
+            reader.panel_height,
+        )?));
+    }
+    Ok(())
+}
+
+fn discard_stale_reader_failures(reader: &mut ReaderState, desired_page: Option<usize>) {
+    let ReaderState {
+        source_failures,
+        plans,
+        window,
+        limits,
+        ..
+    } = reader;
+    source_failures.retain(|source, _| {
+        source_relevant_to_window(*source, plans, window)
+            || desired_page.is_some_and(|page| {
+                source_relevant_to_page_window(*source, plans, page, limits.pages)
+            })
+    });
+}
+
+fn update_reader_builds(reader: &mut ReaderState) -> Result<(), String> {
+    {
+        let ReaderState {
+            source_cache,
+            plans,
+            window,
+            panel_width,
+            panel_height,
+            ..
+        } = reader;
+        for (&source, picture) in source_cache.iter() {
+            for entry in window.iter_mut() {
+                if let PageEntry::Building(build) = entry {
+                    copy_source_into_builds(
+                        source,
+                        picture,
+                        plans,
+                        std::slice::from_mut(build),
+                        *panel_width,
+                        *panel_height,
+                    )?;
+                }
+            }
+        }
+    }
+
+    let mut index = 0;
+    while index < reader.window.len() {
+        let complete = match reader.window.get(index) {
+            Some(PageEntry::Ready { .. }) => {
+                index += 1;
+                continue;
+            }
+            Some(PageEntry::Building(build)) => {
+                let plan = reader
+                    .plans
+                    .get(build.page)
+                    .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
+                build.next_segment == plan.segments.len()
+            }
+            None => break,
+        };
+        if !complete {
+            break;
+        }
+        let Some(PageEntry::Building(build)) = reader.window.remove(index) else {
+            return Err("The comic page window changed unexpectedly.".to_owned());
+        };
+        let page = build.page;
+        let plan = reader
+            .plans
+            .get(page)
+            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
+        let picture = finish_build(build, plan, reader.panel_width, reader.panel_height)?;
+        reader
+            .window
+            .insert(index, PageEntry::Ready { page, picture });
+        index += 1;
+    }
+    Ok(())
+}
+
+fn retain_reader_sources(reader: &mut ReaderState, install_target: Option<usize>) {
+    let ReaderState {
+        source_cache,
+        plans,
+        window,
+        limits,
+        ..
+    } = reader;
+    source_cache.retain(|source, _| {
+        source_relevant_to_window(*source, plans, window)
+            || install_target.is_some_and(|target| {
+                source_relevant_to_following_page_window(*source, plans, target, limits.pages)
+            })
+    });
+}
+
+fn take_installable_reader_page(
+    reader: &mut ReaderState,
+    target: usize,
+) -> Result<Option<(usize, Picture)>, String> {
+    let installable = matches!(
+        reader.window.front(),
+        Some(PageEntry::Ready { page, .. }) if *page == target
+    );
+    if !installable {
+        return Ok(None);
+    }
+    let Some(PageEntry::Ready { page, picture }) = reader.window.pop_front() else {
+        return Err("The ready comic page changed unexpectedly.".to_owned());
+    };
+    Ok(Some((page, picture)))
+}
+
+fn plan_foreground_reader_source(
+    reader: &mut ReaderState,
+    page: usize,
+    spawn_limit: usize,
+    plan: &mut ReaderMaintenancePlan,
+) -> Result<(), String> {
+    let missing = reader.window.iter().find_map(|entry| match entry {
+        PageEntry::Building(build) if build.page == page => reader
+            .plans
+            .get(build.page)
+            .and_then(|page_plan| page_plan.segments.get(build.next_segment))
+            .map(|segment| segment.source),
+        PageEntry::Building(_) | PageEntry::Ready { .. } => None,
+    });
+    let Some(source) = missing else {
+        return Ok(());
+    };
+    if let Some(failure) = reader.source_failures.get(&source) {
+        return Err(failure.advice.clone());
+    }
+    if let Some(intent) = reader.refresh_waiters.get_mut(&source) {
+        *intent = FetchIntent::Foreground { page };
+        plan.refresh_promotion = reader.refresh_task;
+    } else if let Some(&task) = reader.source_fetches.get(&source) {
+        plan.promotion = Some((task, source, page));
+    } else if !reader.source_cache.contains_key(&source) && spawn_limit > 0 {
+        let url = reader
+            .images
+            .get(source)
+            .ok_or_else(|| "The selected comic image is no longer available.".to_owned())?
+            .url
+            .clone();
+        plan.spawns.push(PlannedReaderSpawn {
+            source,
+            purpose: ReaderTaskPurpose::ForegroundSource { source, page },
+            foreground: true,
+            url,
+        });
+    }
+    Ok(())
+}
+
+fn plan_prefetch_reader_sources(
+    reader: &ReaderState,
+    spawn_limit: usize,
+    plan: &mut ReaderMaintenancePlan,
+) -> Result<(), String> {
+    'pages: for entry in &reader.window {
+        let PageEntry::Building(build) = entry else {
+            continue;
+        };
+        let page_plan = reader
+            .plans
+            .get(build.page)
+            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
+        for segment in &page_plan.segments[build.next_segment..] {
+            let source = segment.source;
+            if reader.source_failures.contains_key(&source) {
+                break 'pages;
+            }
+            if reader.refresh_waiters.contains_key(&source) {
+                continue;
+            }
+            if reader.source_cache.contains_key(&source)
+                || reader.source_fetches.contains_key(&source)
+                || plan.spawns.iter().any(|spawn| spawn.source == source)
+            {
+                continue;
+            }
+            let url = reader
+                .images
+                .get(source)
+                .ok_or_else(|| "The selected comic image is no longer available.".to_owned())?
+                .url
+                .clone();
+            plan.spawns.push(PlannedReaderSpawn {
+                source,
+                purpose: ReaderTaskPurpose::PrefetchSource { source },
+                foreground: false,
+                url,
+            });
+            if plan.spawns.len() == spawn_limit {
+                break 'pages;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_reader_maintenance(
+    reader: &mut ReaderState,
+    available_tasks: usize,
+    extend_window: bool,
+    install_target: Option<usize>,
+    desired_page: Option<usize>,
+) -> Result<ReaderMaintenancePlan, String> {
+    if extend_window {
+        extend_reader_window(reader)?;
+    }
+    discard_stale_reader_failures(reader, desired_page);
+    update_reader_builds(reader)?;
+    retain_reader_sources(reader, install_target);
+    let ready = match install_target {
+        Some(target) => take_installable_reader_page(reader, target)?,
+        None => None,
+    };
+    let mut plan = ReaderMaintenancePlan {
+        ready,
+        ..ReaderMaintenancePlan::default()
+    };
+    if plan.ready.is_some() {
+        return Ok(plan);
+    }
+
+    let combined = reader
+        .source_cache
+        .len()
+        .saturating_add(reader.source_fetches.len());
+    let available_slots = reader.limits.source_slots.saturating_sub(combined);
+    let available_fetches = reader
+        .limits
+        .fetches
+        .saturating_sub(reader.source_fetches.len());
+    let spawn_limit = available_tasks.min(available_slots).min(available_fetches);
+    if let Some(page) = install_target {
+        plan_foreground_reader_source(reader, page, spawn_limit, &mut plan)?;
+    } else if spawn_limit > 0
+        && (reader.refresh_task.is_some() || reader.refresh_waiters.is_empty())
+    {
+        plan_prefetch_reader_sources(reader, spawn_limit, &mut plan)?;
+    }
+    Ok(plan)
+}
+
+fn refreshed_source_candidates(
+    reader: &mut ReaderState,
+    desired_page: Option<usize>,
+    foreground_available: bool,
+    available_tasks: usize,
+) -> Vec<(usize, FetchIntent)> {
+    let stale = reader
+        .refresh_waiters
+        .iter()
+        .filter_map(|(&source, &intent)| {
+            let relevant = match intent {
+                FetchIntent::Foreground { page } => {
+                    desired_page == Some(page)
+                        && reader.plans.get(page).is_some_and(|plan| {
+                            plan.segments.iter().any(|segment| segment.source == source)
+                        })
+                }
+                FetchIntent::Prefetch => {
+                    source_relevant_to_window(source, &reader.plans, &reader.window)
+                        || desired_page.is_some_and(|page| {
+                            source_relevant_to_page_window(
+                                source,
+                                &reader.plans,
+                                page,
+                                reader.limits.pages,
+                            )
+                        })
+                }
+            };
+            (!relevant
+                || reader.source_cache.contains_key(&source)
+                || reader.source_fetches.contains_key(&source))
+            .then_some(source)
+        })
+        .collect::<Vec<_>>();
+    for source in stale {
+        reader.refresh_waiters.remove(&source);
+    }
+
+    let source_capacity = reader.limits.source_slots.saturating_sub(
+        reader
+            .source_cache
+            .len()
+            .saturating_add(reader.source_fetches.len()),
+    );
+    let fetch_capacity = reader
+        .limits
+        .fetches
+        .saturating_sub(reader.source_fetches.len());
+    let mut capacity = available_tasks.min(source_capacity).min(fetch_capacity);
+    if !foreground_available
+        && reader
+            .refresh_waiters
+            .values()
+            .any(|intent| matches!(intent, FetchIntent::Foreground { .. }))
+    {
+        capacity = 0;
+    }
+
+    let mut candidates = Vec::new();
+    if foreground_available && capacity > 0 {
+        if let Some((&source, &intent)) = reader
+            .refresh_waiters
+            .iter()
+            .find(|(_, intent)| matches!(intent, FetchIntent::Foreground { .. }))
+        {
+            candidates.push((source, intent));
+            capacity -= 1;
+        }
+    }
+    if capacity > 0 {
+        candidates.extend(
+            reader
+                .refresh_waiters
+                .iter()
+                .filter(|(_, intent)| matches!(intent, FetchIntent::Prefetch))
+                .take(capacity)
+                .map(|(&source, &intent)| (source, intent)),
+        );
+    }
+    candidates
 }
 
 fn entry_page(entry: &PageEntry) -> usize {
@@ -2508,15 +2530,14 @@ fn copy_source_into_builds(
         let source_end = source_start
             .checked_add(copied_len)
             .ok_or_else(|| "The comic source byte interval is not supported.".to_owned())?;
-        let destination_start =
-            row_byte_offset(segment.destination_row, panel_width, build.format)
-                .ok_or_else(|| "The comic page byte offset is not supported.".to_owned())?;
+        let destination_start = row_byte_offset(segment.destination_row, panel_width, build.format)
+            .ok_or_else(|| "The comic page byte offset is not supported.".to_owned())?;
         let destination_end = destination_start
             .checked_add(copied_len)
             .ok_or_else(|| "The comic page byte interval is not supported.".to_owned())?;
-        let source_rows = source_bytes
-            .get(source_start..source_end)
-            .ok_or_else(|| "The comic source pixels do not cover the planned segment.".to_owned())?;
+        let source_rows = source_bytes.get(source_start..source_end).ok_or_else(|| {
+            "The comic source pixels do not cover the planned segment.".to_owned()
+        })?;
         let destination = build
             .bytes
             .get_mut(destination_start..destination_end)
@@ -2559,8 +2580,7 @@ fn decode_reader_source(
     format: PictureFormat,
     panel_width: u32,
 ) -> Result<Picture, String> {
-    let decoded =
-        kobo_image::decode_webp(bytes, format).map_err(|error| error.to_string())?;
+    let decoded = kobo_image::decode_webp(bytes, format).map_err(|error| error.to_string())?;
     if (decoded.width(), decoded.height()) != (expected.width, expected.height) {
         return Err("BOMTOON returned different comic image dimensions.".to_owned());
     }
@@ -2585,7 +2605,6 @@ fn same_assets(current: &[EpisodeImage], refreshed: &[EpisodeImage]) -> bool {
                 && old.path == new.path
         })
 }
-
 
 fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usize) {
     let start = page.saturating_mul(items_per_page).min(count);
@@ -2678,20 +2697,18 @@ mod tests {
         42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
     ];
     const RED_1X1_WEBP: &[u8] = &[
-        82, 73, 70, 70, 26, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 14, 0, 0, 0, 47, 0,
-        0, 0, 16, 205, 85, 32, 34, 2, 209, 255, 136, 4,
+        82, 73, 70, 70, 26, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 14, 0, 0, 0, 47, 0, 0, 0, 16,
+        205, 85, 32, 34, 2, 209, 255, 136, 4,
     ];
     const BLACK_1X3_WEBP: &[u8] = &[
-        82, 73, 70, 70, 68, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 56, 0, 0, 0, 47, 0,
-        128, 0, 16, 205, 85, 32, 34, 2, 30, 72, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        0, 128, 136, 72, 1,
+        82, 73, 70, 70, 68, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 56, 0, 0, 0, 47, 0, 128, 0,
+        16, 205, 85, 32, 34, 2, 30, 72, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 128, 136, 72, 1,
     ];
     const WHITE_1X2_WEBP: &[u8] = &[
-        82, 73, 70, 70, 68, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 56, 0, 0, 0, 47, 0,
-        64, 0, 16, 205, 85, 32, 34, 2, 30, 72, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64,
-        0, 0, 128, 136, 200, 0,
+        82, 73, 70, 70, 68, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 56, 0, 0, 0, 47, 0, 64, 0, 16,
+        205, 85, 32, 34, 2, 30, 72, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 128, 136, 200, 0,
     ];
 
     fn image_manifest(path: &str, policy: &str) -> Vec<u8> {
@@ -2730,8 +2747,7 @@ mod tests {
         let reader = app.reader.as_ref().expect("reader state");
         assert!(reader.window.len() <= reader.limits.pages);
         assert!(
-            reader.source_cache.len() + reader.source_fetches.len()
-                <= reader.limits.source_slots
+            reader.source_cache.len() + reader.source_fetches.len() <= reader.limits.source_slots
         );
         assert!(reader.source_fetches.len() <= reader.limits.fetches);
         assert!(app.reader_tasks.len() <= reader.limits.tasks);
@@ -2937,15 +2953,13 @@ mod tests {
     #[test]
     fn cumulative_height_above_u32_uses_checked_global_intervals() {
         let source_height = 1_u32 << 22;
-        let source_count =
-            usize::try_from(u64::from(u32::MAX) / u64::from(source_height) + 1)
-                .expect("source count");
+        let source_count = usize::try_from(u64::from(u32::MAX) / u64::from(source_height) + 1)
+            .expect("source count");
         let images = (0..source_count)
             .map(|source| episode_image(source, 1, source_height))
             .collect::<Vec<_>>();
 
-        let (plans, total_pages) =
-            page_plan(&images, 1, u32::MAX).expect("u64 global plan");
+        let (plans, total_pages) = page_plan(&images, 1, u32::MAX).expect("u64 global plan");
 
         assert_eq!(total_pages, 2);
         assert_eq!(plans.len(), 2);
@@ -3002,24 +3016,20 @@ mod tests {
     #[test]
     fn typed_page_assembly_gray8_dithers_once_after_the_source_seam() {
         let plans = vec![seam_plan()];
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
         let first = Picture::from_grey(2, 1, vec![10, 10]).expect("first source");
         let second = Picture::from_grey(2, 1, vec![20, 20]).expect("second source");
 
-        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2)
-            .expect("first segment");
+        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2).expect("first segment");
         assert_eq!(builds[0].bytes, [10, 10, 255, 255]);
         assert_eq!(builds[0].next_segment, 1);
         copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2)
             .expect("duplicate source is ignored");
         assert_eq!(builds[0].next_segment, 1);
-        copy_source_into_builds(1, &second, &plans, &mut builds, 2, 2)
-            .expect("second segment");
+        copy_source_into_builds(1, &second, &plans, &mut builds, 2, 2).expect("second segment");
         assert_eq!(builds[0].bytes, [10, 10, 20, 20]);
 
-        let mut expected =
-            Picture::from_grey(2, 2, vec![10, 10, 20, 20]).expect("undithered page");
+        let mut expected = Picture::from_grey(2, 2, vec![10, 10, 20, 20]).expect("undithered page");
         expected.dither(PANEL_GREYS).expect("whole-page dither");
         let picture = finish_build(builds.pop().expect("build"), &plans[0], 2, 2)
             .expect("finished Gray8 page");
@@ -3030,20 +3040,11 @@ mod tests {
     #[test]
     fn typed_page_assembly_rgb8_preserves_exact_colors_across_the_source_seam() {
         let plans = vec![seam_plan()];
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
-        let red = Picture::from_pixels(
-            2,
-            1,
-            PicturePixels::Rgb8(vec![255, 0, 0, 255, 0, 0]),
-        )
-        .expect("red source");
-        let blue = Picture::from_pixels(
-            2,
-            1,
-            PicturePixels::Rgb8(vec![0, 0, 255, 0, 0, 255]),
-        )
-        .expect("blue source");
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
+        let red = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![255, 0, 0, 255, 0, 0]))
+            .expect("red source");
+        let blue = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![0, 0, 255, 0, 0, 255]))
+            .expect("blue source");
 
         copy_source_into_builds(0, &red, &plans, &mut builds, 2, 2).expect("red segment");
         copy_source_into_builds(1, &blue, &plans, &mut builds, 2, 2).expect("blue segment");
@@ -3052,9 +3053,7 @@ mod tests {
 
         assert_eq!(
             picture.pixels(),
-            PicturePixelsRef::Rgb8(&[
-                255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255,
-            ])
+            PicturePixelsRef::Rgb8(&[255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255,])
         );
     }
 
@@ -3074,30 +3073,19 @@ mod tests {
         let grey = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
         let mut grey_builds =
             vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
-        copy_source_into_builds(0, &grey, &plans, &mut grey_builds, 2, 2)
-            .expect("Gray8 segment");
-        let grey_page = finish_build(
-            grey_builds.pop().expect("Gray8 build"),
-            &plan,
-            2,
-            2,
-        )
-        .expect("Gray8 page");
+        copy_source_into_builds(0, &grey, &plans, &mut grey_builds, 2, 2).expect("Gray8 segment");
+        let grey_page =
+            finish_build(grey_builds.pop().expect("Gray8 build"), &plan, 2, 2).expect("Gray8 page");
         assert_eq!(
             grey_page.pixels(),
             PicturePixelsRef::Gray8(&[0, 0, 255, 255])
         );
 
-        let rgb = Picture::from_pixels(
-            2,
-            1,
-            PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
-        )
-        .expect("RGB8 source");
+        let rgb = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]))
+            .expect("RGB8 source");
         let mut rgb_builds =
             vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
-        copy_source_into_builds(0, &rgb, &plans, &mut rgb_builds, 2, 2)
-            .expect("RGB8 segment");
+        copy_source_into_builds(0, &rgb, &plans, &mut rgb_builds, 2, 2).expect("RGB8 segment");
         let rgb_page =
             finish_build(rgb_builds.pop().expect("RGB8 build"), &plan, 2, 2).expect("RGB8 page");
         assert_eq!(
@@ -3118,8 +3106,7 @@ mod tests {
             content_rows: 1,
         }];
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 1).expect("RGB8 build")];
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 1).expect("RGB8 build")];
 
         assert!(
             copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err(),
@@ -3139,8 +3126,7 @@ mod tests {
             content_rows: 1,
         }];
         let source = Picture::from_grey(1, 1, vec![0]).expect("narrow source");
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 1).expect("build")];
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 1).expect("build")];
 
         assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err());
     }
@@ -3157,8 +3143,7 @@ mod tests {
             content_rows: 2,
         }];
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("one-row source");
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
 
         assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 2).is_err());
     }
@@ -3166,31 +3151,17 @@ mod tests {
     #[test]
     fn page_assembly_incomplete_build_is_refused() {
         let plan = seam_plan();
-        let mut builds =
-            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("first source");
-        copy_source_into_builds(
-            0,
-            &source,
-            std::slice::from_ref(&plan),
-            &mut builds,
-            2,
-            2,
-        )
-        .expect("first segment");
+        copy_source_into_builds(0, &source, std::slice::from_ref(&plan), &mut builds, 2, 2)
+            .expect("first segment");
 
         assert!(finish_build(builds.pop().expect("build"), &plan, 2, 2).is_err());
     }
 
     #[test]
     fn page_assembly_rejects_unrepresentable_page_buffer() {
-        assert!(PageBuild::new(
-            0,
-            PictureFormat::Rgb8,
-            u32::MAX,
-            u32::MAX
-        )
-        .is_err());
+        assert!(PageBuild::new(0, PictureFormat::Rgb8, u32::MAX, u32::MAX).is_err());
     }
 
     #[test]
@@ -3210,32 +3181,19 @@ mod tests {
         let error = decode_reader_source(TINY_WEBP, &expected, PictureFormat::Gray8, 0)
             .expect_err("manifest dimensions must be checked before the invalid scale width");
 
-        assert_eq!(
-            error,
-            "BOMTOON returned different comic image dimensions."
-        );
+        assert_eq!(error, "BOMTOON returned different comic image dimensions.");
     }
 
     #[test]
     fn webp_decode_boundary_refuses_non_webp_and_platform_oversize_sources() {
         let png = kobo_image::encode_png_grey(1, 1, &[0]).expect("valid non-WebP picture");
         assert!(
-            decode_reader_source(
-                &png,
-                &episode_image(0, 1, 1),
-                PictureFormat::Gray8,
-                1,
-            )
-            .is_err()
+            decode_reader_source(&png, &episode_image(0, 1, 1), PictureFormat::Gray8, 1,).is_err()
         );
         let oversized = vec![0; 4 * 1024 * 1024 + 1];
-        let error = decode_reader_source(
-            &oversized,
-            &episode_image(0, 1, 1),
-            PictureFormat::Gray8,
-            1,
-        )
-        .expect_err("the platform source-byte bound must run before WebP parsing");
+        let error =
+            decode_reader_source(&oversized, &episode_image(0, 1, 1), PictureFormat::Gray8, 1)
+                .expect_err("the platform source-byte bound must run before WebP parsing");
         assert_eq!(
             error,
             "the picture is 4194305 bytes, and 4194304 is the most that is read"
@@ -3291,9 +3249,7 @@ mod tests {
         assert_fits(screen);
     }
 
-    fn loaded_library_with_metrics(
-        metrics: DisplayMetrics,
-    ) -> (AppRunner<Bomtoon>, Vec<Command>) {
+    fn loaded_library_with_metrics(metrics: DisplayMetrics) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let mut runner = AppRunner::with_metrics(Bomtoon::default(), metrics);
         let commands = runner.start();
         let (task, _) = only_spawn(&commands);
@@ -3341,8 +3297,8 @@ mod tests {
         current_page: usize,
         chrome_visible: bool,
     ) -> AppRunner<Bomtoon> {
-        let width = metrics.width as u32;
-        let panel_height = metrics.height as u32;
+        let width = u32::try_from(metrics.width).expect("positive panel width");
+        let panel_height = u32::try_from(metrics.height).expect("positive panel height");
         let format = metrics.picture_format;
         let images = (0..page_count)
             .map(|source| episode_image(source, width, panel_height))
@@ -3362,8 +3318,7 @@ mod tests {
                 PictureFormat::Gray8 => PicturePixels::Gray8(vec![127; byte_len]),
                 PictureFormat::Rgb8 => PicturePixels::Rgb8(vec![127; byte_len]),
             };
-            let picture =
-                Picture::from_pixels(width, panel_height, pixels).expect("ready page");
+            let picture = Picture::from_pixels(width, panel_height, pixels).expect("ready page");
             window.push_back(PageEntry::Ready { page, picture });
         }
         AppRunner::with_metrics(
@@ -3408,17 +3363,10 @@ mod tests {
         current_page: usize,
         chrome_visible: bool,
     ) -> AppRunner<Bomtoon> {
-        seeded_reader_with_metrics(
-            CLARA_BW_METRICS,
-            page_count,
-            current_page,
-            chrome_visible,
-        )
+        seeded_reader_with_metrics(CLARA_BW_METRICS, page_count, current_page, chrome_visible)
     }
 
-    fn fully_populated_reader(
-        format: PictureFormat,
-    ) -> (AppRunner<Bomtoon>, [TaskId; 4]) {
+    fn fully_populated_reader(format: PictureFormat) -> (AppRunner<Bomtoon>, [TaskId; 4]) {
         let metrics = reader_metrics(format, 2);
         let mut runner = seeded_reader_with_metrics(metrics, 5, 0, true);
         let foreground = TaskId(41);
@@ -3470,9 +3418,7 @@ mod tests {
             reader
                 .refresh_waiters
                 .insert(3, FetchIntent::Foreground { page: 3 });
-            reader
-                .refresh_attempted
-                .insert(3, FetchIntent::Prefetch);
+            reader.refresh_attempted.insert(3, FetchIntent::Prefetch);
             reader.source_failures.insert(
                 4,
                 SourceFailure {
@@ -3496,9 +3442,7 @@ mod tests {
                     page: 1,
                     picture: Picture::from_pixels(1, 2, ready_pixels).expect("ready page"),
                 },
-                PageEntry::Building(
-                    PageBuild::new(2, format, 1, 2).expect("building page"),
-                ),
+                PageEntry::Building(PageBuild::new(2, format, 1, 2).expect("building page")),
             ]);
         }
         (runner, tasks)
@@ -3565,8 +3509,7 @@ mod tests {
 
     fn prepared_reader(format: PictureFormat) -> AppRunner<Bomtoon> {
         let metrics = reader_metrics(format, 1);
-        let (mut runner, manifest_task, _) =
-            reader_waiting_for_manifest_with_metrics(metrics);
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
         runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest_sources(8)),
@@ -3854,16 +3797,10 @@ mod tests {
             picture_format: PictureFormat::Rgb8,
             ..CLARA_BW_METRICS
         };
-        for (metrics, panel_width) in [
-            (CLARA_BW_METRICS, 1072),
-            (libra_colour_metrics, 1264),
-        ] {
+        for (metrics, panel_width) in [(CLARA_BW_METRICS, 1072), (libra_colour_metrics, 1264)] {
             let (_, _, commands) = reader_waiting_for_manifest_with_metrics(metrics);
             let (_, manifest_work) = only_spawn(&commands);
-            assert_eq!(
-                manifest_work,
-                api::images("hunter_q", "ep-1", panel_width)
-            );
+            assert_eq!(manifest_work, api::images("hunter_q", "ep-1", panel_width));
         }
     }
 
@@ -3904,13 +3841,15 @@ mod tests {
         assert_eq!(turns.previous, action_id(READER_PREVIOUS));
         assert_eq!(turns.next, action_id(READER_NEXT));
         assert_eq!(turns.menu, Some(action_id(READER_CHROME)));
-        assert!(screen.nodes.is_empty(), "reader must not expose scrolling controls");
+        assert!(
+            screen.nodes.is_empty(),
+            "reader must not expose scrolling controls"
+        );
         assert!(commands
             .iter()
             .any(|command| matches!(command, Command::PutPicture { .. })));
         assert_fits(&screen);
     }
-
 
     #[test]
     fn center_toggles_chrome_and_boundary_noop_preserves_it() {
@@ -3958,6 +3897,82 @@ mod tests {
         assert!(put < set && set < drop);
     }
 
+    fn assert_prepared_turn_commands(
+        commands: &[Command],
+        format: PictureFormat,
+        old_handle: PictureHandle,
+    ) {
+        let put_indices = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                matches!(command, Command::PutPicture { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let set_indices = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                matches!(command, Command::SetScreen(_)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let drop_indices = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                matches!(command, Command::DropPicture(_)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(put_indices.len(), 1);
+        assert_eq!(set_indices.len(), 1);
+        assert_eq!(drop_indices.len(), 1);
+        assert!(put_indices[0] < set_indices[0] && set_indices[0] < drop_indices[0]);
+        match (&commands[put_indices[0]], format) {
+            (
+                Command::PutPicture {
+                    pixels: PicturePixels::Gray8(_),
+                    ..
+                },
+                PictureFormat::Gray8,
+            )
+            | (
+                Command::PutPicture {
+                    pixels: PicturePixels::Rgb8(_),
+                    ..
+                },
+                PictureFormat::Rgb8,
+            ) => {}
+            (command, _) => panic!("wrong typed page upload: {command:?}"),
+        }
+        let Command::SetScreen(screen) = &commands[set_indices[0]] else {
+            unreachable!();
+        };
+        assert!(
+            screen.reading_surface.is_some(),
+            "prepared turn showed loading"
+        );
+        assert!(matches!(
+            commands[drop_indices[0]],
+            Command::DropPicture(handle) if handle == old_handle
+        ));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            Command::Spawn {
+                work: Task::Fetch { .. },
+                ..
+            }
+        )));
+        assert!(commands.iter().all(|command| {
+            !matches!(command, Command::Spawn { .. })
+                || matches!(
+                    command,
+                    Command::Spawn {
+                        work: Task::Sleep { seconds: 0 },
+                        ..
+                    }
+                )
+        }));
+    }
 
     #[test]
     fn prepared_page_turn_is_typed_synchronous_and_replenishes_only_the_far_edge() {
@@ -3983,73 +3998,7 @@ mod tests {
                 .handle;
 
             let commands = runner.action(action_id(READER_NEXT));
-            let put_indices = commands
-                .iter()
-                .enumerate()
-                .filter_map(|(index, command)| {
-                    matches!(command, Command::PutPicture { .. }).then_some(index)
-                })
-                .collect::<Vec<_>>();
-            let set_indices = commands
-                .iter()
-                .enumerate()
-                .filter_map(|(index, command)| {
-                    matches!(command, Command::SetScreen(_)).then_some(index)
-                })
-                .collect::<Vec<_>>();
-            let drop_indices = commands
-                .iter()
-                .enumerate()
-                .filter_map(|(index, command)| {
-                    matches!(command, Command::DropPicture(_)).then_some(index)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(put_indices.len(), 1);
-            assert_eq!(set_indices.len(), 1);
-            assert_eq!(drop_indices.len(), 1);
-            assert!(put_indices[0] < set_indices[0] && set_indices[0] < drop_indices[0]);
-            match (&commands[put_indices[0]], format) {
-                (
-                    Command::PutPicture {
-                        pixels: PicturePixels::Gray8(_),
-                        ..
-                    },
-                    PictureFormat::Gray8,
-                )
-                | (
-                    Command::PutPicture {
-                        pixels: PicturePixels::Rgb8(_),
-                        ..
-                    },
-                    PictureFormat::Rgb8,
-                ) => {}
-                (command, _) => panic!("wrong typed page upload: {command:?}"),
-            }
-            let Command::SetScreen(screen) = &commands[set_indices[0]] else {
-                unreachable!();
-            };
-            assert!(screen.reading_surface.is_some(), "prepared turn showed loading");
-            assert!(matches!(
-                commands[drop_indices[0]],
-                Command::DropPicture(handle) if handle == old_handle
-            ));
-            assert!(!commands.iter().any(|command| matches!(
-                command,
-                Command::Spawn {
-                    work: Task::Fetch { .. },
-                    ..
-                }
-            )));
-            assert!(commands.iter().all(|command| {
-                !matches!(command, Command::Spawn { .. })
-                    || matches!(
-                        command,
-                        Command::Spawn {
-                            work: Task::Sleep { seconds: 0 },
-                            ..
-                        }
-                    )
-            }));
+            assert_prepared_turn_commands(&commands, format, old_handle);
 
             let reader = runner.app().reader.as_ref().expect("reader");
             assert_eq!(reader.page, 1);
@@ -4063,13 +4012,10 @@ mod tests {
                 .all(|entry| matches!(entry, PageEntry::Ready { .. })));
             let maintenance = reader.maintenance_task.expect("turn maintenance");
 
-            let commands =
-                runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
+            let commands = runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
             assert!(!commands.iter().any(|command| matches!(
                 command,
-                Command::PutPicture { .. }
-                    | Command::SetScreen(_)
-                    | Command::DropPicture(_)
+                Command::PutPicture { .. } | Command::SetScreen(_) | Command::DropPicture(_)
             )));
             let (far_edge_task, work) = only_spawn(&commands);
             assert!(matches!(work, Task::Fetch { .. }));
@@ -4095,279 +4041,333 @@ mod tests {
         }
     }
 
-    #[test]
-    fn both_format_simulator_flow_is_typed_seamless_retryable_and_bounded() {
-        let evidence_dir = std::env::var_os("BOMTOON_TASK7_EVIDENCE_DIR")
-            .map(std::path::PathBuf::from);
-        if let Some(directory) = &evidence_dir {
-            std::fs::create_dir_all(directory).expect("create simulator evidence directory");
-        }
-        let mut evidence_log = Vec::new();
+    struct Task7SimulatorFlow {
+        runner: AppRunner<Bomtoon>,
+        width: u32,
+        height: u32,
+        first_pixels: PicturePixels,
+        first_png: Vec<u8>,
+    }
 
-        for (format, width, height, label) in [
-            (PictureFormat::Gray8, 1_072, 1_448, "gray8"),
-            (PictureFormat::Rgb8, 1_264, 1_680, "rgb8"),
-        ] {
-            let metrics = DisplayMetrics {
-                width,
-                height,
-                picture_format: format,
-                ..CLARA_BW_METRICS
-            };
-            let (mut runner, manifest_task, _) =
-                reader_waiting_for_manifest_with_metrics(metrics);
-            runner.task_outcome(
-                manifest_task,
-                TaskOutcome::Completed(image_manifest_sources(6)),
-            );
-
-            let first_page_commands = (0..16)
-                .find_map(|_| {
-                    let (&task, entry) = runner
-                        .app()
-                        .reader_tasks
-                        .iter()
-                        .next()
-                        .expect("first page reader work");
-                    let commands = runner.task_outcome(
-                        task,
-                        TaskOutcome::Completed(reader_task_completion(entry.purpose)),
-                    );
-                    assert_reader_bounds(runner.app());
-                    commands.iter().any(|command| {
+    fn start_task7_simulator_flow(
+        format: PictureFormat,
+        width: i32,
+        height: i32,
+    ) -> Task7SimulatorFlow {
+        let metrics = DisplayMetrics {
+            width,
+            height,
+            picture_format: format,
+            ..CLARA_BW_METRICS
+        };
+        let expected_width = u32::try_from(width).expect("positive panel width");
+        let expected_height = u32::try_from(height).expect("positive panel height");
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
+        runner.task_outcome(
+            manifest_task,
+            TaskOutcome::Completed(image_manifest_sources(6)),
+        );
+        let first_page_commands = (0..16)
+            .find_map(|_| {
+                let (&task, entry) = runner
+                    .app()
+                    .reader_tasks
+                    .iter()
+                    .next()
+                    .expect("first page reader work");
+                let commands = runner.task_outcome(
+                    task,
+                    TaskOutcome::Completed(reader_task_completion(entry.purpose)),
+                );
+                assert_reader_bounds(runner.app());
+                commands
+                    .iter()
+                    .any(|command| {
                         matches!(
                             command,
                             Command::SetScreen(screen) if screen.reading_surface.is_some()
                         )
                     })
                     .then_some(commands)
-                })
-                .expect("first page before maintenance");
-            let first_put = first_page_commands
-                .iter()
-                .position(|command| matches!(command, Command::PutPicture { .. }))
-                .expect("first page upload");
-            let first_screen = first_page_commands
-                .iter()
-                .position(|command| {
-                    matches!(
-                        command,
-                        Command::SetScreen(screen) if screen.reading_surface.is_some()
-                    )
-                })
-                .expect("first reader screen");
-            let first_maintenance = first_page_commands
-                .iter()
-                .position(|command| {
-                    matches!(
-                        command,
-                        Command::Spawn {
-                            work: Task::Sleep { seconds: 0 },
-                            ..
-                        }
-                    )
-                })
-                .expect("first maintenance");
-            assert!(first_put < first_screen && first_screen < first_maintenance);
-            let reader = runner.app().reader.as_ref().expect("first page reader");
-            assert_eq!(reader.page, 0);
-            assert!(reader.window.is_empty(), "maintenance ran before first paint");
-            let (page_width, page_height, first_pixels) =
-                uploaded_picture(&first_page_commands);
-            assert_eq!((page_width, page_height), (width as u32, height as u32));
-            let first_png = strict_picture_png(page_width, page_height, &first_pixels);
-
-            let limits = reader_limits(format);
-            for _ in 0..64 {
-                let settled = {
-                    let app = runner.app();
-                    let reader = app.reader.as_ref().expect("lookahead reader");
-                    let expected = limits.pages.min(reader.plans.len().saturating_sub(1));
-                    reader.window.len() == expected
-                        && reader
-                            .window
-                            .iter()
-                            .all(|entry| matches!(entry, PageEntry::Ready { .. }))
-                        && app.reader_tasks.is_empty()
-                };
-                if settled {
-                    break;
-                }
-                let (&task, entry) = runner
-                    .app()
-                    .reader_tasks
-                    .iter()
-                    .next()
-                    .expect("lookahead reader work");
-                runner.task_outcome(
-                    task,
-                    TaskOutcome::Completed(reader_task_completion(entry.purpose)),
-                );
-                assert_reader_bounds(runner.app());
-            }
-            let reader = runner.app().reader.as_ref().expect("prepared lookahead");
-            assert_eq!(reader.window.len(), limits.pages);
-            assert!(reader
-                .window
-                .iter()
-                .all(|entry| matches!(entry, PageEntry::Ready { .. })));
-            assert!(runner.app().reader_tasks.is_empty());
-
-            let next_commands = runner.action(action_id(READER_NEXT));
-            assert_eq!(runner.app().reader.as_ref().expect("next reader").page, 1);
-            assert!(next_commands.iter().any(|command| {
+            })
+            .expect("first page before maintenance");
+        let first_put = first_page_commands
+            .iter()
+            .position(|command| matches!(command, Command::PutPicture { .. }))
+            .expect("first page upload");
+        let first_screen = first_page_commands
+            .iter()
+            .position(|command| {
                 matches!(
                     command,
                     Command::SetScreen(screen) if screen.reading_surface.is_some()
                 )
-            }));
-            assert!(!next_commands.iter().any(|command| {
+            })
+            .expect("first reader screen");
+        let first_maintenance = first_page_commands
+            .iter()
+            .position(|command| {
                 matches!(
                     command,
                     Command::Spawn {
-                        work: Task::Fetch { .. },
+                        work: Task::Sleep { seconds: 0 },
                         ..
                     }
                 )
-            }));
-            let (next_width, next_height, next_pixels) = uploaded_picture(&next_commands);
-            assert_eq!((next_width, next_height), (page_width, page_height));
-            let channels = if format == PictureFormat::Gray8 { 1 } else { 3 };
-            let seam_row = usize::try_from(
-                2_u32
-                    .checked_mul(page_width)
-                    .and_then(|boundary| boundary.checked_sub(page_height))
-                    .expect("seam row"),
-            )
-            .expect("seam row fits");
-            let stride = usize::try_from(page_width)
-                .expect("page width fits")
-                .checked_mul(channels)
-                .expect("row stride");
-            let next_bytes = match &next_pixels {
-                PicturePixels::Gray8(bytes) | PicturePixels::Rgb8(bytes) => bytes,
-            };
-            match (format, &next_pixels) {
-                (PictureFormat::Gray8, PicturePixels::Gray8(_)) => {}
-                (PictureFormat::Rgb8, PicturePixels::Rgb8(bytes)) => {
-                    assert!(bytes.chunks_exact(3).all(|pixel| pixel == [255, 0, 0]));
-                }
-                _ => panic!("{format:?} simulator upload used the wrong pixel type"),
-            }
-            for row in seam_row.saturating_sub(1)..=seam_row {
-                let start = row.checked_mul(stride).expect("row offset");
-                assert!(
-                    next_bytes[start..start + stride]
-                        .iter()
-                        .any(|sample| *sample != u8::MAX),
-                    "{format:?} left a white row at the source seam"
-                );
-            }
-            let next_png = strict_picture_png(next_width, next_height, &next_pixels);
-
-            let chrome_commands = runner.action(action_id(READER_CHROME));
-            assert_eq!(
-                last_screen(&chrome_commands)
-                    .reading_surface
-                    .expect("reader chrome surface")
-                    .chrome,
-                ReadingChrome::Overlay
-            );
-            assert_eq!(
-                runner.app().reader.as_ref().expect("chrome reader").page,
-                1
-            );
-
-            let previous_commands = runner.action(action_id(READER_PREVIOUS));
-            assert!(last_screen(&previous_commands).reading_surface.is_none());
-            let failed_source = runner
-                .app()
-                .foreground_reader_task
-                .expect("Previous foreground source");
-            let failure_commands =
-                runner.task_outcome(failed_source, TaskOutcome::Failed(TaskError::TimedOut));
-            assert!(!failure_commands
-                .iter()
-                .any(|command| matches!(command, Command::Spawn { .. })));
-            assert!(runner.app().problem.is_some());
-            assert_eq!(runner.app().retry, Retry::Page(0));
-
-            let mut retry_commands = runner.action(action_id(RETRY));
-            assert!(retry_commands.iter().any(|command| {
-                matches!(
-                    command,
-                    Command::Spawn {
-                        work: Task::Fetch { .. },
-                        ..
-                    }
-                )
-            }));
-            let previous_upload = (0..16)
-                .find_map(|_| {
-                    if retry_commands
-                        .iter()
-                        .any(|command| matches!(command, Command::PutPicture { .. }))
-                    {
-                        return Some(uploaded_picture(&retry_commands));
-                    }
-                    let task = runner
-                        .app()
-                        .foreground_reader_task
-                        .or_else(|| runner.app().reader_tasks.keys().next().copied())
-                        .expect("retry reader work");
-                    let purpose = runner
-                        .app()
-                        .reader_tasks
-                        .get(&task)
-                        .expect("retry task entry")
-                        .purpose;
-                    retry_commands = runner.task_outcome(
-                        task,
-                        TaskOutcome::Completed(reader_task_completion(purpose)),
-                    );
-                    assert_reader_bounds(runner.app());
-                    None
-                })
-                .expect("Previous page after retry");
-            assert_eq!(previous_upload.0, page_width);
-            assert_eq!(previous_upload.1, page_height);
-            assert_eq!(previous_upload.2, first_pixels);
-            assert_eq!(
-                runner.app().reader.as_ref().expect("Previous reader").page,
-                0
-            );
-            let previous_png =
-                strict_picture_png(previous_upload.0, previous_upload.1, &previous_upload.2);
-
-            let back_commands = runner.action(ActionId::BACK);
-            assert_eq!(runner.app().view, View::Episodes);
-            assert!(runner.app().reader.is_none());
-            assert_eq!(
-                back_commands
-                    .iter()
-                    .filter(|command| matches!(command, Command::DropPicture(_)))
-                    .count(),
-                1
-            );
-
-            if let Some(directory) = &evidence_dir {
-                for (name, png) in [
-                    (format!("{label}-page1-before-maintenance.png"), first_png),
-                    (format!("{label}-seam-next.png"), next_png),
-                    (format!("{label}-previous-after-retry.png"), previous_png),
-                ] {
-                    std::fs::write(directory.join(name), png)
-                        .expect("write simulator screenshot");
-                }
-            }
-            evidence_log.push(format!(
-                "{label} {width}x{height} {format:?}: page1-before-maintenance; \
-                 prepared seam Next without fetch/loading; chrome Overlay at page 2; \
-                 Previous fetch failed; app retry restored \
-                 exact page 1 pixels; Back dropped one picture"
-            ));
+            })
+            .expect("first maintenance");
+        assert!(first_put < first_screen && first_screen < first_maintenance);
+        let reader = runner.app().reader.as_ref().expect("first page reader");
+        assert_eq!(reader.page, 0);
+        assert!(
+            reader.window.is_empty(),
+            "maintenance ran before first paint"
+        );
+        let (page_width, page_height, first_pixels) = uploaded_picture(&first_page_commands);
+        assert_eq!((page_width, page_height), (expected_width, expected_height));
+        let first_png = strict_picture_png(page_width, page_height, &first_pixels);
+        Task7SimulatorFlow {
+            runner,
+            width: page_width,
+            height: page_height,
+            first_pixels,
+            first_png,
         }
+    }
 
+    fn settle_task7_reader(runner: &mut AppRunner<Bomtoon>, format: PictureFormat) {
+        let limits = reader_limits(format);
+        for _ in 0..64 {
+            let settled = {
+                let app = runner.app();
+                let reader = app.reader.as_ref().expect("lookahead reader");
+                let expected = limits.pages.min(reader.plans.len().saturating_sub(1));
+                reader.window.len() == expected
+                    && reader
+                        .window
+                        .iter()
+                        .all(|entry| matches!(entry, PageEntry::Ready { .. }))
+                    && app.reader_tasks.is_empty()
+            };
+            if settled {
+                break;
+            }
+            let (&task, entry) = runner
+                .app()
+                .reader_tasks
+                .iter()
+                .next()
+                .expect("lookahead reader work");
+            runner.task_outcome(
+                task,
+                TaskOutcome::Completed(reader_task_completion(entry.purpose)),
+            );
+            assert_reader_bounds(runner.app());
+        }
+        let reader = runner.app().reader.as_ref().expect("prepared lookahead");
+        assert_eq!(reader.window.len(), limits.pages);
+        assert!(reader
+            .window
+            .iter()
+            .all(|entry| matches!(entry, PageEntry::Ready { .. })));
+        assert!(runner.app().reader_tasks.is_empty());
+    }
+
+    fn task7_seam_next(
+        runner: &mut AppRunner<Bomtoon>,
+        format: PictureFormat,
+        page_width: u32,
+        page_height: u32,
+    ) -> Vec<u8> {
+        let next_commands = runner.action(action_id(READER_NEXT));
+        assert_eq!(runner.app().reader.as_ref().expect("next reader").page, 1);
+        assert!(next_commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::SetScreen(screen) if screen.reading_surface.is_some()
+            )
+        }));
+        assert!(!next_commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::Spawn {
+                    work: Task::Fetch { .. },
+                    ..
+                }
+            )
+        }));
+        let (next_width, next_height, next_pixels) = uploaded_picture(&next_commands);
+        assert_eq!((next_width, next_height), (page_width, page_height));
+        let channels = if format == PictureFormat::Gray8 { 1 } else { 3 };
+        let seam_row = usize::try_from(
+            2_u32
+                .checked_mul(page_width)
+                .and_then(|boundary| boundary.checked_sub(page_height))
+                .expect("seam row"),
+        )
+        .expect("seam row fits");
+        let stride = usize::try_from(page_width)
+            .expect("page width fits")
+            .checked_mul(channels)
+            .expect("row stride");
+        let next_bytes = match &next_pixels {
+            PicturePixels::Gray8(bytes) | PicturePixels::Rgb8(bytes) => bytes,
+        };
+        match (format, &next_pixels) {
+            (PictureFormat::Gray8, PicturePixels::Gray8(_)) => {}
+            (PictureFormat::Rgb8, PicturePixels::Rgb8(bytes)) => {
+                assert!(bytes.chunks_exact(3).all(|pixel| pixel == [255, 0, 0]));
+            }
+            _ => panic!("{format:?} simulator upload used the wrong pixel type"),
+        }
+        for row in seam_row.saturating_sub(1)..=seam_row {
+            let start = row.checked_mul(stride).expect("row offset");
+            assert!(
+                next_bytes[start..start + stride]
+                    .iter()
+                    .any(|sample| *sample != u8::MAX),
+                "{format:?} left a white row at the source seam"
+            );
+        }
+        let next_png = strict_picture_png(next_width, next_height, &next_pixels);
+        let chrome_commands = runner.action(action_id(READER_CHROME));
+        assert_eq!(
+            last_screen(&chrome_commands)
+                .reading_surface
+                .expect("reader chrome surface")
+                .chrome,
+            ReadingChrome::Overlay
+        );
+        assert_eq!(runner.app().reader.as_ref().expect("chrome reader").page, 1);
+        next_png
+    }
+
+    fn task7_retry_previous(
+        runner: &mut AppRunner<Bomtoon>,
+        page_width: u32,
+        page_height: u32,
+        first_pixels: &PicturePixels,
+    ) -> Vec<u8> {
+        let previous_commands = runner.action(action_id(READER_PREVIOUS));
+        assert!(last_screen(&previous_commands).reading_surface.is_none());
+        let failed_source = runner
+            .app()
+            .foreground_reader_task
+            .expect("Previous foreground source");
+        let failure_commands =
+            runner.task_outcome(failed_source, TaskOutcome::Failed(TaskError::TimedOut));
+        assert!(!failure_commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert!(runner.app().problem.is_some());
+        assert_eq!(runner.app().retry, Retry::Page(0));
+
+        let mut retry_commands = runner.action(action_id(RETRY));
+        assert!(retry_commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::Spawn {
+                    work: Task::Fetch { .. },
+                    ..
+                }
+            )
+        }));
+        let previous_upload = (0..16)
+            .find_map(|_| {
+                if retry_commands
+                    .iter()
+                    .any(|command| matches!(command, Command::PutPicture { .. }))
+                {
+                    return Some(uploaded_picture(&retry_commands));
+                }
+                let task = runner
+                    .app()
+                    .foreground_reader_task
+                    .or_else(|| runner.app().reader_tasks.keys().next().copied())
+                    .expect("retry reader work");
+                let purpose = runner
+                    .app()
+                    .reader_tasks
+                    .get(&task)
+                    .expect("retry task entry")
+                    .purpose;
+                retry_commands = runner.task_outcome(
+                    task,
+                    TaskOutcome::Completed(reader_task_completion(purpose)),
+                );
+                assert_reader_bounds(runner.app());
+                None
+            })
+            .expect("Previous page after retry");
+        assert_eq!(previous_upload.0, page_width);
+        assert_eq!(previous_upload.1, page_height);
+        assert_eq!(&previous_upload.2, first_pixels);
+        assert_eq!(
+            runner.app().reader.as_ref().expect("Previous reader").page,
+            0
+        );
+        strict_picture_png(previous_upload.0, previous_upload.1, &previous_upload.2)
+    }
+
+    fn run_task7_simulator_flow(
+        format: PictureFormat,
+        width: i32,
+        height: i32,
+        label: &str,
+        evidence_dir: Option<&std::path::Path>,
+    ) -> String {
+        let Task7SimulatorFlow {
+            mut runner,
+            width: page_width,
+            height: page_height,
+            first_pixels,
+            first_png,
+        } = start_task7_simulator_flow(format, width, height);
+        settle_task7_reader(&mut runner, format);
+        let next_png = task7_seam_next(&mut runner, format, page_width, page_height);
+        let previous_png =
+            task7_retry_previous(&mut runner, page_width, page_height, &first_pixels);
+        let back_commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(runner.app().reader.is_none());
+        assert_eq!(
+            back_commands
+                .iter()
+                .filter(|command| matches!(command, Command::DropPicture(_)))
+                .count(),
+            1
+        );
+        if let Some(directory) = evidence_dir {
+            for (name, png) in [
+                (format!("{label}-page1-before-maintenance.png"), first_png),
+                (format!("{label}-seam-next.png"), next_png),
+                (format!("{label}-previous-after-retry.png"), previous_png),
+            ] {
+                std::fs::write(directory.join(name), png).expect("write simulator screenshot");
+            }
+        }
+        format!(
+            "{label} {width}x{height} {format:?}: page1-before-maintenance; \
+             prepared seam Next without fetch/loading; chrome Overlay at page 2; \
+             Previous fetch failed; app retry restored \
+             exact page 1 pixels; Back dropped one picture"
+        )
+    }
+
+    #[test]
+    fn both_format_simulator_flow_is_typed_seamless_retryable_and_bounded() {
+        let evidence_dir =
+            std::env::var_os("BOMTOON_TASK7_EVIDENCE_DIR").map(std::path::PathBuf::from);
+        if let Some(directory) = &evidence_dir {
+            std::fs::create_dir_all(directory).expect("create simulator evidence directory");
+        }
+        let evidence_log = [
+            (PictureFormat::Gray8, 1_072, 1_448, "gray8"),
+            (PictureFormat::Rgb8, 1_264, 1_680, "rgb8"),
+        ]
+        .map(|(format, width, height, label)| {
+            run_task7_simulator_flow(format, width, height, label, evidence_dir.as_deref())
+        });
         if let Some(directory) = evidence_dir {
             std::fs::write(
                 directory.join("task-7-simulator.log"),
@@ -4401,10 +4401,9 @@ mod tests {
             }
 
             let commands = runner.action(action_id(READER_NEXT));
-            assert!(!commands.iter().any(|command| matches!(
-                command,
-                Command::Spawn { .. } | Command::Cancel(_)
-            )));
+            assert!(!commands
+                .iter()
+                .any(|command| matches!(command, Command::Spawn { .. } | Command::Cancel(_))));
             assert!(!commands.iter().any(|command| matches!(
                 command,
                 Command::PutPicture { .. } | Command::DropPicture(_)
@@ -4432,15 +4431,13 @@ mod tests {
     #[test]
     fn previous_rebase_caches_retained_future_prefetch_until_maintenance_uses_it() {
         let format = PictureFormat::Gray8;
-        let mut runner =
-            seeded_reader_with_metrics(reader_metrics(format, 1), 6, 3, false);
+        let mut runner = seeded_reader_with_metrics(reader_metrics(format, 1), 6, 3, false);
         let target_task = TaskId(51);
         let future_task = TaskId(52);
         {
             let app = runner.app_mut();
             let reader = app.reader.as_mut().expect("reader");
-            reader.source_fetches =
-                BTreeMap::from([(2, target_task), (4, future_task)]);
+            reader.source_fetches = BTreeMap::from([(2, target_task), (4, future_task)]);
             app.reader_tasks = BTreeMap::from([
                 (
                     target_task,
@@ -4460,10 +4457,9 @@ mod tests {
         }
 
         let commands = runner.action(action_id(READER_PREVIOUS));
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            Command::Spawn { .. } | Command::Cancel(_)
-        )));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. } | Command::Cancel(_))));
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(
             reader.window.iter().map(entry_page).collect::<Vec<_>>(),
@@ -4479,10 +4475,7 @@ mod tests {
             Some(ReaderTaskPurpose::PrefetchSource { source: 4 })
         );
 
-        let commands = runner.task_outcome(
-            future_task,
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
+        let commands = runner.task_outcome(future_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::Spawn { .. })));
@@ -4495,10 +4488,7 @@ mod tests {
         );
         assert_reader_bounds(runner.app());
 
-        runner.task_outcome(
-            target_task,
-            TaskOutcome::Failed(TaskError::TimedOut),
-        );
+        runner.task_outcome(target_task, TaskOutcome::Failed(TaskError::TimedOut));
         let reader = runner.app().reader.as_ref().expect("reader");
         assert!(runner.app().problem.is_some());
         assert!(reader.source_cache.contains_key(&4));
@@ -4521,10 +4511,7 @@ mod tests {
         );
         assert_reader_bounds(runner.app());
 
-        runner.task_outcome(
-            retry_task,
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
+        runner.task_outcome(retry_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(reader.page, 2);
         assert!(reader.source_cache.contains_key(&4));
@@ -4554,8 +4541,7 @@ mod tests {
     #[test]
     fn previous_rebase_evicts_cached_sources_outside_the_new_forward_range() {
         let format = PictureFormat::Gray8;
-        let mut runner =
-            seeded_reader_with_metrics(reader_metrics(format, 1), 6, 5, false);
+        let mut runner = seeded_reader_with_metrics(reader_metrics(format, 1), 6, 5, false);
         runner
             .app_mut()
             .reader
@@ -4577,6 +4563,49 @@ mod tests {
             vec![4]
         );
         assert_reader_bounds(runner.app());
+    }
+
+    fn assert_previous_seam_upload(
+        runner: &AppRunner<Bomtoon>,
+        commands: &[Command],
+        format: PictureFormat,
+    ) -> TaskId {
+        let (uploaded_format, uploaded) = commands
+            .iter()
+            .find_map(|command| match command {
+                Command::PutPicture {
+                    pixels: PicturePixels::Gray8(pixels),
+                    ..
+                } => Some((PictureFormat::Gray8, pixels.as_slice())),
+                Command::PutPicture {
+                    pixels: PicturePixels::Rgb8(pixels),
+                    ..
+                } => Some((PictureFormat::Rgb8, pixels.as_slice())),
+                _ => None,
+            })
+            .expect("rebuilt seam upload");
+        assert_eq!(uploaded_format, format);
+        match format {
+            PictureFormat::Gray8 => assert_eq!(uploaded, &[0, 255]),
+            PictureFormat::Rgb8 => assert_eq!(uploaded, &[0, 0, 0, 255, 255, 255]),
+        }
+        let put = commands
+            .iter()
+            .position(|command| matches!(command, Command::PutPicture { .. }))
+            .expect("PutPicture");
+        let set = commands
+            .iter()
+            .position(|command| matches!(command, Command::SetScreen(_)))
+            .expect("SetScreen");
+        let drop = commands
+            .iter()
+            .position(|command| matches!(command, Command::DropPicture(PictureHandle(7))))
+            .expect("old DropPicture");
+        assert!(put < set && set < drop);
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(reader.page, 1);
+        assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
+        reader.maintenance_task.expect("seam maintenance")
     }
 
     #[test]
@@ -4614,10 +4643,8 @@ mod tests {
             );
             assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
 
-            let commands = runner.task_outcome(
-                first_task,
-                TaskOutcome::Completed(BLACK_1X3_WEBP.to_vec()),
-            );
+            let commands =
+                runner.task_outcome(first_task, TaskOutcome::Completed(BLACK_1X3_WEBP.to_vec()));
             assert!(
                 commands.iter().all(|command| {
                     !matches!(command, Command::SetScreen(screen) if screen.reading_surface.is_some())
@@ -4653,46 +4680,9 @@ mod tests {
                 Some(ReaderTaskPurpose::ForegroundSource { source: 1, page: 1 })
             );
 
-            let commands = runner.task_outcome(
-                second_task,
-                TaskOutcome::Completed(WHITE_1X2_WEBP.to_vec()),
-            );
-            let (uploaded_format, uploaded) = commands
-                .iter()
-                .find_map(|command| match command {
-                    Command::PutPicture {
-                        pixels: PicturePixels::Gray8(pixels),
-                        ..
-                    } => Some((PictureFormat::Gray8, pixels.as_slice())),
-                    Command::PutPicture {
-                        pixels: PicturePixels::Rgb8(pixels),
-                        ..
-                    } => Some((PictureFormat::Rgb8, pixels.as_slice())),
-                    _ => None,
-                })
-                .expect("rebuilt seam upload");
-            assert_eq!(uploaded_format, format);
-            match format {
-                PictureFormat::Gray8 => assert_eq!(uploaded, &[0, 255]),
-                PictureFormat::Rgb8 => assert_eq!(uploaded, &[0, 0, 0, 255, 255, 255]),
-            }
-            let put = commands
-                .iter()
-                .position(|command| matches!(command, Command::PutPicture { .. }))
-                .expect("PutPicture");
-            let set = commands
-                .iter()
-                .position(|command| matches!(command, Command::SetScreen(_)))
-                .expect("SetScreen");
-            let drop = commands
-                .iter()
-                .position(|command| matches!(command, Command::DropPicture(PictureHandle(7))))
-                .expect("old DropPicture");
-            assert!(put < set && set < drop);
-            let reader = runner.app().reader.as_ref().expect("reader");
-            assert_eq!(reader.page, 1);
-            assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
-            let maintenance = reader.maintenance_task.expect("seam maintenance");
+            let commands =
+                runner.task_outcome(second_task, TaskOutcome::Completed(WHITE_1X2_WEBP.to_vec()));
+            let maintenance = assert_previous_seam_upload(&runner, &commands, format);
 
             runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
             let reader = runner.app().reader.as_ref().expect("reader");
@@ -4742,9 +4732,11 @@ mod tests {
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(reader.generation, 1);
         assert_eq!(reader.page, 0);
-        assert_eq!(reader.picture.map(|picture| picture.handle), Some(PictureHandle(7)));
+        assert_eq!(
+            reader.picture.map(|picture| picture.handle),
+            Some(PictureHandle(7))
+        );
     }
-
 
     #[test]
     fn back_during_reader_loading_cancels_task_and_ignores_late_outcome() {
@@ -4842,8 +4834,7 @@ mod tests {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let (mut runner, tasks) = fully_populated_reader(format);
             let settled = tasks[0];
-            let commands =
-                runner.task_outcome(settled, TaskOutcome::Failed(TaskError::Offline));
+            let commands = runner.task_outcome(settled, TaskOutcome::Failed(TaskError::Offline));
             assert_eq!(runner.app().view, View::Episodes);
             assert_reader_cleanup(
                 &mut runner,
@@ -5237,8 +5228,7 @@ mod tests {
     fn format_bounded_reader_window_reverse_completions() {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let metrics = reader_metrics(format, 1);
-            let (mut runner, manifest_task, _) =
-                reader_waiting_for_manifest_with_metrics(metrics);
+            let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
             runner.task_outcome(
                 manifest_task,
                 TaskOutcome::Completed(image_manifest_sources(8)),
@@ -5248,10 +5238,7 @@ mod tests {
             let mut maximum_combined_sources = 0;
             let mut maximum_fetches = 0;
             let mut callbacks = 0;
-            loop {
-                let Some((&task, entry)) = runner.app().reader_tasks.iter().next_back() else {
-                    break;
-                };
+            while let Some((&task, entry)) = runner.app().reader_tasks.iter().next_back() {
                 let purpose = entry.purpose;
                 let bytes = match purpose {
                     ReaderTaskPurpose::ForegroundSource { .. }
@@ -5280,15 +5267,13 @@ mod tests {
     #[test]
     fn first_page_put_precedes_screen_and_zero_second_maintenance() {
         let metrics = reader_metrics(PictureFormat::Gray8, 1);
-        let (mut runner, manifest_task, _) =
-            reader_waiting_for_manifest_with_metrics(metrics);
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
         let commands = runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest_sources(1)),
         );
         let (source_task, _) = only_spawn(&commands);
-        let commands =
-            runner.task_outcome(source_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let commands = runner.task_outcome(source_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         assert_reader_bounds(runner.app());
 
         let put_index = commands
@@ -5328,8 +5313,7 @@ mod tests {
     #[test]
     fn rgb_reader_source_bound_copies_four_one_row_sources_sequentially() {
         let metrics = reader_metrics(PictureFormat::Rgb8, 4);
-        let (mut runner, manifest_task, _) =
-            reader_waiting_for_manifest_with_metrics(metrics);
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
         runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest_sources(4)),
@@ -5350,19 +5334,14 @@ mod tests {
             };
             assert_eq!(source, expected_source);
             observed_sources.push(source);
-            final_commands =
-                runner.task_outcome(task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+            final_commands = runner.task_outcome(task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
             assert_reader_bounds(runner.app());
         }
         assert_eq!(observed_sources, [0, 1, 2, 3]);
 
-        let expected_source = decode_reader_source(
-            TINY_WEBP,
-            &episode_image(0, 1, 1),
-            PictureFormat::Rgb8,
-            1,
-        )
-        .expect("RGB source");
+        let expected_source =
+            decode_reader_source(TINY_WEBP, &episode_image(0, 1, 1), PictureFormat::Rgb8, 1)
+                .expect("RGB source");
         let PicturePixels::Rgb8(source_pixels) = expected_source.into_pixels() else {
             panic!("expected RGB source pixels");
         };
@@ -5386,17 +5365,13 @@ mod tests {
     #[test]
     fn rapid_ready_page_turns_coalesce_rgb_maintenance() {
         let metrics = reader_metrics(PictureFormat::Rgb8, 1);
-        let (mut runner, manifest_task, _) =
-            reader_waiting_for_manifest_with_metrics(metrics);
+        let (mut runner, manifest_task, _) = reader_waiting_for_manifest_with_metrics(metrics);
         let commands = runner.task_outcome(
             manifest_task,
             TaskOutcome::Completed(image_manifest_sources(5)),
         );
         let (first_source, _) = only_spawn(&commands);
-        runner.task_outcome(
-            first_source,
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
+        runner.task_outcome(first_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let first_maintenance = runner
             .app()
             .reader
@@ -5418,10 +5393,7 @@ mod tests {
                 .then_some(*task)
             })
             .expect("page one source");
-        runner.task_outcome(
-            page_one_source,
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
+        runner.task_outcome(page_one_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let page_two_source = runner
             .app()
             .reader_tasks
@@ -5437,10 +5409,7 @@ mod tests {
 
         runner.action(action_id(READER_NEXT));
         assert_eq!(runner.app().reader.as_ref().expect("reader").page, 1);
-        runner.task_outcome(
-            page_two_source,
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
+        runner.task_outcome(page_two_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let existing_maintenance = runner
             .app()
             .reader
@@ -5478,8 +5447,7 @@ mod tests {
         format: PictureFormat,
         intent: FetchIntent,
     ) -> (AppRunner<Bomtoon>, TaskId) {
-        let mut runner =
-            seeded_reader_with_metrics(reader_metrics(format, 1), 5, 0, false);
+        let mut runner = seeded_reader_with_metrics(reader_metrics(format, 1), 5, 0, false);
         let source_task = TaskId(41);
         {
             let app = runner.app_mut();
@@ -5510,11 +5478,8 @@ mod tests {
         (runner, source_task)
     }
 
-    fn reader_with_reused_source_task(
-        format: PictureFormat,
-    ) -> (AppRunner<Bomtoon>, TaskId) {
-        let mut runner =
-            seeded_reader_with_metrics(reader_metrics(format, 1), 3, 0, false);
+    fn reader_with_reused_source_task(format: PictureFormat) -> (AppRunner<Bomtoon>, TaskId) {
+        let mut runner = seeded_reader_with_metrics(reader_metrics(format, 1), 3, 0, false);
         let source_task = TaskId(41);
         {
             let app = runner.app_mut();
@@ -5531,10 +5496,9 @@ mod tests {
             reader.images = vec![episode_image(0, 1, 3)];
             (reader.plans, reader.total_pages) =
                 page_plan(&reader.images, 1, 1).expect("reused source plan");
-            reader.window =
-                VecDeque::from([PageEntry::Building(
-                    PageBuild::new(1, format, 1, 1).expect("page-one build"),
-                )]);
+            reader.window = VecDeque::from([PageEntry::Building(
+                PageBuild::new(1, format, 1, 1).expect("page-one build"),
+            )]);
             reader.source_fetches = BTreeMap::from([(0, source_task)]);
         }
         (runner, source_task)
@@ -5545,10 +5509,7 @@ mod tests {
         source_task: TaskId,
         policy: &str,
     ) {
-        runner.task_outcome(
-            source_task,
-            TaskOutcome::Failed(TaskError::Unauthorized),
-        );
+        runner.task_outcome(source_task, TaskOutcome::Failed(TaskError::Unauthorized));
         let refresh = runner
             .app()
             .reader
@@ -5612,11 +5573,13 @@ mod tests {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let (mut runner, prefetch) = reader_with_source_task(format, FetchIntent::Prefetch);
 
-            let commands =
-                runner.task_outcome(prefetch, TaskOutcome::Failed(TaskError::TimedOut));
+            let commands = runner.task_outcome(prefetch, TaskOutcome::Failed(TaskError::TimedOut));
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
-            assert!(app.problem.is_none(), "{format:?} exposed a background error");
+            assert!(
+                app.problem.is_none(),
+                "{format:?} exposed a background error"
+            );
             assert!(app.foreground_reader_task.is_none());
             assert_eq!(reader.page, 0);
             assert_eq!(
@@ -5642,7 +5605,13 @@ mod tests {
 
             let commands = runner.action(action_id(RETRY));
             let (retry_task, work) = only_spawn(&commands);
-            assert!(matches!(work, Task::Fetch { credential: None, .. }));
+            assert!(matches!(
+                work,
+                Task::Fetch {
+                    credential: None,
+                    ..
+                }
+            ));
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
             assert!(app.problem.is_none());
@@ -5656,73 +5625,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn concurrent_unauthorized_sources_share_one_bounded_manifest_refresh() {
-        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
-            let (mut runner, first_source_task) =
-                reader_with_source_task(format, FetchIntent::Prefetch);
-
-            let first_commands = runner.task_outcome(
-                first_source_task,
-                TaskOutcome::Failed(TaskError::Unauthorized),
-            );
-            let refresh = runner
-                .app()
-                .reader
-                .as_ref()
-                .and_then(|reader| reader.refresh_task)
-                .expect("shared refresh");
-            assert!(runner.app().problem.is_none());
-            assert!(runner.app().foreground_reader_task.is_none());
-            assert_eq!(runner.app().account, AccountState::Active);
-            assert!(runner.app().screen().reading_surface.is_some());
-            let manifest_spawns = first_commands
-                .iter()
-                .filter(|command| {
-                    matches!(
-                        command,
-                        Command::Spawn {
-                            work: Task::Fetch {
-                                credential: Some(credential),
-                                ..
-                            },
-                            ..
-                        } if credential.header == SecretHeader::Bearer
-                    )
-                })
-                .count();
-            assert_eq!(manifest_spawns, 1);
-            let second_source_task = active_reader_source(runner.app(), 2)
-                .map(|(task, _)| task)
-                .expect("later source scheduled while refresh is pending");
-
-            let second_commands = runner.task_outcome(
-                second_source_task,
-                TaskOutcome::Failed(TaskError::Unauthorized),
-            );
-            let reader = runner.app().reader.as_ref().expect("reader");
-            assert_eq!(reader.refresh_task, Some(refresh));
-            assert_eq!(
-                reader.refresh_waiters.keys().copied().collect::<Vec<_>>(),
-                vec![1, 2]
-            );
-            assert_eq!(
-                reader.refresh_attempted.keys().copied().collect::<Vec<_>>(),
-                vec![1, 2]
-            );
-            assert!(!second_commands.iter().any(|command| {
+    fn concurrent_refresh_runner(format: PictureFormat) -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, first_source_task) =
+            reader_with_source_task(format, FetchIntent::Prefetch);
+        let first_commands = runner.task_outcome(
+            first_source_task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        let refresh = runner
+            .app()
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.refresh_task)
+            .expect("shared refresh");
+        assert!(runner.app().problem.is_none());
+        assert!(runner.app().foreground_reader_task.is_none());
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert!(runner.app().screen().reading_surface.is_some());
+        let manifest_spawns = first_commands
+            .iter()
+            .filter(|command| {
                 matches!(
                     command,
                     Command::Spawn {
                         work: Task::Fetch {
-                            credential: Some(_),
+                            credential: Some(credential),
                             ..
                         },
                         ..
-                    }
+                    } if credential.header == SecretHeader::Bearer
                 )
-            }));
-            assert_reader_bounds(runner.app());
+            })
+            .count();
+        assert_eq!(manifest_spawns, 1);
+        let second_source_task = active_reader_source(runner.app(), 2)
+            .map(|(task, _)| task)
+            .expect("later source scheduled while refresh is pending");
+        let second_commands = runner.task_outcome(
+            second_source_task,
+            TaskOutcome::Failed(TaskError::Unauthorized),
+        );
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(reader.refresh_task, Some(refresh));
+        assert_eq!(
+            reader.refresh_waiters.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            reader.refresh_attempted.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!second_commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::Spawn {
+                    work: Task::Fetch {
+                        credential: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+        assert_reader_bounds(runner.app());
+        (runner, refresh)
+    }
+
+    #[test]
+    fn concurrent_unauthorized_sources_share_one_bounded_manifest_refresh() {
+        for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
+            let (mut runner, refresh) = concurrent_refresh_runner(format);
 
             runner.task_outcome(
                 refresh,
@@ -5745,8 +5717,7 @@ mod tests {
             let retry = active_reader_source(runner.app(), 1)
                 .map(|(task, _)| task)
                 .expect("source one retry");
-            let commands =
-                runner.task_outcome(retry, TaskOutcome::Failed(TaskError::Unauthorized));
+            let commands = runner.task_outcome(retry, TaskOutcome::Failed(TaskError::Unauthorized));
             let reader = runner.app().reader.as_ref().expect("reader");
             assert!(reader.refresh_task.is_none());
             assert!(reader.source_failures.contains_key(&1));
@@ -5785,12 +5756,8 @@ mod tests {
     #[test]
     fn promoted_prefetch_refresh_preserves_original_intent_after_second_unauthorized() {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
-            let (mut runner, source_task) =
-                reader_with_source_task(format, FetchIntent::Prefetch);
-            runner.task_outcome(
-                source_task,
-                TaskOutcome::Failed(TaskError::Unauthorized),
-            );
+            let (mut runner, source_task) = reader_with_source_task(format, FetchIntent::Prefetch);
+            runner.task_outcome(source_task, TaskOutcome::Failed(TaskError::Unauthorized));
             let refresh = runner
                 .app()
                 .reader
@@ -5888,10 +5855,9 @@ mod tests {
                     },
                 );
                 let reader = app.reader.as_mut().expect("reader");
-                reader.window =
-                    VecDeque::from([PageEntry::Building(
-                        PageBuild::new(2, format, 1, 1).expect("page-two build"),
-                    )]);
+                reader.window = VecDeque::from([PageEntry::Building(
+                    PageBuild::new(2, format, 1, 1).expect("page-two build"),
+                )]);
                 reader.source_fetches = BTreeMap::from([(0, prefetch)]);
                 reader.maintenance_task = None;
             }
@@ -6164,18 +6130,14 @@ mod tests {
     fn refresh_failure_maps_foreground_to_page_and_prefetch_to_source_failure() {
         let (mut background, source_task) =
             reader_with_source_task(PictureFormat::Gray8, FetchIntent::Prefetch);
-        background.task_outcome(
-            source_task,
-            TaskOutcome::Failed(TaskError::Unauthorized),
-        );
+        background.task_outcome(source_task, TaskOutcome::Failed(TaskError::Unauthorized));
         let refresh = background
             .app()
             .reader
             .as_ref()
             .and_then(|reader| reader.refresh_task)
             .expect("background refresh");
-        let commands =
-            background.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
+        let commands = background.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
         let app = background.app();
         assert!(app.problem.is_none());
         assert!(app
@@ -6189,22 +6151,16 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::SetScreen(_))));
 
-        let (mut foreground, source_task) = reader_with_source_task(
-            PictureFormat::Gray8,
-            FetchIntent::Foreground { page: 1 },
-        );
-        foreground.task_outcome(
-            source_task,
-            TaskOutcome::Failed(TaskError::Unauthorized),
-        );
+        let (mut foreground, source_task) =
+            reader_with_source_task(PictureFormat::Gray8, FetchIntent::Foreground { page: 1 });
+        foreground.task_outcome(source_task, TaskOutcome::Failed(TaskError::Unauthorized));
         let refresh = foreground
             .app()
             .reader
             .as_ref()
             .and_then(|reader| reader.refresh_task)
             .expect("foreground refresh");
-        let commands =
-            foreground.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
+        let commands = foreground.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
         assert!(foreground.app().problem.is_some());
         assert_eq!(foreground.app().retry, Retry::Page(1));
         assert!(last_screen(&commands).reading_surface.is_none());
