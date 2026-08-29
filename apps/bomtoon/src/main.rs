@@ -876,10 +876,19 @@ impl Bomtoon {
                     source_cache,
                     plans,
                     window,
+                    limits,
                     ..
                 } = reader;
                 source_cache.retain(|source, _| {
                     source_relevant_to_window(*source, plans, window)
+                        || install_target.is_some_and(|target| {
+                            source_relevant_to_following_page_window(
+                                *source,
+                                plans,
+                                target,
+                                limits.pages,
+                            )
+                        })
                 });
             }
 
@@ -1016,12 +1025,17 @@ impl Bomtoon {
         install_target: Option<usize>,
         bytes: &[u8],
     ) -> bool {
-        let page = install_target.unwrap_or_else(|| {
-            self.reader
-                .as_ref()
-                .map_or(0, |reader| reader.page.saturating_add(1))
+        let desired_page = match self.retry {
+            Retry::Page(page) => Some(page),
+            Retry::Restart | Retry::Manifest => None,
+        };
+        let page = install_target.or(desired_page).unwrap_or_else(|| {
+            self.reader.as_ref().map_or(0, |reader| {
+                reader.page.checked_add(1).unwrap_or(reader.page)
+            })
         });
-        let relevant = {
+        let foreground_active = self.foreground_reader_task.is_some();
+        let (relevant, defer_maintenance) = {
             let Some(reader) = self.reader.as_mut() else {
                 return false;
             };
@@ -1029,7 +1043,20 @@ impl Bomtoon {
                 return false;
             }
             reader.source_fetches.remove(&source);
-            source_relevant_to_window(source, &reader.plans, &reader.window)
+            let relevant_to_window =
+                source_relevant_to_window(source, &reader.plans, &reader.window);
+            let relevant_to_desired = desired_page.is_some_and(|target| {
+                source_relevant_to_page_window(
+                    source,
+                    &reader.plans,
+                    target,
+                    reader.limits.pages,
+                )
+            });
+            (
+                relevant_to_window || relevant_to_desired,
+                install_target.is_none() && (foreground_active || !relevant_to_window),
+            )
         };
         if !relevant {
             return false;
@@ -1070,6 +1097,9 @@ impl Bomtoon {
             return false;
         }
         reader.source_cache.insert(source, source_picture);
+        if defer_maintenance {
+            return false;
+        }
         match self.maintain_reader(
             context,
             install_target.is_none(),
@@ -1242,15 +1272,6 @@ impl Bomtoon {
                 .ok_or_else(|| "The selected comic page is empty.".to_owned())?;
             let build =
                 PageBuild::new(page, reader.format, reader.panel_width, reader.panel_height)?;
-            let end = page
-                .checked_add(reader.limits.pages)
-                .and_then(|last| last.checked_add(1))
-                .unwrap_or(reader.plans.len())
-                .min(reader.plans.len());
-            let relevant_sources = reader.plans[page..end]
-                .iter()
-                .flat_map(|plan| plan.segments.iter().map(|segment| segment.source))
-                .collect::<BTreeSet<_>>();
             let required_source = plan.segments[0].source;
             let is_active_source = |source: usize, task: TaskId| {
                 self.reader_tasks.get(&task).is_some_and(|entry| {
@@ -1280,7 +1301,12 @@ impl Bomtoon {
                 .source_fetches
                 .iter()
                 .filter(|(source, task)| {
-                    relevant_sources.contains(source) && is_active_source(**source, **task)
+                    source_relevant_to_page_window(
+                        **source,
+                        &reader.plans,
+                        page,
+                        reader.limits.pages,
+                    ) && is_active_source(**source, **task)
                 })
                 .take(keep_capacity)
                 .map(|(&source, &task)| (source, task))
@@ -1700,6 +1726,43 @@ fn source_relevant_to_window(
             .and_then(|plan| plan.segments.get(build.next_segment..))
             .is_some_and(|segments| segments.iter().any(|segment| segment.source == source))
     })
+}
+
+fn source_relevant_to_page_window(
+    source: usize,
+    plans: &[PagePlan],
+    page: usize,
+    following_pages: usize,
+) -> bool {
+    if page >= plans.len() {
+        return false;
+    }
+    let end = page
+        .checked_add(following_pages)
+        .and_then(|last| last.checked_add(1))
+        .unwrap_or(plans.len())
+        .min(plans.len());
+    plans[page..end]
+        .iter()
+        .flat_map(|plan| &plan.segments)
+        .any(|segment| segment.source == source)
+}
+
+fn source_relevant_to_following_page_window(
+    source: usize,
+    plans: &[PagePlan],
+    page: usize,
+    following_pages: usize,
+) -> bool {
+    let Some(first_following) = page.checked_add(1) else {
+        return false;
+    };
+    source_relevant_to_page_window(
+        source,
+        plans,
+        first_following,
+        following_pages.saturating_sub(1),
+    )
 }
 
 fn validate_continuous_page(plan: &PagePlan) -> Result<(), String> {
@@ -3313,6 +3376,102 @@ mod tests {
     }
 
     #[test]
+    fn previous_rebase_caches_retained_future_prefetch_until_maintenance_uses_it() {
+        let format = PictureFormat::Gray8;
+        let mut runner =
+            seeded_reader_with_metrics(reader_metrics(format, 1), 6, 3, false);
+        let target_task = TaskId(51);
+        let future_task = TaskId(52);
+        {
+            let app = runner.app_mut();
+            let reader = app.reader.as_mut().expect("reader");
+            reader.source_fetches =
+                BTreeMap::from([(2, target_task), (4, future_task)]);
+            app.reader_tasks = BTreeMap::from([
+                (
+                    target_task,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::PrefetchSource { source: 2 },
+                    },
+                ),
+                (
+                    future_task,
+                    ReaderTaskEntry {
+                        generation: 1,
+                        purpose: ReaderTaskPurpose::PrefetchSource { source: 4 },
+                    },
+                ),
+            ]);
+        }
+
+        let commands = runner.action(action_id(READER_PREVIOUS));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            Command::Spawn { .. } | Command::Cancel(_)
+        )));
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(
+            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(runner.app().foreground_reader_task, Some(target_task));
+        assert_eq!(
+            runner
+                .app()
+                .reader_tasks
+                .get(&future_task)
+                .map(|entry| entry.purpose),
+            Some(ReaderTaskPurpose::PrefetchSource { source: 4 })
+        );
+
+        let commands = runner.task_outcome(
+            future_task,
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert!(reader.source_cache.contains_key(&4));
+        assert!(!reader.source_fetches.contains_key(&4));
+        assert_eq!(
+            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_reader_bounds(runner.app());
+
+        runner.task_outcome(
+            target_task,
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert_eq!(reader.page, 2);
+        assert!(reader.source_cache.contains_key(&4));
+        let maintenance = reader.maintenance_task.expect("rebase maintenance");
+        assert_reader_bounds(runner.app());
+
+        runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
+        let app = runner.app();
+        let reader = app.reader.as_ref().expect("reader");
+        assert_eq!(
+            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert!(matches!(
+            reader.window.get(1),
+            Some(PageEntry::Building(build)) if build.page == 4 && build.next_segment == 1
+        ));
+        assert!(!reader.source_fetches.contains_key(&4));
+        assert!(!app.reader_tasks.values().any(|entry| matches!(
+            entry.purpose,
+            ReaderTaskPurpose::PrefetchSource { source: 4 }
+                | ReaderTaskPurpose::ForegroundSource { source: 4, .. }
+        )));
+        assert_reader_bounds(app);
+    }
+
+    #[test]
     fn previous_rerenders_exact_global_seam_and_keeps_no_backward_pages() {
         for format in [PictureFormat::Gray8, PictureFormat::Rgb8] {
             let (mut runner, first_task, active_second, maintenance_task) =
@@ -3351,9 +3510,12 @@ mod tests {
                 first_task,
                 TaskOutcome::Completed(BLACK_1X3_WEBP.to_vec()),
             );
-            assert!(commands.iter().all(|command| {
-                !matches!(command, Command::SetScreen(screen) if screen.reading_surface.is_some())
-            }));
+            assert!(
+                commands.iter().all(|command| {
+                    !matches!(command, Command::SetScreen(screen) if screen.reading_surface.is_some())
+                }),
+                "{format:?} rerendered the old page before the seam was ready: {commands:?}"
+            );
             assert_eq!(
                 runner
                     .app()
