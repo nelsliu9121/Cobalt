@@ -1287,33 +1287,60 @@ impl Bomtoon {
                         )
                 })
             };
-            let active_required = reader
-                .source_fetches
-                .get(&required_source)
-                .is_some_and(|task| is_active_source(required_source, *task));
-            let fetch_capacity = reader.limits.fetches.min(reader.limits.source_slots);
-            let keep_capacity = if active_required {
-                fetch_capacity
-            } else {
-                fetch_capacity.saturating_sub(1)
-            };
-            let kept_fetches = reader
-                .source_fetches
-                .iter()
-                .filter(|(source, task)| {
-                    source_relevant_to_page_window(
-                        **source,
-                        &reader.plans,
-                        page,
-                        reader.limits.pages,
-                    ) && is_active_source(**source, **task)
-                })
-                .take(keep_capacity)
-                .map(|(&source, &task)| (source, task))
-                .collect::<BTreeMap<_, _>>();
-            Ok::<_, String>((build, kept_fetches))
+            let required_cached = reader.source_cache.contains_key(&required_source);
+            let required_fetch = (!required_cached)
+                .then(|| reader.source_fetches.get(&required_source).copied())
+                .flatten()
+                .filter(|task| is_active_source(required_source, *task));
+            let required_retained = required_cached || required_fetch.is_some();
+            let retained_capacity = reader
+                .limits
+                .source_slots
+                .saturating_sub(usize::from(!required_retained));
+            let mut kept_sources = BTreeSet::new();
+            let mut kept_cache_sources = BTreeSet::new();
+            let mut kept_fetches = BTreeMap::new();
+            if required_cached {
+                kept_sources.insert(required_source);
+                kept_cache_sources.insert(required_source);
+            } else if let Some(task) = required_fetch {
+                kept_sources.insert(required_source);
+                kept_fetches.insert(required_source, task);
+            }
+            for &source in reader.source_cache.keys() {
+                if kept_sources.len() == retained_capacity {
+                    break;
+                }
+                if source_relevant_to_page_window(
+                    source,
+                    &reader.plans,
+                    page,
+                    reader.limits.pages,
+                ) && kept_sources.insert(source)
+                {
+                    kept_cache_sources.insert(source);
+                }
+            }
+            for (&source, &task) in &reader.source_fetches {
+                if kept_sources.len() == retained_capacity
+                    || kept_fetches.len() == reader.limits.fetches
+                {
+                    break;
+                }
+                if source_relevant_to_page_window(
+                    source,
+                    &reader.plans,
+                    page,
+                    reader.limits.pages,
+                ) && is_active_source(source, task)
+                    && kept_sources.insert(source)
+                {
+                    kept_fetches.insert(source, task);
+                }
+            }
+            Ok::<_, String>((build, kept_cache_sources, kept_fetches))
         })();
-        let (build, kept_fetches) = match prepared {
+        let (build, kept_cache_sources, kept_fetches) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reader(Retry::Page(page), error);
@@ -1352,7 +1379,9 @@ impl Bomtoon {
         };
         reader.window.clear();
         reader.window.push_back(PageEntry::Building(build));
-        reader.source_cache.clear();
+        reader
+            .source_cache
+            .retain(|source, _| kept_cache_sources.contains(source));
         reader.source_fetches = kept_fetches;
         reader.maintenance_task = None;
         self.problem = None;
@@ -3443,6 +3472,32 @@ mod tests {
 
         runner.task_outcome(
             target_task,
+            TaskOutcome::Failed(TaskError::TimedOut),
+        );
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert!(runner.app().problem.is_some());
+        assert!(reader.source_cache.contains_key(&4));
+        assert_reader_bounds(runner.app());
+
+        let commands = runner.action(action_id(RETRY));
+        let (retry_task, retry_work) = only_spawn(&commands);
+        assert!(matches!(retry_work, Task::Fetch { .. }));
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert!(runner.app().problem.is_none());
+        assert_eq!(runner.app().foreground_reader_task, Some(retry_task));
+        assert!(reader.source_cache.contains_key(&4));
+        assert_eq!(
+            runner
+                .app()
+                .reader_tasks
+                .get(&retry_task)
+                .map(|entry| entry.purpose),
+            Some(ReaderTaskPurpose::ForegroundSource { source: 2, page: 2 })
+        );
+        assert_reader_bounds(runner.app());
+
+        runner.task_outcome(
+            retry_task,
             TaskOutcome::Completed(TINY_WEBP.to_vec()),
         );
         let reader = runner.app().reader.as_ref().expect("reader");
@@ -3469,6 +3524,34 @@ mod tests {
                 | ReaderTaskPurpose::ForegroundSource { source: 4, .. }
         )));
         assert_reader_bounds(app);
+    }
+
+    #[test]
+    fn previous_rebase_evicts_cached_sources_outside_the_new_forward_range() {
+        let format = PictureFormat::Gray8;
+        let mut runner =
+            seeded_reader_with_metrics(reader_metrics(format, 1), 6, 5, false);
+        runner
+            .app_mut()
+            .reader
+            .as_mut()
+            .expect("reader")
+            .source_cache
+            .insert(
+                0,
+                Picture::from_grey(1, 1, vec![0]).expect("unrelated cached source"),
+            );
+        assert_reader_bounds(runner.app());
+
+        runner.action(action_id(READER_PREVIOUS));
+
+        let reader = runner.app().reader.as_ref().expect("reader");
+        assert!(!reader.source_cache.contains_key(&0));
+        assert_eq!(
+            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_reader_bounds(runner.app());
     }
 
     #[test]
