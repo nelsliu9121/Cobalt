@@ -7,8 +7,8 @@
 use kobo_sdk::keyboard::{TextEntry, Typing};
 use kobo_sdk::{
     action_id, ActionId, BandAlign, BannerLevel, Context, Glyph, KoboApp, LogLevel, PictureHandle,
-    RowLead, Screen, ScreenBuilder, SlotWidth, Task, TaskId, TaskOutcome, Tile, TilePicture,
-    TileShape, TileState,
+    PicturePixels, RowLead, Screen, ScreenBuilder, SlotWidth, Task, TaskId, TaskOutcome, Tile,
+    TilePicture, TileShape, TileState,
 };
 use std::process::ExitCode;
 
@@ -830,8 +830,18 @@ impl Gallery {
     /// held by the runtime under its handle, and re-sending it on each paint
     /// would put the whole image back on the wire every time a tab was tapped.
     fn put_pictures(&mut self, context: &mut Context) {
-        self.card = context.put_picture(PictureHandle(1), WEDGE_WIDTH, WEDGE_HEIGHT, wedge());
-        self.swatch = context.put_picture(PictureHandle(2), CARD_WIDTH, CARD_HEIGHT, card());
+        self.card = context.put_picture(
+            PictureHandle(1),
+            WEDGE_WIDTH,
+            WEDGE_HEIGHT,
+            PicturePixels::Gray8(wedge()),
+        );
+        self.swatch = context.put_picture(
+            PictureHandle(2),
+            CARD_WIDTH,
+            CARD_HEIGHT,
+            PicturePixels::Gray8(card()),
+        );
     }
 }
 

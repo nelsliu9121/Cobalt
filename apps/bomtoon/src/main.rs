@@ -4,8 +4,8 @@ mod parse;
 
 use kobo_image::{Picture, PANEL_GREYS};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, ReadingChrome,
-    Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
+    action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, PicturePixels,
+    ReadingChrome, Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
 };
 use model::{display_text, Comic, Episode, EpisodeImage, RecentEntry};
 use std::process::ExitCode;
@@ -517,7 +517,12 @@ impl Bomtoon {
         let width = slice.width();
         let height = slice.height();
         let picture = context
-            .put_picture(handle, width, height, slice.into_grey())
+            .put_picture(
+                handle,
+                width,
+                height,
+                PicturePixels::Gray8(slice.into_grey()),
+            )
             .ok_or_else(|| "The comic slice could not be uploaded.".to_owned())?;
         let old = {
             let reader = self

@@ -3,7 +3,7 @@
 //! Looking at the panel is the only real test of a typeface, but a headless
 //! render catches the gross failures first and costs the device nothing.
 
-use kobo_sdk::{Glyph, ScreenBuilder};
+use kobo_sdk::{Glyph, PicturePixelsRef, ScreenBuilder};
 use kobo_ui::{render_with, Chrome, DisplayMetrics, Screen, Surface, CLARA_BW_METRICS};
 
 fn home() -> Screen {
@@ -56,7 +56,10 @@ fn write(name: &str, screen: &Screen, metrics: &DisplayMetrics) {
     let mut surface = Surface::new(width, height);
     render_with(screen, metrics, &Chrome::default(), &mut surface, None);
     let mut out = format!("P5\n{} {}\n255\n", surface.width, surface.height).into_bytes();
-    out.extend_from_slice(&surface.pixels);
+    let PicturePixelsRef::Gray8(pixels) = surface.pixels() else {
+        unreachable!("PGM previews render on a Gray8 surface");
+    };
+    out.extend_from_slice(pixels);
     std::fs::write(&name, out).expect("write the preview");
     println!("wrote {}", name.display());
 }

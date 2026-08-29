@@ -7,8 +7,8 @@ use kobo_sdk::{
     action_id,
     audio::{AudioMetadata, AudioPlayer},
     Context, DeviceRequest, DeviceResult, Failure, Glyph, Heartbeat, KoboApp, PictureHandle,
-    Screen, ScreenBuilder, ShelfProgress, ShelfUpload, StandardState, StoreResult, TaskId,
-    TaskOutcome,
+    PicturePixels, Screen, ScreenBuilder, ShelfProgress, ShelfUpload, StandardState, StoreResult,
+    TaskId, TaskOutcome,
 };
 use std::process::ExitCode;
 
@@ -329,7 +329,8 @@ impl Audiobook {
     /// second is the one somebody uses fifty times.
     fn open_player(&mut self, context: &mut Context) {
         let (width, height, grey) = cover_art(&self.title);
-        let cover = context.put_picture(PictureHandle(1), width, height, grey);
+        let cover =
+            context.put_picture(PictureHandle(1), width, height, PicturePixels::Gray8(grey));
         let mut player = AudioPlayer::shelf(&self.archive_name, &self.title)
             .metadata(
                 AudioMetadata::new(&self.title)

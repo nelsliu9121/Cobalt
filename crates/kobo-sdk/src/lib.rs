@@ -8,13 +8,13 @@
 pub use kobo_protocol::{
     is_valid_key, AppInfo, AppLinkState, AudioPlaybackState, AudioSource, BatteryDetail,
     BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason, DeviceError, DeviceRequest,
-    DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LogLevel, Message,
-    RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent, ShellRequest, StoreError,
-    StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId, TaskOutcome, WifiNetwork,
-    CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME, MAX_HEADER_VALUE,
-    MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES,
-    MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK, MAX_STORE_KEYS,
-    MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
+    DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LogLevel, Message, PictureFormat,
+    PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent, ShellRequest,
+    StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId, TaskOutcome,
+    WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME,
+    MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES,
+    MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK,
+    MAX_STORE_KEYS, MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
 };
 pub use kobo_ui::QuoteRole;
 pub use kobo_ui::{
@@ -22,9 +22,10 @@ pub use kobo_ui::{
     BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome, ControlState,
     DiagnosticSeverity, DisplayMetrics, Emphasis, Fold, FontHandle, Freeform, Glyph, InlineFormula,
     LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind, ParagraphAlignment,
-    ParagraphPresentation, Percent, PictureHandle, ProseArea, ReadingChrome, ReadingSurface,
-    RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space, TextHit, TextPresentation,
-    TextSelection, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
+    ParagraphPresentation, Percent, PictureHandle, PicturePixelsRef, ProseArea, ReadingChrome,
+    ReadingSurface, RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space, TextHit,
+    TextPresentation, TextSelection, Tile, TilePicture, TileShape, TileState, TopBar,
+    TransferFailure,
     CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS,
     MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS,
     MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
@@ -54,10 +55,10 @@ pub mod prelude {
         AppStore, AudioMetadata, AudioPlaybackState, AudioPlayer, AudioSource, BluetoothDevice,
         BluetoothDeviceKind, Capability, Client, ClientEvent, Command, Context, ControlState,
         DenyReason, Device, DeviceError, DeviceRequest, DeviceResult, DialogAction, Failure, Grant,
-        Grants, Heartbeat, KoboApp, Lifecycle, Navigator, Node, NodeId, PowerPolicy,
-        RemoteInstallOutcome, Screen, ScreenBuilder, ShelfDownload, ShelfProgress, ShelfUpload,
-        ShellError, ShellEvent, ShellRequest, StandardState, StoreError, StoreRequest, StoreResult,
-        WifiNetwork,
+        Grants, Heartbeat, KoboApp, Lifecycle, Navigator, Node, NodeId, PictureFormat,
+        PicturePixels, PicturePixelsRef, PowerPolicy, RemoteInstallOutcome, Screen, ScreenBuilder,
+        ShelfDownload, ShelfProgress, ShelfUpload, ShellError, ShellEvent, ShellRequest,
+        StandardState, StoreError, StoreRequest, StoreResult, WifiNetwork,
     };
 }
 
@@ -2726,7 +2727,7 @@ pub enum Command {
         handle: PictureHandle,
         width: u32,
         height: u32,
-        grey: Vec<u8>,
+        pixels: PicturePixels,
     },
     /// Release a picture the runtime is holding.
     DropPicture(PictureHandle),
@@ -3210,19 +3211,17 @@ impl Context {
         handle: PictureHandle,
         width: u32,
         height: u32,
-        grey: Vec<u8>,
+        pixels: PicturePixels,
     ) -> Option<TilePicture> {
-        let expected = usize::try_from(width)
-            .ok()
-            .and_then(|width| width.checked_mul(usize::try_from(height).ok()?))?;
-        if expected == 0 || expected != grey.len() || expected > MAX_PICTURE_BYTES {
+        let expected = pixels.format().byte_len(width, height)?;
+        if expected == 0 || expected != pixels.byte_count() || expected > MAX_PICTURE_BYTES {
             return None;
         }
         self.commands.push(Command::PutPicture {
             handle,
             width,
             height,
-            grey,
+            pixels,
         });
         Some(TilePicture::new(handle, width, height))
     }
@@ -4909,6 +4908,7 @@ impl Client {
                 height: i32::from(height),
                 pixels_per_inch: i32::from(pixels_per_inch),
                 text_scale,
+                picture_format: PictureFormat::Gray8,
             },
         })
     }
@@ -4937,22 +4937,39 @@ impl Client {
                     handle,
                     width,
                     height,
-                    grey,
+                    pixels,
                 } => {
-                    if grey.len() <= MAX_INLINE_PICTURE_BYTES {
+                    let format = pixels.format();
+                    let byte_count = pixels.byte_count();
+                    let expected = format.byte_len(width, height).ok_or(ClientError::Stream(
+                        StreamError::Protocol(kobo_protocol::ProtocolError::FrameTooLarge),
+                    ))?;
+                    if expected == 0 || expected != byte_count {
+                        return Err(ClientError::Stream(StreamError::Protocol(
+                            kobo_protocol::ProtocolError::InvalidValue("picture size"),
+                        )));
+                    }
+                    if expected > MAX_PICTURE_BYTES {
+                        return Err(ClientError::Stream(StreamError::Protocol(
+                            kobo_protocol::ProtocolError::FrameTooLarge,
+                        )));
+                    }
+                    if byte_count <= MAX_INLINE_PICTURE_BYTES {
                         self.send(Message::PutPicture {
                             handle,
                             width,
                             height,
-                            grey,
+                            pixels,
                         })?;
                     } else {
+                        let bytes = pixels.into_bytes();
                         self.send(Message::BeginPicture {
                             handle,
                             width,
                             height,
+                            format,
                         })?;
-                        for (index, chunk) in grey.chunks(MAX_PICTURE_CHUNK_BYTES).enumerate() {
+                        for (index, chunk) in bytes.chunks(MAX_PICTURE_CHUNK_BYTES).enumerate() {
                             let offset = index
                                 .checked_mul(MAX_PICTURE_CHUNK_BYTES)
                                 .and_then(|offset| u32::try_from(offset).ok())
@@ -4962,7 +4979,7 @@ impl Client {
                             self.send(Message::PictureChunk {
                                 handle,
                                 offset,
-                                grey: chunk.to_vec(),
+                                bytes: chunk.to_vec(),
                             })?;
                         }
                         self.send(Message::CommitPicture { handle })?;
@@ -5150,6 +5167,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn put_picture_keeps_rgb_pixels_typed_in_the_command() {
+        let mut context = Context::default();
+        assert_eq!(
+            context.put_picture(
+                PictureHandle(3),
+                2,
+                1,
+                PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+            ),
+            Some(TilePicture::new(PictureHandle(3), 2, 1))
+        );
+        assert!(matches!(
+            context.commands(),
+            [Command::PutPicture {
+                handle: PictureHandle(3),
+                width: 2,
+                height: 1,
+                pixels: PicturePixels::Rgb8(bytes),
+            }] if bytes == &[1, 2, 3, 4, 5, 6]
+        ));
+    }
+
+    #[test]
+    fn put_picture_refuses_wrong_typed_lengths_and_the_byte_budget() {
+        let mut context = Context::default();
+        assert_eq!(
+            context.put_picture(
+                PictureHandle(3),
+                2,
+                1,
+                PicturePixels::Rgb8(vec![1, 2, 3, 4, 5]),
+            ),
+            None
+        );
+        let width = u32::try_from(MAX_PICTURE_BYTES + 1).expect("picture bound fits u32");
+        assert_eq!(
+            context.put_picture(
+                PictureHandle(3),
+                width,
+                1,
+                PicturePixels::Gray8(vec![0; MAX_PICTURE_BYTES + 1]),
+            ),
+            None
+        );
+        assert!(context.commands().is_empty());
+    }
+
     /// A picture arriving after the screen that refers to it still repaints.
     ///
     /// A screen names a picture by handle, so filling that handle in later
@@ -5172,7 +5237,12 @@ mod tests {
             fn on_action(&mut self, context: &mut Context, _action: ActionId) {
                 if !self.filled {
                     self.filled = true;
-                    let _ = context.put_picture(PictureHandle(1), 2, 2, vec![0, 1, 2, 3]);
+                    let _ = context.put_picture(
+                        PictureHandle(1),
+                        2,
+                        2,
+                        PicturePixels::Gray8(vec![0, 1, 2, 3]),
+                    );
                 }
                 Self::paint(context);
             }
@@ -6007,16 +6077,17 @@ mod tests {
                 Message::BeginPicture {
                     handle: PictureHandle(9),
                     width: 1072,
-                    height: 1448
+                    height: 1448,
+                    format: PictureFormat::Rgb8,
                 }
             ));
-            let expected = 1072_usize * 1448;
+            let expected = 3 * 1072_usize * 1448;
             let mut received = 0;
             while received < expected {
                 let Message::PictureChunk {
                     handle,
                     offset,
-                    grey,
+                    bytes,
                 } = kobo_protocol::read_from(&mut daemon_stream)
                     .expect("chunk")
                     .message
@@ -6025,8 +6096,8 @@ mod tests {
                 };
                 assert_eq!(handle, PictureHandle(9));
                 assert_eq!(usize::try_from(offset).expect("offset"), received);
-                assert!(grey.len() <= MAX_PICTURE_CHUNK_BYTES);
-                received += grey.len();
+                assert!(bytes.len() <= MAX_PICTURE_CHUNK_BYTES);
+                received += bytes.len();
             }
             assert!(matches!(
                 kobo_protocol::read_from(&mut daemon_stream)
@@ -6043,7 +6114,7 @@ mod tests {
                 handle: PictureHandle(9),
                 width: 1072,
                 height: 1448,
-                grey: vec![127; 1072 * 1448],
+                pixels: PicturePixels::Rgb8(vec![127; 3 * 1072 * 1448]),
             }])
             .expect("upload");
         daemon.join().expect("daemon");

@@ -40,7 +40,7 @@
 use kobo_sdk::keyboard::{Keyboard, Pressed};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Context, DeviceRequest, DeviceResult, KoboApp, PictureHandle,
-    Screen, ScreenBuilder, Task, TaskId, TaskOutcome,
+    PicturePixels, Screen, ScreenBuilder, Task, TaskId, TaskOutcome,
 };
 use kobo_ui::tone;
 use std::process::ExitCode;
@@ -482,9 +482,9 @@ impl Morse {
             .map(|signal| signal.character)
         {
             let room = context.metrics().tenth_mm(LETTER_SENDING_TENTHS_MM);
-            if let Some(picture) = paint(character, room)
-                .and_then(|(width, height, grey)| context.put_picture(LETTER, width, height, grey))
-            {
+            if let Some(picture) = paint(character, room).and_then(|(width, height, grey)| {
+                context.put_picture(LETTER, width, height, PicturePixels::Gray8(grey))
+            }) {
                 let millimetres = u16::try_from(LETTER_SENDING_TENTHS_MM / 10).unwrap_or(u16::MAX);
                 screen = screen.picture(picture, millimetres);
             }
@@ -739,7 +739,9 @@ mod tests {
         beats, encode, glyph, letter_at, paint, Beat, Morse, AGAIN, CODE, MAX_MESSAGE, STOP,
         TOGGLE_LIGHT,
     };
-    use kobo_sdk::{action_id, AppRunner, Command, DeviceRequest, TaskOutcome};
+    use kobo_sdk::{
+        action_id, AppRunner, Command, DeviceRequest, PicturePixels, TaskOutcome,
+    };
     use kobo_ui::{tone, Chrome, CLARA_BW_METRICS};
 
     /// Renders a run of beats as the light would show it, so a test can state
@@ -1024,7 +1026,7 @@ mod tests {
                 if let Command::PutPicture {
                     width,
                     height,
-                    grey,
+                    pixels: PicturePixels::Gray8(grey),
                     ..
                 } = command
                 {

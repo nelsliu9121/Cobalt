@@ -840,6 +840,7 @@ version = "0.3.0"
 name = "kobo-protocol"
 version = "0.3.0"
 dependencies = [
+ "kobo-pixels",
  "kobo-ui",
 ]
 

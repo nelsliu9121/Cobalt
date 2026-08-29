@@ -42,9 +42,9 @@ use kobo_read::{Memory, Outcome, Reader};
 use kobo_sdk::keyboard::{Keyboard, Pressed};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, DiagnosticSeverity, Failure, FontHandle,
-    Glyph, Header, KoboApp, LogLevel, PictureHandle, RowLead, ScreenBuilder, ShelfDownload,
-    ShelfProgress, ShelfUpload, StoreResult, Task, TaskId, TaskOutcome, Tile, TilePicture,
-    TileShape, TileState, MAX_STORE_VALUE,
+    Glyph, Header, KoboApp, LogLevel, PictureHandle, PicturePixels, RowLead, ScreenBuilder,
+    ShelfDownload, ShelfProgress, ShelfUpload, StoreResult, Task, TaskId, TaskOutcome, Tile,
+    TilePicture, TileShape, TileState, MAX_STORE_VALUE,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
@@ -1960,9 +1960,12 @@ impl Gutenbird {
                     self.nav_cover_handle =
                         self.nav_cover_handle.wrapping_add(1) % NAV_COVER_HANDLES;
                     let (drawn_width, drawn_height) = (picture.width(), picture.height());
-                    if let Some(reference) =
-                        context.put_picture(handle, drawn_width, drawn_height, picture.into_grey())
-                    {
+                    if let Some(reference) = context.put_picture(
+                        handle,
+                        drawn_width,
+                        drawn_height,
+                        PicturePixels::Gray8(picture.into_grey()),
+                    ) {
                         if let Some(entry) = self.stack.last_mut() {
                             if let Some(at) = entry
                                 .feed
@@ -2135,8 +2138,12 @@ impl Gutenbird {
         picture.dither(kobo_image::PANEL_GREYS);
         let handle = PictureHandle(u32::try_from(index).unwrap_or(0));
         let (width, height) = (picture.width(), picture.height());
-        let Some(reference) = context.put_picture(handle, width, height, picture.into_grey())
-        else {
+        let Some(reference) = context.put_picture(
+            handle,
+            width,
+            height,
+            PicturePixels::Gray8(picture.into_grey()),
+        ) else {
             return false;
         };
         if let Some(entry) = self.stack.last_mut() {
@@ -2167,7 +2174,9 @@ impl Gutenbird {
             return false;
         }
         let handle = PictureHandle(u32::try_from(index).unwrap_or(0));
-        let Some(reference) = context.put_picture(handle, width, height, grey) else {
+        let Some(reference) =
+            context.put_picture(handle, width, height, PicturePixels::Gray8(grey))
+        else {
             return false;
         };
         if let Some(entry) = self.stack.last_mut() {
@@ -2263,7 +2272,14 @@ impl Gutenbird {
         // standing in for it, and the block underneath would move by that much
         // at the moment it arrived -- which is the whole thing being fixed.
         let padded = on_paper(&picture, width, height);
-        let Some(reference) = context.put_picture(OPEN_COVER_HANDLE, width, height, padded) else {
+        let Some(reference) =
+            context.put_picture(
+                OPEN_COVER_HANDLE,
+                width,
+                height,
+                PicturePixels::Gray8(padded),
+            )
+        else {
             return false;
         };
         self.open_cover = Some(reference);
@@ -2297,7 +2313,12 @@ impl Gutenbird {
         if grey.is_empty() {
             return;
         }
-        if let Some(reference) = context.put_picture(OPEN_COVER_HANDLE, width, height, grey) {
+        if let Some(reference) = context.put_picture(
+            OPEN_COVER_HANDLE,
+            width,
+            height,
+            PicturePixels::Gray8(grey),
+        ) {
             self.open_cover = Some(reference);
         }
     }

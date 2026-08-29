@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use kobo_read::{Memory, Reader};
-use kobo_ui::{Chrome, DisplayMetrics, PictureCache, PictureHandle, Surface};
+use kobo_ui::{
+    Chrome, DisplayMetrics, PictureCache, PictureFormat, PictureHandle, PicturePixels, Surface,
+};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -39,6 +41,7 @@ fn main() {
         width: i32::try_from(profile.width).unwrap(),
         height: i32::try_from(profile.height).unwrap(),
         pixels_per_inch: i32::from(profile.pixels_per_inch),
+        picture_format: PictureFormat::Gray8,
         text_scale: kobo_ui::display_metrics_from_env().text_scale,
     };
 
@@ -145,7 +148,7 @@ fn decode_pictures(
         // size to declare, not the box it was asked to fit into.
         let (width, height) = (fitted.width(), fitted.height());
         let grey = fitted.into_grey();
-        if cache.put(handle, width, height, grey) {
+        if cache.put(handle, width, height, PicturePixels::Gray8(grey)) {
             tiles.insert(
                 name.clone(),
                 kobo_ui::TilePicture::new(handle, width, height),

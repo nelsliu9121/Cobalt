@@ -5,6 +5,8 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+pub use kobo_pixels::{PictureFormat, PicturePixels};
+
 use kobo_ui::{
     ActionId, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, ControlState,
     FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle,
@@ -45,7 +47,9 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// adds bounded rich EPUB text and runtime-held publisher-font handles.
 /// Version 10 adds exact text-hold coordinates and typed offline dictionary
 /// requests/results. Version 11 adds the runtime-owned reading surface.
-pub const VERSION: u8 = 11;
+/// Version 12 adds a pixel-format byte to inline pictures and the start of
+/// chunked picture uploads.
+pub const VERSION: u8 = 12;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -57,10 +61,11 @@ pub const HEADER_LEN: usize = 14;
 pub const MAX_FRAME_LEN: usize = 8 * 1_048_576;
 /// The largest decoded picture accepted from one application.
 ///
-/// Four Clara panels is the same bound used by `kobo-image`: enough headroom
-/// for a high-resolution source while remaining below the per-app cache.
-pub const MAX_PICTURE_BYTES: usize = 4 * 1072 * 1448;
-/// Largest picture sent as one legacy `PutPicture` frame.
+/// Three bytes per pixel across a 1264 by 1680 color panel: enough for the
+/// largest supported native framebuffer while remaining below the per-app
+/// cache.
+pub const MAX_PICTURE_BYTES: usize = 3 * 1264 * 1680;
+/// Largest picture sent as one `PutPicture` frame.
 pub const MAX_INLINE_PICTURE_BYTES: usize = 768 * 1024;
 /// Largest piece of a chunked upload. Small enough to bound transient copies
 /// while still moving a full panel in a handful of local-socket writes.
@@ -665,20 +670,21 @@ pub enum Message {
         handle: PictureHandle,
         width: u32,
         height: u32,
-        /// Eight-bit grey, row major, exactly `width * height` bytes.
-        grey: Vec<u8>,
+        /// Typed pixels, row major, with an exact format-dependent byte count.
+        pixels: PicturePixels,
     },
     /// Starts an atomic picture upload larger than one protocol frame.
     BeginPicture {
         handle: PictureHandle,
         width: u32,
         height: u32,
+        format: PictureFormat,
     },
     /// One in-order span of a picture started by [`Message::BeginPicture`].
     PictureChunk {
         handle: PictureHandle,
         offset: u32,
-        grey: Vec<u8>,
+        bytes: Vec<u8>,
     },
     /// Makes a completely received upload visible to screens.
     CommitPicture {
@@ -1596,30 +1602,37 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             handle,
             width,
             height,
-            grey,
+            pixels,
         } => {
             push_u32(&mut payload, handle.0);
             push_u32(&mut payload, *width);
             push_u32(&mut payload, *height);
-            payload.extend_from_slice(grey);
+            payload.push(picture_format_tag(pixels.format()));
+            match pixels {
+                PicturePixels::Gray8(bytes) | PicturePixels::Rgb8(bytes) => {
+                    payload.extend_from_slice(bytes);
+                }
+            }
         }
         Message::BeginPicture {
             handle,
             width,
             height,
+            format,
         } => {
             push_u32(&mut payload, handle.0);
             push_u32(&mut payload, *width);
             push_u32(&mut payload, *height);
+            payload.push(picture_format_tag(*format));
         }
         Message::PictureChunk {
             handle,
             offset,
-            grey,
+            bytes,
         } => {
             push_u32(&mut payload, handle.0);
             push_u32(&mut payload, *offset);
-            payload.extend_from_slice(grey);
+            payload.extend_from_slice(bytes);
         }
         Message::CommitPicture { handle } | Message::DropPicture { handle } => {
             push_u32(&mut payload, handle.0);
@@ -2163,40 +2176,50 @@ fn encoded_message_layout(message: &Message) -> Result<(u8, usize), ProtocolErro
         Message::PutPicture {
             width,
             height,
-            grey,
+            pixels,
             ..
         } => {
             // The declared size and the bytes must agree before anything is
             // allocated on the strength of either, or a decoder reading by
             // dimension would run off the end of a short payload.
-            let expected = picture_len(*width, *height)?;
-            if expected != grey.len() {
+            let expected = pixels
+                .format()
+                .byte_len(*width, *height)
+                .ok_or(ProtocolError::FrameTooLarge)?;
+            if expected != pixels.byte_count() {
                 return Err(ProtocolError::InvalidValue("picture size"));
             }
-            if grey.len() > MAX_INLINE_PICTURE_BYTES {
+            if expected > MAX_INLINE_PICTURE_BYTES {
                 return Err(ProtocolError::FrameTooLarge);
             }
-            Ok((18, 12 + grey.len()))
+            Ok((18, 13 + expected))
         }
         Message::DropPicture { .. } => Ok((19, 4)),
-        Message::BeginPicture { width, height, .. } => {
-            let expected = picture_len(*width, *height)?;
+        Message::BeginPicture {
+            width,
+            height,
+            format,
+            ..
+        } => {
+            let expected = format
+                .byte_len(*width, *height)
+                .ok_or(ProtocolError::FrameTooLarge)?;
             if expected == 0 || expected > MAX_PICTURE_BYTES {
                 return Err(ProtocolError::FrameTooLarge);
             }
-            Ok((20, 12))
+            Ok((20, 13))
         }
-        Message::PictureChunk { offset, grey, .. } => {
-            if grey.is_empty()
-                || grey.len() > MAX_PICTURE_CHUNK_BYTES
+        Message::PictureChunk { offset, bytes, .. } => {
+            if bytes.is_empty()
+                || bytes.len() > MAX_PICTURE_CHUNK_BYTES
                 || usize::try_from(*offset)
                     .ok()
-                    .and_then(|offset| offset.checked_add(grey.len()))
+                    .and_then(|offset| offset.checked_add(bytes.len()))
                     .is_none_or(|end| end > MAX_PICTURE_BYTES)
             {
                 return Err(ProtocolError::FrameTooLarge);
             }
-            Ok((21, 8 + grey.len()))
+            Ok((21, 8 + bytes.len()))
         }
         Message::CommitPicture { .. } => Ok((22, 4)),
         Message::CoverChanged { .. } => Ok((23, 1)),
@@ -2214,11 +2237,19 @@ fn encoded_message_layout(message: &Message) -> Result<(u8, usize), ProtocolErro
     }
 }
 
-fn picture_len(width: u32, height: u32) -> Result<usize, ProtocolError> {
-    usize::try_from(width)
-        .ok()
-        .and_then(|width| width.checked_mul(usize::try_from(height).ok()?))
-        .ok_or(ProtocolError::FrameTooLarge)
+const fn picture_format_tag(format: PictureFormat) -> u8 {
+    match format {
+        PictureFormat::Gray8 => 0,
+        PictureFormat::Rgb8 => 1,
+    }
+}
+
+fn take_picture_format(reader: &mut Reader<'_>) -> Result<PictureFormat, ProtocolError> {
+    match reader.u8()? {
+        0 => Ok(PictureFormat::Gray8),
+        1 => Ok(PictureFormat::Rgb8),
+        _ => Err(ProtocolError::InvalidValue("picture format")),
+    }
 }
 
 #[allow(
@@ -3945,16 +3976,23 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             let handle = PictureHandle(reader.u32()?);
             let width = reader.u32()?;
             let height = reader.u32()?;
-            let expected = picture_len(width, height)?;
+            let format = take_picture_format(&mut reader)?;
+            let expected = format
+                .byte_len(width, height)
+                .ok_or(ProtocolError::FrameTooLarge)?;
             if expected > MAX_INLINE_PICTURE_BYTES {
                 return Err(ProtocolError::FrameTooLarge);
             }
-            let grey = reader.take(expected)?.to_vec();
+            let bytes = reader.take(expected)?.to_vec();
+            let pixels = match format {
+                PictureFormat::Gray8 => PicturePixels::Gray8(bytes),
+                PictureFormat::Rgb8 => PicturePixels::Rgb8(bytes),
+            };
             Message::PutPicture {
                 handle,
                 width,
                 height,
-                grey,
+                pixels,
             }
         }
         19 => Message::DropPicture {
@@ -3964,7 +4002,10 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             let handle = PictureHandle(reader.u32()?);
             let width = reader.u32()?;
             let height = reader.u32()?;
-            let expected = picture_len(width, height)?;
+            let format = take_picture_format(&mut reader)?;
+            let expected = format
+                .byte_len(width, height)
+                .ok_or(ProtocolError::FrameTooLarge)?;
             if expected == 0 || expected > MAX_PICTURE_BYTES {
                 return Err(ProtocolError::FrameTooLarge);
             }
@@ -3972,6 +4013,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
                 handle,
                 width,
                 height,
+                format,
             }
         }
         21 => {
@@ -3991,7 +4033,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             Message::PictureChunk {
                 handle,
                 offset,
-                grey: reader.take(length)?.to_vec(),
+                bytes: reader.take(length)?.to_vec(),
             }
         }
         22 => Message::CommitPicture {
@@ -8455,18 +8497,31 @@ mod picture_tests {
     }
 
     #[test]
-    fn handing_over_a_picture_survives_the_wire() {
+    fn gray_picture_round_trips_with_its_format() {
         let frame = Frame {
             request_id: 1,
             message: Message::PutPicture {
                 handle: PictureHandle(4),
                 width: 3,
                 height: 2,
-                grey: vec![0, 32, 64, 96, 128, 160],
+                pixels: PicturePixels::Gray8(vec![0, 32, 64, 96, 128, 160]),
             },
         };
-        let bytes = encode(&frame).expect("encode");
-        assert_eq!(decode(&bytes).expect("decode"), frame);
+        assert_eq!(decode(&encode(&frame).expect("encode")).expect("decode"), frame);
+    }
+
+    #[test]
+    fn rgb_picture_round_trips_with_its_format() {
+        let frame = Frame {
+            request_id: 1,
+            message: Message::PutPicture {
+                handle: PictureHandle(4),
+                width: 2,
+                height: 1,
+                pixels: PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]),
+            },
+        };
+        assert_eq!(decode(&encode(&frame).expect("encode")).expect("decode"), frame);
     }
 
     #[test]
@@ -8479,7 +8534,7 @@ mod picture_tests {
                 handle: PictureHandle(4),
                 width: 100,
                 height: 100,
-                grey: vec![0; 99],
+                pixels: PicturePixels::Gray8(vec![0; 99]),
             },
         });
         assert!(matches!(refused, Err(ProtocolError::InvalidValue(_))));
@@ -8493,24 +8548,25 @@ mod picture_tests {
                 handle: PictureHandle(4),
                 width: u32::try_from(MAX_INLINE_PICTURE_BYTES + 1).expect("fits"),
                 height: 1,
-                grey: vec![0; MAX_INLINE_PICTURE_BYTES + 1],
+                pixels: PicturePixels::Gray8(vec![0; MAX_INLINE_PICTURE_BYTES + 1]),
             },
         });
         assert!(matches!(refused, Err(ProtocolError::FrameTooLarge)));
     }
 
     #[test]
-    fn every_phase_of_a_large_picture_upload_survives_the_wire() {
+    fn every_phase_of_an_rgb_picture_upload_survives_the_wire() {
         let messages = [
             Message::BeginPicture {
                 handle: PictureHandle(4),
                 width: 1072,
                 height: 1448,
+                format: PictureFormat::Rgb8,
             },
             Message::PictureChunk {
                 handle: PictureHandle(4),
                 offset: 0,
-                grey: vec![17; 4096],
+                bytes: vec![17; 4096],
             },
             Message::CommitPicture {
                 handle: PictureHandle(4),
@@ -8533,10 +8589,50 @@ mod picture_tests {
             message: Message::PictureChunk {
                 handle: PictureHandle(4),
                 offset: 0,
-                grey: vec![0; MAX_PICTURE_CHUNK_BYTES + 1],
+                bytes: vec![0; MAX_PICTURE_CHUNK_BYTES + 1],
             },
         });
         assert!(matches!(refused, Err(ProtocolError::FrameTooLarge)));
+    }
+
+    fn raw_picture_frame(kind: u8, width: u32, height: u32, format: u8, body: &[u8]) -> Vec<u8> {
+        let payload_len = 13 + body.len();
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload_len);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION);
+        bytes.push(kind);
+        bytes.extend_from_slice(&u32::try_from(payload_len).expect("payload fits").to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&4_u32.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.push(format);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn declared_rgb_picture_bodies_with_five_or_seven_bytes_are_refused() {
+        for body in [&[1, 2, 3, 4, 5][..], &[1, 2, 3, 4, 5, 6, 7][..]] {
+            assert!(decode(&raw_picture_frame(18, 2, 1, 1, body)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unknown_picture_format_is_refused() {
+        assert!(matches!(
+            decode(&raw_picture_frame(18, 1, 1, 2, &[0])),
+            Err(ProtocolError::InvalidValue("picture format"))
+        ));
+    }
+
+    #[test]
+    fn an_oversized_picture_is_refused_from_metadata_alone() {
+        let width = u32::try_from(MAX_PICTURE_BYTES + 1).expect("picture bound fits u32");
+        assert!(matches!(
+            decode(&raw_picture_frame(20, width, 1, 0, &[])),
+            Err(ProtocolError::FrameTooLarge)
+        ));
     }
 
     #[test]

@@ -45,7 +45,8 @@ use std::collections::{BTreeMap, VecDeque};
 use kobo_doc::{Block, Document, FORMULA_PICTURE_EM, FORMULA_PICTURE_PREFIX};
 use kobo_read::{Memory, Outcome, Reader};
 use kobo_sdk::{
-    Context, DisplayMetrics, PictureHandle, Screen, Task, TaskId, TaskOutcome, TilePicture,
+    Context, DisplayMetrics, PictureHandle, PicturePixels, Screen, Task, TaskId, TaskOutcome,
+    TilePicture,
 };
 
 /// The most pictures one document may have room reserved for.
@@ -678,7 +679,12 @@ impl BookView {
             let (drawn_width, drawn_height) = (picture.width(), picture.height());
             if let Some(reserved) = self.handed(&name) {
                 if context
-                    .put_picture(reserved, drawn_width, drawn_height, picture.into_grey())
+                    .put_picture(
+                        reserved,
+                        drawn_width,
+                        drawn_height,
+                        PicturePixels::Gray8(picture.into_grey()),
+                    )
                     .is_some()
                     && showing.contains(&name)
                 {

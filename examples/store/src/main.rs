@@ -6,8 +6,8 @@
 
 use kobo_sdk::{
     action_id, ActionId, AppInfo, AppLinkState, Context, DenyReason, DeviceRequest, DeviceResult,
-    Glyph, Heartbeat, KoboApp, PictureHandle, RemoteInstallOutcome, RowLead, Screen, ScreenBuilder,
-    TaskId, TaskOutcome, TilePicture,
+    Glyph, Heartbeat, KoboApp, PictureHandle, PicturePixels, RemoteInstallOutcome, RowLead, Screen,
+    ScreenBuilder, TaskId, TaskOutcome, TilePicture,
 };
 use qrcodegen::{QrCode, QrCodeEcc};
 use std::process::ExitCode;
@@ -625,7 +625,7 @@ fn qr_picture(context: &mut Context, value: &str) -> Option<TilePicture> {
             }
         }
     }
-    context.put_picture(QR_HANDLE, side, side, grey)
+    context.put_picture(QR_HANDLE, side, side, PicturePixels::Gray8(grey))
 }
 
 fn pairing_verification(url: &str) -> Option<String> {
