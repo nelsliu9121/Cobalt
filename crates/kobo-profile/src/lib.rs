@@ -1,5 +1,7 @@
 //! Strict, fail-closed Kobo device profiles.
 
+use kobo_pixels::PictureFormat;
+
 use std::fmt;
 
 /// Which panel-controller interface the device's framebuffer speaks.
@@ -13,6 +15,63 @@ pub enum FramebufferController {
     Hwtcon,
     /// The i.MX6 EPDC v2 interface (72-byte update struct).
     MxcfbV2,
+}
+
+/// One channel in the HWTCON 32-bit color input word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelField {
+    pub offset: u8,
+    pub length: u8,
+}
+
+impl ChannelField {
+    const fn is_eight_bits_within_word(self) -> bool {
+        self.length == 8 && self.offset as u16 + self.length as u16 <= 32
+    }
+
+    const fn overlaps(self, other: Self) -> bool {
+        let end = self.offset as u16 + self.length as u16;
+        let other_end = other.offset as u16 + other.length as u16;
+        (self.offset as u16) < other_end && (other.offset as u16) < end
+    }
+}
+
+/// Explicit, verified facts required to drive a color HWTCON panel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColorPanel {
+    pub red: ChannelField,
+    pub green: ChannelField,
+    pub blue: ChannelField,
+    pub transparency: ChannelField,
+    pub clean_waveform: u32,
+    pub regal_waveform: u32,
+    pub cfa_flags: u32,
+    pub clean_interval: u32,
+}
+
+impl ColorPanel {
+    const fn is_valid_for(self, controller: FramebufferController) -> bool {
+        if !matches!(controller, FramebufferController::Hwtcon)
+            || self.clean_waveform == 0
+            || self.regal_waveform == 0
+            || self.clean_waveform == self.regal_waveform
+            || self.cfa_flags == 0
+            || self.clean_interval != 4
+            || !self.red.is_eight_bits_within_word()
+            || !self.green.is_eight_bits_within_word()
+            || !self.blue.is_eight_bits_within_word()
+            || !self.transparency.is_eight_bits_within_word()
+        {
+            return false;
+        }
+
+        !self.red.overlaps(self.green)
+            && !self.red.overlaps(self.blue)
+            && !self.red.overlaps(self.transparency)
+            && !self.green.overlaps(self.blue)
+            && !self.green.overlaps(self.transparency)
+            && !self.blue.overlaps(self.transparency)
+    }
 }
 
 /// How a device's touch controller reports position relative to the display.
@@ -241,6 +300,7 @@ pub const CLARA_BW_391: DeviceProfile = DeviceProfile {
     compatible_fragments: &["mediatek,mt8110", "mediatek,mt8512"],
     framebuffer_id: "hwtcon",
     framebuffer_controller: FramebufferController::Hwtcon,
+    color: None,
     width: 1072,
     height: 1448,
     pixels_per_inch: 300,
@@ -307,6 +367,7 @@ pub const CLARA_BW_395: DeviceProfile = DeviceProfile {
     compatible_fragments: &["mediatek,mt8110", "mediatek,mt8512"],
     framebuffer_id: "hwtcon",
     framebuffer_controller: FramebufferController::Hwtcon,
+    color: None,
     width: 1072,
     height: 1448,
     pixels_per_inch: 300,
@@ -374,6 +435,7 @@ pub const CLARA_HD_376: DeviceProfile = DeviceProfile {
     compatible_fragments: &["fsl,imx6sll-lpddr3-arm2", "fsl,imx6sll"],
     framebuffer_id: "mxc_epdc_fb",
     framebuffer_controller: FramebufferController::MxcfbV2,
+    color: None,
     width: 1072,
     height: 1448,
     pixels_per_inch: 300,
@@ -437,6 +499,7 @@ pub const CLARA_COLOUR_393: DeviceProfile = DeviceProfile {
     id: "clara-colour-393",
     model: "Kobo Clara Colour",
     device_code: 393,
+    color: None,
     serial_prefix: "N367",
     write_ready: true,
     reap_nickel_supplicant: false,
@@ -451,6 +514,7 @@ pub const ELIPSA_2E_389: DeviceProfile = DeviceProfile {
     compatible_fragments: &["mediatek,mt8110", "mediatek,mt8512"],
     framebuffer_id: "hwtcon",
     framebuffer_controller: FramebufferController::Hwtcon,
+    color: None,
     width: 1404,
     height: 1872,
     pixels_per_inch: 227,
@@ -535,6 +599,7 @@ pub const LIBRA_2_388: DeviceProfile = DeviceProfile {
     compatible_fragments: &["fsl,imx6sll"],
     framebuffer_id: "mxc_epdc_fb",
     framebuffer_controller: FramebufferController::MxcfbV2,
+    color: None,
     width: 1264,
     height: 1680,
     pixels_per_inch: 300,
@@ -635,6 +700,7 @@ pub const LIBRA_COLOUR_390: DeviceProfile = DeviceProfile {
     compatible_fragments: &["mediatek,mt8110", "mediatek,mt8512"],
     framebuffer_id: "hwtcon",
     framebuffer_controller: FramebufferController::Hwtcon,
+    color: None,
     width: 1264,
     height: 1680,
     pixels_per_inch: 300,
@@ -852,6 +918,8 @@ pub struct DeviceProfile {
     pub framebuffer_id: &'static str,
     /// Which update ABI this device's framebuffer driver implements.
     pub framebuffer_controller: FramebufferController,
+    /// Verified color update capability. Absence is deliberately grayscale.
+    pub color: Option<ColorPanel>,
     pub width: u32,
     pub height: u32,
     pub pixels_per_inch: u16,
@@ -969,10 +1037,27 @@ pub struct ValidationReport {
 }
 
 impl DeviceProfile {
+    /// The only picture pixel format safe to expose to applications.
+    ///
+    /// A malformed declaration falls back to grayscale as well as making
+    /// profile validation fail, so no caller can accidentally opt into color.
+    #[must_use]
+    pub const fn picture_format(&self) -> PictureFormat {
+        match self.color {
+            Some(color) if color.is_valid_for(self.framebuffer_controller) => PictureFormat::Rgb8,
+            Some(_) | None => PictureFormat::Gray8,
+        }
+    }
+
     #[must_use]
     pub fn validate(&self, snapshot: &DeviceSnapshot) -> ValidationReport {
         let mut mismatches = Vec::new();
         let mut blockers = Vec::new();
+        if let Some(color) = self.color {
+            if !color.is_valid_for(self.framebuffer_controller) {
+                mismatches.push("color capability is invalid".to_owned());
+            }
+        }
 
         for fragment in self.compatible_fragments {
             if !snapshot
@@ -1639,10 +1724,12 @@ mod tests {
     const CLARA_HD_POSE: PanelPose<'static> = PanelPose::reference(&CLARA_HD_376);
 
     use super::{
-        identify_profile, Bitfield, DeviceProfile, DeviceSnapshot, FramebufferSnapshot,
-        IdentitySnapshot, Readiness, TouchSnapshot, CLARA_BW_391, CLARA_BW_395, CLARA_COLOUR_393,
-        CLARA_HD_376, ELIPSA_2E_389, LIBRA_2_388, LIBRA_COLOUR_390, WRITE_EVIDENCE_PENDING,
+        identify_profile, Bitfield, ChannelField, ColorPanel, DeviceProfile, DeviceSnapshot,
+        FramebufferController, FramebufferSnapshot, IdentitySnapshot, Readiness, TouchSnapshot,
+        CLARA_BW_391, CLARA_BW_395, CLARA_COLOUR_393, CLARA_HD_376, ELIPSA_2E_389, LIBRA_2_388,
+        LIBRA_COLOUR_390, WRITE_EVIDENCE_PENDING,
     };
+    use kobo_pixels::PictureFormat;
 
     /// The Libra 2 as `kobo doctor` read it from a cold boot into Nickel, in
     /// portrait. `rotation` picks the orientation: 1 as measured in portrait,
@@ -2664,5 +2751,195 @@ mod tests {
     fn missing_identity_blocks_every_write() {
         let blockers = CLARA_BW_391.write_identity_blockers(&DeviceSnapshot::default());
         assert_eq!(blockers.len(), 4);
+    }
+
+    const VALID_COLOR_PANEL: ColorPanel = ColorPanel {
+        red: ChannelField {
+            offset: 0,
+            length: 8,
+        },
+        green: ChannelField {
+            offset: 8,
+            length: 8,
+        },
+        blue: ChannelField {
+            offset: 16,
+            length: 8,
+        },
+        transparency: ChannelField {
+            offset: 24,
+            length: 8,
+        },
+        clean_waveform: 10,
+        regal_waveform: 11,
+        cfa_flags: 0x600,
+        clean_interval: 4,
+    };
+
+    fn valid_color_profile() -> DeviceProfile {
+        DeviceProfile {
+            color: Some(VALID_COLOR_PANEL),
+            ..CLARA_BW_391
+        }
+    }
+
+    fn assert_color_capability_rejected(profile: DeviceProfile) {
+        let report = profile.validate(&clara_panel_snapshot(clara_bw_identity()));
+        assert_eq!(report.readiness, Readiness::Rejected);
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .any(|mismatch| mismatch.contains("color capability")),
+            "{:?}",
+            report.mismatches
+        );
+        assert_eq!(profile.picture_format(), PictureFormat::Gray8);
+    }
+
+    #[test]
+    fn color_is_not_advertised_without_a_verified_capability() {
+        for profile in SUPPORTED_PROFILES {
+            assert_eq!(profile.color, None, "{} inferred color", profile.id);
+            assert_eq!(
+                profile.picture_format(),
+                PictureFormat::Gray8,
+                "{} advertised color without a capability",
+                profile.id
+            );
+        }
+        assert_eq!(CLARA_COLOUR_393.picture_format(), PictureFormat::Gray8);
+        assert_eq!(LIBRA_COLOUR_390.picture_format(), PictureFormat::Gray8);
+    }
+
+    #[test]
+    fn color_is_advertised_for_a_strictly_valid_hwtcon_capability() {
+        let profile = valid_color_profile();
+        let report = profile.validate(&clara_panel_snapshot(clara_bw_identity()));
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert_eq!(profile.picture_format(), PictureFormat::Rgb8);
+    }
+
+    #[test]
+    fn color_is_rejected_on_a_non_hwtcon_controller() {
+        assert_color_capability_rejected(DeviceProfile {
+            framebuffer_controller: FramebufferController::MxcfbV2,
+            ..valid_color_profile()
+        });
+    }
+
+    #[test]
+    fn color_is_rejected_for_zero_or_equal_waveforms() {
+        for color in [
+            ColorPanel {
+                clean_waveform: 0,
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                regal_waveform: 0,
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                regal_waveform: VALID_COLOR_PANEL.clean_waveform,
+                ..VALID_COLOR_PANEL
+            },
+        ] {
+            assert_color_capability_rejected(DeviceProfile {
+                color: Some(color),
+                ..CLARA_BW_391
+            });
+        }
+    }
+
+    #[test]
+    fn color_is_rejected_without_cfa_flags() {
+        assert_color_capability_rejected(DeviceProfile {
+            color: Some(ColorPanel {
+                cfa_flags: 0,
+                ..VALID_COLOR_PANEL
+            }),
+            ..CLARA_BW_391
+        });
+    }
+
+    #[test]
+    fn color_is_rejected_without_the_four_update_cleaning_interval() {
+        for clean_interval in [0, 3, 5] {
+            assert_color_capability_rejected(DeviceProfile {
+                color: Some(ColorPanel {
+                    clean_interval,
+                    ..VALID_COLOR_PANEL
+                }),
+                ..CLARA_BW_391
+            });
+        }
+    }
+
+    #[test]
+    fn color_is_rejected_when_any_channel_is_not_eight_bits() {
+        let short = ChannelField {
+            offset: 0,
+            length: 7,
+        };
+        for color in [
+            ColorPanel {
+                red: short,
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                green: ChannelField {
+                    offset: 8,
+                    ..short
+                },
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                blue: ChannelField {
+                    offset: 16,
+                    ..short
+                },
+                ..VALID_COLOR_PANEL
+            },
+            ColorPanel {
+                transparency: ChannelField {
+                    offset: 24,
+                    ..short
+                },
+                ..VALID_COLOR_PANEL
+            },
+        ] {
+            assert_color_capability_rejected(DeviceProfile {
+                color: Some(color),
+                ..CLARA_BW_391
+            });
+        }
+    }
+
+    #[test]
+    fn color_is_rejected_when_channels_overlap() {
+        assert_color_capability_rejected(DeviceProfile {
+            color: Some(ColorPanel {
+                green: ChannelField {
+                    offset: 0,
+                    length: 8,
+                },
+                ..VALID_COLOR_PANEL
+            }),
+            ..CLARA_BW_391
+        });
+    }
+
+    #[test]
+    fn color_is_rejected_when_a_channel_extends_past_bit_31() {
+        assert_color_capability_rejected(DeviceProfile {
+            color: Some(ColorPanel {
+                transparency: ChannelField {
+                    offset: 25,
+                    length: 8,
+                },
+                ..VALID_COLOR_PANEL
+            }),
+            ..CLARA_BW_391
+        });
     }
 }

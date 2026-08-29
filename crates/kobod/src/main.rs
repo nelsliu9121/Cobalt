@@ -30,6 +30,7 @@ fn metrics_for_profile(
         )
     })?;
     metrics.pixels_per_inch = i32::from(profile.pixels_per_inch);
+    metrics.picture_format = profile.picture_format();
     Ok(metrics)
 }
 
@@ -461,6 +462,7 @@ fn serve_simulation(socket_path: &Path, frame_path: &Path) -> Result<(), Box<dyn
                 height: u16::try_from(metrics.height)?,
                 pixels_per_inch: u16::try_from(metrics.pixels_per_inch)?,
                 text_scale: metrics.text_scale,
+                picture_format: metrics.picture_format,
             },
         },
     )?;
@@ -556,8 +558,8 @@ fn serve_application(
                 handle,
                 width,
                 height,
-                grey,
-            } => match pictures.put_report(handle, width, height, grey) {
+                pixels,
+            } => match pictures.put_report(handle, width, height, pixels) {
                 None => println!("picture {} refused", handle.0),
                 Some(evicted) if !evicted.is_empty() => {
                     println!("picture {} evicted {evicted:?}", handle.0);
@@ -568,20 +570,21 @@ fn serve_application(
                 handle,
                 width,
                 height,
+                format,
             } => {
-                if !pictures.begin_upload(handle, width, height) {
+                if !pictures.begin_upload(handle, width, height, format) {
                     println!("picture {} upload refused", handle.0);
                 }
             }
             Message::PictureChunk {
                 handle,
                 offset,
-                grey,
+                bytes,
             } => {
                 if !pictures.upload_chunk(
                     handle,
                     usize::try_from(offset).unwrap_or(usize::MAX),
-                    &grey,
+                    &bytes,
                 ) {
                     println!("picture {} chunk refused", handle.0);
                 }
@@ -814,7 +817,7 @@ fn write_screen(
         .create_new(true)
         .open(&temporary)?;
     let result = (|| -> std::io::Result<()> {
-        file.write_all(&surface.pixels)?;
+        file.write_all(surface.bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)
     })();
@@ -886,6 +889,39 @@ mod tests {
         assert_eq!(metrics.height, 1872);
         assert_eq!(metrics.pixels_per_inch, 227);
         assert_eq!(metrics.text_scale, kobo_ui::TextScale::Large);
+        assert_eq!(metrics.picture_format, kobo_ui::PictureFormat::Gray8);
+    }
+
+    #[test]
+    fn a_verified_color_profile_supplies_rgb_metrics() {
+        let profile = kobo_profile::DeviceProfile {
+            color: Some(kobo_profile::ColorPanel {
+                red: kobo_profile::ChannelField {
+                    offset: 0,
+                    length: 8,
+                },
+                green: kobo_profile::ChannelField {
+                    offset: 8,
+                    length: 8,
+                },
+                blue: kobo_profile::ChannelField {
+                    offset: 16,
+                    length: 8,
+                },
+                transparency: kobo_profile::ChannelField {
+                    offset: 24,
+                    length: 8,
+                },
+                clean_waveform: 10,
+                regal_waveform: 11,
+                cfa_flags: 0x600,
+                clean_interval: 4,
+            }),
+            ..kobo_profile::CLARA_BW_391
+        };
+        let metrics = super::metrics_for_profile(&profile, kobo_ui::CLARA_BW_METRICS)
+            .expect("the supported profile fits layout coordinates");
+        assert_eq!(metrics.picture_format, kobo_ui::PictureFormat::Rgb8);
     }
 
     fn plain() -> kobo_ui::Screen {

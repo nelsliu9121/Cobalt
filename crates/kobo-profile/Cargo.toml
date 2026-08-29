@@ -6,6 +6,9 @@ publish = false
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+kobo-pixels = { path = "../kobo-pixels" }
+
 [lints]
 workspace = true
 

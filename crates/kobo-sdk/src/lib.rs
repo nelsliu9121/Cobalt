@@ -4896,6 +4896,7 @@ impl Client {
             height,
             pixels_per_inch,
             text_scale,
+            picture_format,
         } = response.message
         else {
             return Err(ClientError::UnexpectedMessage);
@@ -4908,7 +4909,7 @@ impl Client {
                 height: i32::from(height),
                 pixels_per_inch: i32::from(pixels_per_inch),
                 text_scale,
-                picture_format: PictureFormat::Gray8,
+                picture_format,
             },
         })
     }
@@ -6020,7 +6021,7 @@ mod tests {
     }
 
     #[test]
-    fn client_handshake_and_screen_delivery() {
+    fn lifecycle_supplies_client_metrics_and_screen_delivery() {
         let (client_stream, mut daemon_stream) = UnixStream::pair().expect("socket pair");
         let daemon = thread::spawn(move || {
             let hello = kobo_protocol::read_from(&mut daemon_stream).expect("hello");
@@ -6034,6 +6035,7 @@ mod tests {
                         height: 1448,
                         pixels_per_inch: 300,
                         text_scale: kobo_ui::TextScale::Default,
+                        picture_format: PictureFormat::Rgb8,
                     },
                 },
             )
@@ -6042,7 +6044,13 @@ mod tests {
             assert!(matches!(screen.message, Message::SetScreen(_)));
         });
         let mut client = Client::from_stream(client_stream, "counter").expect("connect");
-        assert_eq!(client.metrics(), kobo_ui::CLARA_BW_METRICS);
+        assert_eq!(
+            client.metrics(),
+            DisplayMetrics {
+                picture_format: PictureFormat::Rgb8,
+                ..kobo_ui::CLARA_BW_METRICS
+            }
+        );
         client
             .send_commands([Command::SetScreen(
                 ScreenBuilder::new("counter").heading("Counter").build(),
@@ -6065,6 +6073,7 @@ mod tests {
                         height: 1448,
                         pixels_per_inch: 300,
                         text_scale: kobo_ui::TextScale::Default,
+                        picture_format: PictureFormat::Gray8,
                     },
                 },
             )

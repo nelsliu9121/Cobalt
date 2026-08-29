@@ -47,8 +47,8 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// adds bounded rich EPUB text and runtime-held publisher-font handles.
 /// Version 10 adds exact text-hold coordinates and typed offline dictionary
 /// requests/results. Version 11 adds the runtime-owned reading surface.
-/// Version 12 adds a pixel-format byte to inline pictures and the start of
-/// chunked picture uploads.
+/// Version 12 adds pixel-format bytes to the startup metrics and inline
+/// pictures, plus the start of chunked picture uploads.
 pub const VERSION: u8 = 12;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
@@ -577,6 +577,8 @@ pub enum Message {
         /// The reader's accessibility preference. Applications receive this
         /// before laying out or paginating any content.
         text_scale: TextScale,
+        /// The only picture pixel format the runtime has accepted for this panel.
+        picture_format: PictureFormat,
     },
     SetScreen(Screen),
     Action {
@@ -1559,11 +1561,13 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             height,
             pixels_per_inch,
             text_scale,
+            picture_format,
         } => {
             push_u16(&mut payload, *width);
             push_u16(&mut payload, *height);
             push_u16(&mut payload, *pixels_per_inch);
             payload.push(text_scale.wire_value());
+            payload.push(picture_format_tag(*picture_format));
         }
         Message::SetScreen(screen) => {
             let mut count = 0;
@@ -2126,7 +2130,7 @@ fn encoded_task_len(work: &Task) -> Result<usize, ProtocolError> {
 fn encoded_message_layout(message: &Message) -> Result<(u8, usize), ProtocolError> {
     match message {
         Message::Hello { name } => Ok((1, encoded_string_len(name)?)),
-        Message::Welcome { .. } => Ok((2, 7)),
+        Message::Welcome { .. } => Ok((2, 8)),
         Message::SetScreen(screen) => {
             let mut count = 0;
             Ok((3, encoded_screen_len(screen, 0, &mut count)?))
@@ -3710,6 +3714,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             pixels_per_inch: reader.u16()?,
             text_scale: TextScale::from_wire(reader.u8()?)
                 .ok_or(ProtocolError::InvalidValue("text scale"))?,
+            picture_format: take_picture_format(&mut reader)?,
         },
         3 => {
             let mut count = 0;
@@ -7810,6 +7815,47 @@ mod node_coverage_tests {
                 "an unknown {label} tag was accepted"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_started_metrics_round_trip_with_picture_format() {
+        let frame = Frame {
+            request_id: 7,
+            message: Message::Welcome {
+                width: 1264,
+                height: 1680,
+                pixels_per_inch: 300,
+                text_scale: TextScale::Large,
+                picture_format: PictureFormat::Rgb8,
+            },
+        };
+        let encoded = encode(&frame).expect("encode lifecycle");
+        assert_eq!(decode(&encoded).expect("decode lifecycle"), frame);
+    }
+
+    #[test]
+    fn lifecycle_rejects_an_unknown_picture_format() {
+        let mut encoded = encode(&Frame {
+            request_id: 7,
+            message: Message::Welcome {
+                width: 1072,
+                height: 1448,
+                pixels_per_inch: 300,
+                text_scale: TextScale::Default,
+                picture_format: PictureFormat::Gray8,
+            },
+        })
+        .expect("encode lifecycle");
+        *encoded.last_mut().expect("picture format byte") = 2;
+        assert_eq!(
+            decode(&encoded),
+            Err(ProtocolError::InvalidValue("picture format"))
+        );
     }
 }
 

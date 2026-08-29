@@ -836,6 +836,9 @@ dependencies = [
 [[package]]
 name = "kobo-profile"
 version = "0.3.0"
+dependencies = [
+ "kobo-pixels",
+]
 
 [[package]]
 name = "kobo-protocol"

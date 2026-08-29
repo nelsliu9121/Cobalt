@@ -35,6 +35,7 @@ fn profile_metrics() -> DisplayMetrics {
         width: i32::try_from(PROFILE.width).unwrap_or(i32::MAX),
         height: i32::try_from(PROFILE.height).unwrap_or(i32::MAX),
         pixels_per_inch: i32::from(PROFILE.pixels_per_inch),
+        picture_format: kobo_ui::PictureFormat::Gray8,
         text_scale: kobo_ui::display_metrics_from_env().text_scale,
     }
 }
@@ -126,13 +127,13 @@ impl PanelPreview {
 
     fn update(&mut self, surface: &Surface) {
         self.ideal.clear();
-        self.ideal.extend_from_slice(&surface.pixels);
+        self.ideal.extend_from_slice(surface.bytes());
         let Some(transition) = self.planner.plan(surface) else {
             self.last = None;
             return;
         };
         if transition.full {
-            self.visible.copy_from_slice(&surface.pixels);
+            self.visible.copy_from_slice(surface.bytes());
         } else {
             self.apply_partial(surface, transition);
         }
@@ -158,7 +159,7 @@ impl PanelPreview {
             let row = y.saturating_mul(surface.width);
             for x in left..left.saturating_add(width) {
                 let index = row.saturating_add(x);
-                let Some(target) = surface.pixels.get(index).copied() else {
+                let Some(target) = surface.bytes().get(index).copied() else {
                     continue;
                 };
                 let Some(visible) = self.visible.get_mut(index) else {
@@ -574,6 +575,7 @@ impl AppServer {
                     height: u16::try_from(PROFILE.height).unwrap_or(u16::MAX),
                     pixels_per_inch: PROFILE.pixels_per_inch,
                     text_scale: profile_metrics().text_scale,
+                    picture_format: kobo_ui::PictureFormat::Gray8,
                 },
             },
         )?;
@@ -729,22 +731,23 @@ fn hold_picture(state: &Arc<Mutex<AppState>>, message: Message) -> io::Result<()
                 handle,
                 width,
                 height,
-                grey,
-            } => picture_result(handle, pictures.put_report(handle, width, height, grey)),
+                pixels,
+            } => picture_result(handle, pictures.put_report(handle, width, height, pixels)),
             Message::BeginPicture {
                 handle,
                 width,
                 height,
-            } => (!pictures.begin_upload(handle, width, height))
+                format,
+            } => (!pictures.begin_upload(handle, width, height, format))
                 .then(|| format!("picture {} upload refused", handle.0)),
             Message::PictureChunk {
                 handle,
                 offset,
-                grey,
+                bytes,
             } => (!pictures.upload_chunk(
                 handle,
                 usize::try_from(offset).unwrap_or(usize::MAX),
-                &grey,
+                &bytes,
             ))
             .then(|| format!("picture {} chunk refused", handle.0)),
             Message::CommitPicture { handle } => {
@@ -3015,21 +3018,32 @@ mod tests {
     fn leaving_cache_pressure_restores_the_normal_picture_cache() {
         let handle = kobo_ui::PictureHandle(7);
         let mut state = AppState::default();
-        assert!(state.pictures.put(handle, 1, 1, vec![kobo_ui::tone::INK]));
+        assert!(state.pictures.put(
+            handle,
+            1,
+            1,
+            kobo_ui::PicturePixels::Gray8(vec![kobo_ui::tone::INK]),
+        ));
 
         state.scenario = Scenario::CachePressure;
         assert!(!kobo_ui::Pictures::contains(
             state.active_pictures(),
             handle
         ));
-        assert!(state
-            .pressure_pictures
-            .put(handle, 1, 1, vec![kobo_ui::tone::PAPER]));
+        assert!(state.pressure_pictures.put(
+            handle,
+            1,
+            1,
+            kobo_ui::PicturePixels::Gray8(vec![kobo_ui::tone::PAPER]),
+        ));
 
         state.scenario = Scenario::Normal;
         let restored = kobo_ui::Pictures::get(state.active_pictures(), handle)
             .expect("normal cache survived the scenario");
-        assert_eq!(restored.grey, &[kobo_ui::tone::INK]);
+        assert_eq!(
+            restored,
+            kobo_ui::PicturePixelsRef::Gray8(&[kobo_ui::tone::INK]),
+        );
     }
 
     #[test]
@@ -3142,6 +3156,7 @@ mod tests {
                     height: u16::try_from(PROFILE.height).expect("profile height"),
                     pixels_per_inch: PROFILE.pixels_per_inch,
                     text_scale: kobo_ui::TextScale::Default,
+                    picture_format: kobo_ui::PictureFormat::Gray8,
                 }
             );
             write_protocol_frame(

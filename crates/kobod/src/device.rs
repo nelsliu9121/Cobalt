@@ -46,8 +46,8 @@ use kobo_policy::{
 };
 use kobo_protocol::{Frame, Lifecycle, Message, TaskError, TaskOutcome};
 use kobo_ui::{
-    render_all, ActionId, Chrome, FontHandle, FramePlanner, PanelWaveform, PictureCache, Screen,
-    Surface,
+    render_all, ActionId, Chrome, FontHandle, FramePlanner, PanelWaveform, PictureCache,
+    PictureFormat, Screen, Surface,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -1658,8 +1658,8 @@ fn host_applications(
                             handle,
                             width,
                             height,
-                            grey,
-                        } => match apps[index].pictures.put_report(handle, width, height, grey) {
+                            pixels,
+                        } => match apps[index].pictures.put_report(handle, width, height, pixels) {
                             None => trace(&format!("picture {} refused", handle.0)),
                             Some(evicted) => trace_picture_evictions(handle, &evicted),
                         },
@@ -1667,20 +1667,21 @@ fn host_applications(
                             handle,
                             width,
                             height,
+                            format,
                         } => {
-                            if !apps[index].pictures.begin_upload(handle, width, height) {
+                            if !apps[index].pictures.begin_upload(handle, width, height, format) {
                                 trace(&format!("picture {} upload refused", handle.0));
                             }
                         }
                         Message::PictureChunk {
                             handle,
                             offset,
-                            grey,
+                            bytes,
                         } => {
                             if !apps[index].pictures.upload_chunk(
                                 handle,
                                 usize::try_from(offset).unwrap_or(usize::MAX),
-                                &grey,
+                                &bytes,
                             ) {
                                 trace(&format!("picture {} chunk refused", handle.0));
                             }
@@ -2968,6 +2969,7 @@ fn greet(
             "application identity mismatch: launched {expected_name:?}, but it said {name:?}"
         ));
     }
+    let metrics = crate::device_metrics();
     kobo_protocol::write_to(
         &mut stream,
         &Frame {
@@ -2978,9 +2980,9 @@ fn greet(
                 // The panel this runtime renders for. An application that
                 // measures text has to measure it for the same one, and pixel
                 // counts alone do not say how large a pixel is.
-                pixels_per_inch: u16::try_from(crate::device_metrics().pixels_per_inch)
-                    .unwrap_or(u16::MAX),
-                text_scale: crate::device_metrics().text_scale,
+                pixels_per_inch: u16::try_from(metrics.pixels_per_inch).unwrap_or(u16::MAX),
+                text_scale: metrics.text_scale,
+                picture_format: metrics.picture_format,
             },
         },
     )
@@ -3129,6 +3131,9 @@ impl Painter {
         whole_screen: Rect,
         surface: &Surface,
     ) -> Result<(), String> {
+        if surface.format != PictureFormat::Gray8 {
+            return Err("color framebuffer output is not implemented".to_owned());
+        }
         let Some(transition) = self.frames.plan(surface) else {
             // Nothing moved. Refreshing anyway costs a visible flicker and
             // some battery to show exactly the same picture.
@@ -3161,7 +3166,7 @@ impl Painter {
             for row in 0..height {
                 let start = (y + row) * surface.width + x;
                 let end = start + width;
-                gray.extend_from_slice(surface.pixels.get(start..end).ok_or_else(out_of_surface)?);
+                gray.extend_from_slice(surface.bytes().get(start..end).ok_or_else(out_of_surface)?);
             }
             gray
         };
