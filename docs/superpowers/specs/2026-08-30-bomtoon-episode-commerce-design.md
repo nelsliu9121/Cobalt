@@ -529,7 +529,7 @@ Record only sanitized business fields. Revoke capture sessions afterward. No liv
 Verified on 2026-08-31:
 
 - `cargo fmt --all --check` exited zero.
-- `cargo test --workspace --all-targets --all-features` passed 2,671 tests across 55 suites, with 2 ignored and no failures.
+- `cargo test --workspace --all-targets --all-features` passed 2,676 tests across 55 suites, with 2 ignored and no failures.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited zero.
 - Focused commerce, managed-account, protocol, catalog, runtime-compatibility, and BOMTOON package tests all passed before the workspace gates.
 - The browser simulator rendered the Clara BW Featured surface, switched among public destinations, and exercised an offline title open. The offline surface displayed `Join Wi-Fi` guidance and a retry action; no live mutation was submitted.
