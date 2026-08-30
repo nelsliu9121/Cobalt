@@ -82,13 +82,9 @@ const INITIAL_STATE: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-/// Returns the lowercase hexadecimal SHA-256 digest of `message`.
-///
-/// The message is read in place; the only allocation is the final block or
-/// two of padding, so hashing a whole downloaded archive costs no second
-/// copy of it.
+/// Returns the raw SHA-256 digest of `message`.
 #[must_use]
-pub fn hex_digest(message: &[u8]) -> String {
+pub fn digest(message: &[u8]) -> [u8; 32] {
     let mut state = INITIAL_STATE;
     let whole = message.len() - message.len() % 64;
     for chunk in message[..whole].chunks_exact(64) {
@@ -98,14 +94,55 @@ pub fn hex_digest(message: &[u8]) -> String {
         compress(&mut state, chunk);
     }
 
-    let mut digest = String::with_capacity(64);
-    for word in state {
-        for byte in word.to_be_bytes() {
-            digest.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
-            digest.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
-        }
+    let mut output = [0_u8; 32];
+    for (slot, word) in output.chunks_exact_mut(4).zip(state) {
+        slot.copy_from_slice(&word.to_be_bytes());
     }
-    digest
+    output
+}
+
+/// Returns the lowercase hexadecimal SHA-256 digest of `message`.
+///
+/// The message is read in place; the only allocation is the final block or
+/// two of padding and the returned hexadecimal string, so hashing a whole
+/// downloaded archive costs no second copy of it.
+#[must_use]
+pub fn hex_digest(message: &[u8]) -> String {
+    lower_hex(&digest(message))
+}
+
+/// Returns the lowercase hexadecimal HMAC-SHA-256 of `message` under `key`.
+#[must_use]
+pub fn hmac_hex(key: &[u8], message: &[u8]) -> String {
+    let mut key_block = [0_u8; 64];
+    if key.len() > key_block.len() {
+        key_block[..32].copy_from_slice(&digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = Vec::with_capacity(key_block.len() + message.len());
+    inner.extend(key_block.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(message);
+    let inner_digest = digest(&inner);
+
+    let mut outer = [0_u8; 96];
+    for (slot, byte) in outer[..64].iter_mut().zip(key_block) {
+        *slot = byte ^ 0x5c;
+    }
+    outer[64..].copy_from_slice(&inner_digest);
+    lower_hex(&digest(&outer))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        output.push(char::from(
+            b"0123456789abcdef"[usize::from(byte & 0x0f)],
+        ));
+    }
+    output
 }
 
 /// The padded end of a message: whatever bytes did not fill a block, the
@@ -172,7 +209,7 @@ fn compress(state: &mut [u32; 8], chunk: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::hex_digest;
+    use super::{digest, hex_digest, hmac_hex};
 
     #[test]
     fn matches_the_published_test_vectors() {
@@ -191,6 +228,37 @@ mod tests {
         assert_eq!(
             hex_digest(&vec![0x61_u8; 1_000_000]),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn raw_digest_matches_the_published_abc_vector() {
+        assert_eq!(
+            digest(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
+                0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
+                0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231_sha256_vectors() {
+        assert_eq!(
+            hmac_hex(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hmac_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hmac_hex(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }
 

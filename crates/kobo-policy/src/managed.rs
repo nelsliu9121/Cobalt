@@ -19,6 +19,8 @@ pub type Clock = dyn Fn() -> u64 + Send + Sync;
 const STATE_VERSION_V1: &str = "cobalt-managed-v1";
 const STATE_VERSION_V2: &str = "cobalt-managed-v2";
 const MAX_STATE_BYTES: usize = 2 * MAX_SECRET_BYTES + 1024;
+const SCOPE_KEY_HEX_BYTES: usize = 64;
+const ACCOUNT_SCOPE_HEX_BYTES: usize = 32;
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +33,7 @@ enum FaultPoint {
     RemoveState,
     SyncStateParentAfterRename,
     SyncSecretsAfterRename,
+    WriteScopeKey,
 }
 
 #[cfg(test)]
@@ -94,6 +97,10 @@ pub trait ManagedCredentialRecipe: Send + Sync {
     fn binding_secret_name(&self) -> &'static str;
     /// Stable, non-secret identifier for the current session cookie.
     fn binding_digest(&self, secret: &str) -> String;
+    /// Derives private key material when no durable account-scope key exists.
+    fn derive_scope_key(&self, binding_secret: &str) -> String;
+    /// Derives the opaque application-facing scope for one provider account.
+    fn derive_account_scope(&self, scope_key: &str, account_subject: &str) -> String;
     /// Creates a token pair from the current provider session.
     ///
     /// # Errors
@@ -263,6 +270,37 @@ impl ManagedCredentials {
     /// the token pair.
     pub fn resolve(&self, wanted: &Credential) -> Result<Option<ResolvedCredential>, TaskError> {
         self.with_resolved(wanted, Clone::clone)
+    }
+
+    /// Returns a stable opaque scope for the current provider account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError::Denied`] for legacy state without an account
+    /// subject, [`TaskError::NoCredential`] when the binding secret is absent,
+    /// [`TaskError::LocalStorage`] when durable private state is malformed or
+    /// cannot be updated, or the provider error from bootstrap or refresh.
+    pub fn scope(&self, credential: &str) -> Result<Option<String>, TaskError> {
+        if credential != self.recipe.credential_name() {
+            return Ok(None);
+        }
+
+        let mut inner = self.lock_inner()?;
+        let lease = self.acquire_lease()?;
+        let cookie = self.read_binding_secret()?.ok_or(TaskError::NoCredential)?;
+        let digest = self.checked_digest(&cookie)?;
+        let pair = self.obtain_pair(&mut inner, &cookie, &digest, false)?;
+        let account_subject = pair.account_subject.as_deref().ok_or(TaskError::Denied)?;
+        let scope_key = self.read_or_create_scope_key(&cookie)?;
+        let scope = self
+            .recipe
+            .derive_account_scope(&scope_key, account_subject);
+        if !valid_lower_hex(&scope, ACCOUNT_SCOPE_HEX_BYTES) {
+            return Err(TaskError::LocalStorage);
+        }
+        drop(lease);
+        drop(inner);
+        Ok(Some(scope))
     }
 
     /// Renews a matching managed bearer credential regardless of its expiry.
@@ -628,6 +666,24 @@ impl ManagedCredentials {
         managed_state_path(&self.state, self.recipe.credential_name())
     }
 
+    fn scope_key_path(&self) -> PathBuf {
+        self.state
+            .join(format!("{}.scope-key", self.recipe.credential_name()))
+    }
+
+    fn read_or_create_scope_key(&self, binding_secret: &str) -> Result<String, TaskError> {
+        let path = self.scope_key_path();
+        if let Some(scope_key) = read_scope_key(&path)? {
+            return Ok(scope_key);
+        }
+        let scope_key = self.recipe.derive_scope_key(binding_secret);
+        if !valid_lower_hex(&scope_key, SCOPE_KEY_HEX_BYTES) {
+            return Err(TaskError::LocalStorage);
+        }
+        write_scope_key(&path, &scope_key)?;
+        Ok(scope_key)
+    }
+
     fn acquire_lease(&self) -> Result<ManagedCredentialLease, TaskError> {
         acquire_managed_credential_lease(&self.state, self.recipe.credential_name())
     }
@@ -733,6 +789,30 @@ fn valid_provider_pair(pair: &ManagedTokenPair, now: u64) -> bool {
     valid_pair(pair) && pair.access_expires_at_ms > now && pair.refresh_expires_at_ms > now
 }
 
+
+fn valid_lower_hex(value: &str, expected_bytes: usize) -> bool {
+    value.len() == expected_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn read_scope_key(path: &Path) -> Result<Option<String>, TaskError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(TaskError::LocalStorage),
+    };
+    let mut bytes = Vec::with_capacity(SCOPE_KEY_HEX_BYTES + 1);
+    file.take(SCOPE_KEY_HEX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| TaskError::LocalStorage)?;
+    let scope_key = String::from_utf8(bytes).map_err(|_| TaskError::LocalStorage)?;
+    if !valid_lower_hex(&scope_key, SCOPE_KEY_HEX_BYTES) {
+        return Err(TaskError::LocalStorage);
+    }
+    Ok(Some(scope_key))
+}
 fn read_secret(path: &Path) -> Result<Option<String>, TaskError> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -866,6 +946,28 @@ fn write_bound_pair(path: &Path, bound: &BoundPair) -> Result<(), StateWriteFail
     sync_parent(path).map_err(|_| StateWriteFailure::AfterRename)
 }
 
+fn write_scope_key(path: &Path, scope_key: &str) -> Result<(), TaskError> {
+    if !valid_lower_hex(scope_key, SCOPE_KEY_HEX_BYTES) {
+        return Err(TaskError::LocalStorage);
+    }
+    #[cfg(test)]
+    if take_fault(FaultPoint::WriteScopeKey) {
+        return Err(TaskError::LocalStorage);
+    }
+    let (temporary, mut file) = create_temporary(path)?;
+    if file.write_all(scope_key.as_bytes()).is_err() || file.sync_all().is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(TaskError::LocalStorage);
+    }
+    drop(file);
+    if fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(TaskError::LocalStorage);
+    }
+    sync_parent(path)
+}
+
 fn create_temporary(path: &Path) -> Result<(PathBuf, File), TaskError> {
     let file_name = path.file_name().ok_or(TaskError::LocalStorage)?;
     for _ in 0..16 {
@@ -945,6 +1047,7 @@ mod tests {
         refresh_observer: Mutex<Option<Box<OperationObserver>>>,
         revoke_observer: Mutex<Option<Box<OperationObserver>>>,
         revoke_inputs: Mutex<Vec<RevokeInput>>,
+        malformed_scope: std::sync::atomic::AtomicBool,
     }
 
     impl ManagedCredentialRecipe for FakeRecipe {
@@ -956,6 +1059,19 @@ mod tests {
         }
         fn binding_digest(&self, secret: &str) -> String {
             format!("digest:{secret}")
+        }
+        fn derive_scope_key(&self, _binding_secret: &str) -> String {
+            "a".repeat(64)
+        }
+        fn derive_account_scope(&self, scope_key: &str, account_subject: &str) -> String {
+            if self.malformed_scope.load(Ordering::SeqCst) {
+                return "not-a-scope".to_owned();
+            }
+            let mut hasher = DefaultHasher::new();
+            scope_key.hash(&mut hasher);
+            account_subject.hash(&mut hasher);
+            let half = hasher.finish();
+            format!("{half:016x}{half:016x}")
         }
 
         fn bootstrap(&self, _binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
@@ -1045,6 +1161,9 @@ mod tests {
         }
         fn managed_state(&self) -> PathBuf {
             managed_state_path(&self.state, "bomtoon-access-token")
+        }
+        fn scope_key(&self) -> PathBuf {
+            self.state.join("bomtoon-access-token.scope-key")
         }
     }
 
@@ -1151,6 +1270,170 @@ mod tests {
                 .account_subject,
             None
         );
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Err(TaskError::Denied)
+        );
+        assert!(!directories.scope_key().exists());
+    }
+
+    #[test]
+    fn account_scope_survives_cookie_replacement_and_separates_subjects() {
+        let directories = TestDirectories::new("scope-cookie-replacement");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie a");
+        let recipe = Arc::new(FakeRecipe::default());
+        for pair in [
+            token_pair("a", 1_000_000, Some("account-a")),
+            token_pair("b", 1_000_000, Some("account-a")),
+            token_pair("c", 1_000_000, Some("account-b")),
+        ] {
+            recipe
+                .bootstrap
+                .lock()
+                .expect("bootstrap queue")
+                .push_back(Ok(pair));
+        }
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
+
+        let first = managed
+            .scope("bomtoon-access-token")
+            .expect("scope")
+            .expect("managed credential");
+        fs::write(directories.cookie(), "cookie-b").expect("cookie b");
+        let replacement = managed
+            .scope("bomtoon-access-token")
+            .expect("replacement scope")
+            .expect("managed credential");
+        fs::write(directories.cookie(), "cookie-c").expect("cookie c");
+        let other_account = managed
+            .scope("bomtoon-access-token")
+            .expect("other account scope")
+            .expect("managed credential");
+
+        assert_eq!(first, replacement);
+        assert_ne!(first, other_account);
+        assert_eq!(first.len(), 32);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+
+    #[test]
+    fn revoke_retains_private_scope_key_for_same_account_relogin() {
+        let directories = TestDirectories::new("scope-revoke");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie a");
+        let recipe = Arc::new(FakeRecipe::default());
+        for pair in [
+            token_pair("a", 1_000_000, Some("account-a")),
+            token_pair("b", 1_000_000, Some("account-a")),
+        ] {
+            recipe
+                .bootstrap
+                .lock()
+                .expect("bootstrap queue")
+                .push_back(Ok(pair));
+        }
+        recipe
+            .revoke
+            .lock()
+            .expect("revoke queue")
+            .push_back(Ok(()));
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
+
+        let first = managed
+            .scope("bomtoon-access-token")
+            .expect("scope")
+            .expect("managed credential");
+        let stored_key = fs::read_to_string(directories.scope_key()).expect("scope key");
+        let mode = fs::metadata(directories.scope_key())
+            .expect("scope key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        assert_eq!(managed.revoke("bomtoon-access-token"), Ok(true));
+        assert_eq!(
+            fs::read_to_string(directories.scope_key()).expect("retained scope key"),
+            stored_key
+        );
+        fs::write(directories.cookie(), "cookie-b").expect("replacement cookie");
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Ok(Some(first))
+        );
+    }
+
+    #[test]
+    fn scope_distinguishes_wrong_name_from_missing_binding_credential() {
+        let directories = TestDirectories::new("scope-missing");
+        let recipe = Arc::new(FakeRecipe::default());
+        let managed = provider(&directories, Arc::new(|| 1), recipe);
+
+        assert_eq!(managed.scope("other-token"), Ok(None));
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Err(TaskError::NoCredential)
+        );
+        assert!(!directories.scope_key().exists());
+    }
+
+    #[test]
+    fn malformed_derived_scope_is_rejected() {
+        let directories = TestDirectories::new("scope-malformed-output");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe.malformed_scope.store(true, Ordering::SeqCst);
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000, Some("account-a"))));
+        let managed = provider(&directories, Arc::new(|| 1), recipe);
+
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Err(TaskError::LocalStorage)
+        );
+    }
+
+    #[test]
+    fn malformed_durable_scope_key_is_rejected() {
+        let directories = TestDirectories::new("scope-malformed-key");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        fs::write(directories.scope_key(), "not-a-scope-key").expect("malformed scope key");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000, Some("account-a"))));
+        let managed = provider(&directories, Arc::new(|| 1), recipe);
+
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Err(TaskError::LocalStorage)
+        );
+    }
+
+    #[test]
+    fn scope_key_write_failure_returns_no_scope() {
+        let directories = TestDirectories::new("scope-write-failure");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair("a", 1_000_000, Some("account-a"))));
+        let managed = provider(&directories, Arc::new(|| 1), recipe);
+        inject_fault(FaultPoint::WriteScopeKey);
+
+        assert_eq!(
+            managed.scope("bomtoon-access-token"),
+            Err(TaskError::LocalStorage)
+        );
+        assert!(!directories.scope_key().exists());
     }
 
     #[test]

@@ -17,6 +17,8 @@ const IP_RESPONSE_MAX_BYTES: u32 = 4 * 1024;
 const REFRESH_RESPONSE_MAX_BYTES: u32 = 128 * 1024;
 const LOGOUT_RESPONSE_MAX_BYTES: u32 = 16 * 1024;
 const JSON_CONTENT_TYPE: &str = "application/json";
+const MANAGED_SCOPE_KEY_DOMAIN: &[u8] = b"cobalt-managed-scope-key-v1\0";
+const ACCOUNT_SCOPE_DOMAIN: &[u8] = b"bomtoon-account-scope-v1\0";
 const BOMTOON_HEADERS: [(&str, &str); 4] = [
     ("Accept", "application/json"),
     ("x-balcony-id", "BOMTOON_TW"),
@@ -160,6 +162,21 @@ impl ManagedCredentialRecipe for Recipe {
 
     fn binding_digest(&self, secret: &str) -> String {
         crate::sha256::hex_digest(secret.as_bytes())
+    }
+
+    fn derive_scope_key(&self, binding_secret: &str) -> String {
+        let mut material =
+            Vec::with_capacity(MANAGED_SCOPE_KEY_DOMAIN.len() + binding_secret.len());
+        material.extend_from_slice(MANAGED_SCOPE_KEY_DOMAIN);
+        material.extend_from_slice(binding_secret.as_bytes());
+        crate::sha256::hex_digest(&material)
+    }
+
+    fn derive_account_scope(&self, scope_key: &str, account_subject: &str) -> String {
+        let mut message = Vec::with_capacity(ACCOUNT_SCOPE_DOMAIN.len() + account_subject.len());
+        message.extend_from_slice(ACCOUNT_SCOPE_DOMAIN);
+        message.extend_from_slice(account_subject.as_bytes());
+        crate::sha256::hmac_hex(scope_key.as_bytes(), &message)[..32].to_owned()
     }
 
     fn bootstrap(&self, binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
@@ -545,6 +562,34 @@ mod tests {
 
     fn cookie_headers(cookie: &str) -> Vec<(String, String)> {
         owned_headers(&headers_with_cookie(cookie))
+    }
+
+    #[test]
+    fn account_scope_is_stable_and_subject_specific() {
+        let recipe = Recipe::with_transport(Arc::new(FakeTransport::new(
+            std::iter::empty::<Result<Vec<u8>, TaskError>>(),
+        )));
+        let key = recipe.derive_scope_key("high-entropy-cookie-a");
+        assert_eq!(
+            key,
+            crate::sha256::hex_digest(
+                b"cobalt-managed-scope-key-v1\0high-entropy-cookie-a"
+            )
+        );
+        let first = recipe.derive_account_scope(&key, "account-a");
+        assert_eq!(
+            first,
+            crate::sha256::hmac_hex(
+                key.as_bytes(),
+                b"bomtoon-account-scope-v1\0account-a"
+            )[..32]
+        );
+        assert_eq!(first, recipe.derive_account_scope(&key, "account-a"));
+        assert_ne!(first, recipe.derive_account_scope(&key, "account-b"));
+        assert_eq!(first.len(), 32);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
     }
 
     #[test]

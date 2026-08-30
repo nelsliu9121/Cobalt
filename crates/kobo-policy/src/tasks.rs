@@ -382,9 +382,10 @@ impl TaskRunner {
         }
 
         let required = match &work {
-            Task::Fetch { .. } | Task::Post { .. } | Task::RevokeCredential { .. } => {
-                Some(Capability::Network)
-            }
+            Task::Fetch { .. }
+            | Task::Post { .. }
+            | Task::RevokeCredential { .. }
+            | Task::CredentialScope { .. } => Some(Capability::Network),
             Task::ReadFile { .. } | Task::Sleep { .. } => None,
         };
         if let Some(capability) = required {
@@ -761,6 +762,14 @@ fn run(work: &Task, root: &Path, backends: Backends<'_>, cancel: &AtomicBool) ->
             },
             None => TaskOutcome::Failed(TaskError::Denied),
         },
+        Task::CredentialScope { credential } => match backends.managed {
+            Some(provider) => match provider.scope(credential) {
+                Ok(Some(scope)) => TaskOutcome::Completed(scope.into_bytes()),
+                Ok(None) => TaskOutcome::Failed(TaskError::Denied),
+                Err(error) => TaskOutcome::Failed(error),
+            },
+            None => TaskOutcome::Failed(TaskError::Denied),
+        },
         Task::Sleep { seconds } => {
             // Polled in short slices rather than slept in one call, so a
             // cancelled five minute sleep stops now instead of in five minutes.
@@ -910,7 +919,7 @@ mod tests {
     use fs4::FileExt;
     use kobo_protocol::{Credential, Header};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     fn temp_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("kobo-tasks-{name}-{}", std::process::id()));
@@ -1435,6 +1444,8 @@ mod tests {
         bootstraps: AtomicUsize,
         refreshes: AtomicUsize,
         revokes: AtomicUsize,
+        bootstrap_error: Mutex<Option<TaskError>>,
+        bootstrap_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     impl ManagedCredentialRecipe for FakeManagedRecipe {
@@ -1450,9 +1461,34 @@ mod tests {
             "redacted-binding-digest".to_owned()
         }
 
+        fn derive_scope_key(&self, _binding_secret: &str) -> String {
+            "a".repeat(64)
+        }
+
+        fn derive_account_scope(&self, _scope_key: &str, _account_subject: &str) -> String {
+            "b".repeat(32)
+        }
+
         fn bootstrap(&self, _binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
             let call = self.bootstraps.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(managed_pair(&format!("redacted-access-{call}")))
+            if let Some(observer) = self
+                .bootstrap_observer
+                .lock()
+                .expect("bootstrap observer")
+                .as_ref()
+            {
+                observer();
+            }
+            if let Some(error) = self
+                .bootstrap_error
+                .lock()
+                .expect("bootstrap error")
+                .take()
+            {
+                Err(error)
+            } else {
+                Ok(managed_pair(&format!("redacted-access-{call}")))
+            }
         }
 
         fn refresh(
@@ -1957,6 +1993,220 @@ mod tests {
             TaskOutcome::Completed(Vec::new())
         );
         assert_eq!(recipe.revokes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn credential_scope_returns_only_the_opaque_scope() {
+        let (managed, recipe) = managed_provider("credential-scope-success");
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-success-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec())
+        );
+        assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn credential_scope_requires_network_capability() {
+        let (managed, recipe) = managed_provider("credential-scope-capability");
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-capability-root"))
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+        assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn credential_scope_denies_wrong_name_and_missing_provider() {
+        let (managed, recipe) = managed_provider("credential-scope-wrong-name");
+        let mut wrong_name = TaskRunner::simulated(temp_root("credential-scope-wrong-name-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        wrong_name
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "other-token".to_owned(),
+                },
+            )
+            .expect("submit wrong name");
+        assert_eq!(
+            collect(&mut wrong_name, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+        assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 0);
+
+        let mut missing_provider =
+            TaskRunner::simulated(temp_root("credential-scope-no-provider"))
+                .with_capabilities([Capability::Network]);
+        missing_provider
+            .submit(
+                TaskId(2),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit without provider");
+        assert_eq!(
+            collect(&mut missing_provider, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+    }
+
+    #[test]
+    fn credential_scope_reports_missing_binding_credential() {
+        let root = temp_root("credential-scope-no-credential");
+        let secrets = root.join("secrets");
+        let state = root.join("state");
+        std::fs::create_dir_all(&secrets).expect("create managed secrets");
+        std::fs::create_dir_all(&state).expect("create managed state");
+        let recipe = Arc::new(FakeManagedRecipe::default());
+        let managed = Arc::new(
+            ManagedCredentials::new(secrets, state, Arc::new(|| 0), recipe)
+                .expect("construct managed provider"),
+        );
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-no-credential-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::NoCredential)
+        );
+    }
+
+    #[test]
+    fn credential_scope_denies_valid_legacy_bearer_state() {
+        let root = temp_root("credential-scope-legacy");
+        let secrets = root.join("secrets");
+        let state = root.join("state");
+        std::fs::create_dir_all(&secrets).expect("create managed secrets");
+        std::fs::create_dir_all(&state).expect("create managed state");
+        std::fs::write(secrets.join("managed-cookie"), "redacted-cookie")
+            .expect("write managed binding");
+        std::fs::write(
+            state.join("managed-token.state"),
+            "cobalt-managed-v1\nredacted-binding-digest\n10000000\n20000000\nlegacy-access\nlegacy-refresh",
+        )
+        .expect("write legacy state");
+        let recipe = Arc::new(FakeManagedRecipe::default());
+        let managed = Arc::new(
+            ManagedCredentials::new(secrets, state, Arc::new(|| 0), recipe)
+                .expect("construct managed provider"),
+        );
+        assert_eq!(
+            managed.resolve(&Credential::bearer("managed-token")),
+            Ok(Some(crate::ResolvedCredential {
+                header_name: "Authorization".to_owned(),
+                header_value: "Bearer legacy-access".to_owned(),
+            }))
+        );
+
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-legacy-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
+    }
+
+    #[test]
+    fn credential_scope_propagates_offline_bootstrap() {
+        let (managed, recipe) = managed_provider("credential-scope-offline");
+        *recipe
+            .bootstrap_error
+            .lock()
+            .expect("bootstrap error") = Some(TaskError::Unreachable);
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-offline-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn credential_scope_cancellation_wins_over_completed_bootstrap() {
+        let (managed, recipe) = managed_provider("credential-scope-cancel");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let observed_entered = Arc::clone(&entered);
+        let observed_release = Arc::clone(&release);
+        *recipe
+            .bootstrap_observer
+            .lock()
+            .expect("bootstrap observer") = Some(Arc::new(move || {
+            observed_entered.wait();
+            observed_release.wait();
+        }));
+        let mut runner = TaskRunner::simulated(temp_root("credential-scope-cancel-root"))
+            .with_capabilities([Capability::Network])
+            .with_managed_credentials(managed);
+        runner
+            .submit(
+                TaskId(1),
+                Task::CredentialScope {
+                    credential: "managed-token".to_owned(),
+                },
+            )
+            .expect("submit credential scope");
+        entered.wait();
+        runner.cancel(TaskId(1));
+        release.wait();
+
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Cancelled
+        );
     }
 
     #[test]

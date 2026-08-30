@@ -49,7 +49,8 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// requests/results. Version 11 adds the runtime-owned reading surface.
 /// Version 12 adds pixel-format bytes to the startup metrics and inline
 /// pictures, plus the start of chunked picture uploads. Version 13 adds the
-/// runtime's local Gregorian day.
+/// runtime's local Gregorian day and `CredentialScope`; v12 runtimes cannot
+/// decode the new task.
 pub const VERSION: u8 = 13;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
@@ -447,10 +448,21 @@ pub enum Task {
     /// Removes a named credential from managed local storage and asks the
     /// provider to revoke it. The value itself never crosses this boundary.
     RevokeCredential { credential: String },
+    /// Returns a stable opaque scope for a provider-managed account without
+    /// exposing provider identity or credential material.
+    CredentialScope { credential: String },
     /// Reads a file from the application's own directory.
     ReadFile { path: String },
     /// Waits, without holding a wake lock.
     Sleep { seconds: u32 },
+}
+
+fn valid_credential_name(credential: &str) -> bool {
+    !credential.is_empty()
+        && credential.len() <= MAX_HEADER_NAME
+        && credential
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 impl Task {
@@ -488,13 +500,8 @@ impl Task {
                     && headers.iter().all(Header::is_well_formed)
                     && credential.as_ref().is_none_or(Credential::is_well_formed)
             }
-            Self::RevokeCredential { credential } => {
-                !credential.is_empty()
-                    && credential.len() <= MAX_HEADER_NAME
-                    && credential
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            }
+            Self::RevokeCredential { credential }
+            | Self::CredentialScope { credential } => valid_credential_name(credential),
             Self::ReadFile { path } => path.len() <= MAX_STRING_LEN,
             Self::Sleep { .. } => true,
         }
@@ -1832,6 +1839,10 @@ fn encode_task_message(payload: &mut Vec<u8>, message: &Message) -> Result<(), P
                     payload.push(4);
                     push_string(payload, credential)?;
                 }
+                Task::CredentialScope { credential } => {
+                    payload.push(5);
+                    push_string(payload, credential)?;
+                }
             }
         }
         Message::Cancel { task } => push_u32(payload, task.0),
@@ -2169,7 +2180,10 @@ fn encoded_task_len(work: &Task) -> Result<usize, ProtocolError> {
                 add_encoded_len(&mut length, encoded_string_len(&header.value)?)?;
             }
         }
-        Task::RevokeCredential { credential } => {
+        Task::RevokeCredential { credential } | Task::CredentialScope { credential } => {
+            if !valid_credential_name(credential) {
+                return Err(ProtocolError::InvalidValue("credential name"));
+            }
             add_encoded_len(&mut length, encoded_string_len(credential)?)?;
         }
     }
@@ -3897,9 +3911,20 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
                         max_bytes: min(reader.u32()?, MAX_TASK_BYTES_U32),
                     }
                 }
-                4 => Task::RevokeCredential {
-                    credential: reader.string()?,
-                },
+                4 => {
+                    let credential = reader.string()?;
+                    if !valid_credential_name(&credential) {
+                        return Err(ProtocolError::InvalidValue("credential name"));
+                    }
+                    Task::RevokeCredential { credential }
+                }
+                5 => {
+                    let credential = reader.string()?;
+                    if !valid_credential_name(&credential) {
+                        return Err(ProtocolError::InvalidValue("credential name"));
+                    }
+                    Task::CredentialScope { credential }
+                }
                 _ => return Err(ProtocolError::InvalidValue("task kind")),
             };
             Message::Spawn { task, work }
@@ -8203,6 +8228,111 @@ mod store_tests {
         })
         .expect("encode revoke");
         assert_eq!(decode(&encoded).expect("decode revoke").message, message);
+    }
+
+    #[test]
+    fn credential_scope_round_trips_with_kind_five() {
+        let message = Message::Spawn {
+            task: TaskId(42),
+            work: Task::CredentialScope {
+                credential: "bomtoon-access-token".to_owned(),
+            },
+        };
+        let encoded = encode(&Frame {
+            request_id: 10,
+            message: message.clone(),
+        })
+        .expect("encode credential scope");
+
+        assert_eq!(encoded[HEADER_LEN + 4], 5);
+        assert_eq!(
+            decode(&encoded).expect("decode credential scope").message,
+            message
+        );
+    }
+
+    #[test]
+    fn credential_scope_rejects_invalid_and_oversized_names() {
+        for credential in [
+            String::new(),
+            "bad credential".to_owned(),
+            "x".repeat(MAX_HEADER_NAME + 1),
+        ] {
+            let work = Task::CredentialScope { credential };
+            assert!(!work.is_sendable());
+            assert_eq!(
+                encode(&Frame {
+                    request_id: 10,
+                    message: Message::Spawn {
+                        task: TaskId(42),
+                        work,
+                    },
+                }),
+                Err(ProtocolError::InvalidValue("credential name"))
+            );
+        }
+    }
+
+    #[test]
+    fn credential_scope_decoder_rejects_oversize_truncation_and_unknown_tag() {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, 42);
+        payload.push(5);
+        push_string(&mut payload, &"x".repeat(MAX_HEADER_NAME + 1))
+            .expect("protocol string bound is wider than credential name bound");
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&MAGIC);
+        oversized.push(VERSION);
+        oversized.push(9);
+        oversized.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        oversized.extend_from_slice(&10_u32.to_be_bytes());
+        oversized.extend_from_slice(&payload);
+        assert_eq!(
+            decode(&oversized),
+            Err(ProtocolError::InvalidValue("credential name"))
+        );
+
+        let frame = Frame {
+            request_id: 10,
+            message: Message::Spawn {
+                task: TaskId(42),
+                work: Task::CredentialScope {
+                    credential: "bomtoon-access-token".to_owned(),
+                },
+            },
+        };
+        let mut truncated = encode(&frame).expect("encode credential scope");
+        truncated.pop();
+        let payload_len = u32::try_from(truncated.len() - HEADER_LEN).expect("payload length");
+        truncated[6..10].copy_from_slice(&payload_len.to_be_bytes());
+        assert_eq!(decode(&truncated), Err(ProtocolError::Truncated));
+
+        let mut unknown = encode(&frame).expect("encode credential scope");
+        unknown[HEADER_LEN + 4] = 6;
+        assert_eq!(
+            decode(&unknown),
+            Err(ProtocolError::InvalidValue("task kind"))
+        );
+    }
+
+    #[test]
+    fn credential_scope_uses_protocol_version_thirteen_and_rejects_v12() {
+        assert_eq!(VERSION, 13);
+        let frame = Frame {
+            request_id: 10,
+            message: Message::Spawn {
+                task: TaskId(42),
+                work: Task::CredentialScope {
+                    credential: "bomtoon-access-token".to_owned(),
+                },
+            },
+        };
+        let mut encoded = encode(&frame).expect("encode credential scope");
+        assert_eq!(encoded[4], 13);
+        assert_eq!(decode(&encoded), Ok(frame));
+
+        encoded[4] = 12;
+        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(12)));
     }
 
     #[test]
