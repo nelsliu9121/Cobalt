@@ -7,7 +7,7 @@ use kobo_sdk::{
     action_id, ActionId, BannerLevel, Context, Failure, KoboApp, PictureHandle, ReadingChrome,
     Screen, ScreenBuilder, TaskError, TaskId, TaskOutcome, TilePicture,
 };
-use model::{display_text, Comic, Episode, EpisodeImage, RecentEntry};
+use model::{display_text, Comic, Episode, EpisodeImage, ExpirationRow, RecentEntry, WalletSummary};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
 
@@ -172,6 +172,54 @@ struct ReaderTaskEntry {
     generation: u64,
     purpose: ReaderTaskPurpose,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalletTaskPurpose {
+    Summary { generation: u64 },
+    CoinHistory { generation: u64 },
+    TicketHistory { generation: u64 },
+}
+
+#[derive(Default)]
+struct WalletState {
+    summary: Option<WalletSummary>,
+    summary_error: bool,
+    summary_stale: bool,
+    summary_generation: u64,
+    summary_task: Option<TaskId>,
+    summary_refresh_queued: bool,
+    detail_generation: u64,
+    tasks: BTreeMap<TaskId, WalletTaskPurpose>,
+    coin_history: Vec<ExpirationRow>,
+    ticket_history: Vec<ExpirationRow>,
+    coin_history_error: bool,
+    ticket_history_error: bool,
+}
+
+impl WalletState {
+    fn request_summary_generation(&mut self) -> Option<u64> {
+        if self.summary_task.is_some() {
+            self.summary_refresh_queued = true;
+            return None;
+        }
+        self.summary_generation = self.summary_generation.wrapping_add(1);
+        Some(self.summary_generation)
+    }
+
+    fn take_queued_summary_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.summary_refresh_queued)
+    }
+
+    fn accept_summary(&mut self, generation: u64, summary: WalletSummary) -> bool {
+        if generation != self.summary_generation {
+            return false;
+        }
+        self.summary = Some(summary);
+        self.summary_error = false;
+        self.summary_stale = false;
+        true
+    }
+}
+
 
 enum PageEntry {
     Building(PageBuild),
@@ -241,6 +289,7 @@ struct Bomtoon {
     view: View,
     pending: Option<Pending>,
     task: Option<TaskId>,
+    wallet: WalletState,
     comics: Vec<Comic>,
     recent: Vec<RecentEntry>,
     episodes: Vec<Episode>,
@@ -543,8 +592,41 @@ impl Bomtoon {
         }
     }
 
+    fn cancel_wallet(&mut self, context: &mut Context) {
+        self.wallet.summary_generation = self.wallet.summary_generation.wrapping_add(1);
+        self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
+        for task in std::mem::take(&mut self.wallet.tasks).into_keys() {
+            context.cancel(task);
+        }
+        self.wallet.summary_task = None;
+        self.wallet.summary_refresh_queued = false;
+    }
+
+    fn refresh_asset_summary(&mut self, context: &mut Context) {
+        let Some(generation) = self.wallet.request_summary_generation() else {
+            return;
+        };
+        let Some(task) = context.spawn(api::asset_summary()) else {
+            self.wallet.summary_error = true;
+            self.wallet.summary_stale = self.wallet.summary.is_some();
+            return;
+        };
+        self.wallet.summary_task = Some(task);
+        self.wallet
+            .tasks
+            .insert(task, WalletTaskPurpose::Summary { generation });
+    }
+
     fn clear_account_data(&mut self, context: &mut Context) {
         self.cancel_reader(context);
+        self.cancel_wallet(context);
+        self.wallet.summary = None;
+        self.wallet.summary_error = false;
+        self.wallet.summary_stale = false;
+        self.wallet.coin_history.clear();
+        self.wallet.ticket_history.clear();
+        self.wallet.coin_history_error = false;
+        self.wallet.ticket_history_error = false;
         self.comics.clear();
         self.recent.clear();
         self.episodes.clear();
@@ -571,6 +653,7 @@ impl Bomtoon {
         self.shelf = Shelf::Library;
         self.view = View::Status;
         self.spawn(context, Pending::Library(0), api::library(0));
+        self.refresh_asset_summary(context);
     }
 
     fn spawn(&mut self, context: &mut Context, pending: Pending, work: kobo_sdk::Task) {
@@ -1589,6 +1672,66 @@ impl Bomtoon {
             }
         }
     }
+    fn handle_wallet_credential_failure(
+        &mut self,
+        context: &mut Context,
+        account: AccountState,
+    ) {
+        if let Some(task) = self.task.take() {
+            context.cancel(task);
+        }
+        self.pending = None;
+        self.clear_account_data(context);
+        self.account = account;
+        self.problem = None;
+        self.show(context);
+    }
+
+    fn handle_wallet_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        purpose: WalletTaskPurpose,
+        outcome: TaskOutcome,
+    ) {
+        if self.wallet.summary_task == Some(task) {
+            self.wallet.summary_task = None;
+        }
+        match outcome {
+            TaskOutcome::Failed(TaskError::NoCredential) => {
+                self.handle_wallet_credential_failure(context, AccountState::SignedOut);
+                return;
+            }
+            TaskOutcome::Failed(TaskError::Unauthorized) => {
+                self.handle_wallet_credential_failure(context, AccountState::Expired);
+                return;
+            }
+            outcome => {
+                if let WalletTaskPurpose::Summary { generation } = purpose {
+                    if generation == self.wallet.summary_generation {
+                        match outcome {
+                            TaskOutcome::Completed(bytes) => {
+                                if let Ok(summary) = parse::asset_summary(&bytes) {
+                                    self.wallet.accept_summary(generation, summary);
+                                } else {
+                                    self.wallet.summary_error = true;
+                                    self.wallet.summary_stale = self.wallet.summary.is_some();
+                                }
+                            }
+                            TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
+                                self.wallet.summary_error = true;
+                                self.wallet.summary_stale = self.wallet.summary.is_some();
+                            }
+                        }
+                    }
+                    if self.wallet.take_queued_summary_refresh() {
+                        self.refresh_asset_summary(context);
+                    }
+                }
+            }
+        }
+    }
+
 
     fn handle_reader_action(&mut self, context: &mut Context, action: ActionId) {
         if action == action_id(READER_CHROME) {
@@ -1900,6 +2043,10 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
+        if let Some(purpose) = self.wallet.tasks.remove(&task) {
+            self.handle_wallet_outcome(context, task, purpose, outcome);
+            return;
+        }
         if let Some(entry) = self.reader_tasks.remove(&task) {
             if self.foreground_reader_task == Some(task) {
                 self.foreground_reader_task = None;
@@ -2668,6 +2815,13 @@ mod tests {
             "totalElements":1
         }
     }"#;
+    const ASSET_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{
+            "coinBalance":{"coin":7,"bonusCoin":2,"freeCoin":1},
+            "ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}
+        }
+    }"#;
     const REMOTE_LIBRARY_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
         "data":{
@@ -3206,11 +3360,25 @@ mod tests {
         (runner, commands)
     }
 
+    fn spawns(commands: &[Command]) -> Vec<(TaskId, Task)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Spawn { task, work } => Some((*task, work.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fetch_task_with(commands: &[Command], needle: &str) -> (TaskId, Task) {
+        spawns(commands)
+            .into_iter()
+            .find(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains(needle)))
+            .expect("matching fetch task")
+    }
+
     fn only_spawn(commands: &[Command]) -> (TaskId, Task) {
-        let mut spawned = commands.iter().filter_map(|command| match command {
-            Command::Spawn { task, work } => Some((*task, work.clone())),
-            _ => None,
-        });
+        let mut spawned = spawns(commands).into_iter();
         let first = spawned.next().expect("one spawned task");
         assert!(spawned.next().is_none(), "more than one task was spawned");
         first
@@ -3252,7 +3420,7 @@ mod tests {
     fn loaded_library_with_metrics(metrics: DisplayMetrics) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let mut runner = AppRunner::with_metrics(Bomtoon::default(), metrics);
         let commands = runner.start();
-        let (task, _) = only_spawn(&commands);
+        let (task, _) = fetch_task_with(&commands, "/library?");
         let commands = runner.task_outcome(task, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         assert_eq!(runner.app().view, View::Library);
         (runner, commands)
@@ -3753,7 +3921,7 @@ mod tests {
 
     fn failed_start(error: TaskError) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let (mut runner, commands) = started();
-        let (task, _) = only_spawn(&commands);
+        let (task, _) = fetch_task_with(&commands, "/library?");
         let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
         (runner, commands)
     }
@@ -4879,9 +5047,108 @@ mod tests {
     }
 
     #[test]
+    fn startup_loads_library_and_asset_summary_independently() {
+        let (_, commands) = started();
+        let spawned = spawns(&commands);
+        assert_eq!(spawned.len(), 2);
+        assert!(spawned.iter().any(
+            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/library?"))
+        ));
+        assert!(spawned.iter().any(
+            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with("/asset/user"))
+        ));
+    }
+
+    #[test]
+    fn summary_refresh_requests_coalesce_into_one_follow_up() {
+        let mut wallet = WalletState::default();
+        wallet.summary_task = Some(TaskId(7));
+        assert_eq!(wallet.request_summary_generation(), None);
+        assert_eq!(wallet.request_summary_generation(), None);
+        assert!(wallet.summary_refresh_queued);
+
+        wallet.summary_task = None;
+        assert!(wallet.take_queued_summary_refresh());
+        assert!(!wallet.take_queued_summary_refresh());
+    }
+
+    #[test]
+    fn stale_summary_generation_is_rejected() {
+        let mut wallet = WalletState::default();
+        let stale = wallet.request_summary_generation().expect("generation 1");
+        let current = wallet.request_summary_generation().expect("generation 2");
+        assert_ne!(stale, current);
+        wallet.summary = Some(model::WalletSummary {
+            coins: model::AssetAmounts {
+                standard: 20,
+                bonus: 0,
+                free: 0,
+            },
+            tickets: model::AssetAmounts::default(),
+        });
+        assert!(!wallet.accept_summary(
+            stale,
+            model::WalletSummary {
+                coins: model::AssetAmounts {
+                    standard: 10,
+                    bonus: 0,
+                    free: 0,
+                },
+                tickets: model::AssetAmounts::default(),
+            },
+        ));
+        assert_eq!(
+            wallet.summary.and_then(|summary| summary.coins.total()),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn wallet_credential_failure_cancels_library_and_ignores_its_late_outcome() {
+        let (mut runner, commands) = started();
+        let (library_task, _) = fetch_task_with(&commands, "/library?");
+        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        runner.task_outcome(
+            summary_task,
+            TaskOutcome::Failed(TaskError::NoCredential),
+        );
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().task, None);
+        assert_eq!(runner.app().pending, None);
+
+        runner.task_outcome(
+            library_task,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert!(runner.app().comics.is_empty());
+    }
+
+    #[test]
+    fn sign_out_clears_wallet_and_ignores_late_summary() {
+        let (mut runner, commands) = started();
+        let (library_task, _) = fetch_task_with(&commands, "/library?");
+        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        runner.task_outcome(
+            library_task,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
+        let logout_task = begin_logout(&mut runner);
+        runner.task_outcome(logout_task, TaskOutcome::Completed(Vec::new()));
+        assert!(runner.app().wallet.summary.is_none());
+        assert!(runner.app().wallet.tasks.is_empty());
+
+        runner.task_outcome(
+            summary_task,
+            TaskOutcome::Completed(ASSET_RESPONSE.to_vec()),
+        );
+        assert!(runner.app().wallet.summary.is_none());
+    }
+
+    #[test]
     fn startup_requests_library_without_a_session_task() {
         let (_, commands) = started();
-        let (_, work) = only_spawn(&commands);
+        let (_, work) = fetch_task_with(&commands, "/library?");
         let Task::Fetch {
             url, credential, ..
         } = work
@@ -4895,14 +5162,14 @@ mod tests {
     #[test]
     fn missing_credentials_show_login_instructions_and_try_again() {
         let (mut runner, commands) = started();
-        let (task, _) = only_spawn(&commands);
+        let (task, _) = fetch_task_with(&commands, "/library?");
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
 
         assert_eq!(runner.app().account, AccountState::SignedOut);
         assert_login_instructions(&last_screen(&commands));
 
         let commands = runner.action(action_id(RETRY));
-        let (_, work) = only_spawn(&commands);
+        let (_, work) = fetch_task_with(&commands, "/library?");
         assert!(matches!(work, Task::Fetch { .. }));
         assert_eq!(runner.app().account, AccountState::Active);
     }
@@ -5071,7 +5338,7 @@ mod tests {
         assert_fits(&screen);
 
         let commands = runner.action(action_id(RETRY));
-        let (_, work) = only_spawn(&commands);
+        let (_, work) = fetch_task_with(&commands, "/library?");
         assert!(matches!(work, Task::Fetch { .. }));
         assert_eq!(runner.app().account, AccountState::Active);
         assert_all_account_data_cleared(runner.app());
