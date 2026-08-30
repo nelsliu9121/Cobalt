@@ -442,6 +442,9 @@ impl ManagedCredentials {
             .ok_or(TaskError::LocalStorage)?;
         match self.recipe.refresh(cookie, &old_pair) {
             Ok(pair) => self.replace_with_provider_pair(inner, digest, pair),
+            Err(TaskError::Unauthorized) if old_pair.account_subject.is_none() => {
+                Err(TaskError::Unauthorized)
+            }
             Err(TaskError::Unauthorized) => match self.recipe.bootstrap(cookie) {
                 Ok(pair) => self.replace_with_provider_pair(inner, digest, pair),
                 Err(TaskError::Unauthorized) => {
@@ -1185,6 +1188,44 @@ mod tests {
                 .pair
                 .account_subject,
             None
+        );
+    }
+
+    #[test]
+    fn unauthorized_v1_refresh_does_not_bootstrap_or_migrate() {
+        let directories = TestDirectories::new("v1-unauthorized-refresh");
+        fs::write(directories.cookie(), "cookie-a").expect("cookie");
+        let legacy_state =
+            "cobalt-managed-v1\ndigest:cookie-a\n100\n4600000\naccess-a\nrefresh-a";
+        fs::write(directories.managed_state(), legacy_state).expect("write v1 state");
+        let recipe = Arc::new(FakeRecipe::default());
+        recipe
+            .refresh
+            .lock()
+            .expect("refresh queue")
+            .push_back(Err(TaskError::Unauthorized));
+        recipe
+            .bootstrap
+            .lock()
+            .expect("bootstrap queue")
+            .push_back(Ok(token_pair(
+                "migrated",
+                2_000_000,
+                Some("account-a"),
+            )));
+        let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
+
+        assert_eq!(
+            managed.resolve(&Credential::bearer("bomtoon-access-token")),
+            Err(TaskError::Unauthorized)
+        );
+        assert_eq!(
+            recipe.calls.lock().expect("calls").as_slice(),
+            &["refresh"]
+        );
+        assert_eq!(
+            fs::read_to_string(directories.managed_state()).expect("managed state"),
+            legacy_state
         );
     }
 
