@@ -14641,7 +14641,9 @@ mod tests {
         let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
-        runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -14675,8 +14677,11 @@ mod tests {
         assert!(spawns(&commands)
             .iter()
             .all(|(_, work)| !matches!(work, Task::Post { .. })));
-        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
-        runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -14700,8 +14705,11 @@ mod tests {
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
         assert_no_post_or_marker_forget(&commands);
-        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
-        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert_eq!(
             runner.app().commerce.state(),
@@ -14727,10 +14735,11 @@ mod tests {
         let commands = switched.lifecycle(Lifecycle::Foreground);
         let (scope_task, work) = only_spawn(&commands);
         assert_eq!(work, api::account_scope());
-        switched.task_outcome(
+        let commands = switched.task_outcome(
             scope_task,
             TaskOutcome::Completed(b"ffeeddccbbaa99887766554433221100".to_vec()),
         );
+        assert_no_post_or_marker_forget(&commands);
         assert_eq!(
             switched.app().commerce.state(),
             commerce::CommerceState::AcceptedButStale
