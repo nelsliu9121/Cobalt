@@ -1,4 +1,4 @@
-# BOMTOON wallet balances and applicable tickets
+# BOMTOON wallet balances and Account history
 
 ## Status
 
@@ -6,7 +6,7 @@ Approved design. Implementation has not started.
 
 ## Goal
 
-Collect the signed-in BOMTOON user's coin and ticket information without exposing credentials or blocking reading. Show the aggregate coin count in the Library and Recent top bars, provide a dedicated Account page with coin types, ticket totals, and 90-day expiration rows, and show the aggregate ticket count only on comic pages whose episodes accept tickets.
+Collect the signed-in BOMTOON user's coin and ticket information without exposing credentials or blocking reading. Show the aggregate Coin count in the Library and Recent top bars, and provide a dedicated Account page with Coin types, Ticket totals, and 90-day expiration rows. Ticket information is Account data; an episode does not directly consume a Ticket.
 
 The balance summary must have one explicit refresh path so a future successful purchase or rental can re-query the displayed count without introducing polling or a second wallet implementation.
 
@@ -20,12 +20,11 @@ The balance summary must have one explicit refresh path so a future successful p
 - Refresh the wallet summary whenever Account opens.
 - Load 90-day, expiry-sorted coin and ticket rows only while Account is open.
 - Retain the complete aggregate ticket total and every valid ticket expiration row returned by the fixed 90-day Account query.
-- On a Comic/Episodes page, show the aggregate ticket count only when at least one episode has `coinKind == "TICKET"`.
-- Label each ticket-priced episode with its applicable ticket quantity.
+- Keep Ticket balances and expiration history in Account only; do not present Tickets as direct episode payment.
 - Preserve cached summary data during a refresh and reject stale outcomes.
 - Isolate wallet failures from library, episode, and reader behavior.
 - Clear wallet state and invalidate active wallet work on sign-out.
-- Expose one app-internal summary refresh operation that a future successful purchase or rental can invoke.
+- Expose one app-internal summary refresh operation that successful episode commerce can invoke.
 
 ## Non-goals
 
@@ -48,7 +47,7 @@ The deployed client provides these relevant routes and computations:
 - The client computes aggregate tickets as `ticket + bonusTicket + freeTicket`.
 - `GET /api/balcony-api-v2/payment/charge` accepts `createdAt`, `sort`, `coinKind`, and an optional `coinStatusGroup`.
 - The wallet page uses a 90-day `createdAt` window and supports `sort=EXPIRE` for `coinKind=COIN` and `coinKind=TICKET`.
-- The comic purchase UI treats a comic as ticket-applicable when any episode has `coinKind == "TICKET"`, then uses the aggregate ticket balance.
+- Later authenticated commerce evidence established that Tickets do not directly rent or purchase episodes. Episode rental uses Coin or a title-scoped Gift; permanent episode purchase uses Coin.
 
 Evidence URLs:
 
@@ -85,7 +84,7 @@ total_coins = coin + bonus_coin + free_coin
 total_tickets = ticket + bonus_ticket + free_ticket
 ```
 
-The top bar consumes only `total_coins`. Comic ticket presentation consumes only `total_tickets`. Account can display the named remote types without losing information.
+The top bar consumes only `total_coins`. Account consumes `total_tickets` and the named remote Ticket types without losing information. Episode commerce does not consume or present Ticket balance.
 
 ### Expiration rows
 
@@ -104,15 +103,9 @@ A positive future timestamp produces an `Expires YYYY-MM-DD` row. A missing or z
 
 Coin and ticket histories remain separate result sections so either can succeed independently. Each history response is capped at 512 KiB, 256 remote entries, and 256 retained display rows; each retained description is capped at 256 UTF-8 bytes. The summary response is capped at 64 KiB. Amounts must fit `usize`, aggregate addition is checked, and millisecond timestamps must fit `i64`.
 
-### Episode ticket data
+### Episode-commerce boundary
 
-`Episode` retains:
-
-- the optional `coinKind` value;
-- the effective purchase or rental quantity needed for display;
-- the existing purchase/readability state.
-
-Only the exact remote value `TICKET` makes an episode ticket-priced. Unknown values remain non-ticket values and do not make an unreadable episode readable. Existing ownership, sample, free, and paid classification keeps precedence.
+The wallet parser retains aggregate Ticket buckets for Account presentation and history only. `Episode` does not retain Ticket applicability or Ticket quantity. Gift and Coin episode commerce is specified separately in `2026-08-30-bomtoon-episode-commerce-design.md`.
 
 ## API tasks
 
@@ -162,7 +155,7 @@ At most three wallet tasks are active: one summary, one coin history, and one ti
 
 ### Summary refresh seam
 
-One `refresh_asset_summary` operation owns summary refresh behavior. Current callers are startup, Account open, and Account retry. A future purchase/rent success handler calls this same operation after the remote mutation succeeds.
+The episode-commerce success handler calls this same operation after an accepted Coin rental or purchase.
 
 The operation is re-entrant:
 
@@ -210,11 +203,9 @@ Empty history sections say `No coin expiration records` or `No ticket expiration
 
 ### Comic/Episodes
 
-The page header shows `Tickets N` only when at least one loaded episode has `coinKind == "TICKET"`. `N` is the cached aggregate ticket count from `/asset/user`; opening a comic does not start another summary request.
+Comic and episode pages do not display Ticket balance, Ticket applicability, or Ticket quantity. A Ticket may discount a Coin top-up or redeem into Free Coin, but neither operation is episode commerce.
 
-Every ticket-priced episode receives an explicit ticket label and its effective quantity. Non-ticket episodes preserve their existing Free, Sample, Owned, or Requires purchase label. If the wallet summary is unavailable, applicable episodes remain labelled as ticket-priced without inventing an available count.
-
-This change displays eligibility and balance only. It does not enable selection or spending of currently unreadable episodes.
+The episode-commerce design separately adds title-scoped Gift balance and Coin/Gift transaction actions. Account remains the sole surface for aggregate Ticket balances, buckets, and history.
 
 ## Failure and account behavior
 
@@ -253,8 +244,8 @@ Credentials remain runtime-managed through `Credential::bearer("bomtoon-access-t
 - Zero quantities are omitted.
 - Missing, zero, future, and expired timestamps receive the exact display classification.
 - Invalid timestamps, oversized arrays, oversized text, and malformed required fields fail only their section.
-- Ticket-priced episodes require the exact `TICKET` coin kind and retain their effective quantity.
-- Unknown coin kinds do not affect readability or ticket presentation.
+- Episode parsing does not infer direct Ticket applicability from `coinKind`.
+- Unknown coin kinds do not affect readability.
 
 ### Application behavior
 
@@ -264,9 +255,8 @@ Credentials remain runtime-managed through `Credential::bearer("bomtoon-access-t
 - Opening Account renders cached data and starts summary plus detail refreshes.
 - Account partial successes remain visible when another section fails.
 - Back restores the prior shelf and page.
-- Only ticket-applicable comics show the ticket header.
-- Every ticket-priced episode shows its ticket label and quantity.
-- Comics without ticket-priced episodes show no ticket UI.
+- Account retains aggregate Ticket balances, buckets, and history.
+- Comic and episode pages show no direct Ticket-payment UI.
 - A summary refresh requested during an active request coalesces into exactly one follow-up.
 - Prior-generation outcomes cannot overwrite newer summary or detail data.
 - Cached summary survives transient refresh failure.
@@ -275,7 +265,7 @@ Credentials remain runtime-managed through `Credential::bearer("bomtoon-access-t
 
 ### Layout and simulator evidence
 
-Account, Library, Recent, and Comic/Episodes layouts receive checks with `CLARA_BW_METRICS`, including maximum formatted counts, unavailable labels, ticket labels, empty histories, and a full history page. The completed implementation is exercised in the browser simulator and runtime simulator. No physical Kobo connection is part of verification.
+Account, Library, Recent, and Comic/Episodes layouts receive checks with `CLARA_BW_METRICS`, including maximum formatted counts, unavailable labels, empty histories, and a full history page. The completed implementation is exercised in the browser simulator and runtime simulator. No physical Kobo connection is part of verification.
 
 ## Implementation scope
 

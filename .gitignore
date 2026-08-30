@@ -16,6 +16,7 @@ secrets/
 .openai
 .anthropic
 .credentials
+/evidences/
 
 # The running development log. Useful while building, not part of what ships.
 BUILD_IN_PUBLIC.md
