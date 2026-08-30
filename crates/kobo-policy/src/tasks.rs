@@ -216,6 +216,9 @@ fn own_headers(headers: &[kobo_protocol::Header]) -> Result<Vec<(&str, &str)>, T
 /// outcome, so this can never become a second, divergent delivery path.
 pub type Wake = dyn Fn() + Send + Sync;
 
+/// Maximum UTF-8 byte length of a managed account subject.
+pub const MAX_ACCOUNT_SUBJECT_BYTES: usize = 128;
+
 /// The longest a stored secret may be.
 ///
 /// Every credential these applications use is far shorter. A ceiling means a
@@ -1473,6 +1476,7 @@ mod tests {
             access_expires_at_ms: 10_000_000,
             refresh_token: "redacted-refresh".to_owned(),
             refresh_expires_at_ms: 20_000_000,
+            account_subject: Some("account-a".to_owned()),
         }
     }
 

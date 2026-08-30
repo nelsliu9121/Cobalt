@@ -1,4 +1,5 @@
 use kobo_json::{ObjectBuilder, Value};
+use kobo_policy::tasks::MAX_ACCOUNT_SUBJECT_BYTES;
 use kobo_policy::{ManagedCredentialRecipe, ManagedTokenPair};
 use kobo_protocol::TaskError;
 use std::sync::Arc;
@@ -198,7 +199,7 @@ impl ManagedCredentialRecipe for Recipe {
             &headers,
             REFRESH_RESPONSE_MAX_BYTES,
         )?;
-        parse_refresh_tokens(&response)
+        parse_refresh_tokens(&response, pair.account_subject.as_deref())
     }
 
     fn revoke(&self, binding_secret: &str, pair: &ManagedTokenPair) -> Result<(), TaskError> {
@@ -265,20 +266,29 @@ fn validate_cookie(cookie: &str) -> Result<(), TaskError> {
 }
 
 fn parse_session_tokens(response: &[u8]) -> Result<ManagedTokenPair, TaskError> {
-    parse_token_pair(response, SESSION_RESPONSE_MAX_BYTES, "user")
+    let root = parse_bounded(response, SESSION_RESPONSE_MAX_BYTES)?;
+    let container = unique_field(&root, "user")?;
+    let account_subject = unique_field(container, "id")?
+        .as_str()
+        .ok_or(TaskError::Unreachable)?;
+    let account_subject = validate_account_subject(account_subject)?;
+    parse_token_pair(container, Some(account_subject))
 }
 
-fn parse_refresh_tokens(response: &[u8]) -> Result<ManagedTokenPair, TaskError> {
-    parse_token_pair(response, REFRESH_RESPONSE_MAX_BYTES, "result")
+fn parse_refresh_tokens(
+    response: &[u8],
+    account_subject: Option<&str>,
+) -> Result<ManagedTokenPair, TaskError> {
+    let root = parse_bounded(response, REFRESH_RESPONSE_MAX_BYTES)?;
+    let container = unique_field(&root, "result")?;
+    let account_subject = account_subject.map(validate_account_subject).transpose()?;
+    parse_token_pair(container, account_subject)
 }
 
 fn parse_token_pair(
-    response: &[u8],
-    max_bytes: u32,
-    container_name: &str,
+    container: &Value,
+    account_subject: Option<String>,
 ) -> Result<ManagedTokenPair, TaskError> {
-    let root = parse_bounded(response, max_bytes)?;
-    let container = unique_field(&root, container_name)?;
     let (access_token, access_expires_at_ms) = parse_token(container, "accessToken")?;
     let (refresh_token, refresh_expires_at_ms) = parse_token(container, "refreshToken")?;
     Ok(ManagedTokenPair {
@@ -286,7 +296,18 @@ fn parse_token_pair(
         access_expires_at_ms,
         refresh_token,
         refresh_expires_at_ms,
+        account_subject,
     })
+}
+
+fn validate_account_subject(account_subject: &str) -> Result<String, TaskError> {
+    if account_subject.len() > MAX_ACCOUNT_SUBJECT_BYTES {
+        return Err(TaskError::TooLarge);
+    }
+    if account_subject.is_empty() || account_subject.chars().any(char::is_control) {
+        return Err(TaskError::Unreachable);
+    }
+    Ok(account_subject.to_owned())
 }
 
 fn parse_token(container: &Value, name: &str) -> Result<(String, u64), TaskError> {
@@ -377,7 +398,7 @@ mod tests {
 
     const SESSION: &str = r#"{
   "user": {
-    "id": "USER_ID_A",
+    "id": "account-a",
     "accessToken": {"token":"ACCESS_A","createdAt":1000,"expiredAt":86401000},
     "refreshToken": {"token":"REFRESH_A","createdAt":1000,"expiredAt":604801000}
   },
@@ -514,6 +535,7 @@ mod tests {
             access_expires_at_ms: 86_401_000,
             refresh_token: "REFRESH_A".to_owned(),
             refresh_expires_at_ms: 604_801_000,
+            account_subject: Some("account-a".to_owned()),
         }
     }
 
@@ -523,6 +545,64 @@ mod tests {
 
     fn cookie_headers(cookie: &str) -> Vec<(String, String)> {
         owned_headers(&headers_with_cookie(cookie))
+    }
+
+    #[test]
+    fn session_bootstrap_retains_bounded_account_subject() {
+        let pair = parse_session_tokens(SESSION.as_bytes()).expect("session pair");
+        assert_eq!(pair.account_subject.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn refresh_preserves_bootstrap_account_subject() {
+        let pair =
+            parse_refresh_tokens(REFRESH.as_bytes(), Some("account-a")).expect("refresh pair");
+        assert_eq!(pair.account_subject.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn session_bootstrap_rejects_missing_account_subject() {
+        let response = SESSION.replace("    \"id\": \"account-a\",\n", "");
+        assert_eq!(
+            parse_session_tokens(response.as_bytes()),
+            Err(TaskError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_rejects_wrong_account_subject_type() {
+        let response = SESSION.replace("\"account-a\"", "42");
+        assert_eq!(
+            parse_session_tokens(response.as_bytes()),
+            Err(TaskError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_rejects_empty_account_subject() {
+        let response = SESSION.replace("account-a", "");
+        assert_eq!(
+            parse_session_tokens(response.as_bytes()),
+            Err(TaskError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_rejects_oversized_account_subject() {
+        let response = SESSION.replace("account-a", &"界".repeat(43));
+        assert_eq!(
+            parse_session_tokens(response.as_bytes()),
+            Err(TaskError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn session_bootstrap_rejects_control_character_account_subject() {
+        let response = SESSION.replace("account-a", "account\\u000aa");
+        assert_eq!(
+            parse_session_tokens(response.as_bytes()),
+            Err(TaskError::Unreachable)
+        );
     }
 
     #[test]
@@ -546,16 +626,17 @@ mod tests {
                 .expect("result")
                 .to_json()
         );
-        let pair = parse_refresh_tokens(response.as_bytes()).expect("refresh pair");
+        let pair =
+            parse_refresh_tokens(response.as_bytes(), Some("account-a")).expect("refresh pair");
         assert_eq!(pair.access_token, "ACCESS_B");
         assert_eq!(pair.refresh_token, "REFRESH_B");
-        assert!(parse_refresh_tokens(SESSION.as_bytes()).is_err());
+        assert!(parse_refresh_tokens(SESSION.as_bytes(), Some("account-a")).is_err());
     }
 
     #[test]
     fn partial_or_oversized_token_pairs_are_rejected() {
         let partial =
-            br#"{"user":{"accessToken":{"token":"ACCESS_A","createdAt":1,"expiredAt":2}}}"#;
+            br#"{"user":{"id":"account-a","accessToken":{"token":"ACCESS_A","createdAt":1,"expiredAt":2}}}"#;
         assert!(matches!(
             parse_session_tokens(partial),
             Err(TaskError::Unreachable)
@@ -563,7 +644,7 @@ mod tests {
 
         let oversized_token = "X".repeat(kobo_policy::tasks::MAX_SECRET_BYTES + 1);
         let oversized = format!(
-            r#"{{"user":{{"accessToken":{{"token":"{oversized_token}","createdAt":1,"expiredAt":2}},"refreshToken":{{"token":"R","createdAt":1,"expiredAt":2}}}}}}"#
+            r#"{{"user":{{"id":"account-a","accessToken":{{"token":"{oversized_token}","createdAt":1,"expiredAt":2}},"refreshToken":{{"token":"R","createdAt":1,"expiredAt":2}}}}}}"#
         );
         assert!(matches!(
             parse_session_tokens(oversized.as_bytes()),
@@ -603,6 +684,7 @@ mod tests {
 
         let beyond_double_precision = br#"{
           "user": {
+            "id": "account-a",
             "accessToken": {
               "token":"ACCESS_A",
               "createdAt":9007199254740993,
