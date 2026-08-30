@@ -6,8 +6,8 @@ mod parse;
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, DeviceRequest, DeviceResult, Failure, Glyph,
-    KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen, ScreenBuilder, TaskError,
-    TaskId, TaskOutcome, TilePicture, TileShape, CLARA_BW_METRICS,
+    KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen, ScreenBuilder, StoreResult,
+    TaskError, TaskId, TaskOutcome, TilePicture, TileShape, CLARA_BW_METRICS,
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Episode, EpisodeImage, ExpirationRow, Homepage,
@@ -152,11 +152,28 @@ impl ShelfLoadState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum AccountState {
     #[default]
+    Checking,
     Active,
     SignedOut,
     Expired,
     RevocationUnconfirmed,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ConnectionState {
+    #[default]
+    Unknown,
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerStoreOperation {
+    Load,
+    Save,
+    Forget,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum FeaturedStatus {
     #[default]
@@ -722,6 +739,12 @@ struct RebasedReaderWindow {
 #[derive(Default)]
 struct Bomtoon {
     account: AccountState,
+    connection: ConnectionState,
+    account_scope: Option<commerce::AccountScope>,
+    scope_task: Option<TaskId>,
+    scope_refresh_pending: bool,
+    commerce: commerce::Commerce,
+    marker_store: Option<MarkerStoreOperation>,
     view: View,
     destination: MainDestination,
     pending: Option<Pending>,
@@ -944,6 +967,12 @@ impl Bomtoon {
                 .activity(message, None)
                 .build();
         }
+        if self.account == AccountState::Checking && self.connection == ConnectionState::Offline {
+            return ScreenBuilder::new("bomtoon-offline")
+                .top_bar(TITLE)
+                .failure_state(Failure::of(TaskError::Offline), RETRY)
+                .build();
+        }
         if let Some(problem) = &self.problem {
             let title = if self.view == View::Reader {
                 self.reader_title()
@@ -986,7 +1015,7 @@ impl Bomtoon {
                 BannerLevel::Attention,
                 Failure::of(TaskError::RevocationUnconfirmed).advice,
             ),
-            AccountState::SignedOut | AccountState::Active => screen,
+            AccountState::Checking | AccountState::SignedOut | AccountState::Active => screen,
         };
         screen
             .text("Run this on your Mac:\nkobo bomtoon login --device <Kobo IP>")
@@ -1644,7 +1673,169 @@ impl Bomtoon {
             (!self.covers.visible_urls.is_empty()).then_some(CoverSource::Public);
     }
 
+    fn authentication(&self) -> commerce::Authentication {
+        match (self.account, self.account_scope) {
+            (AccountState::Active, Some(scope)) => commerce::Authentication::Authenticated(scope),
+            (AccountState::SignedOut | AccountState::RevocationUnconfirmed, _) => {
+                commerce::Authentication::SignedOut
+            }
+            (AccountState::Expired, _) => commerce::Authentication::Expired,
+            (AccountState::Checking | AccountState::Active, _) => {
+                commerce::Authentication::Unknown
+            }
+        }
+    }
+
+    fn connectivity(&self) -> commerce::Connectivity {
+        match self.connection {
+            ConnectionState::Unknown => commerce::Connectivity::Unknown,
+            ConnectionState::Online => commerce::Connectivity::Online,
+            ConnectionState::Offline => commerce::Connectivity::Offline,
+        }
+    }
+
+    fn apply_commerce_effects(
+        &mut self,
+        context: &mut Context,
+        effects: commerce::CommerceEffects,
+    ) {
+        if self.marker_store.is_none() {
+            match effects.command {
+                Some(commerce::CommerceCommand::SaveMarker(value)) => {
+                    self.marker_store = Some(MarkerStoreOperation::Save);
+                    context.store().save(commerce::MARKER_KEY, value);
+                }
+                Some(commerce::CommerceCommand::ForgetMarker) => {
+                    self.marker_store = Some(MarkerStoreOperation::Forget);
+                    context.store().forget(commerce::MARKER_KEY);
+                }
+                Some(
+                    commerce::CommerceCommand::FetchQuote { .. }
+                    | commerce::CommerceCommand::Post(_)
+                    | commerce::CommerceCommand::RefreshContent(_),
+                )
+                | None => {}
+            }
+        }
+        if effects.redraw {
+            self.show(context);
+        }
+    }
+
+    fn update_commerce_safety(&mut self, context: &mut Context) {
+        let effects = self
+            .commerce
+            .safety_changed(self.authentication(), self.connectivity());
+        self.apply_commerce_effects(context, effects);
+    }
+    fn clear_commerce_access(&mut self, context: &mut Context) {
+        if let Some(task) = self.scope_task.take() {
+            context.cancel(task);
+        }
+        self.scope_refresh_pending = false;
+        self.account_scope = None;
+        self.connection = ConnectionState::Unknown;
+        let _ = self.commerce.safety_changed(
+            commerce::Authentication::Unknown,
+            commerce::Connectivity::Unknown,
+        );
+    }
+
+    fn begin_commerce_safety(&mut self, context: &mut Context) {
+        self.account = AccountState::Checking;
+        self.connection = ConnectionState::Unknown;
+        self.scope_refresh_pending = true;
+        self.account_scope = None;
+        self.commerce = commerce::Commerce::new();
+        self.marker_store = Some(MarkerStoreOperation::Load);
+        context.store().load(commerce::MARKER_KEY);
+        if let Some(task) = context.spawn(api::account_scope()) {
+            self.scope_task = Some(task);
+            self.scope_refresh_pending = false;
+        }
+    }
+
+    fn request_commerce_scope(&mut self, context: &mut Context) {
+        if self.scope_task.is_some() {
+            return;
+        }
+        self.account_scope = None;
+        self.connection = ConnectionState::Unknown;
+        let _ = self.commerce.safety_changed(
+            commerce::Authentication::Unknown,
+            commerce::Connectivity::Unknown,
+        );
+        self.scope_refresh_pending = true;
+        if let Some(task) = context.spawn(api::account_scope()) {
+            self.scope_task = Some(task);
+            self.scope_refresh_pending = false;
+        }
+    }
+    fn finish_credential_loss(
+        &mut self,
+        context: &mut Context,
+        account: AccountState,
+    ) {
+        self.transition_after_credential_loss(context, account);
+    }
+
+    fn handle_scope_outcome(&mut self, context: &mut Context, outcome: TaskOutcome) {
+        match outcome {
+            TaskOutcome::Completed(bytes) => {
+                self.connection = ConnectionState::Online;
+                match commerce::AccountScope::from_bytes(&bytes) {
+                    Ok(scope) => {
+                        self.account = AccountState::Active;
+                        self.account_scope = Some(scope);
+                    }
+                    Err(_) => {
+                        self.account = AccountState::Active;
+                        self.account_scope = None;
+                    }
+                }
+                self.problem = None;
+                self.update_commerce_safety(context);
+            }
+            TaskOutcome::Failed(TaskError::NoCredential) => {
+                self.finish_credential_loss(context, AccountState::SignedOut);
+            }
+            TaskOutcome::Failed(TaskError::Unauthorized) => {
+                self.finish_credential_loss(context, AccountState::Expired);
+            }
+            TaskOutcome::Failed(TaskError::Denied) => {
+                self.account = AccountState::Active;
+                self.account_scope = None;
+                self.connection = ConnectionState::Online;
+                self.problem = None;
+                self.update_commerce_safety(context);
+            }
+            TaskOutcome::Failed(TaskError::Offline) => {
+                if self.account == AccountState::Checking {
+                    self.clear_protected_state(context);
+                    self.account = AccountState::Checking;
+                }
+                self.connection = ConnectionState::Offline;
+                self.problem = None;
+                self.retry = Retry::Restart;
+                self.update_commerce_safety(context);
+            }
+            TaskOutcome::Failed(error) => {
+                self.problem = Some(Failure::of(error).advice.to_owned());
+                self.retry = Retry::Restart;
+            }
+            TaskOutcome::Cancelled => {}
+        }
+    }
+
+    fn observe_connectivity(&mut self, context: &mut Context, outcome: &TaskOutcome) {
+        if matches!(outcome, TaskOutcome::Failed(TaskError::Offline)) {
+            self.connection = ConnectionState::Offline;
+            self.update_commerce_safety(context);
+        }
+    }
+
     fn clear_protected_state(&mut self, context: &mut Context) {
+        self.clear_commerce_access(context);
         if let Some(task) = self.task.take() {
             context.cancel(task);
         }
@@ -1683,6 +1874,7 @@ impl Bomtoon {
     fn transition_after_credential_loss(&mut self, context: &mut Context, account: AccountState) {
         self.clear_protected_state(context);
         self.account = account;
+        self.connection = ConnectionState::Online;
         self.destination = MainDestination::Featured;
         self.featured.page = 0;
         self.view = if account == AccountState::SignedOut {
@@ -1691,6 +1883,11 @@ impl Bomtoon {
             View::Status
         };
         self.problem = None;
+        let effects = self.commerce.safety_changed(
+            self.authentication(),
+            commerce::Connectivity::Online,
+        );
+        self.apply_commerce_effects(context, effects);
     }
 
     fn clear_all_state(&mut self, context: &mut Context) {
@@ -2088,9 +2285,10 @@ impl Bomtoon {
 
     fn restart(&mut self, context: &mut Context) {
         self.problem = None;
-        self.account = AccountState::Active;
         self.clear_protected_state(context);
+        self.begin_commerce_safety(context);
         self.open_public_main(context);
+        self.request_foreground(context, Pending::Library(0));
     }
 
     fn foreground_work(&self, pending: Pending) -> kobo_sdk::Task {
@@ -2158,6 +2356,15 @@ impl Bomtoon {
     }
 
     fn resume_capacity_work(&mut self, context: &mut Context) {
+        if self.scope_refresh_pending && self.scope_task.is_none() {
+            if let Some(task) = context.spawn(api::account_scope()) {
+                self.scope_task = Some(task);
+                self.scope_refresh_pending = false;
+            }
+        }
+        if self.scope_refresh_pending {
+            return;
+        }
         self.resume_queued_foreground(context);
         if self.queued_foreground.is_none() {
             self.resume_deferred_wallet(context);
@@ -2830,11 +3037,7 @@ impl Bomtoon {
         match pending {
             Pending::Logout => {
                 if bytes.is_empty() {
-                    self.clear_protected_state(context);
-                    self.account = AccountState::SignedOut;
-                    self.destination = MainDestination::Featured;
-                    self.featured.page = 0;
-                    self.view = View::Main;
+                    self.transition_after_credential_loss(context, AccountState::SignedOut);
                 } else {
                     self.problem = Some("BOMTOON returned unexpected sign-out data.".to_owned());
                 }
@@ -3157,12 +3360,10 @@ impl Bomtoon {
     fn fail_task(&mut self, context: &mut Context, pending: Pending, error: TaskError) {
         match (pending, error) {
             (Pending::Logout, TaskError::RevocationUnconfirmed) => {
-                self.clear_protected_state(context);
-                self.account = AccountState::RevocationUnconfirmed;
-                self.destination = MainDestination::Featured;
-                self.featured.page = 0;
-                self.view = View::Status;
-                self.problem = None;
+                self.transition_after_credential_loss(
+                    context,
+                    AccountState::RevocationUnconfirmed,
+                );
             }
             (Pending::Logout, TaskError::LocalStorage) => {
                 self.problem = Some("Could not remove the local BOMTOON sign-in data.".to_owned());
@@ -3499,16 +3700,17 @@ impl Bomtoon {
 
 impl KoboApp for Bomtoon {
     fn on_start(&mut self, context: &mut Context) {
-        self.problem = None;
-        self.open_public_main(context);
+        self.restart(context);
         self.show(context);
     }
 
     fn on_resume(&mut self, context: &mut Context) {
         self.request_local_day(context);
+        self.request_commerce_scope(context);
     }
 
     fn on_suspend(&mut self, context: &mut Context) {
+        self.clear_commerce_access(context);
         if self.view == View::Reader
             || self.reader_selection.is_some()
             || self.reader.is_some()
@@ -3525,8 +3727,13 @@ impl KoboApp for Bomtoon {
         }
     }
 
+    fn on_background(&mut self, context: &mut Context) {
+        self.clear_commerce_access(context);
+    }
+
     fn on_foreground(&mut self, context: &mut Context) {
         self.request_local_day(context);
+        self.request_commerce_scope(context);
     }
 
     fn on_device_result(
@@ -3614,7 +3821,10 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        let retry_visible = self.problem.is_some() || self.view == View::Status;
+        let retry_visible = self.problem.is_some()
+            || self.view == View::Status
+            || (self.account == AccountState::Checking
+                && self.connection == ConnectionState::Offline);
         if action == action_id(RETRY) && self.pending.is_none() && retry_visible {
             if !self.retry(context) {
                 self.show(context);
@@ -3767,7 +3977,15 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
+        if self.scope_task == Some(task) {
+            self.scope_task = None;
+            self.handle_scope_outcome(context, outcome);
+            self.show(context);
+            self.resume_capacity_work(context);
+            return;
+        }
         if let Some(cover) = self.covers.tasks.remove(&task) {
+            self.observe_connectivity(context, &outcome);
             self.resume_queued_foreground(context);
             let changed = self.handle_cover_outcome(context, task, cover, outcome);
             if changed {
@@ -3789,6 +4007,7 @@ impl KoboApp for Bomtoon {
                 self.resume_capacity_work(context);
                 return;
             }
+            self.observe_connectivity(context, &outcome);
             self.resume_queued_foreground(context);
             let changed = self.handle_shelf_outcome(context, purpose, outcome);
             if changed && self.view == View::Main && self.destination == MainDestination::Featured {
@@ -3798,12 +4017,14 @@ impl KoboApp for Bomtoon {
             return;
         }
         if let Some(purpose) = self.wallet.tasks.remove(&task) {
+            self.observe_connectivity(context, &outcome);
             self.resume_queued_foreground(context);
             self.handle_wallet_outcome(context, task, purpose, outcome);
             self.resume_capacity_work(context);
             return;
         }
         if let Some(entry) = self.reader_tasks.remove(&task) {
+            self.observe_connectivity(context, &outcome);
             if self.foreground_reader_task == Some(task) {
                 self.foreground_reader_task = None;
             }
@@ -3821,6 +4042,7 @@ impl KoboApp for Bomtoon {
             self.resume_capacity_work(context);
             return;
         };
+        self.observe_connectivity(context, &outcome);
         let shown = match outcome {
             TaskOutcome::Completed(bytes) => self.accept(context, pending, &bytes),
             TaskOutcome::Failed(error) => {
@@ -3836,6 +4058,38 @@ impl KoboApp for Bomtoon {
             self.show(context);
         }
         self.resume_capacity_work(context);
+    }
+
+    fn on_store(&mut self, context: &mut Context, result: StoreResult) {
+        let effects = match (&self.marker_store, result) {
+            (
+                Some(MarkerStoreOperation::Load),
+                StoreResult::Loaded { key, value },
+            ) if key == commerce::MARKER_KEY => {
+                self.marker_store = None;
+                Some(self.commerce.marker_loaded(value.as_deref()))
+            }
+            (Some(MarkerStoreOperation::Save), StoreResult::Saved { key })
+                if key == commerce::MARKER_KEY =>
+            {
+                self.marker_store = None;
+                Some(self.commerce.marker_saved(&key))
+            }
+            (Some(MarkerStoreOperation::Forget), StoreResult::Forgotten { key })
+                if key == commerce::MARKER_KEY =>
+            {
+                self.marker_store = None;
+                Some(self.commerce.marker_forgotten(&key))
+            }
+            (Some(_), StoreResult::Denied(error)) => {
+                self.marker_store = None;
+                Some(self.commerce.store_denied(error))
+            }
+            _ => None,
+        };
+        if let Some(effects) = effects {
+            self.apply_commerce_effects(context, effects);
+        }
     }
 }
 
@@ -4533,8 +4787,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use kobo_sdk::{
-        AppRunner, Chrome, Command, DisplayMetrics, Node, PictureHandle, ReadingChrome,
-        SecretHeader, Task, TilePicture, CLARA_BW_METRICS,
+        AppRunner, Chrome, Command, DisplayMetrics, Lifecycle, Node, PictureHandle, ReadingChrome,
+        SecretHeader, StoreError, StoreRequest, StoreResult, Task, TilePicture, CLARA_BW_METRICS,
     };
 
     const LIBRARY_RESPONSE: &[u8] = br#"{
@@ -5157,6 +5411,620 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn scope_task(commands: &[Command]) -> TaskId {
+        spawns(commands)
+            .into_iter()
+            .find_map(|(task, work)| (work == api::account_scope()).then_some(task))
+            .expect("credential scope task")
+    }
+
+    fn assert_no_post_or_marker_forget(commands: &[Command]) {
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, Command::Spawn { work: Task::Post { .. }, .. })),
+            "commerce emitted POST: {commands:?}"
+        );
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command,
+                Command::Store(StoreRequest::Forget { key }) if key == commerce::MARKER_KEY
+            )),
+            "commerce forgot its marker: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn startup_uses_all_four_task_slots_for_scope_homepage_library_and_wallet() {
+        let (runner, commands) = started();
+        let spawned = spawns(&commands);
+
+        assert_eq!(runner.app().account, AccountState::Checking);
+        assert_eq!(runner.app().connection, ConnectionState::Unknown);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+        assert_eq!(spawned.len(), 4);
+        assert!(spawned.iter().any(|(_, work)| *work == api::account_scope()));
+        assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
+        assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::asset_summary()));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Load { key }) if key == commerce::MARKER_KEY
+        )));
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn startup_marker_then_scope_settles_safety_without_early_commerce() {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+
+        let marker_commands = runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+        assert_no_post_or_marker_forget(&marker_commands);
+
+        let scope_commands = runner.task_outcome(
+            scope,
+            TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
+        );
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Idle
+        );
+        assert_no_post_or_marker_forget(&scope_commands);
+    }
+
+    #[test]
+    fn startup_scope_then_marker_settles_safety_without_early_commerce() {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+
+        let scope_commands = runner.task_outcome(
+            scope,
+            TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
+        );
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+        assert_no_post_or_marker_forget(&scope_commands);
+
+        let marker_commands = runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Idle
+        );
+        assert_no_post_or_marker_forget(&marker_commands);
+    }
+
+    fn test_scope(bytes: &[u8; 32]) -> commerce::AccountScope {
+        commerce::AccountScope::from_bytes(bytes).expect("test account scope")
+    }
+
+    fn marker_for(scope: commerce::AccountScope) -> Vec<u8> {
+        commerce::encode_marker(&commerce::UnresolvedMutationV1 {
+            account_scope: scope,
+            title_id: 41,
+            title_alias: "hunter_q".to_owned(),
+            episode_id: 105,
+            episode_alias: "paid".to_owned(),
+            purchase_type: model::PurchaseType::Rent,
+            quoted_price: 1,
+            pre_mutation_spendable_coin: Some(10),
+            pre_mutation_title_gifts: None,
+        })
+        .expect("test unresolved marker")
+    }
+
+    fn startup_with_marker(value: Option<Vec<u8>>) -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+        let marker_commands = runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value,
+        });
+        assert_no_post_or_marker_forget(&marker_commands);
+        (runner, scope)
+    }
+
+    #[test]
+    fn account_scope_same_marker_reconciles_without_post_or_forget() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let (mut runner, task) = startup_with_marker(Some(marker_for(test_scope(SCOPE))));
+
+        let commands = runner.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Reconciling
+        );
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn account_scope_different_marker_allows_reading_but_locks_commerce() {
+        const OWNER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        const READER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
+        let (mut runner, task) = startup_with_marker(Some(marker_for(test_scope(OWNER))));
+
+        let commands = runner.task_outcome(task, TaskOutcome::Completed(READER.to_vec()));
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn account_scope_credential_failures_map_without_clearing_marker() {
+        const OWNER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        for (error, expected) in [
+            (TaskError::NoCredential, AccountState::SignedOut),
+            (TaskError::Unauthorized, AccountState::Expired),
+        ] {
+            let (mut runner, task) =
+                startup_with_marker(Some(marker_for(test_scope(OWNER))));
+
+            let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
+
+            assert_eq!(runner.app().account, expected);
+            assert_eq!(runner.app().connection, ConnectionState::Online);
+            assert_no_post_or_marker_forget(&commands);
+        }
+    }
+
+    #[test]
+    fn account_scope_legacy_credential_keeps_reading_and_locks_commerce() {
+        const OWNER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let (mut runner, task) = startup_with_marker(Some(marker_for(test_scope(OWNER))));
+
+        let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Denied));
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn offline_cold_start_keeps_auth_unknown_and_marker_intact() {
+        const OWNER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let (mut runner, task) = startup_with_marker(Some(marker_for(test_scope(OWNER))));
+
+        let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Offline));
+
+        assert_eq!(runner.app().account, AccountState::Checking);
+        assert_eq!(runner.app().connection, ConnectionState::Offline);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+        assert_no_post_or_marker_forget(&commands);
+        assert!(
+            format!("{:?}", last_screen(&commands)).contains("Join Wi-Fi"),
+            "cold-start offline did not expose the standard network recovery surface"
+        );
+        let retry_commands = runner.action(action_id(RETRY));
+        assert_eq!(runner.app().account, AccountState::Checking);
+        assert_eq!(runner.app().connection, ConnectionState::Unknown);
+        assert!(spawns(&retry_commands)
+            .iter()
+            .any(|(_, work)| *work == api::account_scope()));
+        assert!(retry_commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Load { key }) if key == commerce::MARKER_KEY
+        )));
+        assert_no_post_or_marker_forget(&retry_commands);
+    }
+
+    #[test]
+    fn offline_warm_session_keeps_loaded_reading_and_locks_commerce() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let (mut runner, task) = startup_with_marker(None);
+        runner.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
+        runner.app_mut().comics.push(Comic {
+            alias: "kept".to_owned(),
+            title: "Kept".to_owned(),
+            cover_url: None,
+            owned_episodes: 1,
+            total_episodes: 1,
+        });
+        let summary = runner
+            .app()
+            .wallet
+            .summary_task
+            .expect("startup wallet task");
+
+        let commands = runner.task_outcome(summary, TaskOutcome::Failed(TaskError::Offline));
+
+        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().connection, ConnectionState::Offline);
+        assert_eq!(runner.app().comics.len(), 1);
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn offline_late_unowned_task_cannot_lock_a_new_session() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let (mut runner, task) = startup_with_marker(None);
+        runner.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+
+        let commands =
+            runner.task_outcome(TaskId(999), TaskOutcome::Failed(TaskError::Offline));
+
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    fn commerce_quote() -> model::Quote {
+        model::Quote {
+            content_id: 41,
+            episode_id: 105,
+            content_alias: "hunter_q".to_owned(),
+            episode_alias: "paid".to_owned(),
+            is_available: false,
+            coin_kind: "COIN".to_owned(),
+            rent_coin: 1,
+            possession_coin: 2,
+            permanent_coin: Some(2),
+            is_rent_gift: false,
+            is_possession_gift: false,
+        }
+    }
+
+    fn commerce_selection() -> commerce::Selection {
+        commerce::Selection {
+            title_id: 41,
+            title_alias: "hunter_q".to_owned(),
+            episode_id: 105,
+            episode_alias: "paid".to_owned(),
+        }
+    }
+
+    fn choosing_commerce(scope: commerce::AccountScope) -> commerce::Commerce {
+        let mut commerce = commerce::Commerce::new();
+        commerce.safety_changed(
+            commerce::Authentication::Authenticated(scope),
+            commerce::Connectivity::Online,
+        );
+        commerce.marker_loaded(None);
+        commerce.begin_quote(commerce_selection(), model::PurchaseType::Rent);
+        commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
+        assert_eq!(commerce.state(), commerce::CommerceState::Choosing);
+        commerce
+    }
+
+    fn persisting_commerce(scope: commerce::AccountScope) -> commerce::Commerce {
+        let mut commerce = commerce::Commerce::new();
+        commerce.safety_changed(
+            commerce::Authentication::Authenticated(scope),
+            commerce::Connectivity::Online,
+        );
+        commerce.marker_loaded(None);
+        commerce.begin_quote(commerce_selection(), model::PurchaseType::Rent);
+        commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
+        commerce.choose(commerce::Action::Rent);
+        let effects =
+            commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
+        assert!(matches!(
+            effects.command,
+            Some(commerce::CommerceCommand::SaveMarker(_))
+        ));
+        commerce
+    }
+
+    fn clearing_commerce(scope: commerce::AccountScope) -> commerce::Commerce {
+        let mut commerce = persisting_commerce(scope);
+        assert!(matches!(
+            commerce.marker_saved(commerce::MARKER_KEY).command,
+            Some(commerce::CommerceCommand::Post(_))
+        ));
+        assert!(matches!(
+            commerce
+                .mutation_finished(commerce::PostOutcome::ExplicitRejection)
+                .command,
+            Some(commerce::CommerceCommand::ForgetMarker)
+        ));
+        commerce
+    }
+
+    #[test]
+    fn unresolved_marker_denied_load_locks_in_both_callback_orders() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        for scope_first in [false, true] {
+            let (mut runner, commands) = started();
+            let scope = scope_task(&commands);
+            let mut observed = Vec::new();
+            if scope_first {
+                observed.extend(runner.task_outcome(
+                    scope,
+                    TaskOutcome::Completed(SCOPE.to_vec()),
+                ));
+            }
+            observed.extend(
+                runner.store_result(StoreResult::Denied(StoreError::Unwritable)),
+            );
+            if !scope_first {
+                observed.extend(runner.task_outcome(
+                    scope,
+                    TaskOutcome::Completed(SCOPE.to_vec()),
+                ));
+            }
+
+            assert_eq!(
+                runner.app().commerce.state(),
+                commerce::CommerceState::AcceptedButStale
+            );
+            assert_no_post_or_marker_forget(&observed);
+        }
+    }
+
+    #[test]
+    fn unresolved_marker_load_requires_exact_key_and_operation() {
+        let (mut runner, _) = started();
+
+        runner.store_result(StoreResult::Loaded {
+            key: "other".to_owned(),
+            value: None,
+        });
+        assert_eq!(
+            runner.app().marker_store,
+            Some(MarkerStoreOperation::Load)
+        );
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+
+        runner.store_result(StoreResult::Saved {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert_eq!(
+            runner.app().marker_store,
+            Some(MarkerStoreOperation::Load)
+        );
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::LoadingSafetyState
+        );
+
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        assert_eq!(runner.app().marker_store, None);
+    }
+
+    #[test]
+    fn unresolved_marker_store_callbacks_require_exact_key_and_operation() {
+        let scope = test_scope(b"00112233445566778899aabbccddeeff");
+        let (mut runner, _) = started();
+
+        runner.app_mut().commerce = persisting_commerce(scope);
+        runner.app_mut().marker_store = Some(MarkerStoreOperation::Save);
+
+        runner.store_result(StoreResult::Saved {
+            key: "other".to_owned(),
+        });
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::PersistingIntent
+        );
+        assert_eq!(
+            runner.app().marker_store,
+            Some(MarkerStoreOperation::Save)
+        );
+
+        runner.store_result(StoreResult::Forgotten {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::PersistingIntent
+        );
+        assert_eq!(
+            runner.app().marker_store,
+            Some(MarkerStoreOperation::Save)
+        );
+
+        runner.store_result(StoreResult::Saved {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Mutating
+        );
+        assert_eq!(runner.app().marker_store, None);
+    }
+
+    #[test]
+    fn unresolved_marker_denied_save_emits_no_post() {
+        let scope = test_scope(b"00112233445566778899aabbccddeeff");
+        let (mut runner, _) = started();
+        runner.app_mut().commerce = persisting_commerce(scope);
+        runner.app_mut().marker_store = Some(MarkerStoreOperation::Save);
+
+        let commands = runner.store_result(StoreResult::Denied(StoreError::Unwritable));
+
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Choosing
+        );
+        assert_eq!(runner.app().marker_store, None);
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn unresolved_marker_denied_forget_stays_locked_and_matching_forget_unlocks() {
+        let scope = test_scope(b"00112233445566778899aabbccddeeff");
+        let (mut denied, _) = started();
+        denied.app_mut().commerce = clearing_commerce(scope);
+        denied.app_mut().marker_store = Some(MarkerStoreOperation::Forget);
+
+        let commands = denied.store_result(StoreResult::Denied(StoreError::Unwritable));
+        assert_eq!(
+            denied.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_eq!(denied.app().marker_store, None);
+        assert_no_post_or_marker_forget(&commands);
+
+        let (mut forgotten, _) = started();
+        forgotten.app_mut().commerce = clearing_commerce(scope);
+        forgotten.app_mut().marker_store = Some(MarkerStoreOperation::Forget);
+        forgotten.store_result(StoreResult::Forgotten {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert_eq!(
+            forgotten.app().commerce.state(),
+            commerce::CommerceState::Idle
+        );
+        assert_eq!(forgotten.app().marker_store, None);
+    }
+
+    #[test]
+    fn unresolved_marker_interrupted_save_and_post_reload_without_second_post() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let scope = test_scope(SCOPE);
+        let marker = marker_for(scope);
+        for commerce in [
+            persisting_commerce(scope),
+            {
+                let mut commerce = persisting_commerce(scope);
+                commerce.marker_saved(commerce::MARKER_KEY);
+                commerce
+            },
+        ] {
+            let (mut interrupted, _) = started();
+            interrupted.app_mut().commerce = commerce;
+            interrupted.app_mut().account_scope = Some(scope);
+            let exit_commands = interrupted.exit();
+            assert_no_post_or_marker_forget(&exit_commands);
+
+            let (mut restarted, task) = startup_with_marker(Some(marker.clone()));
+            let commands =
+                restarted.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
+            assert_eq!(
+                restarted.app().commerce.state(),
+                commerce::CommerceState::Reconciling
+            );
+            assert_no_post_or_marker_forget(&commands);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CommerceInterruption {
+        Suspend,
+        Background,
+        Exit,
+    }
+
+    fn interrupt_commerce(
+        runner: &mut AppRunner<Bomtoon>,
+        interruption: CommerceInterruption,
+    ) -> Vec<Command> {
+        match interruption {
+            CommerceInterruption::Suspend => runner.suspend(),
+            CommerceInterruption::Background => runner.lifecycle(Lifecycle::Background),
+            CommerceInterruption::Exit => runner.exit(),
+        }
+    }
+
+    #[test]
+    fn unresolved_marker_lifecycle_cancels_scope_without_forgetting_marker() {
+        for interruption in [
+            CommerceInterruption::Suspend,
+            CommerceInterruption::Background,
+            CommerceInterruption::Exit,
+        ] {
+            let (mut runner, commands) = started();
+            let scope = scope_task(&commands);
+            let commands = interrupt_commerce(&mut runner, interruption);
+            assert!(commands.contains(&Command::Cancel(scope)));
+            assert_eq!(runner.app().scope_task, None);
+            assert_no_post_or_marker_forget(&commands);
+        }
+    }
+
+    #[test]
+    fn unresolved_marker_lifecycle_clears_volatile_commerce_without_forget() {
+        let scope = test_scope(b"00112233445566778899aabbccddeeff");
+        for interruption in [
+            CommerceInterruption::Suspend,
+            CommerceInterruption::Background,
+            CommerceInterruption::Exit,
+        ] {
+            let (mut runner, _) = started();
+            runner.app_mut().account = AccountState::Active;
+            runner.app_mut().connection = ConnectionState::Online;
+            runner.app_mut().account_scope = Some(scope);
+            runner.app_mut().commerce = choosing_commerce(scope);
+
+            let commands = interrupt_commerce(&mut runner, interruption);
+
+            assert_eq!(
+                runner.app().commerce.state(),
+                commerce::CommerceState::LoadingSafetyState
+            );
+            assert_no_post_or_marker_forget(&commands);
+        }
+    }
+
+    #[test]
+    fn unresolved_marker_logout_preserves_marker_and_clears_commerce_access() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let scope = test_scope(SCOPE);
+        let (mut runner, scope_task) =
+            startup_with_marker(Some(marker_for(scope)));
+        runner.task_outcome(
+            scope_task,
+            TaskOutcome::Completed(SCOPE.to_vec()),
+        );
+        let library = runner.app().task.expect("startup library task");
+        runner.task_outcome(
+            library,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
+        let logout = begin_logout(&mut runner);
+
+        let commands = runner.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
+
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().account_scope, None);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_no_post_or_marker_forget(&commands);
     }
 
     fn fetch_task_with(commands: &[Command], needle: &str) -> (TaskId, Task) {
@@ -5903,7 +6771,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_out_start_opens_public_featured_without_protected_shelves() {
+    fn start_rechecks_credentials_instead_of_trusting_previous_account_state() {
         let mut runner = AppRunner::new(Bomtoon {
             account: AccountState::SignedOut,
             ..Bomtoon::default()
@@ -5911,20 +6779,14 @@ mod tests {
 
         let commands = runner.start();
 
+        assert_eq!(runner.app().account, AccountState::Checking);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
         assert!(commands.iter().any(is_homepage_fetch));
-        assert!(!commands.iter().any(is_library_or_recent_fetch));
-    }
-
-    #[test]
-    fn signed_in_start_opens_public_featured_with_independent_account_probe() {
-        let (runner, commands) = started();
-
-        assert_eq!(runner.app().view, View::Main);
-        assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert!(commands.iter().any(is_homepage_fetch));
-        assert!(!commands.iter().any(is_library_or_recent_fetch));
+        assert!(commands.iter().any(is_library_or_recent_fetch));
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::account_scope()));
         assert!(spawns(&commands)
             .iter()
             .any(|(_, work)| *work == api::asset_summary()));
@@ -7485,17 +8347,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_loads_homepage_and_asset_summary_independently() {
+    fn startup_loads_public_and_account_reads_independently() {
         let (_, commands) = started();
         let spawned = spawns(&commands);
-        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned.len(), 4);
+        assert!(spawned.iter().any(|(_, work)| *work == api::account_scope()));
         assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
+        assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
         assert!(spawned
             .iter()
             .any(|(_, work)| *work == api::asset_summary()));
-        assert!(spawned.iter().all(
-            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/library?") || url.contains("/recent?"))
-        ));
     }
 
     #[test]
