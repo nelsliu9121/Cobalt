@@ -297,7 +297,7 @@ GET https://www.bomtoon.tw/comic/main
 GET https://www.bomtoon.tw/detail/{validated-alias}
 ```
 
-Both use `Credential::None`, offset zero, a 512 KiB ceiling, and ordinary browser-compatible `Accept`/`x-referer` headers only. Reuse `api::image(url)` for covers.
+Both use `credential: None`, offset zero, a 512 KiB ceiling, and exactly the existing `response_headers("text/html")` values (`Accept: text/html` plus `Accept-Language`); neither sends `Referer` nor `x-referer`. Reuse `api::image(url)` for covers.
 
 - [ ] **Step 1: Add failing API contract tests**
 
