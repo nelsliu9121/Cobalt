@@ -1603,6 +1603,10 @@ impl Bomtoon {
     }
 
     fn start_homepage(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
+        if refresh_day.is_some() && self.featured.status != FeaturedStatus::Ready {
+            self.featured.status = FeaturedStatus::Loading;
+            self.featured.stale_warning = None;
+        }
         if let Some((_, queued_day)) = self.queued_homepage.as_mut() {
             *queued_day = refresh_day;
             if refresh_day.is_none() {
@@ -1664,18 +1668,29 @@ impl Bomtoon {
         let Some(failed_day) = self.featured.refresh.active_day.take() else {
             return false;
         };
+        let preserves_ready_feed = self.featured.status == FeaturedStatus::Ready;
         if self
             .featured
             .refresh
             .desired_day
             .is_some_and(|desired| desired != failed_day)
         {
+            if !preserves_ready_feed {
+                self.featured.status = FeaturedStatus::Loading;
+                self.featured.stale_warning = None;
+            }
             self.start_desired_refresh(context);
             return true;
         }
         self.featured.refresh.desired_day = Some(failed_day);
-        self.featured.stale_warning =
-            Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
+        if preserves_ready_feed {
+            self.featured.stale_warning =
+                Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
+        } else {
+            self.featured.status = FeaturedStatus::Failed;
+            self.featured.pending_details = 0;
+            self.featured.stale_warning = None;
+        }
         true
     }
 
@@ -3336,20 +3351,28 @@ impl KoboApp for Bomtoon {
             return;
         }
         if action == action_id(RETRY)
+            && self.problem.is_none()
             && self.view == View::Main
             && self.destination == MainDestination::Featured
             && self.featured.stale_warning.is_some()
+            && self.featured.refresh.active_day.is_none()
         {
             self.start_desired_refresh(context);
             self.show(context);
             return;
         }
         if action == action_id(RETRY)
+            && self.problem.is_none()
             && self.view == View::Main
             && self.destination == MainDestination::Featured
             && self.featured.status == FeaturedStatus::Failed
+            && self.featured.refresh.active_day.is_none()
         {
-            self.start_homepage(context, None);
+            if self.featured.refresh.desired_day.is_some() {
+                self.start_desired_refresh(context);
+            } else {
+                self.start_homepage(context, None);
+            }
             self.show(context);
             return;
         }
@@ -9857,6 +9880,94 @@ mod tests {
         assert_eq!(runner.app().featured.refresh.desired_day, None);
         assert_eq!(runner.app().featured.featured, old_featured);
         assert_eq!(runner.app().featured.recommended, old_recommended);
+    }
+
+    fn assert_non_ready_refresh_failure_is_terminal(status: FeaturedStatus) {
+        let mut runner = ready_featured_runner(Some(local_day(30)));
+        {
+            let featured = &mut runner.app_mut().featured;
+            featured.status = status;
+            featured.featured.clear();
+            featured.recommended.clear();
+        }
+        let commands = observe_local_day(&mut runner, Some(local_day(31)));
+        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+
+        let commands =
+            runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
+        let screen = last_screen(&commands);
+
+        assert_eq!(runner.app().featured.status, FeaturedStatus::Failed);
+        assert!(runner.app().featured.stale_warning.is_none());
+        assert_eq!(
+            runner.app().featured.refresh.loaded_day,
+            Some(local_day(30))
+        );
+        assert_eq!(runner.app().featured.refresh.active_day, None);
+        assert_eq!(
+            runner.app().featured.refresh.desired_day,
+            Some(local_day(31))
+        );
+        assert_eq!(
+            screen
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(node, Node::Button { action, .. } if *action == action_id(RETRY))
+                })
+                .count(),
+            1
+        );
+
+        let retry = runner.action(action_id(RETRY));
+        let (homepage, _) = fetch_task_with(&retry, "/comic/main");
+        assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
+        assert_eq!(
+            runner.app().featured.refresh.active_day,
+            Some(local_day(31))
+        );
+        assert!(matches!(
+            runner.app().shelf_tasks.get(&homepage),
+            Some(ShelfTaskPurpose::Homepage {
+                refresh_day: Some(day),
+                ..
+            }) if *day == local_day(31)
+        ));
+    }
+
+    #[test]
+    fn refresh_failure_from_loading_without_a_ready_feed_is_terminal() {
+        assert_non_ready_refresh_failure_is_terminal(FeaturedStatus::Loading);
+    }
+
+    #[test]
+    fn refresh_failure_from_failed_without_a_ready_feed_is_terminal() {
+        assert_non_ready_refresh_failure_is_terminal(FeaturedStatus::Failed);
+    }
+
+    #[test]
+    fn featured_problem_retry_precedes_stale_refresh_retry() {
+        let mut app = ready_featured(Some(local_day(30)));
+        app.featured.stale_warning = Some("Showing an older Featured feed.".to_owned());
+        app.featured.refresh.desired_day = Some(local_day(31));
+        app.problem = Some("The protected request failed.".to_owned());
+        app.retry = Retry::Restart;
+        let mut runner = AppRunner::new(app);
+
+        let commands = runner.action(action_id(RETRY));
+        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+
+        assert!(runner.app().problem.is_none());
+        assert!(runner.app().featured.stale_warning.is_none());
+        assert_eq!(runner.app().featured.refresh.active_day, None);
+        assert_eq!(runner.app().featured.refresh.desired_day, None);
+        assert!(matches!(
+            runner.app().shelf_tasks.get(&homepage),
+            Some(ShelfTaskPurpose::Homepage {
+                refresh_day: None,
+                ..
+            })
+        ));
     }
 
     #[test]
