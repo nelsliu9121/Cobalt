@@ -816,7 +816,7 @@ impl Bomtoon {
     }
 
     fn sync_visible_covers(&mut self, context: &mut Context) {
-        if self.pending == Some(Pending::Logout) {
+        if self.view == View::Account || self.pending == Some(Pending::Logout) {
             return;
         }
         let visible = self.visible_cover_urls();
@@ -1517,6 +1517,7 @@ impl Bomtoon {
 
     fn open_account(&mut self, context: &mut Context) {
         self.page = 0;
+        self.featured.page = 0;
         self.problem = None;
         self.view = View::Account;
         self.refresh_asset_summary(context);
@@ -3451,6 +3452,7 @@ impl KoboApp for Bomtoon {
         {
             self.view = View::Main;
             self.page = 0;
+            self.featured.page = 0;
             self.show(context);
             return;
         }
@@ -3583,7 +3585,11 @@ impl KoboApp for Bomtoon {
                 EPISODE_ITEMS_PER_PAGE
             };
             let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
-            if self.view != View::Main || next_start < self.destination_len() {
+            if self.view == View::Episodes {
+                if next_start < self.episodes.len() {
+                    self.page = self.page.saturating_add(1);
+                }
+            } else if next_start < self.destination_len() {
                 self.page = self.page.saturating_add(1);
             } else if let Some(next) = self.destination_next_page() {
                 let (pending, work) = match self.destination {
@@ -6056,6 +6062,19 @@ mod tests {
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Recent);
         assert_eq!(runner.app().page, 0);
+
+        runner.app_mut().view = View::Main;
+        runner.app_mut().destination = MainDestination::Featured;
+        runner.app_mut().featured.page = 2;
+        runner.app_mut().page = 7;
+        runner.action(action_id(ACCOUNT));
+        assert_eq!(runner.app().view, View::Account);
+        assert_eq!(runner.app().featured.page, 0);
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert_eq!(runner.app().featured.page, 0);
+        assert_eq!(runner.app().page, 0);
     }
 
     #[test]
@@ -8229,7 +8248,7 @@ mod tests {
         let mut runner = seeded_reader(1, 0, false);
         {
             let app = runner.app_mut();
-            app.view = View::Account;
+            app.view = View::Main;
             app.destination = MainDestination::Library;
             app.page = 4;
             app.featured = FeaturedState {
@@ -8383,6 +8402,13 @@ mod tests {
         let public_featured = runner.app().featured.featured.clone();
         let public_recommended = runner.app().featured.recommended.clone();
         let public_refresh = runner.app().featured.refresh.clone();
+
+        let account_commands = runner.action(action_id(ACCOUNT));
+        assert_eq!(runner.app().view, View::Account);
+        for task in [public_cover_task, shared_cover_task, protected_cover_task] {
+            assert!(!account_commands.contains(&Command::Cancel(task)));
+            assert!(runner.app().covers.tasks.contains_key(&task));
+        }
 
         let commands = runner.action(action_id(SIGN_OUT));
         let (logout_task, work) = only_spawn(&commands);
@@ -8932,7 +8958,7 @@ mod tests {
 
 
     #[test]
-    fn episode_pagination_keeps_six_items_per_page() {
+    fn episode_pagination_keeps_six_items_per_page_and_stops_at_the_final_page() {
         assert_eq!(EPISODE_ITEMS_PER_PAGE, 6);
         assert_eq!(
             page_bounds(0, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
@@ -8942,6 +8968,33 @@ mod tests {
             page_bounds(1, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
             (6, 7)
         );
+        let episodes = (0..=EPISODE_ITEMS_PER_PAGE)
+            .map(|index| Episode {
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                purchase: model::PurchaseState::Owned,
+                ticket_quantity: None,
+            })
+            .collect();
+        let mut runner = AppRunner::new(Bomtoon {
+            view: View::Episodes,
+            episodes,
+            ..Bomtoon::default()
+        });
+
+        let commands = runner.action(action_id(NEXT_PAGE));
+        assert_eq!(runner.app().page, 1);
+        assert_eq!(
+            last_screen(&commands)
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position),
+            Some((2, 2))
+        );
+
+        let commands = runner.action(action_id(NEXT_PAGE));
+        assert_eq!(runner.app().page, 1);
+        assert!(commands.is_empty());
     }
 
     #[test]
