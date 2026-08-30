@@ -2775,10 +2775,7 @@ fn encode_device_result(output: &mut Vec<u8>, result: &DeviceResult) -> Result<(
         DeviceResult::LocalDay(local_day) => {
             output.extend_from_slice(&[16, u8::from(local_day.is_some())]);
             if let Some(local_day) = local_day {
-                push_u16(
-                    output,
-                    u16::from_be_bytes(local_day.year().to_be_bytes()),
-                );
+                push_u16(output, u16::from_be_bytes(local_day.year().to_be_bytes()));
                 output.extend_from_slice(&[local_day.month(), local_day.day()]);
             }
         }
@@ -3062,38 +3059,7 @@ fn decode_device_result(reader: &mut Reader<'_>) -> Result<DeviceResult, Protoco
             Ok(DeviceResult::Frontlight { percent })
         }
         5 => Ok(DeviceResult::Denied(DenyReason::try_from(reader.u8()?)?)),
-        6 => {
-            let flags = valid_radio_flags(reader.u8()?, "Bluetooth state flags")?;
-            let count = usize::from(reader.u8()?);
-            if count > MAX_RADIO_DEVICES {
-                return Err(ProtocolError::InvalidValue("too many Bluetooth devices"));
-            }
-            let mut devices = Vec::with_capacity(count);
-            for _ in 0..count {
-                let address = radio_string(reader)?;
-                let name = radio_string(reader)?;
-                let kind = BluetoothDeviceKind::try_from(reader.u8()?)?;
-                let device_flags = valid_radio_flags(reader.u8()?, "Bluetooth device flags")?;
-                devices.push(BluetoothDevice {
-                    address,
-                    name,
-                    kind,
-                    paired: flags_first(device_flags),
-                    connected: flags_second(device_flags),
-                });
-            }
-            let restart_on_exit = match reader.u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(ProtocolError::InvalidValue("Bluetooth restart flag")),
-            };
-            Ok(DeviceResult::Bluetooth {
-                available: flags_first(flags),
-                enabled: flags_second(flags),
-                devices,
-                restart_on_exit,
-            })
-        }
+        6 => decode_bluetooth_result(reader),
         7 => {
             let flags = valid_radio_flags(reader.u8()?, "Wi-Fi state flags")?;
             let connected_ssid = match reader.u8()? {
@@ -3132,6 +3098,39 @@ fn decode_device_result(reader: &mut Reader<'_>) -> Result<DeviceResult, Protoco
         15 => decode_remote_install(reader),
         _ => Err(ProtocolError::InvalidValue("device result")),
     }
+}
+
+fn decode_bluetooth_result(reader: &mut Reader<'_>) -> Result<DeviceResult, ProtocolError> {
+    let flags = valid_radio_flags(reader.u8()?, "Bluetooth state flags")?;
+    let count = usize::from(reader.u8()?);
+    if count > MAX_RADIO_DEVICES {
+        return Err(ProtocolError::InvalidValue("too many Bluetooth devices"));
+    }
+    let mut devices = Vec::with_capacity(count);
+    for _ in 0..count {
+        let address = radio_string(reader)?;
+        let name = radio_string(reader)?;
+        let kind = BluetoothDeviceKind::try_from(reader.u8()?)?;
+        let device_flags = valid_radio_flags(reader.u8()?, "Bluetooth device flags")?;
+        devices.push(BluetoothDevice {
+            address,
+            name,
+            kind,
+            paired: flags_first(device_flags),
+            connected: flags_second(device_flags),
+        });
+    }
+    let restart_on_exit = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ProtocolError::InvalidValue("Bluetooth restart flag")),
+    };
+    Ok(DeviceResult::Bluetooth {
+        available: flags_first(flags),
+        enabled: flags_second(flags),
+        devices,
+        restart_on_exit,
+    })
 }
 
 fn decode_app_link(reader: &mut Reader<'_>) -> Result<DeviceResult, ProtocolError> {
@@ -6406,10 +6405,7 @@ mod tests {
     fn local_day_is_checked_and_ordered() {
         let august = LocalDay::new(2026, 8, 30).expect("valid local day");
         let september = LocalDay::new(2026, 9, 1).expect("valid local day");
-        assert_eq!(
-            (august.year(), august.month(), august.day()),
-            (2026, 8, 30)
-        );
+        assert_eq!((august.year(), august.month(), august.day()), (2026, 8, 30));
         assert!(august < september);
         assert_eq!(LocalDay::new(2026, 0, 1), None);
         assert_eq!(LocalDay::new(2026, 13, 1), None);
@@ -6632,9 +6628,7 @@ mod tests {
                 available: false,
                 magnet_present: false,
             },
-            DeviceResult::LocalDay(Some(
-                LocalDay::new(2026, 8, 30).expect("valid local day"),
-            )),
+            DeviceResult::LocalDay(Some(LocalDay::new(2026, 8, 30).expect("valid local day"))),
             DeviceResult::LocalDay(None),
             DeviceResult::Apps {
                 entries: vec![AppInfo {

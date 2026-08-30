@@ -3464,10 +3464,7 @@ mod tests {
             crate::local_day_at(before, &zone),
             LocalDay::new(2026, 8, 29)
         );
-        assert_eq!(
-            crate::local_day_at(at, &zone),
-            LocalDay::new(2026, 8, 30)
-        );
+        assert_eq!(crate::local_day_at(at, &zone), LocalDay::new(2026, 8, 30));
     }
 
     #[test]
@@ -3492,14 +3489,8 @@ mod tests {
         let west = TimeZone::posix("HST10").expect("negative offset");
         let east = TimeZone::posix("TST-5:45").expect("non-hour offset");
 
-        assert_eq!(
-            crate::local_day_at(now, &west),
-            LocalDay::new(2026, 8, 29)
-        );
-        assert_eq!(
-            crate::local_day_at(now, &east),
-            LocalDay::new(2026, 8, 30)
-        );
+        assert_eq!(crate::local_day_at(now, &west), LocalDay::new(2026, 8, 29));
+        assert_eq!(crate::local_day_at(now, &east), LocalDay::new(2026, 8, 30));
     }
 
     #[test]
@@ -3551,11 +3542,7 @@ mod tests {
         let mut services = kobo_policy::DeviceServices::simulated();
 
         assert_eq!(
-            crate::runtime_device_result(
-                &mut services,
-                DeviceRequest::ReadLocalDay,
-                || expected
-            ),
+            crate::runtime_device_result(&mut services, DeviceRequest::ReadLocalDay, || expected),
             DeviceResult::LocalDay(expected)
         );
     }
@@ -3564,16 +3551,12 @@ mod tests {
     fn later_request_uses_the_later_timezone() {
         let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
         let mut services = kobo_policy::DeviceServices::simulated();
-        let west = crate::runtime_device_result(
-            &mut services,
-            DeviceRequest::ReadLocalDay,
-            || crate::local_day_for(now, Some("HST10"), || None),
-        );
-        let east = crate::runtime_device_result(
-            &mut services,
-            DeviceRequest::ReadLocalDay,
-            || crate::local_day_for(now, Some("TST-14"), || None),
-        );
+        let west = crate::runtime_device_result(&mut services, DeviceRequest::ReadLocalDay, || {
+            crate::local_day_for(now, Some("HST10"), || None)
+        });
+        let east = crate::runtime_device_result(&mut services, DeviceRequest::ReadLocalDay, || {
+            crate::local_day_for(now, Some("TST-14"), || None)
+        });
 
         assert_ne!(west, east);
     }

@@ -218,7 +218,9 @@ pub fn credential_allowed(
             ("bomtoon-access-token", SecretHeader::Bearer)
         ) && method == RequestMethod::Get
             && has_origin(url, "www.bomtoon.tw", 443)
-            && (bomtoon_library_url(url)
+            && (bomtoon_asset_summary_url(url)
+                || bomtoon_expiration_history_url(url)
+                || bomtoon_library_url(url)
                 || bomtoon_recent_url(url)
                 || bomtoon_content_url(url)
                 || bomtoon_images_url(url));
@@ -310,6 +312,25 @@ fn bomtoon_images_url(url: &str) -> bool {
     aliases.split_once('/').is_some_and(|(content, episode)| {
         !episode.contains('/') && bomtoon_alias(content) && bomtoon_alias(episode)
     })
+}
+
+fn bomtoon_asset_summary_url(url: &str) -> bool {
+    url == "https://www.bomtoon.tw/api/balcony-api-v2/asset/user"
+}
+
+fn bomtoon_expiration_history_url(url: &str) -> bool {
+    const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=";
+    const SUFFIX: &str = "&sort=EXPIRE&coinKind=";
+
+    let Some((created_at, coin_kind)) = url
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.split_once(SUFFIX))
+    else {
+        return false;
+    };
+    !created_at.is_empty()
+        && created_at.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(coin_kind, "COIN" | "TICKET")
 }
 
 fn bomtoon_library_url(url: &str) -> bool {
@@ -1640,6 +1661,79 @@ mod tests {
             "https://www.bomtoon.tw:444/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
             "https://attacker.invalid/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
             "http://www.bomtoon.tw/api/balcony-api-v2/library/recent?sort=CREATE&page=0&contentsOrderNo=0&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
+        ] {
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                url
+            ));
+        }
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Post,
+            exact
+        ));
+    }
+
+    #[test]
+    fn bomtoon_asset_summary_requires_exact_get_bearer_origin_path_and_no_query() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let exact = "https://www.bomtoon.tw/api/balcony-api-v2/asset/user";
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Get,
+            exact
+        ));
+        for url in [
+            "https://attacker.invalid/api/balcony-api-v2/asset/user",
+            "https://www.bomtoon.tw/api/balcony-api-v2/assets/user",
+            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user?extra=true",
+        ] {
+            assert!(!super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                url
+            ));
+        }
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Post,
+            exact
+        ));
+    }
+
+    #[test]
+    fn bomtoon_expiration_history_requires_exact_get_bearer_origin_path_and_query() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        for kind in ["COIN", "TICKET"] {
+            assert!(super::credential_allowed(
+                "bomtoon",
+                &access,
+                RequestMethod::Get,
+                &format!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind={kind}"
+                )
+            ));
+        }
+        let exact = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN";
+        for url in [
+            "https://attacker.invalid/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charges?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?sort=EXPIRE&createdAt=1725000000000&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=&sort=EXPIRE&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=now&sort=EXPIRE&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=CREATE&coinKind=COIN",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=BONUS",
+            "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN&extra=true",
         ] {
             assert!(!super::credential_allowed(
                 "bomtoon",

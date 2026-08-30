@@ -35,8 +35,11 @@ const HISTORY_WINDOW_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const READER_PREVIOUS: &str = "reader-previous";
 const READER_NEXT: &str = "reader-next";
 const READER_CHROME: &str = "reader-chrome";
-const MAIN_DESTINATIONS: [(&str, &str); 3] =
-    [(FEATURED, "Featured"), (RECENT, "Recent"), (LIBRARY, "Library")];
+const MAIN_DESTINATIONS: [(&str, &str); 3] = [
+    (FEATURED, "Featured"),
+    (RECENT, "Recent"),
+    (LIBRARY, "Library"),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum View {
@@ -238,11 +241,7 @@ fn plan_featured(homepage: Homepage) -> FeaturedPlan {
     } = homepage;
     let mut aliases = BTreeSet::new();
     let mut recommended = Vec::new();
-    for comic in newest
-        .into_iter()
-        .chain(week_day)
-        .chain(only_bom)
-    {
+    for comic in newest.into_iter().chain(week_day).chain(only_bom) {
         if aliases.insert(comic.alias.clone()) {
             recommended.push(comic);
         }
@@ -251,10 +250,7 @@ fn plan_featured(homepage: Homepage) -> FeaturedPlan {
     let mut featured = Vec::new();
     let mut details = Vec::new();
     for banner in banners.into_iter().take(3) {
-        if let Some(comic) = recommended
-            .iter()
-            .find(|comic| comic.alias == banner.alias)
-        {
+        if let Some(comic) = recommended.iter().find(|comic| comic.alias == banner.alias) {
             featured.push(comic.clone());
         } else {
             let slot = featured.len();
@@ -276,11 +272,7 @@ fn plan_featured(homepage: Homepage) -> FeaturedPlan {
     }
 }
 
-fn featured_page(
-    featured: &FeaturedState,
-    page: usize,
-    first_page_rows: usize,
-) -> FeaturedPage {
+fn featured_page(featured: &FeaturedState, page: usize, first_page_rows: usize) -> FeaturedPage {
     let first_page_rows = first_page_rows.max(1);
     if page == 0 {
         return FeaturedPage {
@@ -294,10 +286,7 @@ fn featured_page(
         6
     };
     let start = first_page_rows
-        .saturating_add(
-            page.saturating_sub(1)
-                .saturating_mul(continuation_rows),
-        )
+        .saturating_add(page.saturating_sub(1).saturating_mul(continuation_rows))
         .min(featured.recommended.len());
     FeaturedPage {
         featured: 0..0,
@@ -333,10 +322,9 @@ fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
 }
 
 fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
-    ready_cover(covers, url).map_or(
-        RowLead::Icon(Glyph::Book),
-        |picture| RowLead::Picture(picture, Glyph::Book),
-    )
+    ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
+        RowLead::Picture(picture, Glyph::Book)
+    })
 }
 
 fn add_featured_feed(
@@ -373,12 +361,10 @@ fn add_featured_feed(
             )
         }));
     let pages = featured_page_count(featured, first_page_rows);
-    screen
-        .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-        .page_position(
-            u16::try_from(featured.page.saturating_add(1)).unwrap_or(u16::MAX),
-            u16::try_from(pages).unwrap_or(u16::MAX),
-        )
+    screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+        u16::try_from(featured.page.saturating_add(1)).unwrap_or(u16::MAX),
+        u16::try_from(pages).unwrap_or(u16::MAX),
+    )
 }
 
 fn add_featured_content(
@@ -410,10 +396,7 @@ fn featured_page_zero_rows(featured: &FeaturedState) -> usize {
     featured_page_zero_rows_with_covers(featured, &CoverCache::default())
 }
 
-fn featured_page_zero_rows_with_covers(
-    featured: &FeaturedState,
-    covers: &CoverCache,
-) -> usize {
+fn featured_page_zero_rows_with_covers(featured: &FeaturedState, covers: &CoverCache) -> usize {
     let mut measuring = featured.clone();
     measuring.page = 0;
     for rows in (1..=6).rev() {
@@ -426,8 +409,8 @@ fn featured_page_zero_rows_with_covers(
                 .button(RETRY, "Try again");
         }
         let screen = add_featured_feed(builder, &measuring, covers, rows)
-        .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
-        .build();
+            .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
+            .build();
         if !screen
             .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
             .has_errors()
@@ -794,9 +777,7 @@ impl Bomtoon {
                     push(comic.cover_url.as_ref());
                 }
             }
-            MainDestination::Featured
-            | MainDestination::Recent
-            | MainDestination::Library => {}
+            MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
         }
         visible
     }
@@ -1015,12 +996,10 @@ impl Bomtoon {
                     .max(self.recent.len())
                     .div_ceil(LIBRARY_ITEMS_PER_PAGE)
                     .max(1);
-                screen = screen
-                    .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-                    .page_position(
-                        u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                        u16::try_from(pages).unwrap_or(u16::MAX),
-                    );
+                screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+                    u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
+                    u16::try_from(pages).unwrap_or(u16::MAX),
+                );
             }
             MainDestination::Library => {
                 let (start, end) =
@@ -1040,12 +1019,10 @@ impl Bomtoon {
                     .max(self.comics.len())
                     .div_ceil(LIBRARY_ITEMS_PER_PAGE)
                     .max(1);
-                screen = screen
-                    .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-                    .page_position(
-                        u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                        u16::try_from(pages).unwrap_or(u16::MAX),
-                    );
+                screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+                    u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
+                    u16::try_from(pages).unwrap_or(u16::MAX),
+                );
             }
         }
 
@@ -1195,12 +1172,10 @@ impl Bomtoon {
             );
         }
         let pages = row_count.div_ceil(ACCOUNT_HISTORY_ITEMS_PER_PAGE).max(1);
-        screen = screen
-            .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-            .page_position(
-                u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                u16::try_from(pages).unwrap_or(u16::MAX),
-            );
+        screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+            u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
+            u16::try_from(pages).unwrap_or(u16::MAX),
+        );
         if self.wallet.summary_error
             || self.wallet.coin_history_error
             || self.wallet.ticket_history_error
@@ -1306,11 +1281,7 @@ impl Bomtoon {
                 screen = screen.text(label);
             }
         }
-        let pages = self
-            .episodes
-            .len()
-            .div_ceil(EPISODE_ITEMS_PER_PAGE)
-            .max(1);
+        let pages = self.episodes.len().div_ceil(EPISODE_ITEMS_PER_PAGE).max(1);
         screen
             .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
             .page_position(
@@ -1598,8 +1569,8 @@ impl Bomtoon {
         self.covers
             .visible_urls
             .retain(|url| self.covers.entries.contains_key(url));
-        self.covers.visible_source = (!self.covers.visible_urls.is_empty())
-            .then_some(CoverSource::Public);
+        self.covers.visible_source =
+            (!self.covers.visible_urls.is_empty()).then_some(CoverSource::Public);
     }
 
     fn clear_protected_state(&mut self, context: &mut Context) {
@@ -1634,11 +1605,7 @@ impl Bomtoon {
         self.recent_loaded = false;
     }
 
-    fn transition_after_credential_loss(
-        &mut self,
-        context: &mut Context,
-        account: AccountState,
-    ) {
+    fn transition_after_credential_loss(&mut self, context: &mut Context, account: AccountState) {
         self.clear_protected_state(context);
         self.account = account;
         self.destination = MainDestination::Featured;
@@ -1696,7 +1663,8 @@ impl Bomtoon {
             refresh.loaded_day = Some(day);
             return;
         };
-        if day == loaded_day || refresh.active_day == Some(day) || refresh.desired_day == Some(day) {
+        if day == loaded_day || refresh.active_day == Some(day) || refresh.desired_day == Some(day)
+        {
             return;
         }
         refresh.desired_day = Some(day);
@@ -1890,12 +1858,7 @@ impl Bomtoon {
         true
     }
 
-    fn accept_homepage(
-        &mut self,
-        context: &mut Context,
-        generation: u64,
-        bytes: &[u8],
-    ) -> bool {
+    fn accept_homepage(&mut self, context: &mut Context, generation: u64, bytes: &[u8]) -> bool {
         if generation != self.featured.generation {
             return false;
         }
@@ -1925,8 +1888,7 @@ impl Bomtoon {
                     },
                 );
             } else {
-                self.featured.pending_details =
-                    self.featured.pending_details.saturating_sub(1);
+                self.featured.pending_details = self.featured.pending_details.saturating_sub(1);
             }
         }
         if self.featured.pending_details == 0 {
@@ -3228,10 +3190,7 @@ impl Bomtoon {
                 self.clear_manifest_refresh(task);
                 match error {
                     TaskError::NoCredential => {
-                        self.transition_after_credential_loss(
-                            context,
-                            AccountState::SignedOut,
-                        );
+                        self.transition_after_credential_loss(context, AccountState::SignedOut);
                     }
                     TaskError::Unauthorized => {
                         self.transition_after_credential_loss(context, AccountState::Expired);
@@ -3646,10 +3605,7 @@ impl KoboApp for Bomtoon {
                 return;
             }
             let changed = self.handle_shelf_outcome(context, purpose, outcome);
-            if changed
-                && self.view == View::Main
-                && self.destination == MainDestination::Featured
-            {
+            if changed && self.view == View::Main && self.destination == MainDestination::Featured {
                 self.show(context);
             }
             self.resume_deferred_wallet(context);
@@ -4380,7 +4336,6 @@ fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usiz
     let start = page.saturating_mul(items_per_page).min(count);
     (start, start.saturating_add(items_per_page).min(count))
 }
-
 
 fn main() -> ExitCode {
     match kobo_sdk::run("bomtoon", Bomtoon::default()) {
@@ -5777,10 +5732,7 @@ mod tests {
                 ..Bomtoon::default()
             }
             .screen();
-            let bar = screen
-                .nav_bar
-                .as_ref()
-                .expect("one fixed destination bar");
+            let bar = screen.nav_bar.as_ref().expect("one fixed destination bar");
 
             assert_eq!(bar.selected, Some(selected));
             assert_eq!(
@@ -5797,8 +5749,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [action_id(FEATURED), action_id(RECENT), action_id(LIBRARY)]
             );
-            let layout =
-                screen.layout_with(&CLARA_BW_METRICS, &Chrome::measuring(true));
+            let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::measuring(true));
             let y = CLARA_BW_METRICS.height - CLARA_BW_METRICS.nav_bar_height() / 2;
             for (x, action) in [
                 (CLARA_BW_METRICS.width / 6, action_id(FEATURED)),
@@ -5833,18 +5784,8 @@ mod tests {
     #[test]
     fn navigation_lazy_protected_destinations_fetch_only_the_selected_shelf() {
         for (action, destination, expected_path, other_path) in [
-            (
-                RECENT,
-                MainDestination::Recent,
-                "/recent?",
-                "/library?",
-            ),
-            (
-                LIBRARY,
-                MainDestination::Library,
-                "/library?",
-                "/recent?",
-            ),
+            (RECENT, MainDestination::Recent, "/recent?", "/library?"),
+            (LIBRARY, MainDestination::Library, "/library?", "/recent?"),
         ] {
             let mut runner = AppRunner::new(Bomtoon {
                 view: View::Main,
@@ -6031,9 +5972,9 @@ mod tests {
         assert_eq!(runner.app().page, 0);
         assert!(commands.iter().any(is_homepage_fetch));
         assert!(!commands.iter().any(is_library_or_recent_fetch));
-        assert!(!spawns(&commands)
-            .iter()
-            .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/"))));
+        assert!(!spawns(&commands).iter().any(
+            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/"))
+        ));
     }
 
     #[test]
@@ -7305,9 +7246,7 @@ mod tests {
         let (_, commands) = started();
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 2);
-        assert!(spawned
-            .iter()
-            .any(|(_, work)| *work == api::homepage()));
+        assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
         assert!(spawned
             .iter()
             .any(|(_, work)| *work == api::asset_summary()));
@@ -7809,7 +7748,6 @@ mod tests {
         assert_fits(&screen);
     }
 
-
     #[test]
     fn account_stale_detail_generation_cannot_replace_cached_rows() {
         let cached = expiration_row(
@@ -8208,6 +8146,421 @@ mod tests {
         }
     }
 
+    struct SignOutScenario {
+        public_url: String,
+        shared_url: String,
+        shared_loading_url: String,
+        protected_url: String,
+        public_cover_task: TaskId,
+        protected_cover_task: TaskId,
+        public_homepage_task: TaskId,
+        wallet_task: TaskId,
+        reader_task: TaskId,
+        shared_cover_task: TaskId,
+        shared_picture: TilePicture,
+        protected_picture: TilePicture,
+    }
+
+    fn sign_out_scenario() -> SignOutScenario {
+        SignOutScenario {
+            public_url: "https://image.balcony.studio/tw/contents/public.webp".to_owned(),
+            shared_url: "https://image.balcony.studio/tw/contents/shared.webp".to_owned(),
+            shared_loading_url: "https://image.balcony.studio/tw/contents/shared-loading.webp"
+                .to_owned(),
+            protected_url: "https://image.balcony.studio/tw/contents/protected.webp".to_owned(),
+            public_cover_task: TaskId(90),
+            protected_cover_task: TaskId(91),
+            public_homepage_task: TaskId(92),
+            wallet_task: TaskId(93),
+            reader_task: TaskId(94),
+            shared_cover_task: TaskId(95),
+            shared_picture: TilePicture::new(PictureHandle(81), 10, 20),
+            protected_picture: TilePicture::new(PictureHandle(82), 10, 20),
+        }
+    }
+
+    fn seed_sign_out_public_data(app: &mut Bomtoon, scenario: &SignOutScenario) {
+        app.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            generation: 7,
+            featured: vec![
+                ShelfComic {
+                    title: "Public".to_owned(),
+                    alias: "public".to_owned(),
+                    cover_url: Some(scenario.public_url.clone()),
+                },
+                ShelfComic {
+                    title: "Shared".to_owned(),
+                    alias: "shared".to_owned(),
+                    cover_url: Some(scenario.shared_url.clone()),
+                },
+            ],
+            recommended: vec![
+                ShelfComic {
+                    title: "Recommended".to_owned(),
+                    alias: "recommended".to_owned(),
+                    cover_url: Some(scenario.shared_url.clone()),
+                },
+                ShelfComic {
+                    title: "Shared loading".to_owned(),
+                    alias: "shared-loading".to_owned(),
+                    cover_url: Some(scenario.shared_loading_url.clone()),
+                },
+            ],
+            page: 2,
+            refresh: FeaturedRefresh {
+                loaded_day: Some(local_day(30)),
+                desired_day: Some(local_day(31)),
+                active_day: Some(local_day(30)),
+                local_day_pending: true,
+            },
+            ..FeaturedState::default()
+        };
+    }
+
+    fn seed_sign_out_protected_data(app: &mut Bomtoon, scenario: &SignOutScenario) {
+        app.comics = vec![Comic {
+            alias: "protected".to_owned(),
+            title: "Protected".to_owned(),
+            cover_url: Some(scenario.protected_url.clone()),
+            owned_episodes: 1,
+            total_episodes: 2,
+        }];
+        app.recent = vec![RecentEntry {
+            content_alias: "shared".to_owned(),
+            content_title: "Shared protected placement".to_owned(),
+            cover_url: Some(scenario.shared_loading_url.clone()),
+            episode_alias: "ep-1".to_owned(),
+            episode_title: "Episode One".to_owned(),
+        }];
+        app.episodes = vec![Episode {
+            alias: "ep-1".to_owned(),
+            title: "Episode One".to_owned(),
+            purchase: model::PurchaseState::Owned,
+            ticket_quantity: None,
+        }];
+        app.library_loaded = true;
+        app.recent_loaded = true;
+        app.selected_content_alias = "protected".to_owned();
+        app.selected_title = "Protected".to_owned();
+        app.wallet = WalletState {
+            summary: Some(test_wallet_summary()),
+            summary_task: Some(scenario.wallet_task),
+            tasks: BTreeMap::from([(
+                scenario.wallet_task,
+                WalletTaskPurpose::Summary { generation: 1 },
+            )]),
+            coin_history: vec![expiration_row(
+                AssetKind::Coin,
+                AssetSubtype::Standard,
+                1,
+                None,
+            )],
+            ticket_history: vec![expiration_row(
+                AssetKind::Ticket,
+                AssetSubtype::Bonus,
+                1,
+                None,
+            )],
+            summary_generation: 1,
+            ..WalletState::default()
+        };
+        app.reader_tasks.insert(
+            scenario.reader_task,
+            ReaderTaskEntry {
+                generation: app.reader_generation,
+                purpose: ReaderTaskPurpose::Maintenance,
+            },
+        );
+    }
+
+    fn seed_sign_out_cover_cache(app: &mut Bomtoon, scenario: &SignOutScenario) {
+        app.covers.generation = 11;
+        app.covers.visible_urls = vec![
+            scenario.public_url.clone(),
+            scenario.shared_loading_url.clone(),
+            scenario.protected_url.clone(),
+        ];
+        app.covers.entries = BTreeMap::from([
+            (
+                scenario.public_url.clone(),
+                CoverState::Loading(scenario.public_cover_task),
+            ),
+            (
+                scenario.shared_url.clone(),
+                CoverState::Ready(scenario.shared_picture),
+            ),
+            (
+                scenario.shared_loading_url.clone(),
+                CoverState::Loading(scenario.shared_cover_task),
+            ),
+            (
+                scenario.protected_url.clone(),
+                CoverState::Loading(scenario.protected_cover_task),
+            ),
+            (
+                "https://image.balcony.studio/tw/contents/protected-ready.webp".to_owned(),
+                CoverState::Ready(scenario.protected_picture),
+            ),
+        ]);
+        app.covers.tasks = BTreeMap::from([
+            (
+                scenario.public_cover_task,
+                CoverTask {
+                    generation: 11,
+                    url: scenario.public_url.clone(),
+                    source: CoverSource::Public,
+                },
+            ),
+            (
+                scenario.shared_cover_task,
+                CoverTask {
+                    generation: 11,
+                    url: scenario.shared_loading_url.clone(),
+                    source: CoverSource::Protected,
+                },
+            ),
+            (
+                scenario.protected_cover_task,
+                CoverTask {
+                    generation: 11,
+                    url: scenario.protected_url.clone(),
+                    source: CoverSource::Protected,
+                },
+            ),
+        ]);
+    }
+
+    fn sign_out_runner(scenario: &SignOutScenario) -> AppRunner<Bomtoon> {
+        let mut runner = seeded_reader(1, 0, false);
+        let app = runner.app_mut();
+        app.view = View::Main;
+        app.destination = MainDestination::Library;
+        app.page = 4;
+        seed_sign_out_public_data(app, scenario);
+        seed_sign_out_protected_data(app, scenario);
+        app.shelf_tasks.insert(
+            scenario.public_homepage_task,
+            ShelfTaskPurpose::Homepage {
+                generation: app.featured.generation,
+                refresh_day: Some(local_day(30)),
+            },
+        );
+        seed_sign_out_cover_cache(app, scenario);
+        runner
+    }
+
+    fn assert_signed_out_public_state(
+        app: &Bomtoon,
+        scenario: &SignOutScenario,
+        featured: &[ShelfComic],
+        recommended: &[ShelfComic],
+        refresh: &FeaturedRefresh,
+    ) {
+        assert_eq!(app.account, AccountState::SignedOut);
+        assert_eq!(app.view, View::Main);
+        assert_eq!(app.destination, MainDestination::Featured);
+        assert_eq!(app.page, 0);
+        assert_eq!(app.featured.page, 0);
+        assert_eq!(app.featured.featured.as_slice(), featured);
+        assert_eq!(app.featured.recommended.as_slice(), recommended);
+        assert_eq!(&app.featured.refresh, refresh);
+        assert_eq!(
+            app.covers.entries.get(&scenario.shared_url),
+            Some(&CoverState::Ready(scenario.shared_picture))
+        );
+        assert_eq!(
+            app.covers.entries.get(&scenario.public_url),
+            Some(&CoverState::Loading(scenario.public_cover_task))
+        );
+        assert_eq!(
+            app.covers.entries.get(&scenario.shared_loading_url),
+            Some(&CoverState::Loading(scenario.shared_cover_task))
+        );
+        assert!(app.shelf_tasks.contains_key(&scenario.public_homepage_task));
+        assert!(app.covers.tasks.contains_key(&scenario.public_cover_task));
+        assert_eq!(
+            app.covers
+                .tasks
+                .get(&scenario.shared_cover_task)
+                .map(|task| task.source),
+            Some(CoverSource::Public)
+        );
+    }
+
+    fn assert_signed_out_protected_state_cleared(app: &Bomtoon, scenario: &SignOutScenario) {
+        assert!(!app.covers.entries.contains_key(&scenario.protected_url));
+        assert!(app.comics.is_empty());
+        assert!(app.recent.is_empty());
+        assert!(app.episodes.is_empty());
+        assert!(app.selected_content_alias.is_empty());
+        assert!(app.selected_title.is_empty());
+        assert!(app.reader_selection.is_none());
+        assert!(app.reader.is_none());
+        assert!(app.reader_tasks.is_empty());
+        assert!(app.wallet.summary.is_none());
+        assert!(app.wallet.coin_history.is_empty());
+        assert!(app.wallet.ticket_history.is_empty());
+        assert!(app.wallet.tasks.is_empty());
+        assert!(!app
+            .covers
+            .tasks
+            .contains_key(&scenario.protected_cover_task));
+    }
+
+    fn assert_sign_out_cleanup_commands(commands: &[Command], scenario: &SignOutScenario) {
+        assert!(commands.contains(&Command::Cancel(scenario.protected_cover_task)));
+        assert!(commands.contains(&Command::Cancel(scenario.wallet_task)));
+        assert!(commands.contains(&Command::Cancel(scenario.reader_task)));
+        assert!(!commands.contains(&Command::Cancel(scenario.public_homepage_task)));
+        assert!(!commands.contains(&Command::Cancel(scenario.public_cover_task)));
+        assert!(!commands.contains(&Command::Cancel(scenario.shared_cover_task)));
+        assert!(commands.contains(&Command::DropPicture(PictureHandle(7))));
+        assert!(commands.contains(&Command::DropPicture(scenario.protected_picture.handle)));
+        assert!(!commands.contains(&Command::DropPicture(scenario.shared_picture.handle)));
+    }
+
+    fn assert_protected_destinations_require_sign_in(runner: &mut AppRunner<Bomtoon>) {
+        for action in [RECENT, LIBRARY] {
+            runner.app_mut().view = View::Main;
+            runner.app_mut().destination = MainDestination::Featured;
+            let commands = runner.action(action_id(action));
+            assert_eq!(runner.app().view, View::Status);
+            assert!(spawns(&commands).is_empty());
+        }
+    }
+
+    struct FullExitScenario {
+        pending_task: TaskId,
+        shelf_task: TaskId,
+        public_cover_task: TaskId,
+        protected_cover_task: TaskId,
+        wallet_task: TaskId,
+        reader_task: TaskId,
+        public_url: String,
+        protected_url: String,
+        ready_url: String,
+        ready_picture: TilePicture,
+    }
+
+    fn full_exit_scenario() -> FullExitScenario {
+        FullExitScenario {
+            pending_task: TaskId(70),
+            shelf_task: TaskId(71),
+            public_cover_task: TaskId(72),
+            protected_cover_task: TaskId(73),
+            wallet_task: TaskId(74),
+            reader_task: TaskId(75),
+            public_url: "https://image.balcony.studio/tw/contents/public-exit.webp".to_owned(),
+            protected_url: "https://image.balcony.studio/tw/contents/protected-exit.webp"
+                .to_owned(),
+            ready_url: "https://image.balcony.studio/tw/contents/ready-exit.webp".to_owned(),
+            ready_picture: TilePicture::new(PictureHandle(83), 10, 20),
+        }
+    }
+
+    fn full_exit_cover_cache(scenario: &FullExitScenario) -> CoverCache {
+        CoverCache {
+            generation: 6,
+            entries: BTreeMap::from([
+                (
+                    scenario.public_url.clone(),
+                    CoverState::Loading(scenario.public_cover_task),
+                ),
+                (
+                    scenario.protected_url.clone(),
+                    CoverState::Loading(scenario.protected_cover_task),
+                ),
+                (
+                    scenario.ready_url.clone(),
+                    CoverState::Ready(scenario.ready_picture),
+                ),
+            ]),
+            tasks: BTreeMap::from([
+                (
+                    scenario.public_cover_task,
+                    CoverTask {
+                        generation: 6,
+                        url: scenario.public_url.clone(),
+                        source: CoverSource::Public,
+                    },
+                ),
+                (
+                    scenario.protected_cover_task,
+                    CoverTask {
+                        generation: 6,
+                        url: scenario.protected_url.clone(),
+                        source: CoverSource::Protected,
+                    },
+                ),
+            ]),
+            ..CoverCache::default()
+        }
+    }
+
+    fn full_exit_runner(scenario: &FullExitScenario) -> AppRunner<Bomtoon> {
+        AppRunner::new(Bomtoon {
+            pending: Some(Pending::Content(0)),
+            task: Some(scenario.pending_task),
+            featured: FeaturedState {
+                generation: 4,
+                featured: vec![ShelfComic {
+                    title: "Ready".to_owned(),
+                    alias: "ready".to_owned(),
+                    cover_url: Some(scenario.ready_url.clone()),
+                }],
+                refresh: FeaturedRefresh {
+                    local_day_pending: true,
+                    active_day: Some(local_day(30)),
+                    desired_day: Some(local_day(31)),
+                    ..FeaturedRefresh::default()
+                },
+                ..FeaturedState::default()
+            },
+            shelf_tasks: BTreeMap::from([(
+                scenario.shelf_task,
+                ShelfTaskPurpose::Homepage {
+                    generation: 4,
+                    refresh_day: None,
+                },
+            )]),
+            covers: full_exit_cover_cache(scenario),
+            wallet: WalletState {
+                summary_task: Some(scenario.wallet_task),
+                tasks: BTreeMap::from([(
+                    scenario.wallet_task,
+                    WalletTaskPurpose::Summary { generation: 1 },
+                )]),
+                ..WalletState::default()
+            },
+            reader_tasks: BTreeMap::from([(
+                scenario.reader_task,
+                ReaderTaskEntry {
+                    generation: 1,
+                    purpose: ReaderTaskPurpose::Manifest,
+                },
+            )]),
+            reader_generation: 1,
+            ..Bomtoon::default()
+        })
+    }
+
+    fn assert_full_exit_cleanup(
+        runner: &AppRunner<Bomtoon>,
+        commands: &[Command],
+        scenario: &FullExitScenario,
+    ) {
+        assert!(commands.contains(&Command::DropPicture(scenario.ready_picture.handle)));
+        assert!(runner.app().shelf_tasks.is_empty());
+        assert!(runner.app().covers.tasks.is_empty());
+        assert!(runner.app().covers.entries.is_empty());
+        assert!(runner.app().wallet.tasks.is_empty());
+        assert!(runner.app().reader_tasks.is_empty());
+        assert!(!runner.app().featured.refresh.local_day_pending);
+        assert_eq!(runner.app().featured.refresh.active_day, None);
+        assert_eq!(runner.app().featured.refresh.desired_day, None);
+    }
+
     #[test]
     fn wallet_credential_failure_keeps_public_featured_and_ignores_homepage_outcome() {
         let (mut runner, commands) = started();
@@ -8231,181 +8584,19 @@ mod tests {
 
     #[test]
     fn sign_out_retains_public_feed_pictures_and_tasks_while_clearing_protected_state() {
-        let public_url = "https://image.balcony.studio/tw/contents/public.webp".to_owned();
-        let shared_url = "https://image.balcony.studio/tw/contents/shared.webp".to_owned();
-        let shared_loading_url =
-            "https://image.balcony.studio/tw/contents/shared-loading.webp".to_owned();
-        let protected_url =
-            "https://image.balcony.studio/tw/contents/protected.webp".to_owned();
-        let public_cover_task = TaskId(90);
-        let protected_cover_task = TaskId(91);
-        let public_homepage_task = TaskId(92);
-        let wallet_task = TaskId(93);
-        let reader_task = TaskId(94);
-        let shared_cover_task = TaskId(95);
-        let shared_picture = TilePicture::new(PictureHandle(81), 10, 20);
-        let protected_picture = TilePicture::new(PictureHandle(82), 10, 20);
-        let mut runner = seeded_reader(1, 0, false);
-        {
-            let app = runner.app_mut();
-            app.view = View::Main;
-            app.destination = MainDestination::Library;
-            app.page = 4;
-            app.featured = FeaturedState {
-                status: FeaturedStatus::Ready,
-                generation: 7,
-                featured: vec![
-                    ShelfComic {
-                        title: "Public".to_owned(),
-                        alias: "public".to_owned(),
-                        cover_url: Some(public_url.clone()),
-                    },
-                    ShelfComic {
-                        title: "Shared".to_owned(),
-                        alias: "shared".to_owned(),
-                        cover_url: Some(shared_url.clone()),
-                    },
-                ],
-                recommended: vec![
-                    ShelfComic {
-                        title: "Recommended".to_owned(),
-                        alias: "recommended".to_owned(),
-                        cover_url: Some(shared_url.clone()),
-                    },
-                    ShelfComic {
-                        title: "Shared loading".to_owned(),
-                        alias: "shared-loading".to_owned(),
-                        cover_url: Some(shared_loading_url.clone()),
-                    },
-                ],
-                page: 2,
-                refresh: FeaturedRefresh {
-                    loaded_day: Some(local_day(30)),
-                    desired_day: Some(local_day(31)),
-                    active_day: Some(local_day(30)),
-                    local_day_pending: true,
-                },
-                ..FeaturedState::default()
-            };
-            app.comics = vec![Comic {
-                alias: "protected".to_owned(),
-                title: "Protected".to_owned(),
-                cover_url: Some(protected_url.clone()),
-                owned_episodes: 1,
-                total_episodes: 2,
-            }];
-            app.recent = vec![RecentEntry {
-                content_alias: "shared".to_owned(),
-                content_title: "Shared protected placement".to_owned(),
-                cover_url: Some(shared_loading_url.clone()),
-                episode_alias: "ep-1".to_owned(),
-                episode_title: "Episode One".to_owned(),
-            }];
-            app.episodes = vec![Episode {
-                alias: "ep-1".to_owned(),
-                title: "Episode One".to_owned(),
-                purchase: model::PurchaseState::Owned,
-                ticket_quantity: None,
-            }];
-            app.library_loaded = true;
-            app.recent_loaded = true;
-            app.selected_content_alias = "protected".to_owned();
-            app.selected_title = "Protected".to_owned();
-            app.wallet = WalletState {
-                summary: Some(test_wallet_summary()),
-                summary_task: Some(wallet_task),
-                tasks: BTreeMap::from([(
-                    wallet_task,
-                    WalletTaskPurpose::Summary { generation: 1 },
-                )]),
-                coin_history: vec![expiration_row(
-                    AssetKind::Coin,
-                    AssetSubtype::Standard,
-                    1,
-                    None,
-                )],
-                ticket_history: vec![expiration_row(
-                    AssetKind::Ticket,
-                    AssetSubtype::Bonus,
-                    1,
-                    None,
-                )],
-                summary_generation: 1,
-                ..WalletState::default()
-            };
-            app.reader_tasks.insert(
-                reader_task,
-                ReaderTaskEntry {
-                    generation: app.reader_generation,
-                    purpose: ReaderTaskPurpose::Maintenance,
-                },
-            );
-            app.shelf_tasks.insert(
-                public_homepage_task,
-                ShelfTaskPurpose::Homepage {
-                    generation: app.featured.generation,
-                    refresh_day: Some(local_day(30)),
-                },
-            );
-            app.covers.generation = 11;
-            app.covers.visible_urls = vec![
-                public_url.clone(),
-                shared_loading_url.clone(),
-                protected_url.clone(),
-            ];
-            app.covers.entries = BTreeMap::from([
-                (
-                    public_url.clone(),
-                    CoverState::Loading(public_cover_task),
-                ),
-                (shared_url.clone(), CoverState::Ready(shared_picture)),
-                (
-                    shared_loading_url.clone(),
-                    CoverState::Loading(shared_cover_task),
-                ),
-                (
-                    protected_url.clone(),
-                    CoverState::Loading(protected_cover_task),
-                ),
-                (
-                    "https://image.balcony.studio/tw/contents/protected-ready.webp".to_owned(),
-                    CoverState::Ready(protected_picture),
-                ),
-            ]);
-            app.covers.tasks = BTreeMap::from([
-                (
-                    public_cover_task,
-                    CoverTask {
-                        generation: 11,
-                        url: public_url.clone(),
-                        source: CoverSource::Public,
-                    },
-                ),
-                (
-                    shared_cover_task,
-                    CoverTask {
-                        generation: 11,
-                        url: shared_loading_url.clone(),
-                        source: CoverSource::Protected,
-                    },
-                ),
-                (
-                    protected_cover_task,
-                    CoverTask {
-                        generation: 11,
-                        url: protected_url.clone(),
-                        source: CoverSource::Protected,
-                    },
-                ),
-            ]);
-        }
+        let scenario = sign_out_scenario();
+        let mut runner = sign_out_runner(&scenario);
         let public_featured = runner.app().featured.featured.clone();
         let public_recommended = runner.app().featured.recommended.clone();
         let public_refresh = runner.app().featured.refresh.clone();
 
         let account_commands = runner.action(action_id(ACCOUNT));
         assert_eq!(runner.app().view, View::Account);
-        for task in [public_cover_task, shared_cover_task, protected_cover_task] {
+        for task in [
+            scenario.public_cover_task,
+            scenario.shared_cover_task,
+            scenario.protected_cover_task,
+        ] {
             assert!(!account_commands.contains(&Command::Cancel(task)));
             assert!(runner.app().covers.tasks.contains_key(&task));
         }
@@ -8418,62 +8609,19 @@ mod tests {
                 credential: "bomtoon-access-token".to_owned(),
             }
         );
-        assert!(!commands.contains(&Command::Cancel(public_homepage_task)));
-        assert!(!commands.contains(&Command::Cancel(public_cover_task)));
+        assert!(!commands.contains(&Command::Cancel(scenario.public_homepage_task)));
+        assert!(!commands.contains(&Command::Cancel(scenario.public_cover_task)));
 
         let commands = runner.task_outcome(logout_task, TaskOutcome::Completed(Vec::new()));
-        let app = runner.app();
-        assert_eq!(app.account, AccountState::SignedOut);
-        assert_eq!(app.view, View::Main);
-        assert_eq!(app.destination, MainDestination::Featured);
-        assert_eq!(app.page, 0);
-        assert_eq!(app.featured.page, 0);
-        assert_eq!(app.featured.featured, public_featured);
-        assert_eq!(app.featured.recommended, public_recommended);
-        assert_eq!(app.featured.refresh, public_refresh);
-        assert_eq!(
-            app.covers.entries.get(&shared_url),
-            Some(&CoverState::Ready(shared_picture))
+        assert_signed_out_public_state(
+            runner.app(),
+            &scenario,
+            &public_featured,
+            &public_recommended,
+            &public_refresh,
         );
-        assert_eq!(
-            app.covers.entries.get(&public_url),
-            Some(&CoverState::Loading(public_cover_task))
-        );
-        assert_eq!(
-            app.covers.entries.get(&shared_loading_url),
-            Some(&CoverState::Loading(shared_cover_task))
-        );
-        assert!(!app.covers.entries.contains_key(&protected_url));
-        assert!(app.comics.is_empty());
-        assert!(app.recent.is_empty());
-        assert!(app.episodes.is_empty());
-        assert!(app.selected_content_alias.is_empty());
-        assert!(app.selected_title.is_empty());
-        assert!(app.reader_selection.is_none());
-        assert!(app.reader.is_none());
-        assert!(app.reader_tasks.is_empty());
-        assert!(app.wallet.summary.is_none());
-        assert!(app.wallet.coin_history.is_empty());
-        assert!(app.wallet.ticket_history.is_empty());
-        assert!(app.wallet.tasks.is_empty());
-        assert!(app.shelf_tasks.contains_key(&public_homepage_task));
-        assert!(app.covers.tasks.contains_key(&public_cover_task));
-        assert_eq!(
-            app.covers.tasks
-                .get(&shared_cover_task)
-                .map(|task| task.source),
-            Some(CoverSource::Public)
-        );
-        assert!(!app.covers.tasks.contains_key(&protected_cover_task));
-        assert!(commands.contains(&Command::Cancel(protected_cover_task)));
-        assert!(commands.contains(&Command::Cancel(wallet_task)));
-        assert!(commands.contains(&Command::Cancel(reader_task)));
-        assert!(!commands.contains(&Command::Cancel(public_homepage_task)));
-        assert!(!commands.contains(&Command::Cancel(public_cover_task)));
-        assert!(!commands.contains(&Command::Cancel(shared_cover_task)));
-        assert!(commands.contains(&Command::DropPicture(PictureHandle(7))));
-        assert!(commands.contains(&Command::DropPicture(PictureHandle(82))));
-        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert_signed_out_protected_state_cleared(runner.app(), &scenario);
+        assert_sign_out_cleanup_commands(&commands, &scenario);
         assert_eq!(
             last_screen(&commands)
                 .top_bar
@@ -8482,128 +8630,27 @@ mod tests {
                 .label,
             "Sign in"
         );
-
-        for action in [RECENT, LIBRARY] {
-            runner.app_mut().view = View::Main;
-            runner.app_mut().destination = MainDestination::Featured;
-            let commands = runner.action(action_id(action));
-            assert_eq!(runner.app().view, View::Status);
-            assert!(spawns(&commands).is_empty());
-        }
+        assert_protected_destinations_require_sign_in(&mut runner);
     }
 
     #[test]
     fn full_exit_cancels_public_and_protected_work_and_drops_all_session_pictures() {
-        let pending_task = TaskId(70);
-        let shelf_task = TaskId(71);
-        let public_cover_task = TaskId(72);
-        let protected_cover_task = TaskId(73);
-        let wallet_task = TaskId(74);
-        let reader_task = TaskId(75);
-        let public_url = "https://image.balcony.studio/tw/contents/public-exit.webp".to_owned();
-        let protected_url =
-            "https://image.balcony.studio/tw/contents/protected-exit.webp".to_owned();
-        let ready_url = "https://image.balcony.studio/tw/contents/ready-exit.webp".to_owned();
-        let ready_picture = TilePicture::new(PictureHandle(83), 10, 20);
-        let mut runner = AppRunner::new(Bomtoon {
-            pending: Some(Pending::Content(0)),
-            task: Some(pending_task),
-            featured: FeaturedState {
-                generation: 4,
-                featured: vec![ShelfComic {
-                    title: "Ready".to_owned(),
-                    alias: "ready".to_owned(),
-                    cover_url: Some(ready_url.clone()),
-                }],
-                refresh: FeaturedRefresh {
-                    local_day_pending: true,
-                    active_day: Some(local_day(30)),
-                    desired_day: Some(local_day(31)),
-                    ..FeaturedRefresh::default()
-                },
-                ..FeaturedState::default()
-            },
-            shelf_tasks: BTreeMap::from([(
-                shelf_task,
-                ShelfTaskPurpose::Homepage {
-                    generation: 4,
-                    refresh_day: None,
-                },
-            )]),
-            covers: CoverCache {
-                generation: 6,
-                entries: BTreeMap::from([
-                    (
-                        public_url.clone(),
-                        CoverState::Loading(public_cover_task),
-                    ),
-                    (
-                        protected_url.clone(),
-                        CoverState::Loading(protected_cover_task),
-                    ),
-                    (ready_url, CoverState::Ready(ready_picture)),
-                ]),
-                tasks: BTreeMap::from([
-                    (
-                        public_cover_task,
-                        CoverTask {
-                            generation: 6,
-                            url: public_url,
-                            source: CoverSource::Public,
-                        },
-                    ),
-                    (
-                        protected_cover_task,
-                        CoverTask {
-                            generation: 6,
-                            url: protected_url,
-                            source: CoverSource::Protected,
-                        },
-                    ),
-                ]),
-                ..CoverCache::default()
-            },
-            wallet: WalletState {
-                summary_task: Some(wallet_task),
-                tasks: BTreeMap::from([(
-                    wallet_task,
-                    WalletTaskPurpose::Summary { generation: 1 },
-                )]),
-                ..WalletState::default()
-            },
-            reader_tasks: BTreeMap::from([(
-                reader_task,
-                ReaderTaskEntry {
-                    generation: 1,
-                    purpose: ReaderTaskPurpose::Manifest,
-                },
-            )]),
-            reader_generation: 1,
-            ..Bomtoon::default()
-        });
+        let scenario = full_exit_scenario();
+        let mut runner = full_exit_runner(&scenario);
 
         let commands = runner.exit();
-        let cancelled = cancelled_tasks(&commands);
         assert_eq!(
-            cancelled,
+            cancelled_tasks(&commands),
             BTreeSet::from([
-                pending_task,
-                shelf_task,
-                public_cover_task,
-                protected_cover_task,
-                wallet_task,
-                reader_task,
+                scenario.pending_task,
+                scenario.shelf_task,
+                scenario.public_cover_task,
+                scenario.protected_cover_task,
+                scenario.wallet_task,
+                scenario.reader_task,
             ])
         );
-        assert!(commands.contains(&Command::DropPicture(ready_picture.handle)));
-        assert!(runner.app().shelf_tasks.is_empty());
-        assert!(runner.app().covers.tasks.is_empty());
-        assert!(runner.app().covers.entries.is_empty());
-        assert!(runner.app().wallet.tasks.is_empty());
-        assert!(runner.app().reader_tasks.is_empty());
-        assert!(!runner.app().featured.refresh.local_day_pending);
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
+        assert_full_exit_cleanup(&runner, &commands, &scenario);
     }
 
     #[test]
@@ -8717,10 +8764,7 @@ mod tests {
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
         assert_eq!(
-            screen
-                .page_turns
-                .as_ref()
-                .and_then(|turns| turns.position),
+            screen.page_turns.as_ref().and_then(|turns| turns.position),
             Some((2, 6))
         );
         assert!(drawn.contains("Coins"), "missing coin action: {drawn}");
@@ -8955,7 +8999,6 @@ mod tests {
         );
         assert_fits(&screen);
     }
-
 
     #[test]
     fn episode_pagination_keeps_six_items_per_page_and_stops_at_the_final_page() {
@@ -10047,10 +10090,7 @@ mod tests {
                 shelf("new_b", "New B later"),
                 shelf("weekday_a", "Weekday A"),
             ],
-            only_bom: vec![
-                shelf("shared", "Shared later"),
-                shelf("only_a", "Only A"),
-            ],
+            only_bom: vec![shelf("shared", "Shared later"), shelf("only_a", "Only A")],
         }
     }
 
@@ -10122,7 +10162,10 @@ mod tests {
     }
 
     fn homepage_fetches(commands: &[Command]) -> usize {
-        commands.iter().filter(|command| is_homepage_fetch(command)).count()
+        commands
+            .iter()
+            .filter(|command| is_homepage_fetch(command))
+            .count()
     }
 
     fn observe_local_day(
@@ -10314,8 +10357,7 @@ mod tests {
         let newer = observe_local_day(&mut runner, Some(local_day(31)));
         assert_eq!(homepage_fetches(&newer), 0);
 
-        let commands =
-            runner.task_outcome(first_homepage, TaskOutcome::Failed(TaskError::Offline));
+        let commands = runner.task_outcome(first_homepage, TaskOutcome::Failed(TaskError::Offline));
 
         assert_eq!(homepage_fetches(&commands), 1);
         assert_eq!(
@@ -10410,9 +10452,9 @@ mod tests {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        assert!(obsolete_urls.into_iter().all(|url| {
-            cancelled.contains(cover_tasks.get(url).expect("obsolete cover task"))
-        }));
+        assert!(obsolete_urls
+            .into_iter()
+            .all(|url| { cancelled.contains(cover_tasks.get(url).expect("obsolete cover task")) }));
         assert!(runner
             .app()
             .covers
@@ -10452,19 +10494,23 @@ mod tests {
             .filter_map(|comic| comic.cover_url.clone())
             .collect::<Vec<_>>();
         for (index, url) in cached_urls.into_iter().enumerate() {
-            runner.app_mut().covers.entries.entry(url).or_insert_with(|| {
-                CoverState::Ready(TilePicture {
-                    handle: PictureHandle(
-                        100_u32.saturating_add(u32::try_from(index).expect("cover index")),
-                    ),
-                    source: (1, 1),
-                })
-            });
+            runner
+                .app_mut()
+                .covers
+                .entries
+                .entry(url)
+                .or_insert_with(|| {
+                    CoverState::Ready(TilePicture {
+                        handle: PictureHandle(
+                            100_u32.saturating_add(u32::try_from(index).expect("cover index")),
+                        ),
+                        source: (1, 1),
+                    })
+                });
         }
         let commands = observe_local_day(&mut runner, Some(local_day(31)));
         let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let commands =
-            runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
+        let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
         let screen = last_screen(&commands);
 
         assert_eq!(runner.app().featured.featured, old_featured);
@@ -10521,8 +10567,7 @@ mod tests {
         let commands = observe_local_day(&mut runner, Some(local_day(31)));
         let (homepage, _) = fetch_task_with(&commands, "/comic/main");
 
-        let commands =
-            runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
+        let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
         let screen = last_screen(&commands);
 
         assert_eq!(runner.app().featured.status, FeaturedStatus::Failed);
@@ -10602,10 +10647,7 @@ mod tests {
     fn recommended_deduplicates_within_lists_but_not_against_featured() {
         let plan = plan_featured(homepage_fixture());
 
-        assert_eq!(
-            aliases(&plan.featured),
-            ["shared", "banner_b", "banner_c"]
-        );
+        assert_eq!(aliases(&plan.featured), ["shared", "banner_b", "banner_c"]);
         assert_eq!(
             aliases(&plan.recommended),
             ["shared", "new_b", "weekday_a", "only_a"]
@@ -10705,10 +10747,7 @@ mod tests {
             <meta property="og:image" content="https://image.balcony.studio/tw/contents/first.webp">
         "#;
 
-        runner.task_outcome(
-            first,
-            TaskOutcome::Completed(detail.as_bytes().to_vec()),
-        );
+        runner.task_outcome(first, TaskOutcome::Completed(detail.as_bytes().to_vec()));
 
         assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
         assert_eq!(runner.app().featured.pending_details, 1);
@@ -10761,8 +10800,7 @@ mod tests {
         });
         let commands = runner.start();
         let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        runner.app_mut().featured.generation =
-            runner.app().featured.generation.wrapping_add(1);
+        runner.app_mut().featured.generation = runner.app().featured.generation.wrapping_add(1);
         let before = runner.app().featured.clone();
 
         let commands = runner.task_outcome(
@@ -10772,8 +10810,7 @@ mod tests {
         assert!(commands.is_empty());
         assert_eq!(runner.app().featured, before);
 
-        let commands =
-            runner.task_outcome(TaskId(9_999), TaskOutcome::Completed(Vec::new()));
+        let commands = runner.task_outcome(TaskId(9_999), TaskOutcome::Completed(Vec::new()));
         assert!(commands.is_empty());
         assert_eq!(runner.app().featured, before);
     }
@@ -10804,7 +10841,19 @@ mod tests {
         let commands = runner.action(action_id(RETRY));
         assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
         assert_eq!(runner.app().featured.generation, generation.wrapping_add(1));
-        assert_eq!(spawns(&commands), [(runner.app().shelf_tasks.keys().copied().next().expect("retry task"), api::homepage())]);
+        assert_eq!(
+            spawns(&commands),
+            [(
+                runner
+                    .app()
+                    .shelf_tasks
+                    .keys()
+                    .copied()
+                    .next()
+                    .expect("retry task"),
+                api::homepage()
+            )]
+        );
     }
 
     #[test]
@@ -10965,10 +11014,7 @@ mod tests {
         );
         let (old_a, _) = fetch_task_with(&commands, "/detail/old-a");
         let (old_b, _) = fetch_task_with(&commands, "/detail/old-b");
-        runner.task_outcome(
-            old_summary,
-            TaskOutcome::Failed(TaskError::NoCredential),
-        );
+        runner.task_outcome(old_summary, TaskOutcome::Failed(TaskError::NoCredential));
         runner.action(action_id(SIGN_IN));
 
         let commands = runner.action(action_id(RETRY));
@@ -11022,9 +11068,9 @@ mod tests {
         assert_eq!(spawns(&commands).len(), 3);
         assert!(["/detail/a", "/detail/b", "/detail/c"]
             .into_iter()
-            .all(|path| spawns(&commands).iter().any(
-                |(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with(path))
-            )));
+            .all(|path| spawns(&commands)
+                .iter()
+                .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with(path)))));
         assert_eq!(runner.app().featured.pending_details, 3);
         assert_eq!(runner.tasks_in_flight(), 4);
     }
@@ -11074,9 +11120,7 @@ mod tests {
         spawns(commands)
             .into_iter()
             .filter_map(|(task, work)| match work {
-                Task::Fetch { url, .. }
-                    if url.starts_with("https://image.balcony.studio/tw/") =>
-                {
+                Task::Fetch { url, .. } if url.starts_with("https://image.balcony.studio/tw/") => {
                     Some((task, url))
                 }
                 _ => None,
@@ -11148,8 +11192,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("first visible cover fetch");
-        let commands =
-            runner.task_outcome(cover_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let commands = runner.task_outcome(cover_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let ready_screen = last_screen(&commands);
         let ready_rows = ready_screen
             .nodes
@@ -11385,8 +11428,7 @@ mod tests {
         assert_eq!(initial.len(), 4);
         assert_eq!(runner.tasks_in_flight(), 4);
 
-        let commands =
-            runner.task_outcome(initial[0].0, TaskOutcome::Failed(TaskError::TimedOut));
+        let commands = runner.task_outcome(initial[0].0, TaskOutcome::Failed(TaskError::TimedOut));
         let resumed = cover_fetches(&commands);
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].1, shelf_cover_url(4));
@@ -11403,10 +11445,8 @@ mod tests {
         assert_eq!(covers.len(), 2);
         assert_eq!(runner.tasks_in_flight(), 4);
 
-        let commands =
-            runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::TimedOut));
+        let commands = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::TimedOut));
         assert_eq!(cover_fetches(&commands).len(), 1);
         assert_eq!(runner.tasks_in_flight(), 4);
     }
-
 }

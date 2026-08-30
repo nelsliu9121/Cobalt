@@ -959,6 +959,7 @@ impl KoboApp for Settings {
             | DeviceResult::Dictionary { .. }
             | DeviceResult::Apps { .. }
             | DeviceResult::AppLink(_)
+            | DeviceResult::LocalDay(_)
             | DeviceResult::RemoteInstall(_) => {}
         }
         self.show(context);

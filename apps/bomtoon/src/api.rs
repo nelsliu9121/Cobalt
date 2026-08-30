@@ -154,8 +154,8 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_summary, content, expiration_history, homepage, image, images, library, public_detail,
-        recent, ACCEPT_LANGUAGE,
+        asset_summary, content, expiration_history, homepage, image, images, library,
+        public_detail, recent, ACCEPT_LANGUAGE,
     };
     use crate::model::AssetKind;
     use kobo_sdk::{Credential, Header, SecretHeader, Task};

@@ -60,8 +60,7 @@ const PUBLIC_IMAGE_PATHS: &[&str] = &[
     "/tw/co_thumbnail/",
     "/BOMTOON_TW/co_thumbnail/",
 ];
-const PUBLIC_SQUARE_IMAGE_PATHS: &[&str] =
-    &["/tw/co_thumbnail/", "/BOMTOON_TW/co_thumbnail/"];
+const PUBLIC_SQUARE_IMAGE_PATHS: &[&str] = &["/tw/co_thumbnail/", "/BOMTOON_TW/co_thumbnail/"];
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -155,8 +154,7 @@ pub fn public_detail(bytes: &[u8], expected_alias: &str) -> Result<ShelfComic, P
         return Err(ParseError::InvalidValue("detail alias"));
     }
     let html = str::from_utf8(bytes).map_err(ParseError::Utf8)?;
-    let raw_title =
-        open_graph_content(html, "og:title").ok_or(ParseError::Missing("og:title"))?;
+    let raw_title = open_graph_content(html, "og:title").ok_or(ParseError::Missing("og:title"))?;
     let mut title = decode_entities_bounded(
         raw_title,
         MAX_TITLE_BYTES + BOMTOON_TITLE_SUFFIX.len(),
@@ -199,11 +197,7 @@ pub fn library(bytes: &[u8]) -> Result<LibraryPage, ParseError> {
             Ok(Comic {
                 alias: string(item, "alias", "comic.alias")?.to_owned(),
                 title: string(item, "title", "comic.title")?.to_owned(),
-                cover_url: public_thumbnail(
-                    item,
-                    &["MAIN_NON_ADULT"],
-                    PUBLIC_SQUARE_IMAGE_PATHS,
-                ),
+                cover_url: public_thumbnail(item, &["MAIN_NON_ADULT"], PUBLIC_SQUARE_IMAGE_PATHS),
                 owned_episodes: unsigned(item, "collectionCount", "comic.collectionCount")?,
                 total_episodes: unsigned(item, "episodeCount", "comic.episodeCount")?,
             })
@@ -237,11 +231,7 @@ pub fn recent(bytes: &[u8]) -> Result<RecentPage, ParseError> {
             Ok(RecentEntry {
                 content_alias: string(item, "alias", "recent.alias")?.to_owned(),
                 content_title: string(item, "title", "recent.title")?.to_owned(),
-                cover_url: public_thumbnail(
-                    item,
-                    &["MAIN_NON_ADULT"],
-                    PUBLIC_SQUARE_IMAGE_PATHS,
-                ),
+                cover_url: public_thumbnail(item, &["MAIN_NON_ADULT"], PUBLIC_SQUARE_IMAGE_PATHS),
                 episode_alias: string(episode, "alias", "recent.episode.alias")?.to_owned(),
                 episode_title: string(episode, "title", "recent.episode.title")?.to_owned(),
             })
@@ -680,9 +670,10 @@ fn next_open_tag<'a>(
             continue;
         }
         let mut name_end = name_start;
-        while bytes.get(name_end).is_some_and(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':')
-        }) {
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
+        {
             name_end += 1;
         }
         if name_start == name_end {
@@ -774,9 +765,10 @@ fn closing_template_element(html: &str, mut cursor: usize) -> Option<(usize, usi
             name_start += 1;
         }
         let mut name_end = name_start;
-        while bytes.get(name_end).is_some_and(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':')
-        }) {
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
+        {
             name_end += 1;
         }
         if name_start == name_end {
@@ -832,48 +824,38 @@ fn find_tag_end(html: &str, mut cursor: usize) -> Option<usize> {
 fn html_attribute<'a>(tag: &'a str, expected_name: &str) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut cursor = 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
     while bytes
         .get(cursor)
-        .is_some_and(u8::is_ascii_whitespace)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
     {
         cursor += 1;
     }
-    while bytes.get(cursor).is_some_and(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':')
-    }) {
-        cursor += 1;
-    }
     loop {
-        while bytes
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
         if matches!(bytes.get(cursor), None | Some(b'/' | b'>')) {
             return None;
         }
         let name_start = cursor;
-        while bytes.get(cursor).is_some_and(|byte| {
-            !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'>')
-        }) {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'>'))
+        {
             cursor += 1;
         }
         let name_end = cursor;
-        while bytes
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
         if bytes.get(cursor) != Some(&b'=') {
             continue;
         }
         cursor += 1;
-        while bytes
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
         let (value_start, value_end) = match bytes.get(cursor).copied() {
@@ -884,17 +866,16 @@ fn html_attribute<'a>(tag: &'a str, expected_name: &str) -> Option<&'a str> {
                     cursor += 1;
                 }
                 let end = cursor;
-                if bytes.get(cursor).is_none() {
-                    return None;
-                }
+                bytes.get(cursor)?;
                 cursor += 1;
                 (start, end)
             }
             Some(_) => {
                 let start = cursor;
-                while bytes.get(cursor).is_some_and(|byte| {
-                    !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>')
-                }) {
+                while bytes
+                    .get(cursor)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>'))
+                {
                     cursor += 1;
                 }
                 (start, cursor)
@@ -980,7 +961,10 @@ fn push_bounded(
     limit: usize,
     name: &'static str,
 ) -> Result<(), ParseError> {
-    for character in text.chars().filter(|character| !invalid_control(*character)) {
+    for character in text
+        .chars()
+        .filter(|character| !invalid_control(*character))
+    {
         if output.len() + character.len_utf8() > limit {
             return Err(ParseError::InvalidValue(name));
         }
@@ -1769,12 +1753,7 @@ mod tests {
         )
     }
 
-    fn homepage_main(
-        banners: &str,
-        newest: &str,
-        week_day: &str,
-        only_bom: &str,
-    ) -> String {
+    fn homepage_main(banners: &str, newest: &str, week_day: &str, only_bom: &str) -> String {
         format!(
             "{{\"banners\":[{banners}],\"newest\":[{newest}],\"weekDay\":[{week_day}],\"onlyBom\":[{only_bom}]}}"
         )
@@ -1783,9 +1762,7 @@ mod tests {
     fn shelf_json(alias: &str, title: &str, thumbnail: Option<(&str, &str)>) -> String {
         let thumbnails = thumbnail.map_or_else(
             || "[]".to_owned(),
-            |(kind, url)| {
-                format!("[{{\"type\":\"{kind}\",\"imagePath\":\"{url}\"}}]")
-            },
+            |(kind, url)| format!("[{{\"type\":\"{kind}\",\"imagePath\":\"{url}\"}}]"),
         );
         format!(
             "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"isAdult\":false,\"thumbnails\":{thumbnails}}}"
@@ -1903,14 +1880,13 @@ mod tests {
                 "https://image.balcony.studio/BOMTOON_TW/co_thumbnail/weekday_a/1.webp",
             )),
         );
-        let only_bom = format!(
-            concat!(
-                "{{\"alias\":\"only_a\",\"title\":\"Only A\",\"isAdult\":false,\"thumbnails\":[",
-                "{{\"type\":\"MAIN\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/adult.webp\"}},",
-                "{{\"type\":\"SQUARE\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/public.webp\"}}",
-                "]}}"
-            )
-        );
+        let only_bom = concat!(
+            "{\"alias\":\"only_a\",\"title\":\"Only A\",\"isAdult\":false,\"thumbnails\":[",
+            "{\"type\":\"MAIN\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/adult.webp\"},",
+            "{\"type\":\"SQUARE\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/public.webp\"}",
+            "]}"
+        )
+        .to_owned();
         let main = homepage_main(&banners, &newest, &week_day, &only_bom);
 
         let parsed = homepage(homepage_document(&main).as_bytes()).expect("homepage");
@@ -1968,7 +1944,10 @@ mod tests {
             r#"{"banners":[],"newest":[],"weekDay":null,"onlyBom":[]}"#,
             r#"{"banners":[],"newest":[],"weekDay":[],"onlyBom":"wrong"}"#,
         ] {
-            assert!(homepage(homepage_document(main).as_bytes()).is_err(), "{main}");
+            assert!(
+                homepage(homepage_document(main).as_bytes()).is_err(),
+                "{main}"
+            );
         }
         assert!(homepage(br#"<script id="not-next-data">{}</script>"#).is_err());
     }
@@ -1990,12 +1969,7 @@ mod tests {
 
         let comic = shelf_json("safe", "Safe", None);
         let accepted_list = vec![comic.clone(); 64].join(",");
-        let accepted = homepage_main(
-            "",
-            &accepted_list,
-            &accepted_list,
-            &accepted_list,
-        );
+        let accepted = homepage_main("", &accepted_list, &accepted_list, &accepted_list);
         let accepted = homepage(homepage_document(&accepted).as_bytes()).expect("64 list items");
         assert_eq!(accepted.newest.len(), 64);
         assert_eq!(accepted.week_day.len(), 64);
@@ -2021,11 +1995,7 @@ mod tests {
             "a".repeat(2048 - cover_prefix.len() - cover_suffix.len())
         );
         let entries = [
-            shelf_json(
-                &alias_at_cap,
-                &title_at_cap,
-                Some(("COVER", &cover_at_cap)),
-            ),
+            shelf_json(&alias_at_cap, &title_at_cap, Some(("COVER", &cover_at_cap))),
             shelf_json(&"b".repeat(97), "Alias too long", None),
             shelf_json("title_too_long", &format!("{}a", "é".repeat(128)), None),
             shelf_json(
@@ -2070,7 +2040,13 @@ mod tests {
         let entries = urls
             .iter()
             .enumerate()
-            .map(|(index, url)| shelf_json(&format!("comic_{index}"), "Safe title", Some(("COVER", url))))
+            .map(|(index, url)| {
+                shelf_json(
+                    &format!("comic_{index}"),
+                    "Safe title",
+                    Some(("COVER", url)),
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         let main = homepage_main("", &entries, "", "");
@@ -2152,22 +2128,19 @@ mod tests {
     #[test]
     fn public_detail_preserves_alias_and_only_removes_the_exact_title_suffix() {
         let alias = "a".repeat(96);
-        let body =
-            r#"<meta property='og:title' content='Hunter &quot;Q&quot; - BOMTOON'>"#;
+        let body = r"<meta property='og:title' content='Hunter &quot;Q&quot; - BOMTOON'>";
         let comic = public_detail(body.as_bytes(), &alias).expect("detail");
         assert_eq!(comic.alias, alias);
         assert_eq!(comic.title, "Hunter \"Q\" - BOMTOON");
 
-        let encoded_suffix =
-            r#"<meta property="og:title" content="Hunter&#32;- 漫畫 - BOMTOON">"#;
+        let encoded_suffix = r#"<meta property="og:title" content="Hunter&#32;- 漫畫 - BOMTOON">"#;
         assert_eq!(
             public_detail(encoded_suffix.as_bytes(), "hunter_q")
                 .expect("decoded suffix")
                 .title,
             "Hunter"
         );
-        let trailing_space =
-            r#"<meta property="og:title" content="Hunter - 漫畫 - BOMTOON ">"#;
+        let trailing_space = r#"<meta property="og:title" content="Hunter - 漫畫 - BOMTOON ">"#;
         assert_eq!(
             public_detail(trailing_space.as_bytes(), "hunter_q")
                 .expect("non-exact suffix")
@@ -2219,8 +2192,7 @@ mod tests {
 
     #[test]
     fn public_detail_tolerates_missing_or_hostile_images_as_none() {
-        let title =
-            r#"<meta property="og:title" content="Hunter Q - 漫畫 - BOMTOON">"#;
+        let title = r#"<meta property="og:title" content="Hunter Q - 漫畫 - BOMTOON">"#;
         assert_eq!(
             public_detail(title.as_bytes(), "hunter_q")
                 .expect("missing image")

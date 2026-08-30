@@ -9,13 +9,12 @@ pub use kobo_protocol::{
     is_valid_key, AppInfo, AppLinkState, AudioPlaybackState, AudioSource, BatteryDetail,
     BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason, DeviceError, DeviceRequest,
     DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LocalDay, LogLevel, Message,
-    PictureFormat,
-    PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent, ShellRequest,
-    StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId, TaskOutcome,
-    WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME,
-    MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES,
-    MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK,
-    MAX_STORE_KEYS, MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
+    PictureFormat, PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent,
+    ShellRequest, StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId,
+    TaskOutcome, WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS,
+    MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES,
+    MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK,
+    MAX_SHELL_CHUNK, MAX_STORE_KEYS, MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
 };
 pub use kobo_ui::QuoteRole;
 pub use kobo_ui::{
@@ -5079,7 +5078,6 @@ mod tests {
 
     #[test]
     fn read_local_day_emits_one_device_request() {
-        #[derive(Default)]
         struct Probe;
 
         impl KoboApp for Probe {
@@ -5090,12 +5088,9 @@ mod tests {
             fn on_action(&mut self, _context: &mut Context, _action: ActionId) {}
         }
 
-        let mut app = AppRunner::new(Probe::default());
+        let mut app = AppRunner::new(Probe);
         let commands = app.start();
-        assert_eq!(
-            commands,
-            vec![Command::Device(DeviceRequest::ReadLocalDay)]
-        );
+        assert_eq!(commands, vec![Command::Device(DeviceRequest::ReadLocalDay)]);
     }
 
     #[test]

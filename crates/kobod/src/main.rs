@@ -973,21 +973,13 @@ mod tests {
                 "EST5EDT,M3.2.0,M11.1.0",
                 LocalDay::new(2026, 11, 1),
             ),
-            (
-                "2026-08-30T00:30:00Z",
-                "HST10",
-                LocalDay::new(2026, 8, 29),
-            ),
+            ("2026-08-30T00:30:00Z", "HST10", LocalDay::new(2026, 8, 29)),
             (
                 "2026-08-30T00:30:00Z",
                 "TST-5:45",
                 LocalDay::new(2026, 8, 30),
             ),
-            (
-                "1969-12-31T23:59:59Z",
-                "UTC0",
-                LocalDay::new(1969, 12, 31),
-            ),
+            ("1969-12-31T23:59:59Z", "UTC0", LocalDay::new(1969, 12, 31)),
         ];
 
         for (timestamp, posix_rule, expected) in cases {
@@ -1020,18 +1012,15 @@ mod tests {
         );
     }
 
-
     #[test]
     fn local_day_request_uses_the_host_runtime_source() {
         let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
         let mut services = kobo_policy::DeviceServices::simulated();
 
         assert_eq!(
-            super::runtime_device_result(
-                &mut services,
-                DeviceRequest::ReadLocalDay,
-                || super::local_day_for(now, Some("HST10"), || None),
-            ),
+            super::runtime_device_result(&mut services, DeviceRequest::ReadLocalDay, || {
+                super::local_day_for(now, Some("HST10"), || None)
+            },),
             DeviceResult::LocalDay(LocalDay::new(2026, 8, 29))
         );
     }
