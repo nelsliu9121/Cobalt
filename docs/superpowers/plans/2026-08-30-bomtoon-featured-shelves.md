@@ -702,7 +702,7 @@ git commit -m "feat(bomtoon): build the featured feed"
 ```rust
 enum CoverState {
     Loading(TaskId),
-    Ready(PictureHandle),
+    Ready(TilePicture),
     Failed,
 }
 
@@ -727,7 +727,7 @@ Assert:
 - Recent page size is six and summaries are episode titles;
 - Library page size is six and summaries are `owned / total`;
 - every placeholder row uses `RowLead::Icon(Glyph::Book)`;
-- a completed cover changes only its row lead to `RowLead::Picture(handle, Glyph::Book)`;
+- a completed cover changes only its row lead to `RowLead::Picture(picture, Glyph::Book)`;
 - both screens retain the fixed nav bar and fit `CLARA_BW_METRICS`.
 
 - [ ] **Step 2: Add failing cover scheduler tests**
@@ -773,7 +773,7 @@ Expected: current protected shelves show three text buttons, and no shelf cover 
 
 - [ ] **Step 4: Implement compact protected rows**
 
-Use `ScreenBuilder::rows` or `rows_with_trailing` with `RowLead::Picture(handle, Glyph::Book)` when ready and `RowLead::Icon(Glyph::Book)` otherwise. Keep comic title as title. Use episode title for Recent summary and `format!("{} / {}", owned, total)` for Library summary. Page-turn actions update the destination page and immediately reprioritize visible covers.
+Use `ScreenBuilder::rows` or `rows_with_trailing` with `RowLead::Picture(picture, Glyph::Book)` when ready and `RowLead::Icon(Glyph::Book)` otherwise. Keep comic title as title. Use episode title for Recent summary and `format!("{} / {}", owned, total)` for Library summary. Page-turn actions update the destination page and immediately reprioritize visible covers.
 
 - [ ] **Step 5: Implement the URL-keyed scheduler**
 
@@ -785,7 +785,7 @@ On every visible-page change:
 4. reuse every Ready cache entry;
 5. spawn missing URLs in visible order until `Context::spawn` returns `None`;
 6. decode completed bytes with the existing `kobo_image` path;
-7. install one `PictureHandle`, update the URL entry, redraw, and schedule the next missing visible URL.
+7. install one `PictureHandle`, construct a dimensioned `TilePicture`, update the URL entry, redraw, and schedule the next missing visible URL.
 
 Do not persist bytes. Do not retry a failed URL automatically in the same generation. A later explicit destination Retry or metadata refresh may clear Failed for URLs visible in the new generation.
 - [ ] **Step 6: Run focused tests and observe GREEN**
