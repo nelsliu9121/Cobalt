@@ -11,6 +11,14 @@ pub struct Episode {
     pub alias: String,
     pub title: String,
     pub purchase: PurchaseState,
+    pub ticket_quantity: Option<usize>,
+}
+
+impl Episode {
+    #[must_use]
+    pub const fn uses_ticket(&self) -> bool {
+        self.ticket_quantity.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +36,47 @@ pub struct RecentEntry {
     pub content_title: String,
     pub episode_alias: String,
     pub episode_title: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetKind {
+    Coin,
+    Ticket,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetSubtype {
+    Standard,
+    Bonus,
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AssetAmounts {
+    pub standard: usize,
+    pub bonus: usize,
+    pub free: usize,
+}
+
+impl AssetAmounts {
+    pub fn total(self) -> Option<usize> {
+        self.standard.checked_add(self.bonus)?.checked_add(self.free)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletSummary {
+    pub coins: AssetAmounts,
+    pub tickets: AssetAmounts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpirationRow {
+    pub kind: AssetKind,
+    pub subtype: AssetSubtype,
+    pub quantity: usize,
+    pub expires_at: Option<i64>,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,7 +146,49 @@ impl PurchaseState {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_text, EpisodeAvailability, PurchaseState};
+    use super::{
+        display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState,
+    };
+
+    #[test]
+    fn asset_amounts_total_is_checked() {
+        assert_eq!(
+            AssetAmounts {
+                standard: 7,
+                bonus: 2,
+                free: 1,
+            }
+            .total(),
+            Some(10)
+        );
+        assert_eq!(
+            AssetAmounts {
+                standard: usize::MAX,
+                bonus: 1,
+                free: 0,
+            }
+            .total(),
+            None
+        );
+    }
+
+    #[test]
+    fn only_episodes_with_a_ticket_quantity_use_tickets() {
+        let ticket = Episode {
+            alias: "ticket".to_owned(),
+            title: "Ticket episode".to_owned(),
+            purchase: PurchaseState::NotOwned,
+            ticket_quantity: Some(1),
+        };
+        let coin = Episode {
+            alias: "coin".to_owned(),
+            title: "Coin episode".to_owned(),
+            purchase: PurchaseState::NotOwned,
+            ticket_quantity: None,
+        };
+        assert!(ticket.uses_ticket());
+        assert!(!coin.uses_ticket());
+    }
 
     #[test]
     fn purchase_state_uses_live_availability_with_fail_closed_precedence() {

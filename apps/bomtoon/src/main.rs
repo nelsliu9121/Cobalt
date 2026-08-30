@@ -3693,6 +3693,7 @@ mod tests {
             alias: "ep-1".to_owned(),
             title: "Episode One".to_owned(),
             purchase: model::PurchaseState::Owned,
+            ticket_quantity: None,
         });
         app.selected_title = "Hunter Q".to_owned();
         app.page = 3;

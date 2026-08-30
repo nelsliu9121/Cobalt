@@ -151,6 +151,7 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
                 alias: string(item, "alias", "episode.alias")?.to_owned(),
                 title: string(item, "title", "episode.title")?.to_owned(),
                 purchase: PurchaseState::from_remote(availability),
+                ticket_quantity: None,
             })
         })
         .collect()
