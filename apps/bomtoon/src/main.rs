@@ -12,6 +12,7 @@ use model::{
     RecentEntry, WalletSummary,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -760,11 +761,25 @@ impl Bomtoon {
         let mut screen = ScreenBuilder::new("bomtoon-episodes")
             .top_bar(self.selected_title.clone())
             .text(format!("{} episodes", self.episodes.len()));
+        if self.episodes.iter().any(Episode::uses_ticket) {
+            let ticket_text = self
+                .wallet
+                .summary
+                .and_then(|summary| summary.tickets.total())
+                .map_or_else(
+                    || "Tickets unavailable".to_owned(),
+                    |total| format!("Tickets {total}"),
+                );
+            screen = screen.text(ticket_text);
+        }
         let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
         for (index, episode) in self.episodes[start..end].iter().enumerate() {
             let index = start + index;
             let title_fallback = format!("Episode {}", episode.alias);
-            let status = display_text(episode.purchase.label(), "Other status");
+            let mut status = display_text(episode.purchase.label(), "Other status");
+            if let Some(quantity) = episode.ticket_quantity {
+                write!(status, " · Ticket · {quantity}").expect("writing to a String cannot fail");
+            }
             let label = format!(
                 "{} [{}] - {}",
                 display_text(&episode.title, &title_fallback),
@@ -3260,7 +3275,14 @@ mod tests {
             {"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
             {"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
             {"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
-            {"alias":"locked","title":"Locked","isSample":false,"purchaseStatus":null,"paid":true}
+            {"alias":"ticket","title":"Ticket Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"TICKET","rentCoin":1}
+        ]}
+    }"#;
+    const COIN_ONLY_CONTENT_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{"episodes":[
+            {"alias":"owned","title":"Owned Episode","isSample":false,"purchaseStatus":"POSSESSION"},
+            {"alias":"coin","title":"Coin Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1}
         ]}
     }"#;
     const TINY_WEBP: &[u8] = &[
@@ -4426,6 +4448,104 @@ mod tests {
         assert!(actions.contains(&action_id("episode-1")));
         assert!(actions.contains(&action_id("episode-2")));
         assert!(!actions.contains(&action_id("episode-3")));
+    }
+
+    #[test]
+    fn ticket_comic_shows_cached_ticket_total_and_episode_quantity() {
+        let (mut runner, _) = loaded_library();
+        runner.app_mut().wallet.summary = Some(WalletSummary {
+            coins: model::AssetAmounts::default(),
+            tickets: model::AssetAmounts {
+                standard: 3,
+                bonus: 1,
+                free: 0,
+            },
+        });
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Tickets 4"));
+        assert!(drawn.contains("Ticket · 1"));
+        assert_eq!(drawn.matches("Ticket ·").count(), 1);
+        assert!(!screen.nodes.iter().any(
+            |node| matches!(node, Node::Button { action, .. } if *action == action_id("episode-3"))
+        ));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn coin_only_comic_has_no_ticket_ui() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(COIN_ONLY_CONTENT_RESPONSE.to_vec()),
+        );
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(!drawn.contains("Tickets"));
+        assert!(!drawn.contains("Ticket ·"));
+    }
+
+    #[test]
+    fn ticket_comic_without_cached_summary_does_not_fetch_wallet() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.app_mut().wallet.summary = None;
+
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, work) = only_spawn(&commands);
+        assert!(matches!(
+            work,
+            Task::Fetch { ref url, .. }
+                if url.contains("/api/balcony-api-v2/contents/hunter_q?")
+        ));
+        let commands = runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        assert!(spawns(&commands).is_empty());
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Tickets unavailable"));
+        assert!(drawn.contains("Ticket · 1"));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn ticket_comic_maximum_quantity_fits_clara_bw() {
+        let mut app = Bomtoon::default();
+        app.view = View::Episodes;
+        app.selected_title = "Maximum Tickets".to_owned();
+        app.wallet.summary = Some(WalletSummary {
+            coins: model::AssetAmounts::default(),
+            tickets: model::AssetAmounts {
+                standard: usize::MAX,
+                bonus: 0,
+                free: 0,
+            },
+        });
+        app.episodes.push(Episode {
+            alias: "maximum-ticket".to_owned(),
+            title: "Maximum Ticket Episode".to_owned(),
+            purchase: model::PurchaseState::NotOwned,
+            ticket_quantity: Some(usize::MAX),
+        });
+
+        let screen = app.episode_screen();
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains(&format!("Tickets {}", usize::MAX)));
+        assert!(drawn.contains(&format!("Ticket · {}", usize::MAX)));
+        assert!(!screen
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Button { .. })));
+        assert_fits(&screen);
     }
 
     #[test]
