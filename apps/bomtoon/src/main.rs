@@ -920,7 +920,9 @@ impl Bomtoon {
         if self.account != AccountState::Active {
             screen = screen.top_bar_action(SIGN_IN, "Sign in");
         } else if self.destination != MainDestination::Featured {
-            screen = screen.top_bar_action(SIGN_OUT, "Sign out");
+            screen = screen
+                .top_bar_action(ACCOUNT, "Account")
+                .top_bar_action(SIGN_OUT, "Sign out");
         }
 
         match self.destination {
@@ -9685,6 +9687,40 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn account_action_remains_visible_and_reachable_on_both_compact_shelves() {
+        for destination in [MainDestination::Recent, MainDestination::Library] {
+            let app = Bomtoon {
+                account: AccountState::Active,
+                view: View::Main,
+                destination,
+                recent: vec![recent_shelf_entry(0, None)],
+                comics: vec![library_shelf_comic(0, None)],
+                recent_loaded: true,
+                library_loaded: true,
+                total_recent_titles: 1,
+                total_library_titles: 1,
+                ..Bomtoon::default()
+            };
+            let screen = app.screen();
+            let actions = &screen.top_bar.as_ref().expect("protected top bar").actions;
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| action.action == action_id(ACCOUNT)),
+                "{destination:?} compact shelf lost its Account action"
+            );
+            assert!(actions
+                .iter()
+                .any(|action| action.action == action_id(SIGN_OUT)));
+            assert_fits(&screen);
+
+            let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+            runner.action(action_id(ACCOUNT));
+            assert_eq!(runner.app().view, View::Account);
+        }
     }
 
     #[test]
