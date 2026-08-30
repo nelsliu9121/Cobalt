@@ -232,7 +232,7 @@ impl PurchaseState {
         match availability.status {
             Some("POSSESSION") => Self::Owned,
             Some("RENT") => Self::Rented,
-            Some(status) if !status.is_empty() && status != "NONE" => {
+            Some(status) if status != "NONE" => {
                 Self::Other(status.to_owned())
             }
             _ if availability.episode_type == Some("PREVIEW") || availability.is_sample => {
@@ -405,6 +405,18 @@ mod tests {
                     rent_coin: Some(0),
                 },
                 PurchaseState::Other("FUTURE".to_owned()),
+            ),
+            (
+                "empty unknown status",
+                EpisodeAvailability {
+                    status: Some(""),
+                    episode_type: Some("PREVIEW"),
+                    is_sample: true,
+                    paid: Some(false),
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
+                },
+                PurchaseState::Other(String::new()),
             ),
         ];
 
