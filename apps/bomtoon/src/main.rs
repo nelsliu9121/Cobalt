@@ -126,6 +126,29 @@ enum Pending {
     Logout,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ShelfLoadState {
+    pending_page: Option<usize>,
+    error: Option<(usize, String)>,
+}
+
+impl ShelfLoadState {
+    fn begin(&mut self, page: usize) {
+        self.pending_page = Some(page);
+        self.error = None;
+    }
+
+    fn finish(&mut self) {
+        self.pending_page = None;
+        self.error = None;
+    }
+
+    fn fail(&mut self, page: usize, message: impl Into<String>) {
+        self.pending_page = None;
+        self.error = Some((page, message.into()));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum AccountState {
     #[default]
@@ -280,11 +303,7 @@ fn featured_page(featured: &FeaturedState, page: usize, first_page_rows: usize) 
             recommended: 0..featured.recommended.len().min(first_page_rows),
         };
     }
-    let continuation_rows = if featured.stale_warning.is_some() {
-        first_page_rows
-    } else {
-        6
-    };
+    let continuation_rows = 6;
     let start = first_page_rows
         .saturating_add(page.saturating_sub(1).saturating_mul(continuation_rows))
         .min(featured.recommended.len());
@@ -299,11 +318,7 @@ fn featured_page(featured: &FeaturedState, page: usize, first_page_rows: usize) 
 
 fn featured_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
     let first_page_rows = first_page_rows.max(1);
-    let continuation_rows = if featured.stale_warning.is_some() {
-        first_page_rows
-    } else {
-        6
-    };
+    let continuation_rows = 6;
     if featured.recommended.len() <= first_page_rows {
         1
     } else {
@@ -313,6 +328,19 @@ fn featured_page_count(featured: &FeaturedState, first_page_rows: usize) -> usiz
             .saturating_sub(first_page_rows)
             .div_ceil(continuation_rows)
     }
+}
+
+fn featured_content_page(featured: &FeaturedState) -> Option<usize> {
+    if featured.stale_warning.is_some() {
+        featured.page.checked_sub(1)
+    } else {
+        Some(featured.page)
+    }
+}
+
+fn featured_display_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
+    featured_page_count(featured, first_page_rows)
+        .saturating_add(usize::from(featured.stale_warning.is_some()))
 }
 fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
     match url.and_then(|url| covers.entries.get(url)) {
@@ -331,9 +359,10 @@ fn add_featured_feed(
     mut screen: ScreenBuilder,
     featured: &FeaturedState,
     covers: &CoverCache,
+    content_page: usize,
     first_page_rows: usize,
 ) -> ScreenBuilder {
-    let page = featured_page(featured, featured.page, first_page_rows);
+    let page = featured_page(featured, content_page, first_page_rows);
     if !page.featured.is_empty() {
         screen = screen.picture_tiles(
             TileShape::Portrait,
@@ -362,21 +391,26 @@ fn add_featured_feed(
         }));
     let pages = featured_page_count(featured, first_page_rows);
     screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
-        u16::try_from(featured.page.saturating_add(1)).unwrap_or(u16::MAX),
+        u16::try_from(content_page.saturating_add(1)).unwrap_or(u16::MAX),
         u16::try_from(pages).unwrap_or(u16::MAX),
     )
 }
 
 fn add_featured_content(
-    mut screen: ScreenBuilder,
+    screen: ScreenBuilder,
     featured: &FeaturedState,
     covers: &CoverCache,
     first_page_rows: usize,
 ) -> ScreenBuilder {
-    if let Some(warning) = &featured.stale_warning {
-        screen = screen
-            .banner(BannerLevel::Attention, warning.clone())
-            .button(RETRY, "Try again");
+    if featured.page == 0 {
+        if let Some(warning) = &featured.stale_warning {
+            let pages = featured_display_page_count(featured, first_page_rows);
+            return screen
+                .banner(BannerLevel::Attention, warning.clone())
+                .primary_button(RETRY, "Try again")
+                .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
+                .page_position(1, u16::try_from(pages).unwrap_or(u16::MAX));
+        }
     }
     match featured.status {
         FeaturedStatus::Unloaded => screen.text("Featured has not loaded yet."),
@@ -384,7 +418,13 @@ fn add_featured_content(
             screen.activity("Loading Featured", None)
         }
         FeaturedStatus::Loading | FeaturedStatus::Ready => {
-            add_featured_feed(screen, featured, covers, first_page_rows)
+            let content_page = featured_content_page(featured).unwrap_or(0);
+            let pages = featured_display_page_count(featured, first_page_rows);
+            add_featured_feed(screen, featured, covers, content_page, first_page_rows)
+                .page_position(
+                    u16::try_from(featured.page.saturating_add(1)).unwrap_or(u16::MAX),
+                    u16::try_from(pages).unwrap_or(u16::MAX),
+                )
         }
         FeaturedStatus::Failed => screen
             .banner(BannerLevel::Attention, "Featured could not be loaded.")
@@ -399,16 +439,12 @@ fn featured_page_zero_rows(featured: &FeaturedState) -> usize {
 fn featured_page_zero_rows_with_covers(featured: &FeaturedState, covers: &CoverCache) -> usize {
     let mut measuring = featured.clone();
     measuring.page = 0;
+    measuring.stale_warning = None;
     for rows in (1..=6).rev() {
-        let mut builder = ScreenBuilder::new("bomtoon-featured-measure")
+        let builder = ScreenBuilder::new("bomtoon-featured-measure")
             .top_bar("Featured")
-            .top_bar_action(SIGN_IN, "Sign in");
-        if let Some(warning) = &measuring.stale_warning {
-            builder = builder
-                .banner(BannerLevel::Attention, warning.clone())
-                .button(RETRY, "Try again");
-        }
-        let screen = add_featured_feed(builder, &measuring, covers, rows)
+            .top_bar_action(ACCOUNT, "Coins 18446744073709551615");
+        let screen = add_featured_feed(builder, &measuring, covers, 0, rows)
             .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
             .build();
         if !screen
@@ -690,6 +726,7 @@ struct Bomtoon {
     destination: MainDestination,
     pending: Option<Pending>,
     task: Option<TaskId>,
+    queued_foreground: Option<Pending>,
     wallet: WalletState,
     featured: FeaturedState,
     shelf_tasks: BTreeMap<TaskId, ShelfTaskPurpose>,
@@ -698,6 +735,8 @@ struct Bomtoon {
     covers: CoverCache,
     comics: Vec<Comic>,
     recent: Vec<RecentEntry>,
+    library_load: ShelfLoadState,
+    recent_load: ShelfLoadState,
     episodes: Vec<Episode>,
     selected_content_alias: String,
     selected_title: String,
@@ -723,7 +762,11 @@ impl Bomtoon {
         self.sync_visible_covers(context);
         let owns_back = self.account == AccountState::Active
             && match self.view {
-                View::Account | View::Episodes => self.pending.is_none() && self.problem.is_none(),
+                View::Account | View::Episodes => {
+                    self.pending.is_none()
+                        && self.queued_foreground.is_none()
+                        && self.problem.is_none()
+                }
                 View::Reader => true,
                 View::Status | View::Main => false,
             };
@@ -755,7 +798,10 @@ impl Bomtoon {
                 ) =>
             {
                 let first_page_rows = featured_page_zero_rows(&self.featured);
-                let page = featured_page(&self.featured, self.featured.page, first_page_rows);
+                let Some(content_page) = featured_content_page(&self.featured) else {
+                    return visible;
+                };
+                let page = featured_page(&self.featured, content_page, first_page_rows);
                 for index in page.featured {
                     push(self.featured.featured[index].cover_url.as_ref());
                 }
@@ -840,6 +886,9 @@ impl Bomtoon {
     }
 
     fn spawn_visible_covers(&mut self, context: &mut Context) {
+        if self.pending.is_some() || self.queued_foreground.is_some() {
+            return;
+        }
         let Some(source) = self.covers.visible_source else {
             return;
         };
@@ -865,17 +914,18 @@ impl Bomtoon {
     }
 
     fn screen(&self) -> Screen {
-        if let Some(pending) = self.pending {
-            let (title, message) = match pending {
-                Pending::Library(_) => (TITLE, "Loading your library"),
-                Pending::Recent(_) => (TITLE, "Loading recent reading"),
-                Pending::Content(_) => (TITLE, "Loading episode purchase status"),
-                Pending::Logout => (TITLE, "Signing out"),
+        if let Some(pending) = self.pending.or(self.queued_foreground) {
+            let message = match pending {
+                Pending::Content(_) => Some("Loading episode purchase status"),
+                Pending::Logout => Some("Signing out"),
+                Pending::Library(_) | Pending::Recent(_) => None,
             };
-            return ScreenBuilder::new("bomtoon-loading")
-                .top_bar(title)
-                .activity(message, None)
-                .build();
+            if let Some(message) = message {
+                return ScreenBuilder::new("bomtoon-loading")
+                    .top_bar(TITLE)
+                    .activity(message, None)
+                    .build();
+            }
         }
         if let Some(entry) = self
             .foreground_reader_task
@@ -978,51 +1028,67 @@ impl Bomtoon {
                 );
             }
             MainDestination::Recent => {
-                let (start, end) =
-                    page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
-                screen = screen.rows((start..end).map(|index| {
-                    let recent = &self.recent[index];
-                    let title_fallback = format!("Title {}", recent.content_alias);
-                    let episode_fallback = format!("Episode {}", recent.episode_alias);
-                    (
-                        format!("comic-{index}"),
-                        display_text(&recent.content_title, &title_fallback),
-                        display_text(&recent.episode_title, &episode_fallback),
-                        cover_lead(&self.covers, recent.cover_url.as_deref()),
-                    )
-                }));
-                let pages = self
-                    .destination_total()
-                    .max(self.recent.len())
-                    .div_ceil(LIBRARY_ITEMS_PER_PAGE)
-                    .max(1);
-                screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
-                    u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                    u16::try_from(pages).unwrap_or(u16::MAX),
-                );
+                if self.recent_load.pending_page.is_some() {
+                    screen = screen.activity("Loading recent reading", None);
+                } else if let Some((_, error)) = &self.recent_load.error {
+                    screen = screen
+                        .banner(BannerLevel::Attention, error.clone())
+                        .primary_button(RETRY, "Try again");
+                } else {
+                    let (start, end) =
+                        page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
+                    screen = screen.rows((start..end).map(|index| {
+                        let recent = &self.recent[index];
+                        let title_fallback = format!("Title {}", recent.content_alias);
+                        let episode_fallback = format!("Episode {}", recent.episode_alias);
+                        (
+                            format!("comic-{index}"),
+                            display_text(&recent.content_title, &title_fallback),
+                            display_text(&recent.episode_title, &episode_fallback),
+                            cover_lead(&self.covers, recent.cover_url.as_deref()),
+                        )
+                    }));
+                    let pages = self
+                        .destination_total()
+                        .max(self.recent.len())
+                        .div_ceil(LIBRARY_ITEMS_PER_PAGE)
+                        .max(1);
+                    screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+                        u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
+                        u16::try_from(pages).unwrap_or(u16::MAX),
+                    );
+                }
             }
             MainDestination::Library => {
-                let (start, end) =
-                    page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
-                screen = screen.rows((start..end).map(|index| {
-                    let comic = &self.comics[index];
-                    let fallback = format!("Title {}", comic.alias);
-                    (
-                        format!("comic-{index}"),
-                        display_text(&comic.title, &fallback),
-                        format!("{} / {}", comic.owned_episodes, comic.total_episodes),
-                        cover_lead(&self.covers, comic.cover_url.as_deref()),
-                    )
-                }));
-                let pages = self
-                    .destination_total()
-                    .max(self.comics.len())
-                    .div_ceil(LIBRARY_ITEMS_PER_PAGE)
-                    .max(1);
-                screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
-                    u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                    u16::try_from(pages).unwrap_or(u16::MAX),
-                );
+                if self.library_load.pending_page.is_some() {
+                    screen = screen.activity("Loading your library", None);
+                } else if let Some((_, error)) = &self.library_load.error {
+                    screen = screen
+                        .banner(BannerLevel::Attention, error.clone())
+                        .primary_button(RETRY, "Try again");
+                } else {
+                    let (start, end) =
+                        page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
+                    screen = screen.rows((start..end).map(|index| {
+                        let comic = &self.comics[index];
+                        let fallback = format!("Title {}", comic.alias);
+                        (
+                            format!("comic-{index}"),
+                            display_text(&comic.title, &fallback),
+                            format!("{} / {}", comic.owned_episodes, comic.total_episodes),
+                            cover_lead(&self.covers, comic.cover_url.as_deref()),
+                        )
+                    }));
+                    let pages = self
+                        .destination_total()
+                        .max(self.comics.len())
+                        .div_ceil(LIBRARY_ITEMS_PER_PAGE)
+                        .max(1);
+                    screen = screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+                        u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
+                        u16::try_from(pages).unwrap_or(u16::MAX),
+                    );
+                }
             }
         }
 
@@ -1213,14 +1279,6 @@ impl Bomtoon {
         }
     }
 
-    fn destination_is_loaded(&self, target: MainDestination) -> bool {
-        match target {
-            MainDestination::Featured => self.featured.status != FeaturedStatus::Unloaded,
-            MainDestination::Recent => self.recent_loaded,
-            MainDestination::Library => self.library_loaded,
-        }
-    }
-
     fn select_destination(&mut self, context: &mut Context, target: MainDestination) {
         self.page = 0;
         if target == MainDestination::Featured {
@@ -1236,13 +1294,26 @@ impl Bomtoon {
 
         self.destination = target;
         self.view = View::Main;
-        if !self.destination_is_loaded(target) {
-            let (pending, work) = match target {
-                MainDestination::Recent => (Pending::Recent(0), api::recent(0)),
-                MainDestination::Library => (Pending::Library(0), api::library(0)),
+        let needs_request = match target {
+            MainDestination::Recent => {
+                !self.recent_loaded
+                    && self.recent_load.pending_page.is_none()
+                    && self.recent_load.error.is_none()
+            }
+            MainDestination::Library => {
+                !self.library_loaded
+                    && self.library_load.pending_page.is_none()
+                    && self.library_load.error.is_none()
+            }
+            MainDestination::Featured => false,
+        };
+        if needs_request {
+            let pending = match target {
+                MainDestination::Recent => Pending::Recent(0),
+                MainDestination::Library => Pending::Library(0),
                 MainDestination::Featured => return,
             };
-            self.spawn(context, pending, work);
+            self.request_foreground(context, pending);
         }
     }
 
@@ -1578,6 +1649,7 @@ impl Bomtoon {
             context.cancel(task);
         }
         self.pending = None;
+        self.queued_foreground = None;
         self.cancel_reader(context);
         self.cancel_wallet(context);
         self.retain_public_cover_cache(context);
@@ -1590,6 +1662,8 @@ impl Bomtoon {
         self.wallet.ticket_history_error = false;
         self.comics.clear();
         self.recent.clear();
+        self.library_load = ShelfLoadState::default();
+        self.recent_load = ShelfLoadState::default();
         self.episodes.clear();
         self.selected_content_alias.clear();
         self.selected_title.clear();
@@ -1663,8 +1737,13 @@ impl Bomtoon {
             refresh.loaded_day = Some(day);
             return;
         };
-        if day == loaded_day || refresh.active_day == Some(day) || refresh.desired_day == Some(day)
-        {
+        if let Some(active_day) = refresh.active_day {
+            if day != active_day && refresh.desired_day != Some(day) {
+                refresh.desired_day = Some(day);
+            }
+            return;
+        }
+        if day == loaded_day || refresh.desired_day == Some(day) {
             return;
         }
         refresh.desired_day = Some(day);
@@ -1707,7 +1786,7 @@ impl Bomtoon {
     }
 
     fn resume_queued_homepage(&mut self, context: &mut Context) -> bool {
-        if !self.superseded_shelf_tasks.is_empty() {
+        if !self.superseded_shelf_tasks.is_empty() || self.queued_foreground.is_some() {
             return false;
         }
         let Some((generation, refresh_day)) = self.queued_homepage.take() else {
@@ -1799,6 +1878,9 @@ impl Bomtoon {
         }
         self.featured.refresh.desired_day = Some(failed_day);
         if preserves_ready_feed {
+            if self.featured.stale_warning.is_none() {
+                self.featured.page = self.featured.page.saturating_add(1);
+            }
             self.featured.stale_warning =
                 Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
         } else {
@@ -2010,13 +2092,75 @@ impl Bomtoon {
         self.open_public_main(context);
     }
 
-    fn spawn(&mut self, context: &mut Context, pending: Pending, work: kobo_sdk::Task) {
-        match context.spawn(work) {
-            Some(task) => {
-                self.task = Some(task);
-                self.pending = Some(pending);
+    fn foreground_work(&self, pending: Pending) -> kobo_sdk::Task {
+        match pending {
+            Pending::Library(page) => api::library(page),
+            Pending::Recent(page) => api::recent(page),
+            Pending::Content(_) => api::content(&self.selected_content_alias),
+            Pending::Logout => api::logout(),
+        }
+    }
+
+    fn begin_shelf_load(&mut self, pending: Pending) {
+        match pending {
+            Pending::Library(page) => self.library_load.begin(page),
+            Pending::Recent(page) => self.recent_load.begin(page),
+            Pending::Content(_) | Pending::Logout => {}
+        }
+    }
+
+    fn preempt_cover_tasks(&mut self, context: &mut Context) {
+        for (task, cover) in std::mem::take(&mut self.covers.tasks) {
+            context.cancel(task);
+            if self.covers.entries.get(&cover.url) == Some(&CoverState::Loading(task)) {
+                self.covers.entries.remove(&cover.url);
             }
-            None => self.problem = Some("Another network request is still active.".to_owned()),
+        }
+    }
+
+    fn request_foreground(&mut self, context: &mut Context, pending: Pending) {
+        if self.pending == Some(pending) || self.queued_foreground == Some(pending) {
+            return;
+        }
+        self.begin_shelf_load(pending);
+        if self.task.is_some() {
+            if self.queued_foreground.is_none() {
+                self.queued_foreground = Some(pending);
+            }
+            self.preempt_cover_tasks(context);
+            return;
+        }
+        let work = self.foreground_work(pending);
+        if let Some(task) = context.spawn(work) {
+            self.task = Some(task);
+            self.pending = Some(pending);
+        } else {
+            self.queued_foreground = Some(pending);
+            self.preempt_cover_tasks(context);
+        }
+    }
+
+    fn resume_queued_foreground(&mut self, context: &mut Context) {
+        if self.task.is_some() {
+            return;
+        }
+        let Some(pending) = self.queued_foreground.take() else {
+            return;
+        };
+        let work = self.foreground_work(pending);
+        if let Some(task) = context.spawn(work) {
+            self.task = Some(task);
+            self.pending = Some(pending);
+        } else {
+            self.queued_foreground = Some(pending);
+        }
+    }
+
+    fn resume_capacity_work(&mut self, context: &mut Context) {
+        self.resume_queued_foreground(context);
+        if self.queued_foreground.is_none() {
+            self.resume_deferred_wallet(context);
+            self.spawn_visible_covers(context);
         }
     }
 
@@ -2696,41 +2840,37 @@ impl Bomtoon {
             }
             Pending::Library(expected) => match parse::library(bytes) {
                 Ok(page) if page.number == expected => {
-                    let first_page = !self.library_loaded;
+                    self.library_load.finish();
                     self.library_loaded = true;
                     self.total_library_titles = page.total_items;
                     self.comics.extend(page.comics);
                     self.next_library_page =
                         (page.number + 1 < page.total_pages).then_some(page.number + 1);
-                    if !first_page {
+                    if self.destination == MainDestination::Library && expected != 0 {
                         self.page = self.page.saturating_add(1);
                     }
-                    self.destination = MainDestination::Library;
-                    self.view = View::Main;
                 }
-                Ok(_) => {
-                    self.problem = Some("BOMTOON returned a different library page.".to_owned());
-                }
-                Err(error) => self.problem = Some(error.to_string()),
+                Ok(_) => self
+                    .library_load
+                    .fail(expected, "BOMTOON returned a different library page."),
+                Err(error) => self.library_load.fail(expected, error.to_string()),
             },
             Pending::Recent(expected) => match parse::recent(bytes) {
                 Ok(page) if page.number == expected => {
-                    let first_page = !self.recent_loaded;
+                    self.recent_load.finish();
                     self.recent_loaded = true;
                     self.total_recent_titles = page.total_items;
                     self.recent.extend(page.entries);
                     self.next_recent_page =
                         (page.number + 1 < page.total_pages).then_some(page.number + 1);
-                    if !first_page {
+                    if self.destination == MainDestination::Recent && expected != 0 {
                         self.page = self.page.saturating_add(1);
                     }
-                    self.destination = MainDestination::Recent;
-                    self.view = View::Main;
                 }
-                Ok(_) => {
-                    self.problem = Some("BOMTOON returned a different recent page.".to_owned());
-                }
-                Err(error) => self.problem = Some(error.to_string()),
+                Ok(_) => self
+                    .recent_load
+                    .fail(expected, "BOMTOON returned a different recent page."),
+                Err(error) => self.recent_load.fail(expected, error.to_string()),
             },
             Pending::Content(_index) => match parse::episodes(bytes) {
                 Ok(episodes) => {
@@ -2781,7 +2921,7 @@ impl Bomtoon {
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
         self.retry = Retry::Restart;
-        self.spawn(context, Pending::Content(index), api::content(&alias));
+        self.request_foreground(context, Pending::Content(index));
         self.show(context);
     }
 
@@ -3036,7 +3176,13 @@ impl Bomtoon {
             ) => {
                 self.transition_after_credential_loss(context, AccountState::Expired);
             }
-            (_, error) => {
+            (Pending::Library(page), error) => {
+                self.library_load.fail(page, Failure::of(error).advice);
+            }
+            (Pending::Recent(page), error) => {
+                self.recent_load.fail(page, Failure::of(error).advice);
+            }
+            (Pending::Content(_) | Pending::Logout, error) => {
                 self.problem = Some(Failure::of(error).advice.to_owned());
                 self.retry = Retry::Restart;
             }
@@ -3336,9 +3482,15 @@ impl Bomtoon {
         true
     }
 
-    fn cancel_task(&mut self, _pending: Pending) {
-        self.problem = Some("The request was cancelled.".to_owned());
-        self.retry = Retry::Restart;
+    fn cancel_task(&mut self, pending: Pending) {
+        match pending {
+            Pending::Library(page) => self.library_load.fail(page, "The request was cancelled."),
+            Pending::Recent(page) => self.recent_load.fail(page, "The request was cancelled."),
+            Pending::Content(_) | Pending::Logout => {
+                self.problem = Some("The request was cancelled.".to_owned());
+                self.retry = Retry::Restart;
+            }
+        }
     }
 }
 
@@ -3406,6 +3558,7 @@ impl KoboApp for Bomtoon {
         let ready = self.account == AccountState::Active
             && self.problem.is_none()
             && self.pending.is_none()
+            && self.queued_foreground.is_none()
             && self.foreground_reader_task.is_none();
         if action == ActionId::BACK && ready && matches!(self.view, View::Account | View::Episodes)
         {
@@ -3414,6 +3567,23 @@ impl KoboApp for Bomtoon {
             self.featured.page = 0;
             self.show(context);
             return;
+        }
+        if action == action_id(RETRY) && self.problem.is_none() && self.view == View::Main {
+            let retry_page = match self.destination {
+                MainDestination::Recent => self.recent_load.error.as_ref().map(|(page, _)| *page),
+                MainDestination::Library => self.library_load.error.as_ref().map(|(page, _)| *page),
+                MainDestination::Featured => None,
+            };
+            if let Some(page) = retry_page {
+                let pending = match self.destination {
+                    MainDestination::Recent => Pending::Recent(page),
+                    MainDestination::Library => Pending::Library(page),
+                    MainDestination::Featured => unreachable!("Featured has no shelf retry"),
+                };
+                self.request_foreground(context, pending);
+                self.show(context);
+                return;
+            }
         }
         if action == action_id(RETRY)
             && self.problem.is_none()
@@ -3458,7 +3628,12 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        if self.view == View::Main && self.pending.is_none() {
+        let blocks_main_navigation = self
+            .pending
+            .into_iter()
+            .chain(self.queued_foreground)
+            .any(|pending| matches!(pending, Pending::Content(_) | Pending::Logout));
+        if self.view == View::Main && !blocks_main_navigation {
             let target = if action == action_id(FEATURED) {
                 Some(MainDestination::Featured)
             } else if action == action_id(RECENT) {
@@ -3474,7 +3649,14 @@ impl KoboApp for Bomtoon {
                 return;
             }
         }
-        if self.view == View::Main && self.destination == MainDestination::Featured {
+        let featured_content_ready = self.problem.is_none()
+            && self.pending.is_none()
+            && self.queued_foreground.is_none()
+            && self.foreground_reader_task.is_none();
+        if self.view == View::Main
+            && self.destination == MainDestination::Featured
+            && featured_content_ready
+        {
             if action == action_id(PREVIOUS_PAGE) {
                 self.featured.page = self.featured.page.saturating_sub(1);
                 self.show(context);
@@ -3482,7 +3664,7 @@ impl KoboApp for Bomtoon {
             }
             if action == action_id(NEXT_PAGE) {
                 let first_page_rows = featured_page_zero_rows(&self.featured);
-                let pages = featured_page_count(&self.featured, first_page_rows);
+                let pages = featured_display_page_count(&self.featured, first_page_rows);
                 if self.featured.page.saturating_add(1) < pages {
                     self.featured.page = self.featured.page.saturating_add(1);
                 }
@@ -3496,6 +3678,7 @@ impl KoboApp for Bomtoon {
                 }
             }
         }
+
         if !ready {
             self.show(context);
             return;
@@ -3506,7 +3689,7 @@ impl KoboApp for Bomtoon {
         }
         if self.view == View::Account {
             if action == action_id(SIGN_OUT) {
-                self.spawn(context, Pending::Logout, api::logout());
+                self.request_foreground(context, Pending::Logout);
             } else if action == action_id(RETRY_BALANCES)
                 && (self.wallet.summary_error
                     || self.wallet.coin_history_error
@@ -3551,15 +3734,15 @@ impl KoboApp for Bomtoon {
             } else if next_start < self.destination_len() {
                 self.page = self.page.saturating_add(1);
             } else if let Some(next) = self.destination_next_page() {
-                let (pending, work) = match self.destination {
-                    MainDestination::Recent => (Pending::Recent(next), api::recent(next)),
-                    MainDestination::Library => (Pending::Library(next), api::library(next)),
+                let pending = match self.destination {
+                    MainDestination::Recent => Pending::Recent(next),
+                    MainDestination::Library => Pending::Library(next),
                     MainDestination::Featured => {
                         self.show(context);
                         return;
                     }
                 };
-                self.spawn(context, pending, work);
+                self.request_foreground(context, pending);
             }
         } else if self.view == View::Main {
             for index in 0..self.destination_len() {
@@ -3582,17 +3765,17 @@ impl KoboApp for Bomtoon {
 
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
         if let Some(cover) = self.covers.tasks.remove(&task) {
+            self.resume_queued_foreground(context);
             let changed = self.handle_cover_outcome(context, task, cover, outcome);
-            self.resume_deferred_wallet(context);
             if changed {
                 self.show(context);
-            } else {
-                self.spawn_visible_covers(context);
             }
+            self.resume_capacity_work(context);
             return;
         }
         if let Some(purpose) = self.shelf_tasks.remove(&task) {
             if self.superseded_shelf_tasks.remove(&task) {
+                self.resume_queued_foreground(context);
                 let changed = self.resume_queued_homepage(context);
                 if changed
                     && self.view == View::Main
@@ -3600,42 +3783,39 @@ impl KoboApp for Bomtoon {
                 {
                     self.show(context);
                 }
-                self.resume_deferred_wallet(context);
-                self.spawn_visible_covers(context);
+                self.resume_capacity_work(context);
                 return;
             }
+            self.resume_queued_foreground(context);
             let changed = self.handle_shelf_outcome(context, purpose, outcome);
             if changed && self.view == View::Main && self.destination == MainDestination::Featured {
                 self.show(context);
             }
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+            self.resume_capacity_work(context);
             return;
         }
         if let Some(purpose) = self.wallet.tasks.remove(&task) {
+            self.resume_queued_foreground(context);
             self.handle_wallet_outcome(context, task, purpose, outcome);
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+            self.resume_capacity_work(context);
             return;
         }
         if let Some(entry) = self.reader_tasks.remove(&task) {
             if self.foreground_reader_task == Some(task) {
                 self.foreground_reader_task = None;
             }
+            self.resume_queued_foreground(context);
             self.handle_reader_outcome(context, task, entry, outcome);
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+            self.resume_capacity_work(context);
             return;
         }
         if self.task != Some(task) {
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+            self.resume_capacity_work(context);
             return;
         }
         self.task = None;
         let Some(pending) = self.pending.take() else {
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+            self.resume_capacity_work(context);
             return;
         };
         let shown = match outcome {
@@ -3652,8 +3832,7 @@ impl KoboApp for Bomtoon {
         if !shown {
             self.show(context);
         }
-        self.resume_deferred_wallet(context);
-        self.spawn_visible_covers(context);
+        self.resume_capacity_work(context);
     }
 }
 
@@ -4369,6 +4548,19 @@ mod tests {
             "totalElements":1
         }
     }"#;
+    const RECENT_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":{
+            "content":[{
+                "alias":"hunter_q",
+                "title":"Hunter Q",
+                "episode":{"alias":"60","title":"Episode 60"}
+            }],
+            "number":0,
+            "totalPages":1,
+            "totalElements":1
+        }
+    }"#;
     const ASSET_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
         "data":{
@@ -4986,6 +5178,16 @@ mod tests {
                 _ => None,
             })
             .expect("a screen command")
+    }
+
+    fn retry_button_count(screen: &Screen) -> usize {
+        screen
+            .nodes
+            .iter()
+            .filter(
+                |node| matches!(node, Node::Button { action, .. } if *action == action_id(RETRY)),
+            )
+            .count()
     }
 
     fn assert_fits(screen: &Screen) {
@@ -5820,55 +6022,75 @@ mod tests {
     }
 
     #[test]
-    fn navigation_pending_protected_shelf_ignores_destination_taps() {
-        let empty_recent_response = br#"{
-            "result":"SUCCESS",
-            "data":{
-                "content":[],
-                "number":0,
-                "totalPages":1,
-                "totalElements":0
-            }
-        }"#;
-        for (open, queued, destination, pending, response) in [
-            (
-                RECENT,
-                LIBRARY,
-                MainDestination::Recent,
-                Pending::Recent(0),
-                empty_recent_response.as_slice(),
-            ),
-            (
-                LIBRARY,
-                RECENT,
-                MainDestination::Library,
-                Pending::Library(0),
-                LIBRARY_RESPONSE,
-            ),
-        ] {
-            let mut runner = AppRunner::new(Bomtoon {
-                view: View::Main,
-                destination: MainDestination::Featured,
-                ..Bomtoon::default()
-            });
-            let commands = runner.action(action_id(open));
-            let (task, _) = only_spawn(&commands);
-            assert_eq!(runner.app().pending, Some(pending));
+    fn recent_load_failure_retry_and_late_success_stay_destination_local() {
+        let (mut runner, _) = started();
 
-            let commands = runner.action(action_id(queued));
+        let commands = runner.action(action_id(RECENT));
+        let (first, _) = fetch_task_with(&commands, "/recent?");
+        let loading = last_screen(&commands);
+        assert_eq!(runner.app().recent_load.pending_page, Some(0));
+        assert!(loading.nav_bar.is_some());
+        assert!(format!("{loading:?}").contains("Loading recent reading"));
 
-            assert_eq!(runner.app().view, View::Main);
-            assert_eq!(runner.app().destination, destination);
-            assert_eq!(runner.app().pending, Some(pending));
-            assert_eq!(runner.app().task, Some(task));
-            assert!(spawns(&commands).is_empty());
+        let commands = runner.action(action_id(FEATURED));
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(last_screen(&commands).nav_bar.is_some());
 
-            runner.task_outcome(task, TaskOutcome::Completed(response.to_vec()));
-            assert_eq!(runner.app().view, View::Main);
-            assert_eq!(runner.app().destination, destination);
-            assert_eq!(runner.app().pending, None);
-            assert_eq!(runner.app().task, None);
-        }
+        runner.task_outcome(first, TaskOutcome::Failed(TaskError::Offline));
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(runner.app().problem.is_none());
+        assert!(runner.app().recent_load.error.is_some());
+
+        let commands = runner.action(action_id(RECENT));
+        let error_screen = last_screen(&commands);
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert!(error_screen.nav_bar.is_some());
+        assert!(error_screen.nodes.iter().any(
+            |node| matches!(node, Node::Button { action, .. } if *action == action_id(RETRY))
+        ));
+        assert_fits(&error_screen);
+
+        let commands = runner.action(action_id(RETRY));
+        let (retry, _) = fetch_task_with(&commands, "/recent?");
+        assert_eq!(runner.app().recent_load.pending_page, Some(0));
+        runner.action(action_id(FEATURED));
+
+        runner.task_outcome(retry, TaskOutcome::Completed(RECENT_RESPONSE.to_vec()));
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(runner.app().recent_loaded);
+        assert!(runner.app().recent_load.error.is_none());
+
+        let commands = runner.action(action_id(RECENT));
+        assert!(spawns(&commands).is_empty());
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert!(format!("{:?}", last_screen(&commands)).contains("Episode"));
+    }
+
+    #[test]
+    fn protected_shelf_work_allows_destination_switches_and_serializes_one_next_shelf() {
+        let (mut runner, _) = started();
+
+        let recent_commands = runner.action(action_id(RECENT));
+        let (recent, _) = fetch_task_with(&recent_commands, "/recent?");
+        let library_commands = runner.action(action_id(LIBRARY));
+        assert!(spawns(&library_commands).is_empty());
+        assert_eq!(runner.app().destination, MainDestination::Library);
+        assert_eq!(runner.app().queued_foreground, Some(Pending::Library(0)));
+        assert!(last_screen(&library_commands).nav_bar.is_some());
+
+        let commands =
+            runner.task_outcome(recent, TaskOutcome::Completed(RECENT_RESPONSE.to_vec()));
+        let (library, work) = only_spawn(&commands);
+        assert_eq!(work, api::library(0));
+        assert_eq!(runner.app().destination, MainDestination::Library);
+        assert!(runner.app().recent_loaded);
+        assert_eq!(runner.app().pending, Some(Pending::Library(0)));
+
+        runner.action(action_id(FEATURED));
+        runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(runner.app().library_loaded);
+        assert!(runner.app().library_load.error.is_none());
     }
 
     #[test]
@@ -10350,6 +10572,36 @@ mod tests {
     }
 
     #[test]
+    fn active_day_refresh_retains_observed_loaded_baseline_as_next_target() {
+        let mut runner = ready_featured_runner(Some(local_day(29)));
+        let first = observe_local_day(&mut runner, Some(local_day(30)));
+        let (day_30, _) = fetch_task_with(&first, "/comic/main");
+
+        let observed_baseline = observe_local_day(&mut runner, Some(local_day(29)));
+        assert_eq!(homepage_fetches(&observed_baseline), 0);
+        assert_eq!(
+            runner.app().featured.refresh.desired_day,
+            Some(local_day(29))
+        );
+
+        let commands = runner.task_outcome(
+            day_30,
+            TaskOutcome::Completed(homepage_response(&[], &[("day-30", "Day 30")])),
+        );
+
+        assert_eq!(homepage_fetches(&commands), 1);
+        assert_eq!(
+            runner.app().featured.refresh.loaded_day,
+            Some(local_day(30))
+        );
+        assert_eq!(
+            runner.app().featured.refresh.active_day,
+            Some(local_day(29))
+        );
+        assert_eq!(runner.app().featured.refresh.desired_day, None);
+    }
+
+    #[test]
     fn refresh_failure_chains_the_latest_desired_day() {
         let mut runner = ready_featured_runner(Some(local_day(29)));
         let first = observe_local_day(&mut runner, Some(local_day(30)));
@@ -10515,7 +10767,7 @@ mod tests {
 
         assert_eq!(runner.app().featured.featured, old_featured);
         assert_eq!(runner.app().featured.recommended, old_recommended);
-        assert_eq!(runner.app().featured.page, 1);
+        assert_eq!(runner.app().featured.page, 2);
         assert_eq!(
             runner.app().covers.entries.get(&shared_url),
             Some(&CoverState::Ready(picture))
@@ -10530,20 +10782,18 @@ mod tests {
             Some(local_day(31))
         );
         assert!(runner.app().featured.stale_warning.is_some());
-        assert_eq!(
-            screen
-                .nodes
-                .iter()
-                .filter(|node| {
-                    matches!(node, Node::Button { action, .. } if *action == action_id(RETRY))
-                })
-                .count(),
-            1
-        );
+        assert_eq!(retry_button_count(&screen), 0);
         assert_fits(&screen);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::DropPicture(PictureHandle(77)))));
+
+        runner.action(action_id(PREVIOUS_PAGE));
+        let warning_commands = runner.action(action_id(PREVIOUS_PAGE));
+        let warning_screen = last_screen(&warning_commands);
+        assert_eq!(runner.app().featured.page, 0);
+        assert_eq!(retry_button_count(&warning_screen), 1);
+        assert_fits(&warning_screen);
 
         let retry = runner.action(action_id(RETRY));
         assert_eq!(homepage_fetches(&retry), 1);
@@ -10913,23 +11163,32 @@ mod tests {
     }
 
     #[test]
-    fn featured_continuation_has_six_recommendations_and_no_tiles() {
-        let mut featured = feed_with_recommendations(20);
-        let first_page_rows = featured_page_zero_rows(&featured);
-        featured.page = 1;
+    fn featured_page_zero_uses_signed_in_maximum_coins_action_and_fits_clara() {
+        let featured = feed_with_recommendations(20);
+        let measured = featured_page_zero_rows(&featured);
         let screen = Bomtoon {
-            account: AccountState::SignedOut,
+            account: AccountState::Active,
             view: View::Main,
             destination: MainDestination::Featured,
             featured,
+            wallet: WalletState {
+                summary: Some(WalletSummary {
+                    coins: model::AssetAmounts {
+                        standard: usize::MAX,
+                        bonus: 0,
+                        free: 0,
+                    },
+                    tickets: model::AssetAmounts::default(),
+                }),
+                ..WalletState::default()
+            },
             ..Bomtoon::default()
         }
         .screen();
 
-        assert!(!screen
-            .nodes
-            .iter()
-            .any(|node| matches!(node, Node::TileGrid { .. })));
+        let action = &screen.top_bar.as_ref().expect("Featured top bar").actions[0];
+        assert_eq!(action.action, action_id(ACCOUNT));
+        assert_eq!(action.label, format!("Coins {}", usize::MAX));
         let rows = screen
             .nodes
             .iter()
@@ -10937,21 +11196,72 @@ mod tests {
                 Node::Rows { rows, .. } => Some(rows),
                 _ => None,
             })
-            .expect("Recommended rows");
-        assert_eq!(rows.len(), 6);
-        assert_eq!(rows[0].title, format!("Recommended {first_page_rows}"));
-        assert_eq!(
-            screen.page_turns.expect("Featured page turns").position,
-            Some((
-                2,
-                u16::try_from(featured_page_count(
-                    &feed_with_recommendations(20),
-                    first_page_rows,
-                ))
-                .expect("bounded test page count"),
-            ))
-        );
+            .expect("measured Featured rows");
+        assert_eq!(rows.len(), measured);
         assert_fits(&screen);
+    }
+
+    #[test]
+    fn stale_featured_warning_and_feed_pages_keep_every_recommendation_once() {
+        let mut featured = feed_with_recommendations(20);
+        let first_page_rows = featured_page_zero_rows(&featured);
+        let feed_pages = featured_page_count(&featured, first_page_rows);
+        featured.stale_warning =
+            Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
+        let mut runner = AppRunner::with_metrics(
+            Bomtoon {
+                account: AccountState::SignedOut,
+                view: View::Main,
+                destination: MainDestination::Featured,
+                featured,
+                ..Bomtoon::default()
+            },
+            CLARA_BW_METRICS,
+        );
+
+        let warning = runner.app().screen();
+        assert!(format!("{warning:?}").contains("Showing the previous feed"));
+        assert!(!warning
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Rows { .. } | Node::TileGrid { .. })));
+        assert_fits(&warning);
+
+        let mut observed = Vec::new();
+        for content_page in 0..feed_pages {
+            let commands = runner.action(action_id(NEXT_PAGE));
+            assert_eq!(runner.app().featured.page, content_page + 1);
+            let screen = last_screen(&commands);
+            let rows = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .expect("stale feed rows");
+            if content_page == 0 {
+                assert_eq!(rows.len(), first_page_rows);
+            } else {
+                assert!(!screen
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node, Node::TileGrid { .. })));
+                if content_page + 1 < feed_pages {
+                    assert_eq!(rows.len(), 6);
+                }
+            }
+            observed.extend(rows.iter().map(|row| row.title.clone()));
+            assert!(!format!("{screen:?}").contains("Showing the previous feed"));
+            assert_fits(&screen);
+        }
+
+        assert_eq!(
+            observed,
+            (0..20)
+                .map(|index| format!("Recommended {index}"))
+                .collect::<Vec<_>>()
+        );
     }
     #[test]
     fn featured_page_turn_actions_change_only_the_public_feed_position() {
@@ -11116,6 +11426,32 @@ mod tests {
         )
     }
 
+    fn library_cover_runner(count: usize) -> AppRunner<Bomtoon> {
+        AppRunner::with_metrics(
+            Bomtoon {
+                account: AccountState::Active,
+                view: View::Main,
+                destination: MainDestination::Featured,
+                comics: (0..count)
+                    .map(|index| library_shelf_comic(index, Some(shelf_cover_url(index))))
+                    .collect(),
+                library_loaded: true,
+                total_library_titles: count,
+                ..Bomtoon::default()
+            },
+            CLARA_BW_METRICS,
+        )
+    }
+
+    fn four_cover_task_ids(commands: &[Command]) -> Vec<TaskId> {
+        let tasks = cover_fetches(commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 4);
+        tasks
+    }
+
     fn cover_fetches(commands: &[Command]) -> Vec<(TaskId, String)> {
         spawns(commands)
             .into_iter()
@@ -11136,6 +11472,104 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn four_active_covers_preempt_for_recent_and_resume_once_after_cancel_settles() {
+        let mut runner = library_cover_runner(6);
+        let covers = four_cover_task_ids(&runner.action(action_id(LIBRARY)));
+
+        let queued = runner.action(action_id(RECENT));
+        assert!(spawns(&queued).is_empty());
+        assert_eq!(
+            cancelled_tasks(&queued),
+            covers.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(runner.app().queued_foreground, Some(Pending::Recent(0)));
+        assert!(runner.app().problem.is_none());
+
+        let resumed = runner.task_outcome(covers[0], TaskOutcome::Cancelled);
+        let (recent, work) = only_spawn(&resumed);
+        assert_eq!(work, api::recent(0));
+        assert_eq!(runner.app().pending, Some(Pending::Recent(0)));
+        assert_eq!(runner.app().queued_foreground, None);
+
+        for cover in covers.into_iter().skip(1) {
+            let commands = runner.task_outcome(cover, TaskOutcome::Cancelled);
+            assert!(spawns(&commands)
+                .iter()
+                .all(|(_, work)| *work != api::recent(0)));
+            assert_eq!(runner.app().task, Some(recent));
+        }
+
+        runner.task_outcome(recent, TaskOutcome::Completed(RECENT_RESPONSE.to_vec()));
+        assert!(runner.app().recent_loaded);
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert!(runner.app().problem.is_none());
+    }
+
+    #[test]
+    fn four_active_covers_preempt_for_comic_and_do_not_duplicate_queued_content() {
+        let mut runner = recent_cover_runner(6);
+        let covers = four_cover_task_ids(&runner.action(action_id(RECENT)));
+
+        let queued = runner.action(action_id("comic-0"));
+        assert!(spawns(&queued).is_empty());
+        assert_eq!(
+            cancelled_tasks(&queued),
+            covers.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(runner.app().queued_foreground, Some(Pending::Content(0)));
+        assert!(runner.app().problem.is_none());
+
+        let resumed = runner.task_outcome(covers[0], TaskOutcome::Cancelled);
+        let (content, work) = only_spawn(&resumed);
+        assert_eq!(work, api::content("recent-0"));
+
+        for cover in covers.into_iter().skip(1) {
+            let commands = runner.task_outcome(cover, TaskOutcome::Cancelled);
+            assert!(spawns(&commands)
+                .iter()
+                .all(|(_, work)| *work != api::content("recent-0")));
+            assert_eq!(runner.app().task, Some(content));
+        }
+
+        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(runner.app().problem.is_none());
+    }
+
+    #[test]
+    fn four_active_covers_preempt_for_logout_and_resume_before_wallet_refills() {
+        let mut runner = recent_cover_runner(6);
+        let covers = four_cover_task_ids(&runner.action(action_id(RECENT)));
+        runner.action(action_id(ACCOUNT));
+        assert_eq!(runner.app().view, View::Account);
+
+        let queued = runner.action(action_id(SIGN_OUT));
+        assert!(spawns(&queued).is_empty());
+        assert_eq!(
+            cancelled_tasks(&queued),
+            covers.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(runner.app().queued_foreground, Some(Pending::Logout));
+        assert!(runner.app().problem.is_none());
+
+        let resumed = runner.task_outcome(covers[0], TaskOutcome::Cancelled);
+        let (logout, work) = only_spawn(&resumed);
+        assert_eq!(work, api::logout());
+
+        for cover in covers.into_iter().skip(1) {
+            let commands = runner.task_outcome(cover, TaskOutcome::Cancelled);
+            assert!(spawns(&commands)
+                .iter()
+                .all(|(_, work)| *work != api::logout()));
+            assert_eq!(runner.app().task, Some(logout));
+        }
+
+        runner.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
     }
 
     #[test]
