@@ -216,6 +216,7 @@ impl DeviceServices {
             DeviceRequest::ReadBattery => self.read_battery(),
             DeviceRequest::ReadBatteryDetail => self.read_battery_detail(),
             DeviceRequest::ReadCover => self.read_cover(),
+            DeviceRequest::ReadLocalDay => DeviceResult::LocalDay(None),
             DeviceRequest::HoldWifi { seconds } => self.hold_wifi(seconds),
             DeviceRequest::ReleaseWifi => {
                 self.wifi_held_for = None;
@@ -552,8 +553,8 @@ impl DeviceServices {
 
 /// Returns the application capability required by a hardware or platform request.
 ///
-/// Runtime-owned app-store transactions return `None`; they are authorized by
-/// the built-in caller identity instead of a third-party manifest capability.
+/// Runtime-owned requests return `None`; they are authorized by the built-in
+/// caller identity instead of a third-party manifest capability.
 #[must_use]
 pub fn request_capability(request: &DeviceRequest) -> Option<Capability> {
     Some(match request {
@@ -588,7 +589,8 @@ pub fn request_capability(request: &DeviceRequest) -> Option<Capability> {
         // installation the requester is already running from, so the network
         // permission is the one that governs it.
         DeviceRequest::Update { .. } => Capability::Network,
-        DeviceRequest::ListInstalledApps
+        DeviceRequest::ReadLocalDay
+        | DeviceRequest::ListInstalledApps
         | DeviceRequest::ReadAppCatalog
         | DeviceRequest::RefreshAppCatalog
         | DeviceRequest::InstallApp { .. }
@@ -607,12 +609,22 @@ fn clamp_seconds(duration: Duration) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backends, DeviceServices, DeviceState};
+    use super::{request_capability, Backends, DeviceServices, DeviceState};
     use crate::{Capability, Declared, PowerPolicy};
     use kobo_protocol::{DenyReason, DeviceRequest, DeviceResult};
 
     fn seconds_of(duration: std::time::Duration) -> u32 {
         u32::try_from(duration.as_secs()).expect("policy fits in u32")
+    }
+
+    #[test]
+    fn local_day_is_runtime_owned_and_optional_in_simulation() {
+        let mut services = DeviceServices::simulated();
+        assert_eq!(request_capability(&DeviceRequest::ReadLocalDay), None);
+        assert_eq!(
+            services.handle(DeviceRequest::ReadLocalDay),
+            DeviceResult::LocalDay(None)
+        );
     }
 
     #[test]

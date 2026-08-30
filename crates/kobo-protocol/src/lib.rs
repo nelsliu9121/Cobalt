@@ -48,8 +48,9 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// Version 10 adds exact text-hold coordinates and typed offline dictionary
 /// requests/results. Version 11 adds the runtime-owned reading surface.
 /// Version 12 adds pixel-format bytes to the startup metrics and inline
-/// pictures, plus the start of chunked picture uploads.
-pub const VERSION: u8 = 12;
+/// pictures, plus the start of chunked picture uploads. Version 13 adds the
+/// runtime's local Gregorian day.
+pub const VERSION: u8 = 13;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -197,6 +198,50 @@ pub const SHELF_RESERVE: u64 = 64 * 1024 * 1024;
 /// A handle to work the runtime is carrying out on an application's behalf.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(pub u32);
+
+/// A calendar day in the runtime's local timezone.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LocalDay {
+    year: i16,
+    month: u8,
+    day: u8,
+}
+
+impl LocalDay {
+    /// Creates a day when all three fields form a Gregorian calendar date.
+    #[must_use]
+    pub const fn new(year: i16, month: u8, day: u8) -> Option<Self> {
+        if day == 0 || day > days_in_month(year, month) {
+            return None;
+        }
+        Some(Self { year, month, day })
+    }
+
+    #[must_use]
+    pub const fn year(self) -> i16 {
+        self.year
+    }
+
+    #[must_use]
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+
+    #[must_use]
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+}
+
+const fn days_in_month(year: i16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
 
 /// The most headers one request may carry, beyond the ones the runtime sets.
 pub const MAX_HEADERS: usize = 8;
@@ -986,6 +1031,8 @@ pub enum DeviceRequest {
     /// only useful to something that knows the state it changed from. This is
     /// how a screen that has just opened finds that out.
     ReadCover,
+    /// Report the current Gregorian day in the runtime's local timezone.
+    ReadLocalDay,
     /// Keep Wi-Fi associated for at most this many seconds.
     HoldWifi { seconds: u32 },
     /// Release a Wi-Fi hold early.
@@ -1202,6 +1249,8 @@ pub enum DeviceResult {
         available: bool,
         magnet_present: bool,
     },
+    /// The current Gregorian day, or `None` when the runtime cannot determine it.
+    LocalDay(Option<LocalDay>),
     /// Front light state.
     Frontlight { percent: u8 },
     /// Bluetooth controller state and the bounded set currently known.
@@ -2288,6 +2337,7 @@ fn encode_device_request(
         DeviceRequest::ReadBattery => fixed_device_request(output, 1, 0),
         DeviceRequest::ReadBatteryDetail => output.push(29),
         DeviceRequest::ReadCover => output.push(30),
+        DeviceRequest::ReadLocalDay => output.push(42),
         DeviceRequest::HoldWifi { seconds } => fixed_device_request(output, 2, *seconds),
         DeviceRequest::ReleaseWifi => fixed_device_request(output, 3, 0),
         DeviceRequest::KeepAwake { seconds } => fixed_device_request(output, 4, *seconds),
@@ -2550,6 +2600,7 @@ fn decode_device_request(reader: &mut Reader<'_>) -> Result<DeviceRequest, Proto
         1 => fixed_argument(reader, 0).map(|()| DeviceRequest::ReadBattery),
         29 => Ok(DeviceRequest::ReadBatteryDetail),
         30 => Ok(DeviceRequest::ReadCover),
+        42 => Ok(DeviceRequest::ReadLocalDay),
         2 => Ok(DeviceRequest::HoldWifi {
             seconds: reader.u32()?,
         }),
@@ -2721,6 +2772,16 @@ fn encode_device_result(output: &mut Vec<u8>, result: &DeviceResult) -> Result<(
             available,
             magnet_present,
         } => output.extend_from_slice(&[11, u8::from(*available), u8::from(*magnet_present)]),
+        DeviceResult::LocalDay(local_day) => {
+            output.extend_from_slice(&[16, u8::from(local_day.is_some())]);
+            if let Some(local_day) = local_day {
+                push_u16(
+                    output,
+                    u16::from_be_bytes(local_day.year().to_be_bytes()),
+                );
+                output.extend_from_slice(&[local_day.month(), local_day.day()]);
+            }
+        }
         DeviceResult::Frontlight { percent } => {
             output.push(4);
             output.push(*percent);
@@ -2979,6 +3040,20 @@ fn decode_device_result(reader: &mut Reader<'_>) -> Result<DeviceResult, Protoco
             available: read_boolean(reader, "cover sensor available")?,
             magnet_present: read_boolean(reader, "cover magnet present")?,
         }),
+        16 => {
+            let local_day = if read_boolean(reader, "local day presence")? {
+                let year = i16::from_be_bytes(reader.u16()?.to_be_bytes());
+                let month = reader.u8()?;
+                let day = reader.u8()?;
+                Some(
+                    LocalDay::new(year, month, day)
+                        .ok_or(ProtocolError::InvalidValue("local day"))?,
+                )
+            } else {
+                None
+            };
+            Ok(DeviceResult::LocalDay(local_day))
+        }
         4 => {
             let percent = reader.u8()?;
             if percent > 100 {
@@ -6318,6 +6393,61 @@ mod tests {
         );
     }
 
+    fn assert_round_trip(message: Message) {
+        let frame = Frame {
+            request_id: 11,
+            message,
+        };
+        let bytes = encode(&frame).expect("encode");
+        assert_eq!(decode(&bytes).expect("decode"), frame);
+    }
+
+    #[test]
+    fn local_day_is_checked_and_ordered() {
+        let august = LocalDay::new(2026, 8, 30).expect("valid local day");
+        let september = LocalDay::new(2026, 9, 1).expect("valid local day");
+        assert_eq!(
+            (august.year(), august.month(), august.day()),
+            (2026, 8, 30)
+        );
+        assert!(august < september);
+        assert_eq!(LocalDay::new(2026, 0, 1), None);
+        assert_eq!(LocalDay::new(2026, 13, 1), None);
+        assert_eq!(LocalDay::new(2026, 8, 0), None);
+        assert_eq!(LocalDay::new(2026, 8, 32), None);
+        assert_eq!(LocalDay::new(2026, 4, 31), None);
+        assert_eq!(LocalDay::new(2026, 2, 30), None);
+        assert_eq!(LocalDay::new(2025, 2, 29), None);
+        assert_eq!(LocalDay::new(1900, 2, 29), None);
+        assert!(LocalDay::new(2024, 2, 29).is_some());
+        assert!(LocalDay::new(2000, 2, 29).is_some());
+    }
+
+    #[test]
+    fn local_day_request_and_results_round_trip() {
+        assert_round_trip(Message::DeviceRequest(DeviceRequest::ReadLocalDay));
+        assert_round_trip(Message::DeviceResult(DeviceResult::LocalDay(Some(
+            LocalDay::new(2026, 8, 30).expect("valid local day"),
+        ))));
+        assert_round_trip(Message::DeviceResult(DeviceResult::LocalDay(None)));
+    }
+
+    #[test]
+    fn local_day_decoder_rejects_an_impossible_date() {
+        let frame = Frame {
+            request_id: 11,
+            message: Message::DeviceResult(DeviceResult::LocalDay(Some(
+                LocalDay::new(2026, 2, 28).expect("valid local day"),
+            ))),
+        };
+        let mut bytes = encode(&frame).expect("encode");
+        *bytes.last_mut().expect("day byte") = 30;
+        assert_eq!(
+            decode(&bytes),
+            Err(ProtocolError::InvalidValue("local day"))
+        );
+    }
+
     #[test]
     fn every_device_request_round_trips() {
         let requests = vec![
@@ -6370,6 +6500,7 @@ mod tests {
             DeviceRequest::SetAudioVolume { percent: 65 },
             DeviceRequest::ReadBatteryDetail,
             DeviceRequest::ReadCover,
+            DeviceRequest::ReadLocalDay,
             DeviceRequest::Update {
                 url: "https://github.com/o/r/releases/download/v0.1.1/KoboRoot.tgz".to_owned(),
                 sha256: "a".repeat(64),
@@ -6501,6 +6632,10 @@ mod tests {
                 available: false,
                 magnet_present: false,
             },
+            DeviceResult::LocalDay(Some(
+                LocalDay::new(2026, 8, 30).expect("valid local day"),
+            )),
+            DeviceResult::LocalDay(None),
             DeviceResult::Apps {
                 entries: vec![AppInfo {
                     id: "word-count".to_owned(),

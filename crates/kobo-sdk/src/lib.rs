@@ -8,7 +8,8 @@
 pub use kobo_protocol::{
     is_valid_key, AppInfo, AppLinkState, AudioPlaybackState, AudioSource, BatteryDetail,
     BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason, DeviceError, DeviceRequest,
-    DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LogLevel, Message, PictureFormat,
+    DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LocalDay, LogLevel, Message,
+    PictureFormat,
     PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent, ShellRequest,
     StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId, TaskOutcome,
     WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME,
@@ -4041,6 +4042,11 @@ impl Device<'_> {
         self.request(DeviceRequest::ReadCover);
     }
 
+    /// Asks for the current Gregorian day in the runtime's local timezone.
+    pub fn read_local_day(&mut self) {
+        self.request(DeviceRequest::ReadLocalDay);
+    }
+
     /// Asks to keep Wi-Fi associated for at most `duration`.
     ///
     /// Use this for a dashboard that must stay reachable. It is the most
@@ -5070,6 +5076,27 @@ impl Client {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn read_local_day_emits_one_device_request() {
+        #[derive(Default)]
+        struct Probe;
+
+        impl KoboApp for Probe {
+            fn on_start(&mut self, context: &mut Context) {
+                context.device().read_local_day();
+            }
+
+            fn on_action(&mut self, _context: &mut Context, _action: ActionId) {}
+        }
+
+        let mut app = AppRunner::new(Probe::default());
+        let commands = app.start();
+        assert_eq!(
+            commands,
+            vec![Command::Device(DeviceRequest::ReadLocalDay)]
+        );
+    }
 
     #[test]
     fn an_update_that_could_not_possibly_verify_is_refused_before_the_wire() {
