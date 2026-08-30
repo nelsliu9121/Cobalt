@@ -27,18 +27,36 @@ pub struct Homepage {
     pub only_bom: Vec<ShelfComic>,
 }
 
+const HOUR_MS: i64 = 60 * 60 * 1_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentDetail {
+    pub id: usize,
+    pub episodes: Vec<Episode>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Episode {
+    pub id: usize,
     pub alias: String,
     pub title: String,
     pub purchase: PurchaseState,
-    pub ticket_quantity: Option<usize>,
+    pub rent_expires_at: Option<i64>,
+    pub rent_coin: Option<usize>,
+    pub purchase_coin: Option<usize>,
+    pub gift_eligible: bool,
 }
 
 impl Episode {
     #[must_use]
-    pub const fn uses_ticket(&self) -> bool {
-        self.ticket_quantity.is_some()
+    pub fn remaining_rental_hours(&self, now_ms: i64) -> Option<usize> {
+        if self.purchase != PurchaseState::Rented {
+            return None;
+        }
+        let expiry = self.rent_expires_at?;
+        let remaining = expiry.saturating_sub(now_ms).max(0);
+        let hours = remaining / HOUR_MS + i64::from(remaining % HOUR_MS != 0);
+        usize::try_from(hours).ok()
     }
 }
 
@@ -116,10 +134,85 @@ pub struct EpisodeAvailability<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PurchaseState {
     Owned,
+    Rented,
     Sample,
     Free,
     NotOwned,
     Other(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PurchaseType {
+    RentGift,
+    Rent,
+    Possession,
+}
+
+impl PurchaseType {
+    #[must_use]
+    pub const fn as_remote(self) -> &'static str {
+        match self {
+            Self::RentGift => "RENT_GIFT",
+            Self::Rent => "RENT",
+            Self::Possession => "POSSESSION",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GiftBalance {
+    pub available: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Quote {
+    pub content_id: usize,
+    pub episode_id: usize,
+    pub content_alias: String,
+    pub episode_alias: String,
+    pub is_available: bool,
+    pub coin_kind: String,
+    pub rent_coin: usize,
+    pub possession_coin: usize,
+    pub permanent_coin: Option<usize>,
+    pub is_rent_gift: bool,
+    pub is_possession_gift: bool,
+}
+
+impl Quote {
+    #[must_use]
+    pub fn rent_price(&self) -> Option<usize> {
+        (self.coin_kind == "COIN").then_some(self.rent_coin)
+    }
+
+    #[must_use]
+    pub fn purchase_price(&self) -> Option<usize> {
+        if self.coin_kind != "COIN"
+            || self
+                .permanent_coin
+                .is_some_and(|coin| coin != self.possession_coin)
+        {
+            None
+        } else {
+            Some(self.possession_coin)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoinUse {
+    pub aggregate: usize,
+    pub standard: usize,
+    pub bonus: usize,
+    pub free: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurchaseReceipt {
+    pub purchase_type: PurchaseType,
+    pub content_alias: String,
+    pub episode_alias: String,
+    pub coin_use: CoinUse,
 }
 
 pub fn display_text(text: &str, fallback: &str) -> String {
@@ -136,30 +229,34 @@ pub fn display_text(text: &str, fallback: &str) -> String {
 
 impl PurchaseState {
     pub fn from_remote(availability: EpisodeAvailability<'_>) -> Self {
-        if availability.status == Some("POSSESSION") {
-            Self::Owned
-        } else if availability.episode_type == Some("PREVIEW") || availability.is_sample {
-            Self::Sample
-        } else if availability.possession_coin == Some(0)
-            || availability.rent_coin == Some(0)
-            || availability.paid == Some(false)
-        {
-            Self::Free
-        } else if availability.status.is_none() || availability.status == Some("NONE") {
-            Self::NotOwned
-        } else {
-            Self::Other(availability.status.unwrap_or_default().to_owned())
+        match availability.status {
+            Some("POSSESSION") => Self::Owned,
+            Some("RENT") => Self::Rented,
+            Some(status) if !status.is_empty() && status != "NONE" => {
+                Self::Other(status.to_owned())
+            }
+            _ if availability.episode_type == Some("PREVIEW") || availability.is_sample => {
+                Self::Sample
+            }
+            _ if availability.possession_coin == Some(0)
+                || availability.rent_coin == Some(0)
+                || availability.paid == Some(false) =>
+            {
+                Self::Free
+            }
+            _ => Self::NotOwned,
         }
     }
 
     #[must_use]
     pub const fn is_readable(&self) -> bool {
-        matches!(self, Self::Owned | Self::Sample | Self::Free)
+        matches!(self, Self::Owned | Self::Rented | Self::Sample | Self::Free)
     }
 
     pub fn label(&self) -> &str {
         match self {
             Self::Owned => "Owned",
+            Self::Rented => "Rented",
             Self::Sample => "Free sample",
             Self::Free => "Free",
             Self::NotOwned => "Not owned",
@@ -170,7 +267,9 @@ impl PurchaseState {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState};
+    use super::{
+        display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState, PurchaseType, Quote,
+    };
 
     #[test]
     fn asset_amounts_total_is_checked() {
@@ -194,29 +293,49 @@ mod tests {
         );
     }
 
+    const HOUR_MS: i64 = 60 * 60 * 1_000;
+
+    fn rented(rent_expires_at: Option<i64>) -> Episode {
+        Episode {
+            id: 17,
+            alias: "episode-17".to_owned(),
+            title: "Episode 17".to_owned(),
+            purchase: PurchaseState::Rented,
+            rent_expires_at,
+            rent_coin: Some(2),
+            purchase_coin: Some(3),
+            gift_eligible: true,
+        }
+    }
+
     #[test]
-    fn only_episodes_with_a_ticket_quantity_use_tickets() {
-        let ticket = Episode {
-            alias: "ticket".to_owned(),
-            title: "Ticket episode".to_owned(),
-            purchase: PurchaseState::NotOwned,
-            ticket_quantity: Some(1),
-        };
-        let coin = Episode {
-            alias: "coin".to_owned(),
-            title: "Coin episode".to_owned(),
-            purchase: PurchaseState::NotOwned,
-            ticket_quantity: None,
-        };
-        assert!(ticket.uses_ticket());
-        assert!(!coin.uses_ticket());
+    fn remaining_rental_hours_use_a_whole_hour_ceiling() {
+        assert_eq!(rented(Some(HOUR_MS)).remaining_rental_hours(0), Some(1));
+        assert_eq!(
+            rented(Some(HOUR_MS + 1)).remaining_rental_hours(0),
+            Some(2)
+        );
+        assert_eq!(
+            rented(Some(48 * HOUR_MS)).remaining_rental_hours(0),
+            Some(48)
+        );
+    }
+
+    #[test]
+    fn elapsed_and_missing_rentals_have_explicit_remaining_time() {
+        assert_eq!(rented(Some(HOUR_MS)).remaining_rental_hours(HOUR_MS), Some(0));
+        assert_eq!(
+            rented(Some(HOUR_MS)).remaining_rental_hours(2 * HOUR_MS),
+            Some(0)
+        );
+        assert_eq!(rented(None).remaining_rental_hours(0), None);
     }
 
     #[test]
     fn purchase_state_uses_live_availability_with_fail_closed_precedence() {
         let cases = [
             (
-                "hunter f1",
+                "sample",
                 EpisodeAvailability {
                     status: Some("NONE"),
                     episode_type: Some("PREVIEW"),
@@ -228,7 +347,7 @@ mod tests {
                 PurchaseState::Sample,
             ),
             (
-                "hunter episode 1",
+                "free",
                 EpisodeAvailability {
                     status: Some("NONE"),
                     episode_type: Some("GENERAL"),
@@ -240,7 +359,7 @@ mod tests {
                 PurchaseState::Free,
             ),
             (
-                "hunter episode 2",
+                "not owned",
                 EpisodeAvailability {
                     status: Some("NONE"),
                     episode_type: Some("GENERAL"),
@@ -252,7 +371,19 @@ mod tests {
                 PurchaseState::NotOwned,
             ),
             (
-                "owned precedence",
+                "rent precedence",
+                EpisodeAvailability {
+                    status: Some("RENT"),
+                    episode_type: Some("PREVIEW"),
+                    is_sample: true,
+                    paid: Some(false),
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
+                },
+                PurchaseState::Rented,
+            ),
+            (
+                "possession precedence",
                 EpisodeAvailability {
                     status: Some("POSSESSION"),
                     episode_type: Some("PREVIEW"),
@@ -264,40 +395,16 @@ mod tests {
                 PurchaseState::Owned,
             ),
             (
-                "legacy sample",
+                "unknown status",
                 EpisodeAvailability {
-                    status: Some("NONE"),
-                    episode_type: None,
+                    status: Some("FUTURE"),
+                    episode_type: Some("PREVIEW"),
                     is_sample: true,
-                    paid: None,
-                    possession_coin: None,
-                    rent_coin: None,
-                },
-                PurchaseState::Sample,
-            ),
-            (
-                "legacy free",
-                EpisodeAvailability {
-                    status: Some("NONE"),
-                    episode_type: None,
-                    is_sample: false,
                     paid: Some(false),
-                    possession_coin: None,
-                    rent_coin: None,
+                    possession_coin: Some(0),
+                    rent_coin: Some(0),
                 },
-                PurchaseState::Free,
-            ),
-            (
-                "omitted prices and type",
-                EpisodeAvailability {
-                    status: Some("NONE"),
-                    episode_type: None,
-                    is_sample: false,
-                    paid: None,
-                    possession_coin: None,
-                    rent_coin: None,
-                },
-                PurchaseState::NotOwned,
+                PurchaseState::Other("FUTURE".to_owned()),
             ),
         ];
 
@@ -307,12 +414,47 @@ mod tests {
     }
 
     #[test]
-    fn owned_sample_and_free_episodes_are_readable() {
+    fn server_granted_and_free_episode_states_are_readable() {
         assert!(PurchaseState::Owned.is_readable());
+        assert!(PurchaseState::Rented.is_readable());
         assert!(PurchaseState::Sample.is_readable());
         assert!(PurchaseState::Free.is_readable());
         assert!(!PurchaseState::NotOwned.is_readable());
-        assert!(!PurchaseState::Other("RENTAL".to_owned()).is_readable());
+        assert!(!PurchaseState::Other("FUTURE".to_owned()).is_readable());
+    }
+
+    #[test]
+    fn purchase_types_have_exact_remote_values() {
+        assert_eq!(PurchaseType::RentGift.as_remote(), "RENT_GIFT");
+        assert_eq!(PurchaseType::Rent.as_remote(), "RENT");
+        assert_eq!(PurchaseType::Possession.as_remote(), "POSSESSION");
+    }
+
+    #[test]
+    fn quote_prices_require_coin_and_conflicts_disable_only_purchase() {
+        let mut quote = Quote {
+            content_id: 41,
+            episode_id: 17,
+            content_alias: "comic-41".to_owned(),
+            episode_alias: "episode-17".to_owned(),
+            is_available: true,
+            coin_kind: "COIN".to_owned(),
+            rent_coin: 2,
+            possession_coin: 3,
+            permanent_coin: Some(3),
+            is_rent_gift: true,
+            is_possession_gift: false,
+        };
+        assert_eq!(quote.rent_price(), Some(2));
+        assert_eq!(quote.purchase_price(), Some(3));
+
+        quote.permanent_coin = Some(4);
+        assert_eq!(quote.rent_price(), Some(2));
+        assert_eq!(quote.purchase_price(), None);
+
+        quote.coin_kind = "TICKET".to_owned();
+        assert_eq!(quote.rent_price(), None);
+        assert_eq!(quote.purchase_price(), None);
     }
 
     #[test]

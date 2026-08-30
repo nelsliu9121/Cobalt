@@ -1,6 +1,7 @@
 use crate::model::{
-    AssetAmounts, AssetKind, AssetSubtype, BannerComic, Comic, Episode, EpisodeAvailability,
-    EpisodeImage, ExpirationRow, Homepage, PurchaseState, RecentEntry, ShelfComic, WalletSummary,
+    AssetAmounts, AssetKind, AssetSubtype, BannerComic, CoinUse, Comic, ContentDetail, Episode,
+    EpisodeAvailability, EpisodeImage, ExpirationRow, GiftBalance, Homepage, PurchaseReceipt,
+    PurchaseState, PurchaseType, Quote, RecentEntry, ShelfComic, WalletSummary,
 };
 use http::Uri;
 use kobo_json::Value;
@@ -17,6 +18,11 @@ const MAX_HOMEPAGE_LIST: usize = 64;
 const MAX_ALIAS_BYTES: usize = 96;
 const MAX_TITLE_BYTES: usize = 256;
 const MAX_COVER_URL_BYTES: usize = 2048;
+const MAX_COMMERCE_BODY_BYTES: usize = 64 * 1024;
+const MAX_GIFT_ENTRIES: usize = 64;
+const MAX_COMMERCE_ALIAS_BYTES: usize = 128;
+const MAX_EPISODE_TITLE_BYTES: usize = 512;
+const MAX_REMOTE_CODE_BYTES: usize = 128;
 const BOMTOON_TITLE_SUFFIX: &str = " - 漫畫 - BOMTOON";
 const HTML_ENTITIES: &[(&str, &str)] = &[
     ("amp", "&"),
@@ -361,48 +367,219 @@ pub fn expiration_history(bytes: &[u8], kind: AssetKind) -> Result<Vec<Expiratio
     Ok(rows)
 }
 
-pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
+pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
     let root = parse_json(bytes)?;
-    if string(&root, "result", "result")? != "SUCCESS" {
-        return Err(ParseError::InvalidValue("result"));
-    }
+    require_success(&root)?;
     let data = field(&root, "data", "data")?;
-    let values = array(data, "episodes", "data.episodes")?;
-
-    values
+    let episodes = array(data, "episodes", "data.episodes")?
         .iter()
         .map(|item| {
-            let coin_kind = optional_string(item, "coinKind", "episode.coinKind")?;
+            let coin_kind =
+                optional_bounded_string(item, "coinKind", "episode.coinKind", MAX_REMOTE_CODE_BYTES)?;
+            let possession_coin =
+                optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
+            let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
+            let permanent_coin =
+                optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
             let availability = EpisodeAvailability {
-                status: nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?,
+                status: bounded_nullable_string(
+                    item,
+                    "purchaseStatus",
+                    "episode.purchaseStatus",
+                    MAX_REMOTE_CODE_BYTES,
+                )?,
                 episode_type: optional_string(item, "type", "episode.type")?,
                 is_sample: boolean(item, "isSample", "episode.isSample")?,
                 paid: optional_boolean(item, "paid", "episode.paid")?,
-                possession_coin: optional_unsigned(
-                    item,
-                    "possessionCoin",
-                    "episode.possessionCoin",
-                )?,
-                rent_coin: optional_unsigned(item, "rentCoin", "episode.rentCoin")?,
+                possession_coin,
+                rent_coin,
             };
-            let ticket_quantity = if coin_kind == Some("TICKET") {
-                Some(
-                    availability
-                        .rent_coin
-                        .or(availability.possession_coin)
-                        .ok_or(ParseError::Missing("episode ticket quantity"))?,
-                )
+            let paid_with_coin = coin_kind == Some("COIN");
+            let purchase_coin = if paid_with_coin
+                && permanent_coin.is_none_or(|coin| Some(coin) == possession_coin)
+            {
+                possession_coin
             } else {
                 None
             };
             Ok(Episode {
-                alias: string(item, "alias", "episode.alias")?.to_owned(),
-                title: string(item, "title", "episode.title")?.to_owned(),
+                id: unsigned(item, "id", "episode.id")?,
+                alias: bounded_string(
+                    item,
+                    "alias",
+                    "episode.alias",
+                    MAX_COMMERCE_ALIAS_BYTES,
+                )?
+                .to_owned(),
+                title: bounded_string(
+                    item,
+                    "title",
+                    "episode.title",
+                    MAX_EPISODE_TITLE_BYTES,
+                )?
+                .to_owned(),
                 purchase: PurchaseState::from_remote(availability),
-                ticket_quantity,
+                rent_expires_at: optional_timestamp(
+                    item,
+                    "rentExpiredAt",
+                    "episode.rentExpiredAt",
+                )?,
+                rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
+                purchase_coin,
+                gift_eligible: optional_boolean(
+                    item,
+                    "isRentGift",
+                    "episode.isRentGift",
+                )?
+                .unwrap_or(false),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    Ok(ContentDetail {
+        id: unsigned(data, "id", "data.id")?,
+        episodes,
+    })
+}
+
+pub fn gift_balance(bytes: &[u8]) -> Result<GiftBalance, ParseError> {
+    let root = parse_commerce_json(bytes)?;
+    require_success(&root)?;
+    let data = field(&root, "data", "data")?;
+    let received = bounded_array(
+        data,
+        "receivedGifts",
+        "data.receivedGifts",
+        MAX_GIFT_ENTRIES,
+    )?;
+    bounded_array(
+        data,
+        "receivableGifts",
+        "data.receivableGifts",
+        MAX_GIFT_ENTRIES,
+    )?;
+
+    let mut available = 0usize;
+    for gift in received {
+        let gift_type =
+            bounded_string(gift, "giftType", "gift.giftType", MAX_REMOTE_CODE_BYTES)?;
+        let is_received = boolean(gift, "isReceived", "gift.isReceived")?;
+        if gift_type != "RENT" || !is_received {
+            continue;
+        }
+        let issued = unsigned(gift, "issuedCount", "gift.issuedCount")?;
+        let used = unsigned(gift, "usedCount", "gift.usedCount")?;
+        let remaining = issued
+            .checked_sub(used)
+            .ok_or(ParseError::InvalidValue("gift counts"))?;
+        available = available
+            .checked_add(remaining)
+            .ok_or(ParseError::InvalidValue("gift available count"))?;
+    }
+    Ok(GiftBalance { available })
+}
+
+pub fn quote(bytes: &[u8]) -> Result<Quote, ParseError> {
+    let root = parse_commerce_json(bytes)?;
+    require_success(&root)?;
+    let data = field(&root, "data", "data")?;
+    Ok(Quote {
+        content_id: unsigned(data, "contentsId", "quote.contentsId")?,
+        episode_id: unsigned(data, "episodeId", "quote.episodeId")?,
+        content_alias: bounded_string(
+            data,
+            "contentsAlias",
+            "quote.contentsAlias",
+            MAX_COMMERCE_ALIAS_BYTES,
+        )?
+        .to_owned(),
+        episode_alias: bounded_string(
+            data,
+            "episodeAlias",
+            "quote.episodeAlias",
+            MAX_COMMERCE_ALIAS_BYTES,
+        )?
+        .to_owned(),
+        is_available: boolean(data, "isAvailable", "quote.isAvailable")?,
+        coin_kind: bounded_string(
+            data,
+            "coinKind",
+            "quote.coinKind",
+            MAX_REMOTE_CODE_BYTES,
+        )?
+        .to_owned(),
+        rent_coin: unsigned(data, "rentCoin", "quote.rentCoin")?,
+        possession_coin: unsigned(data, "possessionCoin", "quote.possessionCoin")?,
+        permanent_coin: optional_unsigned(data, "permanentCoin", "quote.permanentCoin")?,
+        is_rent_gift: boolean(data, "isRentGift", "quote.isRentGift")?,
+        is_possession_gift: boolean(
+            data,
+            "isPossessionGift",
+            "quote.isPossessionGift",
+        )?,
+    })
+}
+
+pub fn purchase_receipt(bytes: &[u8]) -> Result<PurchaseReceipt, ParseError> {
+    let root = parse_commerce_json(bytes)?;
+    require_success(&root)?;
+    let data = field(&root, "data", "data")?;
+    let purchase_type = match bounded_string(
+        data,
+        "purchaseType",
+        "receipt.purchaseType",
+        MAX_REMOTE_CODE_BYTES,
+    )? {
+        "RENT_GIFT" => PurchaseType::RentGift,
+        "RENT" => PurchaseType::Rent,
+        "POSSESSION" => PurchaseType::Possession,
+        _ => return Err(ParseError::InvalidValue("receipt.purchaseType")),
+    };
+    let aggregate = unsigned(data, "useCoin", "receipt.useCoin")?;
+    let bucket_presence = [
+        data.get("useGoldCoin").is_some(),
+        data.get("useBonusCoin").is_some(),
+        data.get("useFreeCoin").is_some(),
+    ];
+    let (standard, bonus, free) = match bucket_presence {
+        [false, false, false] => (0, 0, 0),
+        [true, true, true] => {
+            let standard = unsigned(data, "useGoldCoin", "receipt.useGoldCoin")?;
+            let bonus = unsigned(data, "useBonusCoin", "receipt.useBonusCoin")?;
+            let free = unsigned(data, "useFreeCoin", "receipt.useFreeCoin")?;
+            let total = standard
+                .checked_add(bonus)
+                .and_then(|total| total.checked_add(free))
+                .ok_or(ParseError::InvalidValue("receipt coin breakdown"))?;
+            if total != aggregate {
+                return Err(ParseError::InvalidValue("receipt coin breakdown"));
+            }
+            (standard, bonus, free)
+        }
+        _ => return Err(ParseError::InvalidValue("receipt coin breakdown")),
+    };
+    Ok(PurchaseReceipt {
+        purchase_type,
+        content_alias: bounded_string(
+            data,
+            "contentsAlias",
+            "receipt.contentsAlias",
+            MAX_COMMERCE_ALIAS_BYTES,
+        )?
+        .to_owned(),
+        episode_alias: bounded_string(
+            data,
+            "episodeAlias",
+            "receipt.episodeAlias",
+            MAX_COMMERCE_ALIAS_BYTES,
+        )?
+        .to_owned(),
+        coin_use: CoinUse {
+            aggregate,
+            standard,
+            bonus,
+            free,
+        },
+    })
 }
 
 pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
@@ -978,6 +1155,21 @@ fn parse_json(bytes: &[u8]) -> Result<Value, ParseError> {
     kobo_json::parse(text).map_err(ParseError::Json)
 }
 
+fn parse_commerce_json(bytes: &[u8]) -> Result<Value, ParseError> {
+    if bytes.len() > MAX_COMMERCE_BODY_BYTES {
+        return Err(ParseError::InvalidValue("commerce response size"));
+    }
+    parse_json(bytes)
+}
+
+fn require_success(root: &Value) -> Result<(), ParseError> {
+    if string(root, "result", "result")? == "SUCCESS" {
+        Ok(())
+    } else {
+        Err(ParseError::InvalidValue("result"))
+    }
+}
+
 fn field<'a>(value: &'a Value, key: &str, name: &'static str) -> Result<&'a Value, ParseError> {
     value.get(key).ok_or(ParseError::Missing(name))
 }
@@ -986,6 +1178,20 @@ fn string<'a>(value: &'a Value, key: &str, name: &'static str) -> Result<&'a str
     field(value, key, name)?
         .as_str()
         .ok_or(ParseError::WrongType(name))
+}
+
+fn bounded_string<'a>(
+    value: &'a Value,
+    key: &str,
+    name: &'static str,
+    limit: usize,
+) -> Result<&'a str, ParseError> {
+    let text = string(value, key, name)?;
+    if text.len() > limit {
+        Err(ParseError::InvalidValue(name))
+    } else {
+        Ok(text)
+    }
 }
 
 fn nullable_string<'a>(
@@ -1000,6 +1206,20 @@ fn nullable_string<'a>(
     }
 }
 
+fn bounded_nullable_string<'a>(
+    value: &'a Value,
+    key: &str,
+    name: &'static str,
+    limit: usize,
+) -> Result<Option<&'a str>, ParseError> {
+    let text = nullable_string(value, key, name)?;
+    if text.is_some_and(|text| text.len() > limit) {
+        Err(ParseError::InvalidValue(name))
+    } else {
+        Ok(text)
+    }
+}
+
 fn optional_string<'a>(
     value: &'a Value,
     key: &str,
@@ -1009,6 +1229,20 @@ fn optional_string<'a>(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text)),
         Some(_) => Err(ParseError::WrongType(name)),
+    }
+}
+
+fn optional_bounded_string<'a>(
+    value: &'a Value,
+    key: &str,
+    name: &'static str,
+    limit: usize,
+) -> Result<Option<&'a str>, ParseError> {
+    let text = optional_string(value, key, name)?;
+    if text.is_some_and(|text| text.len() > limit) {
+        Err(ParseError::InvalidValue(name))
+    } else {
+        Ok(text)
     }
 }
 
@@ -1134,22 +1368,24 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_summary, episodes, expiration_history, homepage, images, library, public_detail,
-        recent, ParseError,
+        asset_summary, content_detail, expiration_history, gift_balance, homepage, images, library,
+        public_detail, purchase_receipt, quote, recent, ParseError,
     };
-    use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState};
+    use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
     const CONTENT: &[u8] = br#"{
       "result":"SUCCESS",
       "data":{
+        "id":41,
         "episodes":[
-          {"alias":"f1","title":"Free preview","type":"PREVIEW","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0,"permanentCoin":3},
-          {"alias":"1","title":"Episode 1","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0,"permanentCoin":3},
-          {"alias":"2","title":"Episode 2","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":3,"rentCoin":2,"permanentCoin":3},
-          {"alias":"owned","title":"Owned","type":"PREVIEW","isSample":true,"purchaseStatus":"POSSESSION","paid":false,"possessionCoin":0,"rentCoin":0},
-          {"alias":"legacy-sample","title":"Legacy sample","isSample":true,"purchaseStatus":"NONE","paid":null},
-          {"alias":"legacy-free","title":"Legacy free","isSample":false,"purchaseStatus":"NONE","paid":false},
-          {"alias":"omitted","title":"Omitted prices and type","isSample":false,"purchaseStatus":"NONE","paid":null}
+          {"id":101,"alias":"sample","title":"Free preview","type":"PREVIEW","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
+          {"id":102,"alias":"free","title":"Free episode","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
+          {"id":103,"alias":"paid","title":"Paid episode","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"coinKind":"COIN","possessionCoin":3,"rentCoin":2,"permanentCoin":3,"isRentGift":true},
+          {"id":104,"alias":"rented","title":"Rented episode","type":"GENERAL","isSample":false,"purchaseStatus":"RENT","paid":true,"rentExpiredAt":7200001},
+          {"id":105,"alias":"owned","title":"Owned episode","type":"PREVIEW","isSample":true,"purchaseStatus":"POSSESSION","paid":false,"possessionCoin":0,"rentCoin":0},
+          {"id":106,"alias":"future","title":"Future status","type":"PREVIEW","isSample":true,"purchaseStatus":"FUTURE","paid":false,"possessionCoin":0,"rentCoin":0},
+          {"id":107,"alias":"ticket","title":"Ticket is not episode payment","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"TICKET","possessionCoin":4,"rentCoin":1},
+          {"id":108,"alias":"conflict","title":"Conflicting permanent price","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","possessionCoin":4,"rentCoin":2,"permanentCoin":5}
         ]
       }
     }"#;
@@ -1395,47 +1631,223 @@ mod tests {
     }
 
     #[test]
-    fn ticket_coin_kind_requires_and_retains_effective_quantity() {
-        let parsed = episodes(
+    fn gift_balance_sums_only_received_rent_gifts() {
+        let parsed = gift_balance(
             br#"{
               "result":"SUCCESS",
-              "data":{"episodes":[
-                {"alias":"rent","title":"Rent ticket","purchaseStatus":"NONE","isSample":false,"coinKind":"TICKET","rentCoin":1,"possessionCoin":4},
-                {"alias":"possession","title":"Possession ticket","purchaseStatus":"NONE","isSample":false,"coinKind":"TICKET","possessionCoin":2},
-                {"alias":"coin","title":"Coin","purchaseStatus":"NONE","isSample":false,"coinKind":"COIN","rentCoin":3},
-                {"alias":"lower","title":"Lowercase","purchaseStatus":"NONE","isSample":false,"coinKind":"ticket","rentCoin":5}
-              ]}
+              "data":{
+                "receivedGifts":[
+                  {"giftId":1,"giftType":"RENT","isReceived":true,"issuedCount":5,"usedCount":2},
+                  {"giftId":2,"giftType":"RENT","isReceived":false,"issuedCount":8,"usedCount":1},
+                  {"giftId":3,"giftType":"POSSESSION","isReceived":true,"issuedCount":9,"usedCount":0}
+                ],
+                "receivableGifts":[
+                  {"giftId":4,"giftType":"RENT","isReceived":false,"issuedCount":20,"usedCount":0}
+                ]
+              }
             }"#,
         )
-        .expect("episodes");
-        assert_eq!(parsed[0].ticket_quantity, Some(1));
-        assert_eq!(parsed[1].ticket_quantity, Some(2));
-        assert_eq!(parsed[2].ticket_quantity, None);
-        assert_eq!(parsed[3].ticket_quantity, None);
+        .expect("valid Gift balance");
+        assert_eq!(parsed.available, 3);
     }
 
     #[test]
-    fn ticket_coin_kind_rejects_missing_quantity() {
-        let body = br#"{"result":"SUCCESS","data":{"episodes":[{
-          "alias":"ticket","title":"Ticket","purchaseStatus":"NONE","isSample":false,
-          "coinKind":"TICKET"
-        }]}}"#;
-        assert!(matches!(
-            episodes(body),
-            Err(ParseError::Missing("episode ticket quantity"))
-        ));
+    fn gift_balance_rejects_invalid_retained_counts_and_overflow() {
+        for body in [
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":2}],"receivableGifts":[]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":-1,"usedCount":0}],"receivableGifts":[]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"usedCount":0}],"receivableGifts":[]}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":"yes","issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#
+                .as_slice(),
+        ] {
+            assert!(gift_balance(body).is_err());
+        }
+
+        let overflow = format!(
+            r#"{{"result":"SUCCESS","data":{{"receivedGifts":[
+              {{"giftType":"RENT","isReceived":true,"issuedCount":{},"usedCount":0}},
+              {{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}}
+            ],"receivableGifts":[]}}}}"#,
+            usize::MAX
+        );
+        assert!(gift_balance(overflow.as_bytes()).is_err());
     }
 
     #[test]
-    fn coin_kind_requires_an_observed_type_when_present() {
-        let body = br#"{"result":"SUCCESS","data":{"episodes":[{
-          "alias":"ticket","title":"Ticket","purchaseStatus":"NONE","isSample":false,
-          "coinKind":false
-        }]}}"#;
-        assert!(matches!(
-            episodes(body),
-            Err(ParseError::WrongType("episode.coinKind"))
-        ));
+    fn gift_arrays_are_limited_to_64_entries_each() {
+        let entries = (0..65)
+            .map(|_| {
+                r#"{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}"#
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let received = format!(
+            r#"{{"result":"SUCCESS","data":{{"receivedGifts":[{entries}],"receivableGifts":[]}}}}"#
+        );
+        let receivable = format!(
+            r#"{{"result":"SUCCESS","data":{{"receivedGifts":[],"receivableGifts":[{entries}]}}}}"#
+        );
+        assert!(gift_balance(received.as_bytes()).is_err());
+        assert!(gift_balance(receivable.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn quote_retains_bounded_identity_prices_and_gift_flags() {
+        let parsed = quote(
+            br#"{
+              "result":"SUCCESS",
+              "data":{
+                "contentsId":41,
+                "episodeId":103,
+                "contentsAlias":"fake-comic",
+                "episodeAlias":"paid",
+                "isAvailable":true,
+                "coinKind":"COIN",
+                "rentCoin":2,
+                "possessionCoin":3,
+                "permanentCoin":3,
+                "isRentGift":true,
+                "isPossessionGift":false,
+                "contentsTitle":"Ignored title",
+                "episodeTitle":"Ignored episode",
+                "priceInfo":{"server":"prose"},
+                "thumbnail":"ignored"
+              }
+            }"#,
+        )
+        .expect("valid quote");
+        assert_eq!(parsed.content_id, 41);
+        assert_eq!(parsed.episode_id, 103);
+        assert_eq!(parsed.content_alias, "fake-comic");
+        assert_eq!(parsed.episode_alias, "paid");
+        assert!(parsed.is_available);
+        assert_eq!(parsed.rent_price(), Some(2));
+        assert_eq!(parsed.purchase_price(), Some(3));
+        assert!(parsed.is_rent_gift);
+        assert!(!parsed.is_possession_gift);
+    }
+
+    #[test]
+    fn unknown_coin_kind_and_permanent_conflict_disable_safe_quote_choices() {
+        let quote_body = |coin_kind: &str, permanent_coin: usize| {
+            format!(
+                r#"{{"result":"SUCCESS","data":{{
+                  "contentsId":41,"episodeId":103,
+                  "contentsAlias":"fake-comic","episodeAlias":"paid",
+                  "isAvailable":true,"coinKind":"{coin_kind}",
+                  "rentCoin":2,"possessionCoin":3,"permanentCoin":{permanent_coin},
+                  "isRentGift":true,"isPossessionGift":false
+                }}}}"#
+            )
+        };
+        let unknown = quote_body("TICKET", 3);
+        let parsed = quote(unknown.as_bytes()).expect("unknown kind is retained fail-closed");
+        assert_eq!(parsed.rent_price(), None);
+        assert_eq!(parsed.purchase_price(), None);
+        assert!(parsed.is_rent_gift);
+
+        let conflicting = quote_body("COIN", 4);
+        let parsed = quote(conflicting.as_bytes()).expect("conflicting permanent price");
+        assert_eq!(parsed.rent_price(), Some(2));
+        assert_eq!(parsed.purchase_price(), None);
+    }
+
+    #[test]
+    fn purchase_receipt_validates_type_identity_and_coin_use() {
+        let parsed = purchase_receipt(
+            br#"{
+              "result":"SUCCESS",
+              "data":{
+                "purchaseType":"POSSESSION",
+                "contentsAlias":"fake-comic",
+                "episodeAlias":"paid",
+                "useCoin":3,
+                "useGoldCoin":1,
+                "useBonusCoin":1,
+                "useFreeCoin":1,
+                "createdAt":"ignored",
+                "episodeCount":99,
+                "isPaymentAuto":false,
+                "isRepeatPurchase":true
+              }
+            }"#,
+        )
+        .expect("valid receipt");
+        assert_eq!(parsed.purchase_type, PurchaseType::Possession);
+        assert_eq!(parsed.content_alias, "fake-comic");
+        assert_eq!(parsed.episode_alias, "paid");
+        assert_eq!(parsed.coin_use.aggregate, 3);
+        assert_eq!(parsed.coin_use.standard, 1);
+        assert_eq!(parsed.coin_use.bonus, 1);
+        assert_eq!(parsed.coin_use.free, 1);
+
+        let aggregate_only = purchase_receipt(
+            br#"{"result":"SUCCESS","data":{
+              "purchaseType":"RENT","contentsAlias":"fake-comic","episodeAlias":"paid","useCoin":2
+            }}"#,
+        )
+        .expect("aggregate-only receipt");
+        assert_eq!(aggregate_only.purchase_type, PurchaseType::Rent);
+        assert_eq!(aggregate_only.coin_use.aggregate, 2);
+        assert_eq!(aggregate_only.coin_use.standard, 0);
+        assert_eq!(aggregate_only.coin_use.bonus, 0);
+        assert_eq!(aggregate_only.coin_use.free, 0);
+
+        let gift = purchase_receipt(
+            br#"{"result":"SUCCESS","data":{
+              "purchaseType":"RENT_GIFT","contentsAlias":"fake-comic","episodeAlias":"paid","useCoin":0
+            }}"#,
+        )
+        .expect("Gift receipt");
+        assert_eq!(gift.purchase_type, PurchaseType::RentGift);
+    }
+
+    #[test]
+    fn receipt_coin_buckets_are_all_or_none_and_sum_to_aggregate() {
+        for body in [
+            br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"one","useCoin":2,"useGoldCoin":2}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"one","useCoin":2,"useGoldCoin":1,"useBonusCoin":0,"useFreeCoin":0}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"purchaseType":"FUTURE","contentsAlias":"fake","episodeAlias":"one","useCoin":0}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"one","useCoin":0,"useGoldCoin":null}}"#
+                .as_slice(),
+            br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"one","useCoin":0,"useGoldCoin":null,"useBonusCoin":null,"useFreeCoin":null}}"#
+                .as_slice(),
+        ] {
+            assert!(purchase_receipt(body).is_err());
+        }
+
+        let overflow = format!(
+            r#"{{"result":"SUCCESS","data":{{
+              "purchaseType":"POSSESSION","contentsAlias":"fake","episodeAlias":"one",
+              "useCoin":{},"useGoldCoin":{},"useBonusCoin":1,"useFreeCoin":0
+            }}}}"#,
+            usize::MAX,
+            usize::MAX
+        );
+        assert!(purchase_receipt(overflow.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn commerce_response_bodies_are_capped_at_64_kib() {
+        let padding = "x".repeat(64 * 1024);
+        let gift = format!(
+            r#"{{"result":"SUCCESS","padding":"{padding}","data":{{"receivedGifts":[],"receivableGifts":[]}}}}"#
+        );
+        let quote_body = format!(
+            r#"{{"result":"SUCCESS","padding":"{padding}","data":{{"contentsId":1,"episodeId":2,"contentsAlias":"fake","episodeAlias":"one","isAvailable":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":false,"isPossessionGift":false}}}}"#
+        );
+        let receipt = format!(
+            r#"{{"result":"SUCCESS","padding":"{padding}","data":{{"purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"one","useCoin":1}}}}"#
+        );
+        assert!(gift_balance(gift.as_bytes()).is_err());
+        assert!(quote(quote_body.as_bytes()).is_err());
+        assert!(purchase_receipt(receipt.as_bytes()).is_err());
     }
 
     #[test]
@@ -1625,6 +2037,7 @@ mod tests {
         ],"number":0,"totalPages":1,"totalElements":117}}"#;
         let page = library(body).expect("valid library response");
         assert_eq!(page.comics[0].alias, "365");
+
         assert_eq!(page.comics[0].owned_episodes, 25);
         assert_eq!(
             page.comics[0].cover_url.as_deref(),
@@ -1638,73 +2051,143 @@ mod tests {
     }
 
     #[test]
-    fn episodes_are_read_from_data_episodes() {
-        let parsed = episodes(CONTENT).expect("valid content response");
-        assert_eq!(parsed.len(), 7);
-        assert_eq!(parsed[0].alias, "f1");
-        assert_eq!(parsed[1].title, "Episode 1");
-        assert_eq!(parsed[2].alias, "2");
-    }
-
-    #[test]
-    fn live_availability_fields_map_with_fail_closed_precedence() {
-        let parsed = episodes(CONTENT).expect("valid content response");
-        let purchases = parsed
-            .iter()
-            .map(|episode| episode.purchase.clone())
-            .collect::<Vec<_>>();
+    fn content_detail_retains_ids_access_expiry_and_safe_prices() {
+        let parsed = content_detail(CONTENT).expect("valid content response");
+        assert_eq!(parsed.id, 41);
+        assert_eq!(parsed.episodes.len(), 8);
+        assert_eq!(parsed.episodes[0].id, 101);
+        assert_eq!(parsed.episodes[3].rent_expires_at, Some(7_200_001));
         assert_eq!(
-            purchases,
+            parsed
+                .episodes
+                .iter()
+                .map(|episode| episode.purchase.clone())
+                .collect::<Vec<_>>(),
             [
                 PurchaseState::Sample,
                 PurchaseState::Free,
                 PurchaseState::NotOwned,
+                PurchaseState::Rented,
                 PurchaseState::Owned,
-                PurchaseState::Sample,
-                PurchaseState::Free,
+                PurchaseState::Other("FUTURE".to_owned()),
+                PurchaseState::NotOwned,
                 PurchaseState::NotOwned,
             ]
         );
+
+        let paid = &parsed.episodes[2];
+        assert_eq!(paid.rent_coin, Some(2));
+        assert_eq!(paid.purchase_coin, Some(3));
+        assert!(paid.gift_eligible);
+
+        let ticket = &parsed.episodes[6];
+        assert_eq!(ticket.rent_coin, None);
+        assert_eq!(ticket.purchase_coin, None);
+        assert!(!ticket.gift_eligible);
+
+        let conflict = &parsed.episodes[7];
+        assert_eq!(conflict.rent_coin, Some(2));
+        assert_eq!(conflict.purchase_coin, None);
     }
 
     #[test]
-    fn episodes_rejects_non_json_content() {
-        let body = br#"<html><script id="__NEXT_DATA__" type="application/json">{"result":"SUCCESS","data":{"episodes":[]}}</script></html>"#;
-        assert!(matches!(episodes(body), Err(ParseError::Json(_))));
-    }
+    fn content_detail_rejects_non_json_and_invalid_identity_or_expiry() {
+        let html = br#"<script type="application/json">{"result":"SUCCESS","data":{"id":1,"episodes":[]}}</script>"#;
+        assert!(matches!(content_detail(html), Err(ParseError::Json(_))));
 
-    #[test]
-    fn paid_may_be_absent_or_null() {
-        let body = br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"absent","title":"Absent","purchaseStatus":"NONE","isSample":false},{"alias":"null","title":"Null","purchaseStatus":"NONE","isSample":false,"paid":null}]}}"#;
-        let parsed = episodes(body).expect("optional paid values");
-        assert_eq!(parsed[0].purchase, PurchaseState::NotOwned);
-        assert_eq!(parsed[1].purchase, PurchaseState::NotOwned);
-    }
-
-    #[test]
-    fn episode_purchase_fields_require_observed_types() {
         for body in [
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":false,"isSample":false}]}}"#
+            br#"{"result":"SUCCESS","data":{"id":-1,"episodes":[]}}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":-1,"alias":"one","title":"One","purchaseStatus":"NONE","isSample":false}]}}"#
                 .as_slice(),
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":"false"}]}}"#
+            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":false,"isSample":false}]}}"#
                 .as_slice(),
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"paid":"false"}]}}"#
+            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":-1}]}}"#
                 .as_slice(),
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"type":false}]}}"#
+            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":1.5}]}}"#
                 .as_slice(),
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"possessionCoin":"0"}]}}"#
-                .as_slice(),
-            br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"rentCoin":false}]}}"#
+            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":9223372036854775808}]}}"#
                 .as_slice(),
         ] {
-            assert!(matches!(episodes(body), Err(ParseError::WrongType(_))));
+            assert!(content_detail(body).is_err());
         }
+    }
 
-        let negative_price = br#"{"result":"SUCCESS","data":{"episodes":[{"alias":"1","title":"One","purchaseStatus":null,"isSample":false,"possessionCoin":-1}]}}"#;
-        assert!(matches!(
-            episodes(negative_price),
-            Err(ParseError::InvalidValue("episode.possessionCoin"))
-        ));
+    #[test]
+    fn optional_episode_fields_still_require_observed_types() {
+        for field in [
+            r#""paid":"false""#,
+            r#""type":false"#,
+            r#""coinKind":false"#,
+            r#""possessionCoin":"0""#,
+            r#""rentCoin":false"#,
+            r#""permanentCoin":-1"#,
+            r#""isRentGift":"true""#,
+        ] {
+            let body = format!(
+                r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
+                  "id":1,"alias":"one","title":"One","purchaseStatus":null,"isSample":false,{field}
+                }}]}}}}"#
+            );
+            assert!(content_detail(body.as_bytes()).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn commerce_aliases_and_episode_titles_use_utf8_byte_limits() {
+        let content_body = |alias: &str, title: &str| {
+            format!(
+                r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
+                  "id":2,"alias":"{alias}","title":"{title}",
+                  "purchaseStatus":"NONE","isSample":false
+                }}]}}}}"#
+            )
+        };
+        let alias_128 = "a".repeat(128);
+        let title_512 = "T".repeat(512);
+        let exact = content_body(&alias_128, &title_512);
+        assert!(content_detail(exact.as_bytes()).is_ok());
+
+        let alias_129 = "a".repeat(129);
+        let too_long_alias = content_body(&alias_129, "One");
+        assert!(content_detail(too_long_alias.as_bytes()).is_err());
+        let multibyte_alias = "界".repeat(43);
+        let too_many_alias_bytes = content_body(&multibyte_alias, "One");
+        assert!(content_detail(too_many_alias_bytes.as_bytes()).is_err());
+
+        let title_513 = "界".repeat(171);
+        let too_long_title = content_body("one", &title_513);
+        assert!(content_detail(too_long_title.as_bytes()).is_err());
+        let status_129 = "F".repeat(129);
+        let oversized_status = format!(
+            r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
+              "id":2,"alias":"one","title":"One",
+              "purchaseStatus":"{status_129}","isSample":false
+            }}]}}}}"#
+        );
+        assert!(content_detail(oversized_status.as_bytes()).is_err());
+
+        let quote_body = |alias: &str| {
+            format!(
+                r#"{{"result":"SUCCESS","data":{{
+                  "contentsId":1,"episodeId":2,
+                  "contentsAlias":"{alias}","episodeAlias":"one",
+                  "isAvailable":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,
+                  "isRentGift":false,"isPossessionGift":false
+                }}}}"#
+            )
+        };
+        assert!(quote(quote_body(&alias_128).as_bytes()).is_ok());
+        assert!(quote(quote_body(&alias_129).as_bytes()).is_err());
+
+        let receipt_body = |alias: &str| {
+            format!(
+                r#"{{"result":"SUCCESS","data":{{
+                  "purchaseType":"RENT","contentsAlias":"fake","episodeAlias":"{alias}","useCoin":1
+                }}}}"#
+            )
+        };
+        assert!(purchase_receipt(receipt_body(&alias_128).as_bytes()).is_ok());
+        assert!(purchase_receipt(receipt_body(&alias_129).as_bytes()).is_err());
     }
 
     #[test]

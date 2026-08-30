@@ -13,7 +13,6 @@ use model::{
     RecentEntry, ShelfComic, WalletSummary,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -738,6 +737,7 @@ struct Bomtoon {
     library_load: ShelfLoadState,
     recent_load: ShelfLoadState,
     episodes: Vec<Episode>,
+    selected_content_id: Option<usize>,
     selected_content_alias: String,
     selected_title: String,
     reader_selection: Option<EpisodeSelection>,
@@ -1321,25 +1321,24 @@ impl Bomtoon {
         let mut screen = ScreenBuilder::new("bomtoon-episodes")
             .top_bar(self.selected_title.clone())
             .text(format!("{} episodes", self.episodes.len()));
-        if self.episodes.iter().any(Episode::uses_ticket) {
-            let ticket_text = self
-                .wallet
-                .summary
-                .and_then(|summary| summary.tickets.total())
-                .map_or_else(
-                    || "Tickets unavailable".to_owned(),
-                    |total| format!("Tickets {total}"),
-                );
-            screen = screen.text(ticket_text);
-        }
         let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
+        let now_ms = unix_time_ms();
         for (index, episode) in self.episodes[start..end].iter().enumerate() {
             let index = start + index;
             let title_fallback = format!("Episode {}", episode.alias);
-            let mut status = display_text(episode.purchase.label(), "Other status");
-            if let Some(quantity) = episode.ticket_quantity {
-                write!(status, " · Ticket · {quantity}").expect("writing to a String cannot fail");
-            }
+            let status = if episode.purchase == model::PurchaseState::Rented {
+                now_ms
+                    .and_then(|now| episode.remaining_rental_hours(now))
+                    .map_or_else(
+                        || "Read · Rented".to_owned(),
+                        |hours| {
+                            let unit = if hours == 1 { "hr" } else { "hrs" };
+                            format!("Read · {hours} {unit}")
+                        },
+                    )
+            } else {
+                display_text(episode.purchase.label(), "Other status")
+            };
             let label = format!(
                 "{} [{}] - {}",
                 display_text(&episode.title, &title_fallback),
@@ -1665,6 +1664,7 @@ impl Bomtoon {
         self.library_load = ShelfLoadState::default();
         self.recent_load = ShelfLoadState::default();
         self.episodes.clear();
+        self.selected_content_id = None;
         self.selected_content_alias.clear();
         self.selected_title.clear();
         self.reader_selection = None;
@@ -2872,9 +2872,10 @@ impl Bomtoon {
                     .fail(expected, "BOMTOON returned a different recent page."),
                 Err(error) => self.recent_load.fail(expected, error.to_string()),
             },
-            Pending::Content(_index) => match parse::episodes(bytes) {
-                Ok(episodes) => {
-                    self.episodes = episodes;
+            Pending::Content(_index) => match parse::content_detail(bytes) {
+                Ok(content) => {
+                    self.selected_content_id = Some(content.id);
+                    self.episodes = content.episodes;
                     self.page = 0;
                     self.view = View::Episodes;
                 }
@@ -2917,6 +2918,7 @@ impl Bomtoon {
             return;
         };
         self.page = 0;
+        self.selected_content_id = None;
         self.selected_content_alias.clone_from(&alias);
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
@@ -4617,18 +4619,19 @@ mod tests {
     const REMOTE_LIBRARY_PAGE_SIZE: usize = 30;
     const CONTENT_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
-        "data":{"episodes":[
-            {"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
-            {"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
-            {"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
-            {"alias":"ticket","title":"Ticket Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"TICKET","rentCoin":1}
+        "data":{"id":41,"episodes":[
+            {"id":101,"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
+            {"id":102,"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
+            {"id":103,"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
+            {"id":104,"alias":"rented","title":"Rented Episode","isSample":false,"purchaseStatus":"RENT"},
+            {"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2}
         ]}
     }"#;
     const COIN_ONLY_CONTENT_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
-        "data":{"episodes":[
-            {"alias":"owned","title":"Owned Episode","isSample":false,"purchaseStatus":"POSSESSION"},
-            {"alias":"coin","title":"Coin Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1}
+        "data":{"id":42,"episodes":[
+            {"id":201,"alias":"owned","title":"Owned Episode","isSample":false,"purchaseStatus":"POSSESSION"},
+            {"id":202,"alias":"coin","title":"Coin Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2}
         ]}
     }"#;
     const TINY_WEBP: &[u8] = &[
@@ -5722,12 +5725,17 @@ mod tests {
             episode_title: "Episode One".to_owned(),
         });
         app.episodes.push(Episode {
+            id: 101,
             alias: "ep-1".to_owned(),
             title: "Episode One".to_owned(),
             purchase: model::PurchaseState::Owned,
-            ticket_quantity: None,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
         });
         app.selected_title = "Hunter Q".to_owned();
+        app.selected_content_id = Some(41);
         app.page = 3;
         app.next_library_page = Some(4);
         app.next_recent_page = Some(5);
@@ -5741,6 +5749,7 @@ mod tests {
         assert!(app.comics.is_empty());
         assert!(app.recent.is_empty());
         assert!(app.episodes.is_empty());
+        assert_eq!(app.selected_content_id, None);
         assert!(app.selected_title.is_empty());
         assert_eq!(app.page, 0);
         assert_eq!(app.next_library_page, None);
@@ -5755,6 +5764,7 @@ mod tests {
         assert_eq!(app.comics.len(), 1);
         assert_eq!(app.recent.len(), 1);
         assert_eq!(app.episodes.len(), 1);
+        assert_eq!(app.selected_content_id, Some(41));
         assert_eq!(app.selected_title, "Hunter Q");
         assert_eq!(app.page, 3);
         assert_eq!(app.next_library_page, Some(4));
@@ -6241,7 +6251,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_sample_and_free_episode_rows_are_actions() {
+    fn owned_rented_sample_and_free_episode_rows_are_actions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
@@ -6261,11 +6271,13 @@ mod tests {
         assert!(actions.contains(&action_id("episode-0")));
         assert!(actions.contains(&action_id("episode-1")));
         assert!(actions.contains(&action_id("episode-2")));
-        assert!(!actions.contains(&action_id("episode-3")));
+        assert!(actions.contains(&action_id("episode-3")));
+        assert!(!actions.contains(&action_id("episode-4")));
+        assert_eq!(runner.app().selected_content_id, Some(41));
     }
 
     #[test]
-    fn ticket_comic_shows_cached_ticket_total_and_episode_quantity() {
+    fn episode_page_removes_direct_ticket_ui_and_labels_rentals() {
         let (mut runner, _) = loaded_library();
         runner.app_mut().wallet.summary = Some(WalletSummary {
             coins: model::AssetAmounts::default(),
@@ -6283,10 +6295,10 @@ mod tests {
         );
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
-        assert!(drawn.contains("Tickets 4"));
-        assert!(drawn.contains("Ticket · 1"));
-        assert_eq!(drawn.matches("Ticket ·").count(), 1);
-        assert!(!screen.nodes.iter().any(
+        assert!(!drawn.contains("Tickets 4"));
+        assert!(!drawn.contains("Ticket ·"));
+        assert!(drawn.contains("Read · Rented"));
+        assert!(screen.nodes.iter().any(
             |node| matches!(node, Node::Button { action, .. } if *action == action_id("episode-3"))
         ));
         assert_fits(&screen);
@@ -6307,7 +6319,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_comic_without_cached_summary_does_not_fetch_wallet() {
+    fn episode_content_without_cached_wallet_does_not_fetch_wallet() {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.app_mut().wallet.summary = None;
@@ -6326,44 +6338,52 @@ mod tests {
         assert!(spawns(&commands).is_empty());
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
-        assert!(drawn.contains("Tickets unavailable"));
-        assert!(drawn.contains("Ticket · 1"));
+        assert!(!drawn.contains("Tickets"));
+        assert!(!drawn.contains("Ticket ·"));
+        assert!(drawn.contains("Read · Rented"));
         assert_fits(&screen);
     }
 
     #[test]
-    fn ticket_comic_maximum_quantity_fits_clara_bw() {
-        let mut app = Bomtoon {
+    fn rental_hour_labels_fit_clara_bw() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms().expect("host clock");
+        let rental = |id, alias: &str, rent_expires_at| Episode {
+            id,
+            alias: alias.to_owned(),
+            title: alias.to_owned(),
+            purchase: model::PurchaseState::Rented,
+            rent_expires_at,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
+        };
+        let app = Bomtoon {
             view: View::Episodes,
-            selected_title: "Maximum Tickets".to_owned(),
-            wallet: WalletState {
-                summary: Some(WalletSummary {
-                    coins: model::AssetAmounts::default(),
-                    tickets: model::AssetAmounts {
-                        standard: usize::MAX,
-                        bonus: 0,
-                        free: 0,
-                    },
-                }),
-                ..WalletState::default()
-            },
+            selected_title: "Rental labels".to_owned(),
+            episodes: vec![
+                rental(1, "Two days", Some(now_ms + 48 * HOUR_MS)),
+                rental(2, "One hour", Some(now_ms + HOUR_MS)),
+                rental(3, "Elapsed", Some(now_ms)),
+                rental(4, "Unknown expiry", None),
+            ],
             ..Bomtoon::default()
         };
-        app.episodes.push(Episode {
-            alias: "maximum-ticket".to_owned(),
-            title: "Maximum Ticket Episode".to_owned(),
-            purchase: model::PurchaseState::NotOwned,
-            ticket_quantity: Some(usize::MAX),
-        });
 
         let screen = app.episode_screen();
         let drawn = format!("{screen:?}");
-        assert!(drawn.contains(&format!("Tickets {}", usize::MAX)));
-        assert!(drawn.contains(&format!("Ticket · {}", usize::MAX)));
-        assert!(!screen
-            .nodes
-            .iter()
-            .any(|node| matches!(node, Node::Button { .. })));
+        assert!(drawn.contains("Read · 48 hrs"));
+        assert!(drawn.contains("Read · 1 hr"));
+        assert!(drawn.contains("Read · 0 hrs"));
+        assert!(drawn.contains("Read · Rented"));
+        assert_eq!(
+            screen
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, Node::Button { .. }))
+                .count(),
+            4
+        );
         assert_fits(&screen);
     }
 
@@ -8456,10 +8476,14 @@ mod tests {
             episode_title: "Episode One".to_owned(),
         }];
         app.episodes = vec![Episode {
+            id: 101,
             alias: "ep-1".to_owned(),
             title: "Episode One".to_owned(),
             purchase: model::PurchaseState::Owned,
-            ticket_quantity: None,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
         }];
         app.library_loaded = true;
         app.recent_loaded = true;
@@ -9235,10 +9259,14 @@ mod tests {
         );
         let episodes = (0..=EPISODE_ITEMS_PER_PAGE)
             .map(|index| Episode {
+                id: index,
                 alias: format!("ep-{index}"),
                 title: format!("Episode {index}"),
                 purchase: model::PurchaseState::Owned,
-                ticket_quantity: None,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
             })
             .collect();
         let mut runner = AppRunner::new(Bomtoon {
