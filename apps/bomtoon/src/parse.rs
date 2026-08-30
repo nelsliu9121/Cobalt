@@ -690,6 +690,14 @@ fn next_open_tag<'a>(
             continue;
         }
         let tag_end = find_tag_end(html, name_end)?;
+        if !bytes
+            .get(name_end)
+            .copied()
+            .is_some_and(is_tag_name_delimiter)
+        {
+            cursor = tag_end + 1;
+            continue;
+        }
         let name = &html[name_start..name_end];
         if name.eq_ignore_ascii_case(expected_name) {
             return Some((start, tag_end, &html[start..=tag_end]));
@@ -701,6 +709,10 @@ fn next_open_tag<'a>(
         };
     }
     None
+}
+
+fn is_tag_name_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
 }
 
 fn is_inert_html_element(name: &str) -> bool {
@@ -739,7 +751,7 @@ fn closing_raw_element(html: &str, mut cursor: usize, name: &str) -> Option<(usi
     loop {
         let close = cursor + find_ascii_case_insensitive(&html[cursor..], needle)?;
         let after_name = html.as_bytes().get(close + needle.len()).copied()?;
-        if after_name == b'>' || after_name.is_ascii_whitespace() {
+        if is_tag_name_delimiter(after_name) {
             let tag_end = find_tag_end(html, close + needle.len())?;
             return Some((close, tag_end + 1));
         }
@@ -772,6 +784,14 @@ fn closing_template_element(html: &str, mut cursor: usize) -> Option<(usize, usi
             continue;
         }
         let tag_end = find_tag_end(html, name_end)?;
+        if !bytes
+            .get(name_end)
+            .copied()
+            .is_some_and(is_tag_name_delimiter)
+        {
+            cursor = tag_end + 1;
+            continue;
+        }
         let name = &html[name_start..name_end];
         if name.eq_ignore_ascii_case("template") {
             if closing {
@@ -1819,6 +1839,24 @@ mod tests {
     }
 
     #[test]
+    fn homepage_ignores_malformed_template_closer() {
+        let body = br#"
+          <template>
+            </template=ignored>
+            <script id="__NEXT_DATA__">not-json</script>
+          </template>
+          <script id="__NEXT_DATA__">{"props":{"pageProps":{"main":{"banners":[],"newest":[],"weekDay":[],"onlyBom":[]}}}}</script>
+        "#;
+
+        let parsed = homepage(body).expect("malformed closer does not end template");
+
+        assert!(parsed.banners.is_empty());
+        assert!(parsed.newest.is_empty());
+        assert!(parsed.week_day.is_empty());
+        assert!(parsed.only_bom.is_empty());
+    }
+
+    #[test]
     fn homepage_reads_only_next_data_main_and_filters_banner_targets() {
         let banners = [
             banner_json("CONTENTS", "COMIC", "featured_a"),
@@ -2068,6 +2106,22 @@ mod tests {
 
         let comic =
             public_detail(body.as_bytes(), "real").expect("nested template content is inert");
+        assert_eq!(comic.title, "Real");
+    }
+
+    #[test]
+    fn public_detail_ignores_malformed_template_closer() {
+        let body = r#"
+          <template>
+            </template=ignored>
+            <meta property="og:title" content="Fake - 漫畫 - BOMTOON">
+          </template>
+          <meta property="og:title" content="Real - 漫畫 - BOMTOON">
+        "#;
+
+        let comic =
+            public_detail(body.as_bytes(), "real").expect("malformed closer does not end template");
+
         assert_eq!(comic.title, "Real");
     }
 
