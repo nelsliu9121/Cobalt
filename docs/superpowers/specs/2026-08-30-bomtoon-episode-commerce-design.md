@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation complete. Automated gates pass. Limited non-spending simulator smoke passes. Remaining simulator and operator-attended release checks are pending.
+Implementation complete. Automated gates pass. Limited non-spending simulator smoke passes. Remaining simulator and operator-attended release checks are pending; the operator waived them as a merge gate on 2026-08-31 without recording them as passed.
 
 ## Goal
 
@@ -547,6 +547,8 @@ Still operator-attended and pending:
 
 - fresh paid `RENT` and `POSSESSION` refresh checks;
 - one accepted live refresh-failure check proving no repost.
+
+These checks remain pending release evidence. The operator's merge waiver does not satisfy or replace them.
 
 ## Documentation and clean cutover
 
