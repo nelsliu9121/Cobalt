@@ -1333,6 +1333,9 @@ impl Bomtoon {
     }
 
     fn start_homepage(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
+        for task in std::mem::take(&mut self.shelf_tasks).into_keys() {
+            context.cancel(task);
+        }
         self.featured.generation = self.featured.generation.wrapping_add(1);
         self.featured.status = FeaturedStatus::Loading;
         self.featured.featured.clear();
@@ -9269,6 +9272,44 @@ mod tests {
             assert_eq!(runner.app().pending, Some(Pending::Content(index)));
             assert_eq!(runner.app().selected_content_alias, alias);
         }
+    }
+
+    #[test]
+    fn featured_restart_cancels_pending_homepage_before_bounded_enrichment() {
+        let (mut runner, commands) = started();
+        let (stale_homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (old_summary, _) = fetch_task_with(&commands, "/asset/user");
+        runner.task_outcome(
+            old_summary,
+            TaskOutcome::Failed(TaskError::NoCredential),
+        );
+        runner.action(action_id(SIGN_IN));
+
+        let commands = runner.action(action_id(RETRY));
+        let (replacement_homepage, _) = fetch_task_with(&commands, "/comic/main");
+
+        assert!(commands.contains(&Command::Cancel(stale_homepage)));
+        assert_eq!(runner.app().shelf_tasks.len(), 1);
+        assert!(matches!(
+            runner.app().shelf_tasks.get(&replacement_homepage),
+            Some(ShelfTaskPurpose::Homepage { generation, .. })
+                if *generation == runner.app().featured.generation
+        ));
+
+        runner.task_outcome(stale_homepage, TaskOutcome::Cancelled);
+        let commands = runner.task_outcome(
+            replacement_homepage,
+            TaskOutcome::Completed(homepage_response(&["a", "b", "c", "d"], &[])),
+        );
+
+        assert_eq!(spawns(&commands).len(), 3);
+        assert!(["/detail/a", "/detail/b", "/detail/c"]
+            .into_iter()
+            .all(|path| spawns(&commands).iter().any(
+                |(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with(path))
+            )));
+        assert_eq!(runner.app().featured.pending_details, 3);
+        assert_eq!(runner.tasks_in_flight(), 4);
     }
 
 }
