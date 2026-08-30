@@ -2,8 +2,29 @@
 pub struct Comic {
     pub alias: String,
     pub title: String,
+    pub cover_url: Option<String>,
     pub owned_episodes: usize,
     pub total_episodes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShelfComic {
+    pub alias: String,
+    pub title: String,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BannerComic {
+    pub alias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Homepage {
+    pub banners: Vec<BannerComic>,
+    pub newest: Vec<ShelfComic>,
+    pub week_day: Vec<ShelfComic>,
+    pub only_bom: Vec<ShelfComic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +55,7 @@ pub struct EpisodeImage {
 pub struct RecentEntry {
     pub content_alias: String,
     pub content_title: String,
+    pub cover_url: Option<String>,
     pub episode_alias: String,
     pub episode_title: String,
 }

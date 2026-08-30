@@ -4447,6 +4447,7 @@ mod tests {
         app.recent.push(RecentEntry {
             content_alias: "hunter_q".to_owned(),
             content_title: "Hunter Q".to_owned(),
+            cover_url: None,
             episode_alias: "ep-1".to_owned(),
             episode_title: "Episode One".to_owned(),
         });
@@ -6697,6 +6698,7 @@ mod tests {
             runner.app_mut().comics.push(Comic {
                 alias: format!("comic-{index}"),
                 title: format!("Comic {index}"),
+                cover_url: None,
                 owned_episodes: index,
                 total_episodes: LIBRARY_ITEMS_PER_PAGE,
             });
@@ -6730,6 +6732,7 @@ mod tests {
             runner.app_mut().comics.push(Comic {
                 alias: format!("comic-{index}"),
                 title: format!("Comic {index}"),
+                cover_url: None,
                 owned_episodes: index,
                 total_episodes: REMOTE_LIBRARY_PAGE_SIZE + 1,
             });
