@@ -1,6 +1,9 @@
+use jiff::{tz::TimeZone, Timestamp};
 use kobo_policy::{DeviceServices, TaskRunner};
 
-use kobo_protocol::{Frame, LogLevel, Message, TaskError, TaskOutcome};
+use kobo_protocol::{
+    DeviceRequest, DeviceResult, Frame, LocalDay, LogLevel, Message, TaskError, TaskOutcome,
+};
 use kobo_ui::{display_metrics_from_env, Screen, Surface};
 use std::env;
 use std::error::Error;
@@ -41,6 +44,57 @@ pub fn device_metrics() -> kobo_ui::DisplayMetrics {
         .get()
         .copied()
         .unwrap_or_else(display_metrics_from_env)
+}
+
+fn local_day_at(timestamp: Timestamp, time_zone: &TimeZone) -> Option<LocalDay> {
+    let date = time_zone.to_datetime(timestamp).date();
+    LocalDay::new(
+        date.year(),
+        u8::try_from(date.month()).ok()?,
+        u8::try_from(date.day()).ok()?,
+    )
+}
+
+fn explicit_local_day_for(
+    timestamp: Option<Timestamp>,
+    explicit_time_zone: Option<&str>,
+) -> Option<LocalDay> {
+    let time_zone = TimeZone::posix(explicit_time_zone?).ok()?;
+    local_day_at(timestamp?, &time_zone)
+}
+
+fn local_day_for(
+    timestamp: Timestamp,
+    explicit_time_zone: Option<&str>,
+    discover_system_zone: impl FnOnce() -> Option<TimeZone>,
+) -> Option<LocalDay> {
+    match explicit_time_zone {
+        Some(posix_rule) => explicit_local_day_for(Some(timestamp), Some(posix_rule)),
+        None => local_day_at(timestamp, &discover_system_zone()?),
+    }
+}
+
+fn simulator_local_day() -> Option<LocalDay> {
+    let explicit_time_zone = match env::var("TZ") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => return None,
+    };
+    let timestamp = Timestamp::try_from(std::time::SystemTime::now()).ok()?;
+    local_day_for(timestamp, explicit_time_zone.as_deref(), || {
+        TimeZone::try_system().ok()
+    })
+}
+
+fn runtime_device_result(
+    services: &mut DeviceServices,
+    request: DeviceRequest,
+    local_day: impl FnOnce() -> Option<LocalDay>,
+) -> DeviceResult {
+    match request {
+        DeviceRequest::ReadLocalDay => DeviceResult::LocalDay(local_day()),
+        request => services.handle(request),
+    }
 }
 
 #[cfg(feature = "device-write")]
@@ -615,7 +669,8 @@ fn serve_application(
             Message::Launch { name } => println!("launch requested: {name}"),
             Message::Log { level, message } => log_app(level, &message),
             Message::DeviceRequest(request) => {
-                let result = services.handle(request.clone());
+                let result =
+                    runtime_device_result(&mut services, request.clone(), simulator_local_day);
                 println!("device request {request:?} -> {result:?}");
                 write_shared(
                     &writer,
@@ -887,6 +942,115 @@ impl Drop for SocketGuard {
 
 #[cfg(test)]
 mod tests {
+    use jiff::{tz::TimeZone, Timestamp};
+    use kobo_protocol::{DeviceRequest, DeviceResult, LocalDay};
+
+    #[test]
+    fn local_day_device_boundaries_run_without_device_write() {
+        let cases = [
+            (
+                "2026-08-29T18:29:59Z",
+                "TST-5:30",
+                LocalDay::new(2026, 8, 29),
+            ),
+            (
+                "2026-08-29T18:30:00Z",
+                "TST-5:30",
+                LocalDay::new(2026, 8, 30),
+            ),
+            (
+                "2026-03-08T07:00:00Z",
+                "EST5EDT,M3.2.0,M11.1.0",
+                LocalDay::new(2026, 3, 8),
+            ),
+            (
+                "2026-11-01T06:00:00Z",
+                "EST5EDT,M3.2.0,M11.1.0",
+                LocalDay::new(2026, 11, 1),
+            ),
+            (
+                "2026-08-30T00:30:00Z",
+                "HST10",
+                LocalDay::new(2026, 8, 29),
+            ),
+            (
+                "2026-08-30T00:30:00Z",
+                "TST-5:45",
+                LocalDay::new(2026, 8, 30),
+            ),
+            (
+                "1969-12-31T23:59:59Z",
+                "UTC0",
+                LocalDay::new(1969, 12, 31),
+            ),
+        ];
+
+        for (timestamp, posix_rule, expected) in cases {
+            let timestamp: Timestamp = timestamp.parse().expect("timestamp");
+            let zone = TimeZone::posix(posix_rule).expect("POSIX zone");
+            assert_eq!(
+                super::local_day_at(timestamp, &zone),
+                expected,
+                "{timestamp} in {posix_rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_day_device_source_rejects_missing_or_invalid_inputs() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let outside_jiff_range = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(253_402_300_800))
+            .expect("the platform clock represents the year 10000");
+        let invalid_clock_conversion = Timestamp::try_from(outside_jiff_range).ok();
+
+        assert_eq!(super::explicit_local_day_for(Some(now), None), None);
+        assert_eq!(
+            super::explicit_local_day_for(Some(now), Some("invalid timezone")),
+            None
+        );
+        assert_eq!(
+            super::explicit_local_day_for(invalid_clock_conversion, Some("UTC0")),
+            None
+        );
+    }
+
+
+    #[test]
+    fn local_day_request_uses_the_host_runtime_source() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let mut services = kobo_policy::DeviceServices::simulated();
+
+        assert_eq!(
+            super::runtime_device_result(
+                &mut services,
+                DeviceRequest::ReadLocalDay,
+                || super::local_day_for(now, Some("HST10"), || None),
+            ),
+            DeviceResult::LocalDay(LocalDay::new(2026, 8, 29))
+        );
+    }
+
+    #[test]
+    fn local_day_host_falls_back_only_when_explicit_timezone_is_absent() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let fallback = || TimeZone::posix("TST-14").ok();
+
+        assert_eq!(
+            super::local_day_for(now, None, fallback),
+            LocalDay::new(2026, 8, 30)
+        );
+        assert_eq!(
+            super::local_day_for(now, Some("invalid timezone"), fallback),
+            None,
+            "an invalid explicit timezone must not fall through to discovery"
+        );
+        assert_eq!(
+            super::local_day_for(now, None, || None),
+            None,
+            "failed system-zone discovery must not substitute UTC"
+        );
+    }
 
     #[test]
     fn an_elipsa_session_keeps_its_verified_metrics_without_another_probe() {

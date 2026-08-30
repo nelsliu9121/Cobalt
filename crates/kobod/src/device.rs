@@ -33,6 +33,7 @@
 //! spread across returns.
 
 use crate::blackbox::{self, trace};
+use jiff::Timestamp;
 use kobo_hal::display::{DisplaySession, OWNER_UNLOCK_PHRASE};
 use kobo_hal::gpio::{self, GpioEvent, GpioSession};
 use kobo_hal::input::TouchSession;
@@ -445,6 +446,13 @@ fn local_offset_seconds() -> i64 {
     let minutes = parts.next().and_then(|part| part.parse::<i64>().ok());
     sign * (hours * 3600 + minutes.unwrap_or(0) * 60)
 }
+
+fn device_local_day() -> Option<kobo_protocol::LocalDay> {
+    let explicit_time_zone = std::env::var("TZ").ok()?;
+    let timestamp = Timestamp::try_from(SystemTime::now()).ok()?;
+    crate::explicit_local_day_for(Some(timestamp), Some(&explicit_time_zone))
+}
+
 /// How long to wait for the restarted reader to feed the freeze watchdog
 /// before handing it back regardless.
 ///
@@ -2122,7 +2130,11 @@ fn host_applications(
                                             COBALT_ROOT,
                                         )))
                                     }
-                                    _ => services.handle(request.clone()),
+                                    _ => crate::runtime_device_result(
+                                        &mut services,
+                                        request.clone(),
+                                        device_local_day,
+                                    ),
                                 }
                             };
                             // Every Bluetooth reply passes through here, so
@@ -3439,6 +3451,133 @@ fn pump_application(
 
 #[cfg(test)]
 mod tests {
+    use jiff::{tz::TimeZone, Timestamp};
+    use kobo_protocol::{DeviceRequest, DeviceResult, LocalDay};
+
+    #[test]
+    fn local_day_changes_exactly_at_local_midnight() {
+        let zone = TimeZone::posix("TST-5:30").expect("fixed POSIX zone");
+        let before: Timestamp = "2026-08-29T18:29:59Z".parse().expect("timestamp");
+        let at: Timestamp = "2026-08-29T18:30:00Z".parse().expect("timestamp");
+
+        assert_eq!(
+            crate::local_day_at(before, &zone),
+            LocalDay::new(2026, 8, 29)
+        );
+        assert_eq!(
+            crate::local_day_at(at, &zone),
+            LocalDay::new(2026, 8, 30)
+        );
+    }
+
+    #[test]
+    fn posix_daylight_rules_map_instants_to_checked_days() {
+        let zone = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").expect("POSIX zone");
+        let spring: Timestamp = "2026-03-08T07:00:00Z".parse().expect("timestamp");
+        let autumn: Timestamp = "2026-11-01T06:00:00Z".parse().expect("timestamp");
+
+        assert_eq!(
+            crate::local_day_at(spring, &zone),
+            LocalDay::new(2026, 3, 8)
+        );
+        assert_eq!(
+            crate::local_day_at(autumn, &zone),
+            LocalDay::new(2026, 11, 1)
+        );
+    }
+
+    #[test]
+    fn negative_and_non_hour_offsets_map_the_same_instant() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let west = TimeZone::posix("HST10").expect("negative offset");
+        let east = TimeZone::posix("TST-5:45").expect("non-hour offset");
+
+        assert_eq!(
+            crate::local_day_at(now, &west),
+            LocalDay::new(2026, 8, 29)
+        );
+        assert_eq!(
+            crate::local_day_at(now, &east),
+            LocalDay::new(2026, 8, 30)
+        );
+    }
+
+    #[test]
+    fn one_instant_can_be_different_days_in_different_zones() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let west = TimeZone::posix("HST10").expect("west POSIX zone");
+        let east = TimeZone::posix("TST-14").expect("east POSIX zone");
+
+        assert_ne!(
+            crate::local_day_at(now, &west),
+            crate::local_day_at(now, &east)
+        );
+    }
+
+    #[test]
+    fn epoch_adjacent_instants_keep_the_pre_epoch_day() {
+        let zone = TimeZone::posix("UTC0").expect("UTC POSIX zone");
+        let before_epoch: Timestamp = "1969-12-31T23:59:59Z".parse().expect("timestamp");
+
+        assert_eq!(
+            crate::local_day_at(before_epoch, &zone),
+            LocalDay::new(1969, 12, 31)
+        );
+    }
+
+    #[test]
+    fn device_source_rejects_missing_or_invalid_timezone_and_clock() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let outside_jiff_range = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(253_402_300_800))
+            .expect("the platform clock represents the year 10000");
+        let invalid_clock_conversion = Timestamp::try_from(outside_jiff_range).ok();
+
+        assert_eq!(crate::explicit_local_day_for(Some(now), None), None);
+        assert_eq!(
+            crate::explicit_local_day_for(Some(now), Some("not a POSIX timezone")),
+            None
+        );
+        assert_eq!(
+            crate::explicit_local_day_for(invalid_clock_conversion, Some("UTC0")),
+            None,
+            "a failed system clock conversion must not become an epoch date"
+        );
+    }
+
+    #[test]
+    fn device_request_handler_returns_the_runtime_day() {
+        let expected = LocalDay::new(2026, 8, 30);
+        let mut services = kobo_policy::DeviceServices::simulated();
+
+        assert_eq!(
+            crate::runtime_device_result(
+                &mut services,
+                DeviceRequest::ReadLocalDay,
+                || expected
+            ),
+            DeviceResult::LocalDay(expected)
+        );
+    }
+
+    #[test]
+    fn later_request_uses_the_later_timezone() {
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let mut services = kobo_policy::DeviceServices::simulated();
+        let west = crate::runtime_device_result(
+            &mut services,
+            DeviceRequest::ReadLocalDay,
+            || crate::local_day_for(now, Some("HST10"), || None),
+        );
+        let east = crate::runtime_device_result(
+            &mut services,
+            DeviceRequest::ReadLocalDay,
+            || crate::local_day_for(now, Some("TST-14"), || None),
+        );
+
+        assert_ne!(west, east);
+    }
+
     /// `TZ` is read from the environment, which is process-global, so these
     /// are one test rather than several: two tests setting it at once would
     /// see each other's value.

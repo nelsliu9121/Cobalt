@@ -64,6 +64,7 @@ repository = "https://github.com/BandarLabs/Cobalt"
 
 [workspace.dependencies]
 fs4 = { version = "1", features = ["sync"] }
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

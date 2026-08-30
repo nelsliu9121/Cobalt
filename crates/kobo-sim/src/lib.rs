@@ -14,9 +14,12 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use jiff::{tz::TimeZone, Timestamp};
 use kobo_policy::{shelf::Shelf, store::Store, DeviceServices, ManagedCredentials, TaskRunner};
 use kobo_profile::{DeviceProfile, PanelPose, CLARA_BW_391};
-use kobo_protocol::{read_from, write_to, Frame, Lifecycle, Message};
+use kobo_protocol::{
+    read_from, write_to, DeviceRequest, DeviceResult, Frame, Lifecycle, LocalDay, Message,
+};
 use kobo_ui::{
     ActionId, DisplayMetrics, FramePlanner, FrameTransition, Node, NodeId, PanelWaveform,
     PictureFormat, PicturePixels, PicturePixelsRef, Screen, Surface,
@@ -37,6 +40,54 @@ fn profile_metrics() -> DisplayMetrics {
         pixels_per_inch: i32::from(PROFILE.pixels_per_inch),
         picture_format: kobo_ui::PictureFormat::Gray8,
         text_scale: kobo_ui::display_metrics_from_env().text_scale,
+    }
+}
+
+fn local_day_at(timestamp: Timestamp, time_zone: &TimeZone) -> Option<LocalDay> {
+    let date = time_zone.to_datetime(timestamp).date();
+    LocalDay::new(
+        date.year(),
+        u8::try_from(date.month()).ok()?,
+        u8::try_from(date.day()).ok()?,
+    )
+}
+
+fn local_day_for(
+    timestamp: Timestamp,
+    explicit_time_zone: Option<&str>,
+    discover_system_zone: impl FnOnce() -> Option<TimeZone>,
+) -> Option<LocalDay> {
+    let time_zone = match explicit_time_zone {
+        Some(posix_rule) => TimeZone::posix(posix_rule).ok()?,
+        None => discover_system_zone()?,
+    };
+    local_day_at(timestamp, &time_zone)
+}
+
+fn simulator_local_day() -> Option<LocalDay> {
+    let explicit_time_zone = match std::env::var("TZ") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+    };
+    let timestamp = Timestamp::try_from(SystemTime::now()).ok()?;
+    local_day_for(timestamp, explicit_time_zone.as_deref(), || {
+        TimeZone::try_system().ok()
+    })
+}
+
+fn simulated_device_result(
+    services: &mut DeviceServices,
+    scenario: Scenario,
+    request: DeviceRequest,
+    local_day: impl FnOnce() -> Option<LocalDay>,
+) -> DeviceResult {
+    match request {
+        DeviceRequest::ReadLocalDay => DeviceResult::LocalDay(local_day()),
+        _ if scenario == Scenario::PermissionDenied => {
+            DeviceResult::Denied(kobo_protocol::DenyReason::NotDeclared)
+        }
+        request => services.handle(request),
     }
 }
 
@@ -1928,12 +1979,12 @@ fn read_app_messages(
                     } else if !simulated_platform_request_allowed(name, &request) {
                         kobo_protocol::DeviceResult::Denied(kobo_protocol::DenyReason::NotDeclared)
                     } else {
-                        match scenario {
-                            Scenario::PermissionDenied => kobo_protocol::DeviceResult::Denied(
-                                kobo_protocol::DenyReason::NotDeclared,
-                            ),
-                            _ => services.handle(request.clone()),
-                        }
+                        simulated_device_result(
+                            &mut services,
+                            scenario,
+                            request.clone(),
+                            simulator_local_day,
+                        )
                     };
                 {
                     let mut state = state
@@ -2649,6 +2700,91 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn local_day_request_uses_the_simulator_runtime_source() {
+        use jiff::Timestamp;
+        use kobo_protocol::{DeviceRequest, DeviceResult, LocalDay};
+
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let mut services = kobo_policy::DeviceServices::simulated();
+
+        assert_eq!(
+            simulated_device_result(
+                &mut services,
+                Scenario::Normal,
+                DeviceRequest::ReadLocalDay,
+                || local_day_for(now, Some("TST-14"), || None),
+            ),
+            DeviceResult::LocalDay(LocalDay::new(2026, 8, 30))
+        );
+    }
+
+    #[test]
+    fn local_day_simulator_discovers_a_zone_only_when_tz_is_absent() {
+        use jiff::{tz::TimeZone, Timestamp};
+        use kobo_protocol::LocalDay;
+
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+
+        assert_eq!(
+            local_day_for(now, None, || TimeZone::posix("HST10").ok()),
+            LocalDay::new(2026, 8, 29)
+        );
+        assert_eq!(
+            local_day_for(now, Some("invalid timezone"), || {
+                TimeZone::posix("TST-14").ok()
+            }),
+            None,
+            "an invalid explicit timezone must not fall through to discovery"
+        );
+        assert_eq!(
+            local_day_for(now, None, || None),
+            None,
+            "failed system-zone discovery must not substitute UTC"
+        );
+    }
+
+    #[test]
+    fn later_local_day_request_uses_the_later_timezone() {
+        use jiff::Timestamp;
+        use kobo_protocol::DeviceRequest;
+
+        let now: Timestamp = "2026-08-30T00:30:00Z".parse().expect("timestamp");
+        let mut services = kobo_policy::DeviceServices::simulated();
+        let west = simulated_device_result(
+            &mut services,
+            Scenario::Normal,
+            DeviceRequest::ReadLocalDay,
+            || local_day_for(now, Some("HST10"), || None),
+        );
+        let east = simulated_device_result(
+            &mut services,
+            Scenario::Normal,
+            DeviceRequest::ReadLocalDay,
+            || local_day_for(now, Some("TST-14"), || None),
+        );
+
+        assert_ne!(west, east);
+    }
+
+    #[test]
+    fn local_day_is_safe_even_in_the_permission_denied_scenario() {
+        use kobo_protocol::{DeviceRequest, DeviceResult, LocalDay};
+
+        let expected = LocalDay::new(2026, 8, 30);
+        let mut services = kobo_policy::DeviceServices::simulated();
+
+        assert_eq!(
+            simulated_device_result(
+                &mut services,
+                Scenario::PermissionDenied,
+                DeviceRequest::ReadLocalDay,
+                || expected,
+            ),
+            DeviceResult::LocalDay(expected)
+        );
+    }
 
     static NEXT_PRIVATE_DIR: AtomicUsize = AtomicUsize::new(0);
 
