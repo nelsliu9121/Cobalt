@@ -838,6 +838,8 @@ struct Bomtoon {
     commerce_generation: u64,
     commerce_task: Option<CommerceTask>,
     commerce_episode: Option<usize>,
+    pending_purchase_rejection: Option<&'static str>,
+    purchase_rejection_notice: Option<&'static str>,
     retained_quote: Option<commerce::QuotePresentation>,
     reconciliation: Option<ReconciliationState>,
     reconciliation_post_accepted: bool,
@@ -1575,6 +1577,9 @@ impl Bomtoon {
         } else {
             screen.text(self.episode_balance_label())
         };
+        if let Some(result) = self.purchase_rejection_notice {
+            screen = screen.text(format!("Purchase rejected: {result}"));
+        }
         let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
         let now_ms = unix_time_ms();
         for (index, episode) in self.episodes[start..end].iter().enumerate() {
@@ -2177,13 +2182,24 @@ impl Bomtoon {
         selection: &commerce::Selection,
         outcome: TaskOutcome,
     ) {
-        let Some(reconciliation) = self.reconciliation.as_ref() else {
-            return;
-        };
-        if reconciliation.generation != generation || reconciliation.account_scope != account_scope
-        {
+        let matching_reconciliation = self.reconciliation.as_ref().is_some_and(|reconciliation| {
+            reconciliation.generation == generation && reconciliation.account_scope == account_scope
+        });
+        if !matching_reconciliation {
             return;
         }
+        if matches!(&outcome, TaskOutcome::Failed(TaskError::NoCredential)) {
+            self.finish_credential_loss(context, AccountState::SignedOut);
+            return;
+        }
+        if matches!(&outcome, TaskOutcome::Failed(TaskError::Unauthorized)) {
+            self.finish_credential_loss(context, AccountState::Expired);
+            return;
+        }
+        let reconciliation = self
+            .reconciliation
+            .as_ref()
+            .expect("matching reconciliation disappeared");
         let result = match outcome {
             TaskOutcome::Completed(bytes)
                 if self.current_commerce_scope() == Some(account_scope) =>
@@ -2549,10 +2565,15 @@ impl Bomtoon {
             {
                 (commerce::PostOutcome::Accepted, true)
             }
-            TaskOutcome::Completed(bytes) if parse::purchase_explicitly_rejected(&bytes) => {
-                (commerce::PostOutcome::ExplicitRejection, false)
+            TaskOutcome::Completed(bytes) => {
+                if let Some(result) = parse::purchase_rejection_result(&bytes) {
+                    self.pending_purchase_rejection = Some(result);
+                    (commerce::PostOutcome::ExplicitRejection, false)
+                } else {
+                    (commerce::PostOutcome::Ambiguous, false)
+                }
             }
-            TaskOutcome::Completed(_) | TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
+            TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
                 (commerce::PostOutcome::Ambiguous, false)
             }
         };
@@ -2672,6 +2693,8 @@ impl Bomtoon {
 
     fn clear_protected_state(&mut self, context: &mut Context) {
         self.clear_commerce_access(context);
+        self.pending_purchase_rejection = None;
+        self.purchase_rejection_notice = None;
         if let Some(task) = self.task.take() {
             context.cancel(task);
         }
@@ -3975,6 +3998,8 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
+        self.pending_purchase_rejection = None;
+        self.purchase_rejection_notice = None;
         self.page = 0;
         self.clear_title_gifts(context);
         self.selected_content_id = None;
@@ -4011,9 +4036,17 @@ impl Bomtoon {
     }
 
     fn open_episode(&mut self, context: &mut Context, index: usize) {
+        if !matches!(
+            self.commerce.state(),
+            commerce::CommerceState::LoadingSafetyState | commerce::CommerceState::Idle
+        ) {
+            return;
+        }
         let Some(episode) = self.episodes.get(index) else {
             return;
         };
+        self.pending_purchase_rejection = None;
+        self.purchase_rejection_notice = None;
         if episode.purchase == model::PurchaseState::NotOwned {
             let Some(title_id) = self.selected_content_id else {
                 return;
@@ -4024,10 +4057,15 @@ impl Bomtoon {
                 episode_id: episode.id,
                 episode_alias: episode.alias.clone(),
             };
-            self.commerce_episode = Some(index);
             let effects = self
                 .commerce
                 .begin_quote(selection, model::PurchaseType::Possession);
+            if matches!(
+                &effects.command,
+                Some(commerce::CommerceCommand::FetchQuote { .. })
+            ) {
+                self.commerce_episode = Some(index);
+            }
             self.apply_commerce_effects(context, effects);
             return;
         }
@@ -5080,7 +5118,11 @@ impl KoboApp for Bomtoon {
             {
                 self.marker_store = None;
                 self.retained_quote = None;
-                Some(self.commerce.marker_forgotten(&key))
+                let effects = self.commerce.marker_forgotten(&key);
+                if self.commerce.state() == commerce::CommerceState::Idle {
+                    self.purchase_rejection_notice = self.pending_purchase_rejection.take();
+                }
+                Some(effects)
             }
             (Some(_), StoreResult::Denied(error)) => {
                 self.marker_store = None;
@@ -14225,7 +14267,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_backend_rejection_forgets_without_authoritative_refresh() {
+    fn explicit_backend_rejection_waits_for_matching_forget_before_safe_notice() {
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
 
         let commands = runner.task_outcome(
@@ -14244,6 +14286,109 @@ mod tests {
             runner.app().commerce.state(),
             commerce::CommerceState::ClearingIntent
         );
+        assert_eq!(runner.app().pending_purchase_rejection, Some("FAIL"));
+        assert_eq!(runner.app().purchase_rejection_notice, None);
+        assert!(!format!("{:?}", runner.app().screen()).contains("Purchase rejected"));
+
+        let commands = runner.store_result(StoreResult::Forgotten {
+            key: "other.marker".to_owned(),
+        });
+        assert!(commands.is_empty());
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::ClearingIntent
+        );
+        assert_eq!(runner.app().pending_purchase_rejection, Some("FAIL"));
+        assert_eq!(runner.app().purchase_rejection_notice, None);
+
+        let commands = runner.store_result(StoreResult::Forgotten {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert_no_post_or_marker_forget(&commands);
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
+        assert_eq!(runner.app().pending_purchase_rejection, None);
+        assert_eq!(runner.app().purchase_rejection_notice, Some("FAIL"));
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Purchase rejected: FAIL"), "{drawn}");
+        assert!(!drawn.contains("not accepted"), "{drawn}");
+
+        let commands = runner.action(action_id("episode-4"));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::quote("hunter_q", "paid", model::PurchaseType::Possession)
+        );
+        assert_eq!(runner.app().pending_purchase_rejection, None);
+        assert_eq!(runner.app().purchase_rejection_notice, None);
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, Command::Store(_))));
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn processing_purchase_response_reconciles_without_forget_or_repost() {
+        let (mut runner, post) = runner_waiting_for_paid_rent_post();
+
+        let commands = runner.task_outcome(
+            post,
+            TaskOutcome::Completed(
+                br#"{"result":"PROCESSING","data":{"message":"wait"}}"#.to_vec(),
+            ),
+        );
+
+        fetch_task_with(&commands, "/contents/hunter_q?");
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Reconciling
+        );
+        assert_eq!(runner.app().pending_purchase_rejection, None);
+        assert_no_post_or_marker_forget(&commands);
+
+        let commands = runner.store_result(StoreResult::Forgotten {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert!(commands.is_empty());
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Reconciling
+        );
+        assert_no_post_or_marker_forget(&commands);
+
+        let commands = runner.action(action_id("episode-4"));
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn marker_reconciliation_content_credential_loss_uses_protected_transition() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        for (error, expected) in [
+            (TaskError::NoCredential, AccountState::SignedOut),
+            (TaskError::Unauthorized, AccountState::Expired),
+        ] {
+            let (mut runner, scope) = startup_with_marker(Some(marker_for(test_scope(SCOPE))));
+            let commands = runner.task_outcome(scope, TaskOutcome::Completed(SCOPE.to_vec()));
+            let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+            seed_all_account_data(&mut runner);
+            runner.app_mut().pending_purchase_rejection = Some("FAIL");
+            runner.app_mut().purchase_rejection_notice = Some("FAIL");
+
+            let commands = runner.task_outcome(content, TaskOutcome::Failed(error));
+            assert_eq!(
+                runner.app().commerce.state(),
+                commerce::CommerceState::AcceptedButStale
+            );
+            assert_eq!(runner.app().account, expected);
+            assert_eq!(runner.app().account_scope, None);
+            assert!(runner.app().reconciliation.is_none());
+            assert_all_account_data_cleared(runner.app());
+            assert!(runner.app().wallet.summary.is_none());
+            assert_eq!(runner.app().gifts.title_id, None);
+            assert_eq!(runner.app().pending_purchase_rejection, None);
+            assert_eq!(runner.app().purchase_rejection_notice, None);
+            assert_no_post_or_marker_forget(&commands);
+        }
     }
     #[test]
     fn failed_authoritative_refresh_locks_and_only_refresh_status_retries() {
@@ -14436,6 +14581,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_episode_action_during_quote_keeps_original_episode_bound() {
+        const TWO_UNOWNED: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"first","title":"First Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true},{"id":106,"alias":"second","title":"Second Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
+        const NO_GIFTS: &[u8] =
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(TWO_UNOWNED.to_vec()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
+
+        let commands = runner.action(action_id("episode-0"));
+        let (quote, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::quote("hunter_q", "first", model::PurchaseType::Possession)
+        );
+        assert_eq!(spawns(&commands).len(), 1);
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, Command::Store(_))));
+        assert_no_post_or_marker_forget(&commands);
+
+        let commands = runner.action(action_id("episode-1"));
+
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, Command::Store(_))));
+        assert_no_post_or_marker_forget(&commands);
+        assert_eq!(runner.app().commerce_episode, Some(0));
+        assert_eq!(runner.app().quote_episode_title(), "First Paid");
+        assert!(runner.app().commerce_task.as_ref().is_some_and(|task| {
+            task.id == quote
+                && matches!(
+                    &task.purpose,
+                    CommerceTaskPurpose::Quote { selection, .. }
+                        if selection.episode_id == 105 && selection.episode_alias == "first"
+                )
+        }));
+    }
+
+    #[test]
     fn quote_heading_names_the_selected_unowned_episode() {
         const TWO_UNOWNED: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"first","title":"First Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true},{"id":106,"alias":"second","title":"Second Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const NO_GIFTS: &[u8] =
@@ -14511,8 +14703,20 @@ mod tests {
 
     #[test]
     fn failed_or_in_progress_gift_refresh_disables_only_gift_purchase() {
-        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
         const QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let assert_only_gift_disabled = |screen: &Screen| {
+            assert!(screen.nodes.iter().any(|node| matches!(
+                node,
+                Node::Button { label, state: ControlState::Disabled, .. } if label == "Use Gift"
+            )));
+            for expected in ["Rent · 1 coins", "Buy · 2 coins"] {
+                assert!(screen.nodes.iter().any(|node| matches!(
+                    node,
+                    Node::Button { label, state: ControlState::Enabled, .. }
+                        if label == expected
+                )));
+            }
+        };
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.store_result(StoreResult::Loaded {
@@ -14523,20 +14727,20 @@ mod tests {
         let commands =
             runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
         let (gift, _) = only_spawn(&commands);
-        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
-        runner.app_mut().gifts.error = true;
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
         runner.task_outcome(quote, TaskOutcome::Completed(QUOTE.to_vec()));
 
-        let screen = runner.app().screen();
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { label, state: ControlState::Disabled, .. } if label == "Use Gift"
-        )));
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { label, state: ControlState::Enabled, .. } if label == "Rent · 1 coins"
-        )));
+        assert_eq!(
+            runner.app().gifts.task.as_ref().map(|task| task.id),
+            Some(gift)
+        );
+        assert_only_gift_disabled(&runner.app().screen());
+
+        runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+
+        assert!(runner.app().gifts.error);
+        assert!(runner.app().gifts.task.is_none());
+        assert_only_gift_disabled(&runner.app().screen());
     }
     #[test]
     fn accepted_coin_possession_reconciles_and_back_reloads_library() {

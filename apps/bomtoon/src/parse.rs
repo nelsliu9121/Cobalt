@@ -560,14 +560,10 @@ pub fn purchase_receipt(bytes: &[u8]) -> Result<PurchaseReceipt, ParseError> {
         },
     })
 }
-pub fn purchase_explicitly_rejected(bytes: &[u8]) -> bool {
-    let Ok(root) = parse_commerce_json(bytes) else {
-        return false;
-    };
-    let Ok(result) = bounded_string(&root, "result", "result", MAX_REMOTE_CODE_BYTES) else {
-        return false;
-    };
-    !result.is_empty() && result != "SUCCESS" && root.get("data").is_some()
+pub fn purchase_rejection_result(bytes: &[u8]) -> Option<&'static str> {
+    let root = parse_commerce_json(bytes).ok()?;
+    let result = bounded_string(&root, "result", "result", MAX_REMOTE_CODE_BYTES).ok()?;
+    (result == "FAIL" && matches!(root.get("data"), Some(Value::Object(_)))).then_some("FAIL")
 }
 
 pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
@@ -1357,7 +1353,7 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 mod tests {
     use super::{
         asset_summary, content_detail, expiration_history, gift_balance, homepage, images, library,
-        public_detail, purchase_receipt, quote, recent, ParseError,
+        public_detail, purchase_receipt, purchase_rejection_result, quote, recent, ParseError,
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
@@ -1817,6 +1813,36 @@ mod tests {
             usize::MAX
         );
         assert!(purchase_receipt(overflow.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn purchase_rejection_requires_exact_fail_with_object_data() {
+        assert_eq!(
+            purchase_rejection_result(br#"{"result":"FAIL","data":{"message":"ignored"}}"#),
+            Some("FAIL")
+        );
+        for body in [
+            br#"{"result":"PROCESSING","data":{}}"#.as_slice(),
+            br#"{"result":"FUTURE","data":{}}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":{}}"#.as_slice(),
+            br#"{"result":"","data":{}}"#.as_slice(),
+            br#"{"data":{}}"#.as_slice(),
+            br"".as_slice(),
+            br#"{"result":"FAIL"}"#.as_slice(),
+            br#"{"result":"FAIL","data":null}"#.as_slice(),
+            br#"{"result":"FAIL","data":[]}"#.as_slice(),
+            br#"{"result":"FAIL","data":"message"}"#.as_slice(),
+            br#"{"result":"FAIL","data":"#.as_slice(),
+        ] {
+            assert_eq!(purchase_rejection_result(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_purchase_rejection_is_ambiguous() {
+        let padding = "x".repeat(64 * 1024);
+        let body = format!(r#"{{"result":"FAIL","data":{{"padding":"{padding}"}}}}"#);
+        assert_eq!(purchase_rejection_result(body.as_bytes()), None);
     }
 
     #[test]
