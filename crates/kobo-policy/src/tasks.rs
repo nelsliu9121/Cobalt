@@ -1479,12 +1479,7 @@ mod tests {
             {
                 observer();
             }
-            if let Some(error) = self
-                .bootstrap_error
-                .lock()
-                .expect("bootstrap error")
-                .take()
-            {
+            if let Some(error) = self.bootstrap_error.lock().expect("bootstrap error").take() {
                 Err(error)
             } else {
                 Ok(managed_pair(&format!("redacted-access-{call}")))
@@ -2058,9 +2053,8 @@ mod tests {
         );
         assert_eq!(recipe.bootstraps.load(Ordering::SeqCst), 0);
 
-        let mut missing_provider =
-            TaskRunner::simulated(temp_root("credential-scope-no-provider"))
-                .with_capabilities([Capability::Network]);
+        let mut missing_provider = TaskRunner::simulated(temp_root("credential-scope-no-provider"))
+            .with_capabilities([Capability::Network]);
         missing_provider
             .submit(
                 TaskId(2),
@@ -2152,10 +2146,7 @@ mod tests {
     #[test]
     fn credential_scope_propagates_offline_bootstrap() {
         let (managed, recipe) = managed_provider("credential-scope-offline");
-        *recipe
-            .bootstrap_error
-            .lock()
-            .expect("bootstrap error") = Some(TaskError::Unreachable);
+        *recipe.bootstrap_error.lock().expect("bootstrap error") = Some(TaskError::Unreachable);
         let mut runner = TaskRunner::simulated(temp_root("credential-scope-offline-root"))
             .with_capabilities([Capability::Network])
             .with_managed_credentials(managed);
@@ -2203,10 +2194,7 @@ mod tests {
         runner.cancel(TaskId(1));
         release.wait();
 
-        assert_eq!(
-            collect(&mut runner, 1)[0].outcome,
-            TaskOutcome::Cancelled
-        );
+        assert_eq!(collect(&mut runner, 1)[0].outcome, TaskOutcome::Cancelled);
     }
 
     #[test]

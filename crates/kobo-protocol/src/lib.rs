@@ -500,8 +500,9 @@ impl Task {
                     && headers.iter().all(Header::is_well_formed)
                     && credential.as_ref().is_none_or(Credential::is_well_formed)
             }
-            Self::RevokeCredential { credential }
-            | Self::CredentialScope { credential } => valid_credential_name(credential),
+            Self::RevokeCredential { credential } | Self::CredentialScope { credential } => {
+                valid_credential_name(credential)
+            }
             Self::ReadFile { path } => path.len() <= MAX_STRING_LEN,
             Self::Sleep { .. } => true,
         }
@@ -8284,7 +8285,11 @@ mod store_tests {
         oversized.extend_from_slice(&MAGIC);
         oversized.push(VERSION);
         oversized.push(9);
-        oversized.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        oversized.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("credential scope payload length")
+                .to_be_bytes(),
+        );
         oversized.extend_from_slice(&10_u32.to_be_bytes());
         oversized.extend_from_slice(&payload);
         assert_eq!(

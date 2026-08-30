@@ -137,6 +137,7 @@ enum Pending {
 struct ShelfLoadState {
     pending_page: Option<usize>,
     error: Option<(usize, String)>,
+    loaded: bool,
 }
 
 impl ShelfLoadState {
@@ -148,6 +149,7 @@ impl ShelfLoadState {
     fn finish(&mut self) {
         self.pending_page = None;
         self.error = None;
+        self.loaded = true;
     }
 
     fn fail(&mut self, page: usize, message: impl Into<String>) {
@@ -762,9 +764,6 @@ struct ReconciliationState {
     gift_generation: Option<u64>,
 }
 
-
-
-
 enum PageEntry {
     Building(PageBuild),
     Ready { page: usize, picture: Picture },
@@ -875,8 +874,6 @@ struct Bomtoon {
     next_recent_page: Option<usize>,
     total_library_titles: usize,
     total_recent_titles: usize,
-    library_loaded: bool,
-    recent_loaded: bool,
     problem: Option<String>,
 }
 
@@ -932,14 +929,14 @@ impl Bomtoon {
                     push(self.featured.recommended[index].cover_url.as_ref());
                 }
             }
-            MainDestination::Recent if self.recent_loaded => {
+            MainDestination::Recent if self.recent_load.loaded => {
                 let (start, end) =
                     page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
                 for entry in &self.recent[start..end] {
                     push(entry.cover_url.as_ref());
                 }
             }
-            MainDestination::Library if self.library_loaded => {
+            MainDestination::Library if self.library_load.loaded => {
                 let (start, end) =
                     page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
                 for comic in &self.comics[start..end] {
@@ -1077,12 +1074,7 @@ impl Bomtoon {
             .and_then(|index| self.episodes.get(index))
             .map_or_else(
                 || "Episode options".to_owned(),
-                |episode| {
-                    display_text(
-                        &episode.title,
-                        &format!("Episode {}", episode.alias),
-                    )
-                },
+                |episode| display_text(&episode.title, &format!("Episode {}", episode.alias)),
             )
     }
 
@@ -1552,12 +1544,12 @@ impl Bomtoon {
         self.view = View::Main;
         let needs_request = match target {
             MainDestination::Recent => {
-                !self.recent_loaded
+                !self.recent_load.loaded
                     && self.recent_load.pending_page.is_none()
                     && self.recent_load.error.is_none()
             }
             MainDestination::Library => {
-                !self.library_loaded
+                !self.library_load.loaded
                     && self.library_load.pending_page.is_none()
                     && self.library_load.error.is_none()
             }
@@ -1614,8 +1606,7 @@ impl Bomtoon {
                 "{} · {status}",
                 display_text(&episode.title, &title_fallback),
             );
-            if episode.purchase.is_readable()
-                || episode.purchase == model::PurchaseState::NotOwned
+            if episode.purchase.is_readable() || episode.purchase == model::PurchaseState::NotOwned
             {
                 screen = screen.button(format!("episode-{index}"), label);
             } else {
@@ -1761,16 +1752,13 @@ impl Bomtoon {
             TaskOutcome::Completed(bytes)
                 if self.current_commerce_scope() == Some(task.account_scope) =>
             {
-                match parse::gift_balance(&bytes) {
-                    Ok(balance) => {
-                        self.gifts.available = Some(balance.available);
-                        self.gifts.error = false;
-                        Ok(balance.available)
-                    }
-                    Err(_) => {
-                        self.gifts.error = true;
-                        Err(())
-                    }
+                if let Ok(balance) = parse::gift_balance(&bytes) {
+                    self.gifts.available = Some(balance.available);
+                    self.gifts.error = false;
+                    Ok(balance.available)
+                } else {
+                    self.gifts.error = true;
+                    Err(())
                 }
             }
             TaskOutcome::Completed(_) | TaskOutcome::Failed(_) => {
@@ -1787,8 +1775,7 @@ impl Bomtoon {
                         && reconciliation.gift_generation == Some(task.generation)
                         && reconciliation.account_scope == task.account_scope
                     {
-                        reconciliation.gifts =
-                            observed.map_or(Evidence::Failed, Evidence::Value);
+                        reconciliation.gifts = observed.map_or(Evidence::Failed, Evidence::Value);
                     }
                 }
             }
@@ -2056,9 +2043,7 @@ impl Bomtoon {
                 commerce::Authentication::SignedOut
             }
             (AccountState::Expired, _) => commerce::Authentication::Expired,
-            (AccountState::Checking | AccountState::Active, _) => {
-                commerce::Authentication::Unknown
-            }
+            (AccountState::Checking | AccountState::Active, _) => commerce::Authentication::Unknown,
         }
     }
 
@@ -2073,7 +2058,7 @@ impl Bomtoon {
     fn start_reconciliation(
         &mut self,
         context: &mut Context,
-        selection: commerce::Selection,
+        selection: &commerce::Selection,
         refresh_wallet: bool,
         refresh_gifts: bool,
     ) {
@@ -2109,7 +2094,7 @@ impl Bomtoon {
                 purpose: CommerceTaskPurpose::ReconcileContent {
                     generation,
                     account_scope,
-                    selection: selection.clone(),
+                    selection: Clone::clone(selection),
                 },
             });
         } else if let Some(reconciliation) = self.reconciliation.as_mut() {
@@ -2164,10 +2149,9 @@ impl Bomtoon {
         let Some(marker) = marker else {
             return ContentEvidence::Entitled;
         };
-        let Some(episode) = episodes
-            .iter()
-            .find(|episode| episode.id == marker.episode_id && episode.alias == marker.episode_alias)
-        else {
+        let Some(episode) = episodes.iter().find(|episode| {
+            episode.id == marker.episode_id && episode.alias == marker.episode_alias
+        }) else {
             return ContentEvidence::NotEntitled;
         };
         let expected = match marker.purchase_type {
@@ -2190,14 +2174,13 @@ impl Bomtoon {
         context: &mut Context,
         generation: u64,
         account_scope: commerce::AccountScope,
-        selection: commerce::Selection,
+        selection: &commerce::Selection,
         outcome: TaskOutcome,
     ) {
         let Some(reconciliation) = self.reconciliation.as_ref() else {
             return;
         };
-        if reconciliation.generation != generation
-            || reconciliation.account_scope != account_scope
+        if reconciliation.generation != generation || reconciliation.account_scope != account_scope
         {
             return;
         }
@@ -2206,13 +2189,15 @@ impl Bomtoon {
                 if self.current_commerce_scope() == Some(account_scope) =>
             {
                 match parse::content_detail(&bytes) {
-                    Ok(content) if content.id == selection.title_id => {
-                        let evidence =
-                            Self::content_evidence(reconciliation.marker.as_ref(), &content.episodes);
+                    Ok(detail) if detail.id == selection.title_id => {
+                        let evidence = Self::content_evidence(
+                            reconciliation.marker.as_ref(),
+                            &detail.episodes,
+                        );
                         if self.selected_content_id == Some(selection.title_id)
                             && self.selected_content_alias == selection.title_alias
                         {
-                            self.episodes = content.episodes;
+                            self.episodes = detail.episodes;
                             let last_page = self
                                 .episodes
                                 .len()
@@ -2259,14 +2244,12 @@ impl Bomtoon {
             &reconciliation.gifts,
         ) {
             (None, Evidence::Value(_), Evidence::NotRequired, Evidence::NotRequired) => true,
-            (Some(marker), Evidence::Value(content), wallet, gifts) => {
+            (Some(marker), Evidence::Value(entitlement), wallet, gifts) => {
                 let (spent, unchanged) = match marker.purchase_type {
                     model::PurchaseType::RentGift => {
                         let current = match gifts {
                             Evidence::Value(current) => Some(*current),
-                            Evidence::NotRequired
-                            | Evidence::Pending
-                            | Evidence::Failed => None,
+                            Evidence::NotRequired | Evidence::Pending | Evidence::Failed => None,
                         };
                         (
                             marker
@@ -2283,9 +2266,7 @@ impl Bomtoon {
                     model::PurchaseType::Rent | model::PurchaseType::Possession => {
                         let current = match wallet {
                             Evidence::Value(current) => Some(*current),
-                            Evidence::NotRequired
-                            | Evidence::Pending
-                            | Evidence::Failed => None,
+                            Evidence::NotRequired | Evidence::Pending | Evidence::Failed => None,
                         };
                         (
                             marker
@@ -2300,11 +2281,9 @@ impl Bomtoon {
                         )
                     }
                 };
-                match content {
+                match entitlement {
                     ContentEvidence::Entitled => spent,
-                    ContentEvidence::NotEntitled => {
-                        !reconciliation.post_accepted && unchanged
-                    }
+                    ContentEvidence::NotEntitled => !reconciliation.post_accepted && unchanged,
                     ContentEvidence::Contradictory => false,
                 }
             }
@@ -2319,11 +2298,10 @@ impl Bomtoon {
         if conclusive
             && reconciliation.marker.as_ref().is_some_and(|marker| {
                 marker.purchase_type == model::PurchaseType::Possession
-                    && reconciliation.content
-                        == Evidence::Value(ContentEvidence::Entitled)
+                    && reconciliation.content == Evidence::Value(ContentEvidence::Entitled)
             })
         {
-            self.library_loaded = false;
+            self.library_load.loaded = false;
         }
         let effects = self.commerce.reconciled(
             reconciliation.account_scope,
@@ -2336,11 +2314,7 @@ impl Bomtoon {
         self.apply_commerce_effects(context, effects);
     }
 
-    fn observe_reconciliation_wallet(
-        &mut self,
-        purpose: WalletTaskPurpose,
-        outcome: &TaskOutcome,
-    ) {
+    fn observe_reconciliation_wallet(&mut self, purpose: WalletTaskPurpose, outcome: &TaskOutcome) {
         let Some(reconciliation) = self.reconciliation.as_ref() else {
             return;
         };
@@ -2430,11 +2404,8 @@ impl Bomtoon {
                     self.commerce_generation = self.commerce_generation.wrapping_add(1);
                     let generation = self.commerce_generation;
                     let account_scope = marker.account_scope;
-                    let work = api::purchase(
-                        &marker.title_alias,
-                        marker.episode_id,
-                        marker.purchase_type,
-                    );
+                    let work =
+                        api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
                     if let Some(id) = context.spawn(work) {
                         self.commerce_task = Some(CommerceTask {
                             id,
@@ -2453,12 +2424,7 @@ impl Bomtoon {
                     }
                 }
                 Some(commerce::CommerceCommand::RefreshContent(selection)) => {
-                    self.start_reconciliation(
-                        context,
-                        selection,
-                        refresh_wallet,
-                        refresh_gifts,
-                    );
+                    self.start_reconciliation(context, &selection, refresh_wallet, refresh_gifts);
                 }
                 None => {}
             }
@@ -2485,7 +2451,7 @@ impl Bomtoon {
                         context,
                         generation,
                         account_scope,
-                        selection,
+                        &selection,
                         outcome,
                     );
                 }
@@ -2520,80 +2486,79 @@ impl Bomtoon {
             return;
         }
         let effects = match purpose {
-            CommerceTaskPurpose::Quote {
-                selection,
-                purchase,
-                ..
-            } => {
-                let selection_is_current = self.selected_content_id == Some(selection.title_id)
-                    && self.selected_content_alias == selection.title_alias
-                    && self.episodes.iter().any(|episode| {
-                        episode.id == selection.episode_id
-                            && episode.alias == selection.episode_alias
-                    });
-                match outcome {
-                    TaskOutcome::Completed(bytes) if selection_is_current => {
-                        match parse::quote(&bytes) {
-                            Ok(quote) => {
-                                let spendable = self
-                                    .wallet
-                                    .summary
-                                    .and_then(|summary| summary.coins.total());
-                                let active_rental = self.episodes.iter().any(|episode| {
-                                    episode.id == selection.episode_id
-                                        && episode.alias == selection.episode_alias
-                                        && episode.purchase == model::PurchaseState::Rented
-                                });
-                                let title_gifts = (!self.gifts.error
-                                    && self.gifts.task.is_none()
-                                    && self.gifts.title_id == Some(selection.title_id))
-                                    .then_some(self.gifts.available)
-                                    .flatten();
-                                let _ = purchase;
-                                self.commerce.quote_received(
-                                    quote,
-                                    spendable,
-                                    title_gifts,
-                                    active_rental,
-                                )
-                            }
-                            Err(_) => self.commerce.quote_failed(),
-                        }
-                    }
-                    TaskOutcome::Completed(_)
-                    | TaskOutcome::Failed(_)
-                    | TaskOutcome::Cancelled => self.commerce.quote_failed(),
-                }
+            CommerceTaskPurpose::Quote { selection, .. } => {
+                self.handle_quote_outcome(&selection, outcome)
             }
-            CommerceTaskPurpose::Post { marker, .. } => {
-                let (outcome, accepted) = match outcome {
-                    TaskOutcome::Completed(bytes)
-                        if parse::purchase_receipt(&bytes).is_ok_and(|receipt| {
-                            receipt.purchase_type == marker.purchase_type
-                                && receipt.content_alias == marker.title_alias
-                                && receipt.episode_alias == marker.episode_alias
-                                && receipt.coin_use.aggregate == marker.quoted_price
-                        }) =>
-                    {
-                        (commerce::PostOutcome::Accepted, true)
-                    }
-                    TaskOutcome::Completed(bytes)
-                        if parse::purchase_explicitly_rejected(&bytes) =>
-                    {
-                        (commerce::PostOutcome::ExplicitRejection, false)
-                    }
-                    TaskOutcome::Completed(_)
-                    | TaskOutcome::Failed(_)
-                    | TaskOutcome::Cancelled => (commerce::PostOutcome::Ambiguous, false),
-                };
-                self.reconciliation_post_accepted = accepted;
-                self.commerce.mutation_finished(outcome)
-            }
+            CommerceTaskPurpose::Post { marker, .. } => self.handle_post_outcome(&marker, outcome),
             CommerceTaskPurpose::ReconcileContent { .. } => unreachable!(),
         };
         self.apply_commerce_effects(context, effects);
     }
 
+    fn handle_quote_outcome(
+        &mut self,
+        selection: &commerce::Selection,
+        outcome: TaskOutcome,
+    ) -> commerce::CommerceEffects {
+        let selection_is_current = self.selected_content_id == Some(selection.title_id)
+            && self.selected_content_alias == selection.title_alias
+            && self.episodes.iter().any(|episode| {
+                episode.id == selection.episode_id && episode.alias == selection.episode_alias
+            });
+        match outcome {
+            TaskOutcome::Completed(bytes) if selection_is_current => match parse::quote(&bytes) {
+                Ok(quote) => {
+                    let spendable = self
+                        .wallet
+                        .summary
+                        .and_then(|summary| summary.coins.total());
+                    let active_rental = self.episodes.iter().any(|episode| {
+                        episode.id == selection.episode_id
+                            && episode.alias == selection.episode_alias
+                            && episode.purchase == model::PurchaseState::Rented
+                    });
+                    let title_gifts = (!self.gifts.error
+                        && self.gifts.task.is_none()
+                        && self.gifts.title_id == Some(selection.title_id))
+                    .then_some(self.gifts.available)
+                    .flatten();
+                    self.commerce
+                        .quote_received(quote, spendable, title_gifts, active_rental)
+                }
+                Err(_) => self.commerce.quote_failed(),
+            },
+            TaskOutcome::Completed(_) | TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
+                self.commerce.quote_failed()
+            }
+        }
+    }
+
+    fn handle_post_outcome(
+        &mut self,
+        marker: &commerce::UnresolvedMutationV1,
+        outcome: TaskOutcome,
+    ) -> commerce::CommerceEffects {
+        let (outcome, accepted) = match outcome {
+            TaskOutcome::Completed(bytes)
+                if parse::purchase_receipt(&bytes).is_ok_and(|receipt| {
+                    receipt.purchase_type == marker.purchase_type
+                        && receipt.content_alias == marker.title_alias
+                        && receipt.episode_alias == marker.episode_alias
+                        && receipt.coin_use.aggregate == marker.quoted_price
+                }) =>
+            {
+                (commerce::PostOutcome::Accepted, true)
+            }
+            TaskOutcome::Completed(bytes) if parse::purchase_explicitly_rejected(&bytes) => {
+                (commerce::PostOutcome::ExplicitRejection, false)
+            }
+            TaskOutcome::Completed(_) | TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
+                (commerce::PostOutcome::Ambiguous, false)
+            }
+        };
+        self.reconciliation_post_accepted = accepted;
+        self.commerce.mutation_finished(outcome)
+    }
 
     fn update_commerce_safety(&mut self, context: &mut Context) {
         let effects = self
@@ -2649,11 +2614,7 @@ impl Bomtoon {
             self.scope_refresh_pending = false;
         }
     }
-    fn finish_credential_loss(
-        &mut self,
-        context: &mut Context,
-        account: AccountState,
-    ) {
+    fn finish_credential_loss(&mut self, context: &mut Context, account: AccountState) {
         self.transition_after_credential_loss(context, account);
     }
 
@@ -2661,15 +2622,12 @@ impl Bomtoon {
         match outcome {
             TaskOutcome::Completed(bytes) => {
                 self.connection = ConnectionState::Online;
-                match commerce::AccountScope::from_bytes(&bytes) {
-                    Ok(scope) => {
-                        self.account = AccountState::Active;
-                        self.account_scope = Some(scope);
-                    }
-                    Err(_) => {
-                        self.account = AccountState::Active;
-                        self.account_scope = None;
-                    }
+                if let Ok(scope) = commerce::AccountScope::from_bytes(&bytes) {
+                    self.account = AccountState::Active;
+                    self.account_scope = Some(scope);
+                } else {
+                    self.account = AccountState::Active;
+                    self.account_scope = None;
                 }
                 self.problem = None;
                 self.update_commerce_safety(context);
@@ -2746,8 +2704,6 @@ impl Bomtoon {
         self.next_recent_page = None;
         self.total_library_titles = 0;
         self.total_recent_titles = 0;
-        self.library_loaded = false;
-        self.recent_loaded = false;
     }
 
     fn transition_after_credential_loss(&mut self, context: &mut Context, account: AccountState) {
@@ -2762,10 +2718,9 @@ impl Bomtoon {
             View::Status
         };
         self.problem = None;
-        let effects = self.commerce.safety_changed(
-            self.authentication(),
-            commerce::Connectivity::Online,
-        );
+        let effects = self
+            .commerce
+            .safety_changed(self.authentication(), commerce::Connectivity::Online);
         self.apply_commerce_effects(context, effects);
     }
 
@@ -3927,7 +3882,6 @@ impl Bomtoon {
             Pending::Library(expected) => match parse::library(bytes) {
                 Ok(page) if page.number == expected => {
                     self.library_load.finish();
-                    self.library_loaded = true;
                     self.total_library_titles = page.total_items;
                     self.comics.extend(page.comics);
                     self.next_library_page =
@@ -3944,7 +3898,6 @@ impl Bomtoon {
             Pending::Recent(expected) => match parse::recent(bytes) {
                 Ok(page) if page.number == expected => {
                     self.recent_load.finish();
-                    self.recent_loaded = true;
                     self.total_recent_titles = page.total_items;
                     self.recent.extend(page.entries);
                     self.next_recent_page =
@@ -3959,11 +3912,11 @@ impl Bomtoon {
                 Err(error) => self.recent_load.fail(expected, error.to_string()),
             },
             Pending::Content(_index) => match parse::content_detail(bytes) {
-                Ok(content) => {
+                Ok(detail) => {
                     let reader_after_refresh = self.reader_after_content_refresh.take();
                     let episode_page = self.page;
-                    self.selected_content_id = Some(content.id);
-                    self.episodes = content.episodes;
+                    self.selected_content_id = Some(detail.id);
+                    self.episodes = detail.episodes;
                     self.page = reader_after_refresh.map_or(0, |_| {
                         episode_page.min(
                             self.episodes
@@ -4079,9 +4032,7 @@ impl Bomtoon {
             return;
         }
         if episode.purchase == model::PurchaseState::Rented
-            && unix_time_ms()
-                .and_then(|now| episode.remaining_rental_hours(now))
-                == Some(0)
+            && unix_time_ms().and_then(|now| episode.remaining_rental_hours(now)) == Some(0)
         {
             self.reader_after_content_refresh = Some(index);
             self.request_foreground(context, Pending::Content(index));
@@ -4302,10 +4253,7 @@ impl Bomtoon {
         }
         match (pending, error) {
             (Pending::Logout, TaskError::RevocationUnconfirmed) => {
-                self.transition_after_credential_loss(
-                    context,
-                    AccountState::RevocationUnconfirmed,
-                );
+                self.transition_after_credential_loss(context, AccountState::RevocationUnconfirmed);
             }
             (Pending::Logout, TaskError::LocalStorage) => {
                 self.problem = Some("Could not remove the local BOMTOON sign-in data.".to_owned());
@@ -4638,6 +4586,38 @@ impl Bomtoon {
             }
         }
     }
+    fn handle_foreground_task_outcome(
+        &mut self,
+        context: &mut Context,
+        task: TaskId,
+        outcome: TaskOutcome,
+    ) {
+        if self.task != Some(task) {
+            self.resume_capacity_work(context);
+            return;
+        }
+        self.task = None;
+        let Some(pending) = self.pending.take() else {
+            self.resume_capacity_work(context);
+            return;
+        };
+        self.observe_connectivity(context, &outcome);
+        let shown = match outcome {
+            TaskOutcome::Completed(bytes) => self.accept(context, pending, &bytes),
+            TaskOutcome::Failed(error) => {
+                self.fail_task(context, pending, error);
+                false
+            }
+            TaskOutcome::Cancelled => {
+                self.cancel_task(pending);
+                false
+            }
+        };
+        if !shown {
+            self.show(context);
+        }
+        self.resume_capacity_work(context);
+    }
 }
 
 impl KoboApp for Bomtoon {
@@ -4730,8 +4710,7 @@ impl KoboApp for Bomtoon {
                     self.show(context);
                     return;
                 }
-                commerce::CommerceState::LoadingSafetyState
-                | commerce::CommerceState::Idle => {}
+                commerce::CommerceState::LoadingSafetyState | commerce::CommerceState::Idle => {}
             }
         }
         if self.commerce.state() == commerce::CommerceState::AcceptedButStale {
@@ -4743,8 +4722,7 @@ impl KoboApp for Bomtoon {
             }
             return;
         }
-        if self.view == View::Episodes
-            && self.commerce.state() == commerce::CommerceState::Choosing
+        if self.view == View::Episodes && self.commerce.state() == commerce::CommerceState::Choosing
         {
             let choice = if action == action_id(USE_GIFT) {
                 Some(commerce::Action::UseGift)
@@ -4788,7 +4766,7 @@ impl KoboApp for Bomtoon {
             self.view = View::Main;
             self.page = 0;
             self.featured.page = 0;
-            if self.destination == MainDestination::Library && !self.library_loaded {
+            if self.destination == MainDestination::Library && !self.library_load.loaded {
                 self.comics.clear();
                 self.total_library_titles = 0;
                 self.next_library_page = None;
@@ -5004,7 +4982,11 @@ impl KoboApp for Bomtoon {
             self.resume_capacity_work(context);
             return;
         }
-        if self.commerce_task.as_ref().is_some_and(|active| active.id == task) {
+        if self
+            .commerce_task
+            .as_ref()
+            .is_some_and(|active| active.id == task)
+        {
             let commerce_task = self
                 .commerce_task
                 .take()
@@ -5076,39 +5058,14 @@ impl KoboApp for Bomtoon {
             self.resume_capacity_work(context);
             return;
         }
-        if self.task != Some(task) {
-            self.resume_capacity_work(context);
-            return;
-        }
-        self.task = None;
-        let Some(pending) = self.pending.take() else {
-            self.resume_capacity_work(context);
-            return;
-        };
-        self.observe_connectivity(context, &outcome);
-        let shown = match outcome {
-            TaskOutcome::Completed(bytes) => self.accept(context, pending, &bytes),
-            TaskOutcome::Failed(error) => {
-                self.fail_task(context, pending, error);
-                false
-            }
-            TaskOutcome::Cancelled => {
-                self.cancel_task(pending);
-                false
-            }
-        };
-        if !shown {
-            self.show(context);
-        }
-        self.resume_capacity_work(context);
+        self.handle_foreground_task_outcome(context, task, outcome);
     }
 
     fn on_store(&mut self, context: &mut Context, result: StoreResult) {
         let effects = match (&self.marker_store, result) {
-            (
-                Some(MarkerStoreOperation::Load),
-                StoreResult::Loaded { key, value },
-            ) if key == commerce::MARKER_KEY => {
+            (Some(MarkerStoreOperation::Load), StoreResult::Loaded { key, value })
+                if key == commerce::MARKER_KEY =>
+            {
                 self.marker_store = None;
                 Some(self.commerce.marker_loaded(value.as_deref()))
             }
@@ -6457,14 +6414,8 @@ mod tests {
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
-        runner.task_outcome(
-            library,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
-        );
-        runner.task_outcome(
-            summary,
-            TaskOutcome::Completed(ASSET_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
+        runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         (runner, homepage)
     }
 
@@ -6500,9 +6451,13 @@ mod tests {
 
     fn assert_no_post_or_marker_forget(commands: &[Command]) {
         assert!(
-            commands
-                .iter()
-                .all(|command| !matches!(command, Command::Spawn { work: Task::Post { .. }, .. })),
+            commands.iter().all(|command| !matches!(
+                command,
+                Command::Spawn {
+                    work: Task::Post { .. },
+                    ..
+                }
+            )),
             "commerce emitted POST: {commands:?}"
         );
         assert!(
@@ -6526,7 +6481,9 @@ mod tests {
             commerce::CommerceState::LoadingSafetyState
         );
         assert_eq!(spawned.len(), 4);
-        assert!(spawned.iter().any(|(_, work)| *work == api::account_scope()));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::account_scope()));
         assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
         assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
         assert!(spawned
@@ -6560,10 +6517,7 @@ mod tests {
         );
         assert_eq!(runner.app().account, AccountState::Active);
         assert_eq!(runner.app().connection, ConnectionState::Online);
-        assert_eq!(
-            runner.app().commerce.state(),
-            commerce::CommerceState::Idle
-        );
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
         assert_no_post_or_marker_forget(&scope_commands);
     }
 
@@ -6588,10 +6542,7 @@ mod tests {
         });
         assert_eq!(runner.app().account, AccountState::Active);
         assert_eq!(runner.app().connection, ConnectionState::Online);
-        assert_eq!(
-            runner.app().commerce.state(),
-            commerce::CommerceState::Idle
-        );
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
         assert_no_post_or_marker_forget(&marker_commands);
     }
 
@@ -6665,8 +6616,7 @@ mod tests {
             (TaskError::NoCredential, AccountState::SignedOut),
             (TaskError::Unauthorized, AccountState::Expired),
         ] {
-            let (mut runner, task) =
-                startup_with_marker(Some(marker_for(test_scope(OWNER))));
+            let (mut runner, task) = startup_with_marker(Some(marker_for(test_scope(OWNER))));
 
             let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
 
@@ -6756,8 +6706,7 @@ mod tests {
         runner.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
         assert_eq!(runner.app().connection, ConnectionState::Online);
 
-        let commands =
-            runner.task_outcome(TaskId(999), TaskOutcome::Failed(TaskError::Offline));
+        let commands = runner.task_outcome(TaskId(999), TaskOutcome::Failed(TaskError::Offline));
 
         assert_eq!(runner.app().connection, ConnectionState::Online);
         assert_no_post_or_marker_forget(&commands);
@@ -6811,8 +6760,7 @@ mod tests {
         commerce.begin_quote(commerce_selection(), model::PurchaseType::Rent);
         commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
         commerce.choose(commerce::Action::Rent);
-        let effects =
-            commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
+        let effects = commerce.quote_received(commerce_quote(), Some(10), Some(0), false);
         assert!(matches!(
             effects.command,
             Some(commerce::CommerceCommand::SaveMarker(_))
@@ -6843,19 +6791,11 @@ mod tests {
             let scope = scope_task(&commands);
             let mut observed = Vec::new();
             if scope_first {
-                observed.extend(runner.task_outcome(
-                    scope,
-                    TaskOutcome::Completed(SCOPE.to_vec()),
-                ));
+                observed.extend(runner.task_outcome(scope, TaskOutcome::Completed(SCOPE.to_vec())));
             }
-            observed.extend(
-                runner.store_result(StoreResult::Denied(StoreError::Unwritable)),
-            );
+            observed.extend(runner.store_result(StoreResult::Denied(StoreError::Unwritable)));
             if !scope_first {
-                observed.extend(runner.task_outcome(
-                    scope,
-                    TaskOutcome::Completed(SCOPE.to_vec()),
-                ));
+                observed.extend(runner.task_outcome(scope, TaskOutcome::Completed(SCOPE.to_vec())));
             }
 
             assert_eq!(
@@ -6874,10 +6814,7 @@ mod tests {
             key: "other".to_owned(),
             value: None,
         });
-        assert_eq!(
-            runner.app().marker_store,
-            Some(MarkerStoreOperation::Load)
-        );
+        assert_eq!(runner.app().marker_store, Some(MarkerStoreOperation::Load));
         assert_eq!(
             runner.app().commerce.state(),
             commerce::CommerceState::LoadingSafetyState
@@ -6886,10 +6823,7 @@ mod tests {
         runner.store_result(StoreResult::Saved {
             key: commerce::MARKER_KEY.to_owned(),
         });
-        assert_eq!(
-            runner.app().marker_store,
-            Some(MarkerStoreOperation::Load)
-        );
+        assert_eq!(runner.app().marker_store, Some(MarkerStoreOperation::Load));
         assert_eq!(
             runner.app().commerce.state(),
             commerce::CommerceState::LoadingSafetyState
@@ -6921,10 +6855,7 @@ mod tests {
             runner.app().commerce.state(),
             commerce::CommerceState::PersistingIntent
         );
-        assert_eq!(
-            runner.app().marker_store,
-            Some(MarkerStoreOperation::Save)
-        );
+        assert_eq!(runner.app().marker_store, Some(MarkerStoreOperation::Save));
 
         runner.store_result(StoreResult::Forgotten {
             key: commerce::MARKER_KEY.to_owned(),
@@ -6933,10 +6864,7 @@ mod tests {
             runner.app().commerce.state(),
             commerce::CommerceState::PersistingIntent
         );
-        assert_eq!(
-            runner.app().marker_store,
-            Some(MarkerStoreOperation::Save)
-        );
+        assert_eq!(runner.app().marker_store, Some(MarkerStoreOperation::Save));
 
         runner.store_result(StoreResult::Saved {
             key: commerce::MARKER_KEY.to_owned(),
@@ -6998,14 +6926,11 @@ mod tests {
         const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
         let scope = test_scope(SCOPE);
         let marker = marker_for(scope);
-        for commerce in [
-            persisting_commerce(scope),
-            {
-                let mut commerce = persisting_commerce(scope);
-                commerce.marker_saved(commerce::MARKER_KEY);
-                commerce
-            },
-        ] {
+        for commerce in [persisting_commerce(scope), {
+            let mut commerce = persisting_commerce(scope);
+            commerce.marker_saved(commerce::MARKER_KEY);
+            commerce
+        }] {
             let (mut interrupted, _) = started();
             interrupted.app_mut().commerce = commerce;
             interrupted.app_mut().account_scope = Some(scope);
@@ -7013,8 +6938,7 @@ mod tests {
             assert_no_post_or_marker_forget(&exit_commands);
 
             let (mut restarted, task) = startup_with_marker(Some(marker.clone()));
-            let commands =
-                restarted.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
+            let commands = restarted.task_outcome(task, TaskOutcome::Completed(SCOPE.to_vec()));
             assert_eq!(
                 restarted.app().commerce.state(),
                 commerce::CommerceState::Reconciling
@@ -7085,17 +7009,10 @@ mod tests {
     fn unresolved_marker_logout_preserves_marker_and_clears_commerce_access() {
         const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
         let scope = test_scope(SCOPE);
-        let (mut runner, scope_task) =
-            startup_with_marker(Some(marker_for(scope)));
-        runner.task_outcome(
-            scope_task,
-            TaskOutcome::Completed(SCOPE.to_vec()),
-        );
+        let (mut runner, scope_task) = startup_with_marker(Some(marker_for(scope)));
+        runner.task_outcome(scope_task, TaskOutcome::Completed(SCOPE.to_vec()));
         let library = runner.app().task.expect("startup library task");
-        runner.task_outcome(
-            library,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         let logout = begin_logout(&mut runner);
 
         let commands = runner.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
@@ -7216,6 +7133,13 @@ mod tests {
                 bonus: 1,
                 free: 0,
             },
+        }
+    }
+
+    fn loaded_shelf() -> ShelfLoadState {
+        ShelfLoadState {
+            loaded: true,
+            ..ShelfLoadState::default()
         }
     }
 
@@ -7702,8 +7626,8 @@ mod tests {
         app.next_recent_page = Some(5);
         app.total_library_titles = 91;
         app.total_recent_titles = 62;
-        app.library_loaded = true;
-        app.recent_loaded = true;
+        app.library_load.loaded = true;
+        app.recent_load.loaded = true;
     }
 
     fn assert_all_account_data_cleared(app: &Bomtoon) {
@@ -7717,8 +7641,8 @@ mod tests {
         assert_eq!(app.next_recent_page, None);
         assert_eq!(app.total_library_titles, 0);
         assert_eq!(app.total_recent_titles, 0);
-        assert!(!app.library_loaded);
-        assert!(!app.recent_loaded);
+        assert!(!app.library_load.loaded);
+        assert!(!app.recent_load.loaded);
     }
 
     fn assert_seeded_account_data_is_kept(app: &Bomtoon) {
@@ -7732,8 +7656,8 @@ mod tests {
         assert_eq!(app.next_recent_page, Some(5));
         assert_eq!(app.total_library_titles, 91);
         assert_eq!(app.total_recent_titles, 62);
-        assert!(app.library_loaded);
-        assert!(app.recent_loaded);
+        assert!(app.library_load.loaded);
+        assert!(app.recent_load.loaded);
     }
 
     fn begin_logout(runner: &mut AppRunner<Bomtoon>) -> TaskId {
@@ -7795,8 +7719,8 @@ mod tests {
                 account: AccountState::Active,
                 view: View::Main,
                 destination,
-                library_loaded: true,
-                recent_loaded: true,
+                library_load: loaded_shelf(),
+                recent_load: loaded_shelf(),
                 wallet: WalletState {
                     summary: Some(test_wallet_summary()),
                     ..WalletState::default()
@@ -7896,8 +7820,8 @@ mod tests {
             let screen = Bomtoon {
                 view: View::Main,
                 destination,
-                library_loaded: true,
-                recent_loaded: true,
+                library_load: loaded_shelf(),
+                recent_load: loaded_shelf(),
                 ..Bomtoon::default()
             }
             .screen();
@@ -7981,7 +7905,7 @@ mod tests {
             account: AccountState::Active,
             view: View::Main,
             destination: MainDestination::Recent,
-            recent_loaded: true,
+            recent_load: loaded_shelf(),
             page: 4,
             ..Bomtoon::default()
         });
@@ -8026,7 +7950,7 @@ mod tests {
 
         runner.task_outcome(retry, TaskOutcome::Completed(RECENT_RESPONSE.to_vec()));
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert!(runner.app().recent_loaded);
+        assert!(runner.app().recent_load.loaded);
         assert!(runner.app().recent_load.error.is_none());
 
         let commands = runner.action(action_id(RECENT));
@@ -8038,7 +7962,7 @@ mod tests {
     #[test]
     fn protected_shelf_work_allows_destination_switches_and_serializes_one_next_shelf() {
         let (mut runner, _) = started_ready_for_homepage();
-        runner.app_mut().library_loaded = false;
+        runner.app_mut().library_load.loaded = false;
         runner.app_mut().comics.clear();
 
         let recent_commands = runner.action(action_id(RECENT));
@@ -8054,13 +7978,13 @@ mod tests {
         let (library, work) = only_spawn(&commands);
         assert_eq!(work, api::library(0));
         assert_eq!(runner.app().destination, MainDestination::Library);
-        assert!(runner.app().recent_loaded);
+        assert!(runner.app().recent_load.loaded);
         assert_eq!(runner.app().pending, Some(Pending::Library(0)));
 
         runner.action(action_id(FEATURED));
         runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert!(runner.app().library_loaded);
+        assert!(runner.app().library_load.loaded);
         assert!(runner.app().library_load.error.is_none());
     }
 
@@ -8178,7 +8102,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.app_mut().destination = MainDestination::Recent;
-        runner.app_mut().recent_loaded = true;
+        runner.app_mut().recent_load.loaded = true;
         runner.app_mut().page = 4;
 
         runner.action(action_id(LIBRARY));
@@ -9456,7 +9380,9 @@ mod tests {
         let (_, commands) = started();
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 4);
-        assert!(spawned.iter().any(|(_, work)| *work == api::account_scope()));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::account_scope()));
         assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
         assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
         assert!(spawned
@@ -10449,8 +10375,8 @@ mod tests {
             purchase_coin: None,
             gift_eligible: false,
         }];
-        app.library_loaded = true;
-        app.recent_loaded = true;
+        app.library_load.loaded = true;
+        app.recent_load.loaded = true;
         app.selected_content_alias = "protected".to_owned();
         app.selected_title = "Protected".to_owned();
         app.wallet = WalletState {
@@ -11053,7 +10979,7 @@ mod tests {
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().comics.len(), 1);
         assert_eq!(runner.app().total_library_titles, 1);
-        assert!(runner.app().library_loaded);
+        assert!(runner.app().library_load.loaded);
     }
 
     #[test]
@@ -12630,9 +12556,11 @@ mod tests {
         assert!(runner.app().featured.stale_warning.is_none());
     }
 
-    #[test]
-    fn refresh_success_is_atomic_and_reprioritizes_visible_covers() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
+    fn settle_visible_cover_baseline(
+        runner: &mut AppRunner<Bomtoon>,
+        shared_url: &str,
+        obsolete_urls: &[&str; 2],
+    ) -> (BTreeMap<String, TaskId>, Option<TilePicture>) {
         let cover_commands = runner.action(action_id(PREVIOUS_PAGE));
         let cover_tasks = spawns(&cover_commands)
             .into_iter()
@@ -12643,14 +12571,13 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         for url in runner.app().covers.visible_urls.clone() {
             if !cover_tasks.contains_key(&url) {
-                runner.app_mut().covers.entries.insert(url, CoverState::Failed);
+                runner
+                    .app_mut()
+                    .covers
+                    .entries
+                    .insert(url, CoverState::Failed);
             }
         }
-        let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp";
-        let obsolete_urls = [
-            "https://image.balcony.studio/tw/contents/feature-c.webp",
-            "https://image.balcony.studio/tw/contents/rec-0.webp",
-        ];
         for url in [
             shared_url,
             "https://image.balcony.studio/tw/contents/feature-b.webp",
@@ -12669,9 +12596,22 @@ mod tests {
         let _obsolete_picture = ready_cover(&runner.app().covers, Some(obsolete_urls[0]))
             .expect("settled obsolete cover picture");
         assert_eq!(runner.tasks_in_flight(), 1);
+        let shared_picture = ready_cover(&runner.app().covers, Some(shared_url));
+        (cover_tasks, shared_picture)
+    }
+
+    #[test]
+    fn refresh_success_is_atomic_and_reprioritizes_visible_covers() {
+        let mut runner = ready_featured_runner(Some(local_day(30)));
+        let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp";
+        let obsolete_urls = [
+            "https://image.balcony.studio/tw/contents/feature-c.webp",
+            "https://image.balcony.studio/tw/contents/rec-0.webp",
+        ];
+        let (cover_tasks, shared_picture) =
+            settle_visible_cover_baseline(&mut runner, shared_url, &obsolete_urls);
         let old_featured = runner.app().featured.featured.clone();
         let old_recommended = runner.app().featured.recommended.clone();
-        let shared_picture = ready_cover(&runner.app().covers, Some(shared_url));
 
         let commands = observe_local_day(&mut runner, Some(local_day(31)));
         let (homepage, _) = fetch_task_with(&commands, "/comic/main");
@@ -13415,7 +13355,7 @@ mod tests {
                 recent: (0..count)
                     .map(|index| recent_shelf_entry(index, Some(shelf_cover_url(index))))
                     .collect(),
-                recent_loaded: true,
+                recent_load: loaded_shelf(),
                 total_recent_titles: count,
                 ..Bomtoon::default()
             },
@@ -13432,7 +13372,7 @@ mod tests {
                 comics: (0..count)
                     .map(|index| library_shelf_comic(index, Some(shelf_cover_url(index))))
                     .collect(),
-                library_loaded: true,
+                library_load: loaded_shelf(),
                 total_library_titles: count,
                 ..Bomtoon::default()
             },
@@ -13500,7 +13440,7 @@ mod tests {
         }
 
         runner.task_outcome(recent, TaskOutcome::Completed(RECENT_RESPONSE.to_vec()));
-        assert!(runner.app().recent_loaded);
+        assert!(runner.app().recent_load.loaded);
         assert_eq!(runner.app().destination, MainDestination::Recent);
         assert!(runner.app().problem.is_none());
     }
@@ -13578,8 +13518,8 @@ mod tests {
                 destination,
                 recent: vec![recent_shelf_entry(0, None)],
                 comics: vec![library_shelf_comic(0, None)],
-                recent_loaded: true,
-                library_loaded: true,
+                recent_load: loaded_shelf(),
+                library_load: loaded_shelf(),
                 total_recent_titles: 1,
                 total_library_titles: 1,
                 ..Bomtoon::default()
@@ -13656,7 +13596,7 @@ mod tests {
                 comics: (0..6)
                     .map(|index| library_shelf_comic(index, None))
                     .collect(),
-                library_loaded: true,
+                library_load: loaded_shelf(),
                 total_library_titles: 6,
                 ..Bomtoon::default()
             },
@@ -13708,7 +13648,7 @@ mod tests {
                     recent_shelf_entry(0, Some(shared.clone())),
                     recent_shelf_entry(1, Some(shared.clone())),
                 ],
-                recent_loaded: true,
+                recent_load: loaded_shelf(),
                 total_recent_titles: 2,
                 ..Bomtoon::default()
             },
@@ -13875,10 +13815,7 @@ mod tests {
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
-        runner.task_outcome(
-            library,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         runner.app_mut().featured = feed_with_recommendations(6);
 
         let commands = runner.action(action_id(FEATURED));
@@ -14047,11 +13984,9 @@ mod tests {
         let commands = runner.action(action_id(RETRY_GIFTS));
         let (_, work) = only_spawn(&commands);
         assert_eq!(work, api::title_gifts(41));
-        assert!(
-            spawns(&commands)
-                .iter()
-                .all(|(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/asset/user")))
-        );
+        assert!(spawns(&commands).iter().all(
+            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/asset/user"))
+        ));
     }
     #[test]
     fn quote_requote_and_marker_acknowledgement_order_the_purchase_post() {
@@ -14070,10 +14005,7 @@ mod tests {
             TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
         );
         let (gift_task, _) = only_spawn(&commands);
-        runner.task_outcome(
-            gift_task,
-            TaskOutcome::Completed(GIFT_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(gift_task, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
 
         let commands = runner.action(action_id("episode-4"));
         let (quote_task, work) = only_spawn(&commands);
@@ -14081,10 +14013,8 @@ mod tests {
             work,
             api::quote("hunter_q", "paid", model::PurchaseType::Possession)
         );
-        let commands = runner.task_outcome(
-            quote_task,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(quote_task, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let quote_screen = last_screen(&commands);
         assert!(format!("{quote_screen:?}").contains("Buy · 2 coins"));
 
@@ -14133,11 +14063,11 @@ mod tests {
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
-        runner.task_outcome(
-            quote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
+        runner.task_outcome(quote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Choosing
         );
-        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Choosing);
         runner
     }
 
@@ -14149,10 +14079,7 @@ mod tests {
             work,
             api::quote("hunter_q", "paid", model::PurchaseType::Possession)
         );
-        runner.task_outcome(
-            requote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(requote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let commands = runner.store_result(StoreResult::Saved {
             key: commerce::MARKER_KEY.to_owned(),
         });
@@ -14179,15 +14106,9 @@ mod tests {
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
-        runner.task_outcome(
-            quote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(quote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let (requote, _) = only_spawn(&runner.action(action_id(RENT)));
-        runner.task_outcome(
-            requote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(requote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let commands = runner.store_result(StoreResult::Saved {
             key: commerce::MARKER_KEY.to_owned(),
         });
@@ -14214,15 +14135,9 @@ mod tests {
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
-        runner.task_outcome(
-            quote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(quote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let (requote, _) = only_spawn(&runner.action(action_id(USE_GIFT)));
-        runner.task_outcome(
-            requote,
-            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(requote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
         let commands = runner.store_result(StoreResult::Saved {
             key: commerce::MARKER_KEY.to_owned(),
         });
@@ -14247,17 +14162,15 @@ mod tests {
         let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Forget { .. })
-        )));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
 
         let commands =
             runner.task_outcome(content, TaskOutcome::Completed(RENTED_CONTENT.to_vec()));
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Forget { .. })
-        )));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(NINE_COINS.to_vec()));
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -14379,11 +14292,9 @@ mod tests {
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
-        assert!(
-            spawns(&commands)
-                .iter()
-                .all(|(_, work)| !matches!(work, Task::Post { .. }))
-        );
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| !matches!(work, Task::Post { .. })));
 
         runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
         runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
@@ -14418,8 +14329,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
 
@@ -14428,14 +14338,13 @@ mod tests {
         assert_eq!(work, api::content("hunter_q"));
         assert_eq!(runner.app().view, View::Episodes);
 
-        let commands =
-            runner.task_outcome(refresh, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
+        let commands = runner.task_outcome(refresh, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
         assert!(spawns(&commands).iter().any(
             |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/images/"))
         ));
-        assert!(spawns(&commands).iter().all(
-            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/gift/"))
-        ));
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/gift/"))));
         assert_eq!(runner.app().view, View::Reader);
     }
     #[test]
@@ -14445,24 +14354,24 @@ mod tests {
         let (requote, _) = only_spawn(&before_save.action(action_id(RENT)));
         let commands = before_save.action(ActionId::BACK);
         assert!(commands.contains(&Command::Cancel(requote)));
-        assert_eq!(before_save.app().commerce.state(), commerce::CommerceState::Idle);
+        assert_eq!(
+            before_save.app().commerce.state(),
+            commerce::CommerceState::Idle
+        );
         assert_eq!(before_save.app().view, View::Episodes);
         assert_no_post_or_marker_forget(&commands);
-        let commands =
-            before_save.task_outcome(requote, TaskOutcome::Completed(QUOTE.to_vec()));
+        let commands = before_save.task_outcome(requote, TaskOutcome::Completed(QUOTE.to_vec()));
         assert_no_post_or_marker_forget(&commands);
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Save { .. })
-        )));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Save { .. }))));
 
         let mut persisting = runner_choosing_paid_episode();
         let (requote, _) = only_spawn(&persisting.action(action_id(RENT)));
         let commands = persisting.task_outcome(requote, TaskOutcome::Completed(QUOTE.to_vec()));
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Save { .. })
-        )));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Save { .. }))));
         let commands = persisting.action(ActionId::BACK);
         assert_eq!(
             persisting.app().commerce.state(),
@@ -14504,10 +14413,9 @@ mod tests {
             runner.app().commerce.state(),
             commerce::CommerceState::ClearingIntent
         );
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Forget { .. })
-        )));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
         let commands = runner.action(ActionId::BACK);
         assert_eq!(runner.app().view, View::Episodes);
         assert_no_post_or_marker_forget(&commands);
@@ -14641,18 +14549,16 @@ mod tests {
         let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Forget { .. })
-        )));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
         runner.store_result(StoreResult::Forgotten {
             key: commerce::MARKER_KEY.to_owned(),
         });
-        assert!(!runner.app().library_loaded);
+        assert!(!runner.app().library_load.loaded);
         assert_eq!(runner.app().view, View::Episodes);
 
         let commands = runner.action(ActionId::BACK);
@@ -14679,14 +14585,12 @@ mod tests {
             .all(|(_, work)| !matches!(work, Task::Post { .. })));
         let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Forget { .. })
-        )));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
         assert!(spawns(&commands)
             .iter()
             .all(|(_, work)| !matches!(work, Task::Post { .. })));
@@ -14776,9 +14680,8 @@ mod tests {
         assert_eq!(runner.app().view, View::Episodes);
         assert!(spawns(&commands).is_empty());
         assert_no_post_or_marker_forget(&commands);
-        assert!(!commands.iter().any(|command| matches!(
-            command,
-            Command::Store(StoreRequest::Save { .. })
-        )));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::Save { .. }))));
     }
 }

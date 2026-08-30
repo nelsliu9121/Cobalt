@@ -123,9 +123,7 @@ pub fn quote(content_alias: &str, episode_alias: &str, purchase: PurchaseType) -
         PurchaseType::Possession => PurchaseType::Possession.as_remote(),
     };
     fetch(
-        format!(
-            "{QUOTE_URL}{content_alias}/{episode_alias}?purchaseType={purchase_type}"
-        ),
+        format!("{QUOTE_URL}{content_alias}/{episode_alias}?purchaseType={purchase_type}"),
         COMMERCE_BYTES,
         Credential::bearer("bomtoon-access-token"),
         balcony_headers(),
@@ -134,8 +132,7 @@ pub fn quote(content_alias: &str, episode_alias: &str, purchase: PurchaseType) -
 
 pub fn purchase(content_alias: &str, episode_id: usize, purchase: PurchaseType) -> Task {
     let episode_id_text = episode_id.to_string();
-    let episode_id =
-        kobo_json::parse(&episode_id_text).expect("a usize is always a JSON integer");
+    let episode_id = kobo_json::parse(&episode_id_text).expect("a usize is always a JSON integer");
     let body = ObjectBuilder::new()
         .set("id", episode_id)
         .set("purchaseType", purchase.as_remote())

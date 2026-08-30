@@ -180,10 +180,7 @@ fn strict_marker_fields(value: &Value) -> Result<&[(String, Value)], MarkerError
     Ok(fields)
 }
 
-fn field<'a>(
-    fields: &'a [(String, Value)],
-    name: &'static str,
-) -> Result<&'a Value, MarkerError> {
+fn field<'a>(fields: &'a [(String, Value)], name: &'static str) -> Result<&'a Value, MarkerError> {
     fields
         .iter()
         .find(|(candidate, _)| candidate == name)
@@ -198,10 +195,7 @@ fn parse_usize(value: &Value, name: &'static str) -> Result<usize, MarkerError> 
         .ok_or(MarkerError::InvalidField(name))
 }
 
-fn parse_optional_usize(
-    value: &Value,
-    name: &'static str,
-) -> Result<Option<usize>, MarkerError> {
+fn parse_optional_usize(value: &Value, name: &'static str) -> Result<Option<usize>, MarkerError> {
     if matches!(value, Value::Null) {
         Ok(None)
     } else {
@@ -422,11 +416,7 @@ fn quote_presentation(
     }
 }
 
-fn gift_control(
-    quote: &Quote,
-    title_gifts: Option<usize>,
-    active_rental: bool,
-) -> QuoteControl {
+fn gift_control(quote: &Quote, title_gifts: Option<usize>, active_rental: bool) -> QuoteControl {
     let disabled_reason = if active_rental {
         Some("Active rental".to_owned())
     } else if quote.is_available {
@@ -609,7 +599,6 @@ impl Commerce {
         }
     }
 
-
     #[must_use]
     pub fn reconciliation_marker(&self) -> Option<&UnresolvedMutationV1> {
         match &self.flow {
@@ -666,10 +655,7 @@ impl Commerce {
             return self.settle_loaded_marker();
         }
 
-        if matches!(
-            self.flow,
-            Flow::LoadingSafetyState | Flow::AcceptedButStale
-        ) {
+        if matches!(self.flow, Flow::LoadingSafetyState | Flow::AcceptedButStale) {
             return self.settle_loaded_marker();
         }
         CommerceEffects::default()
@@ -688,11 +674,7 @@ impl Commerce {
         self.settle_loaded_marker()
     }
 
-    pub fn begin_quote(
-        &mut self,
-        selection: Selection,
-        purchase: PurchaseType,
-    ) -> CommerceEffects {
+    pub fn begin_quote(&mut self, selection: Selection, purchase: PurchaseType) -> CommerceEffects {
         if !matches!(self.flow, Flow::Idle)
             || validate_alias(&selection.title_alias, "title_alias").is_err()
             || validate_alias(&selection.episode_alias, "episode_alias").is_err()
@@ -726,8 +708,7 @@ impl Commerce {
                 account_scope,
                 selection,
             } => {
-                if self.current_scope() != Some(account_scope)
-                    || !quote_matches(&selection, &quote)
+                if self.current_scope() != Some(account_scope) || !quote_matches(&selection, &quote)
                 {
                     self.flow = Flow::LoadingSafetyState;
                     return self.settle_loaded_marker();
@@ -987,11 +968,6 @@ impl Commerce {
         CommerceEffects::reconcile(selection, true, true)
     }
 
-    #[must_use]
-    pub const fn can_emit_post(&self) -> bool {
-        false
-    }
-
     fn settle_loaded_marker(&mut self) -> CommerceEffects {
         match &self.marker {
             MarkerLoad::Pending => {
@@ -1019,18 +995,15 @@ impl Commerce {
                         };
                         CommerceEffects::reconcile(selection, true, true)
                     }
-                    Some(_) => {
-                        self.flow = Flow::AcceptedButStale;
-                        CommerceEffects::redraw()
-                    }
                     None if matches!(
                         (self.authentication, self.connectivity),
                         (Authentication::Unknown, _) | (_, Connectivity::Unknown)
-                    ) => {
+                    ) =>
+                    {
                         self.flow = Flow::LoadingSafetyState;
                         CommerceEffects::default()
                     }
-                    None => {
+                    Some(_) | None => {
                         self.flow = Flow::AcceptedButStale;
                         CommerceEffects::redraw()
                     }
@@ -1093,14 +1066,14 @@ impl Commerce {
 
     fn volatile_scope(&self) -> Option<AccountScope> {
         match &self.flow {
-            Flow::Quoting { account_scope, .. } => Some(*account_scope),
-            Flow::Choosing(choosing) => Some(choosing.account_scope),
-            Flow::Requoting { previous, .. } => Some(previous.account_scope),
-            Flow::Reconciling {
+            Flow::Quoting { account_scope, .. }
+            | Flow::Reconciling {
                 account_scope,
                 marker: None,
                 ..
             } => Some(*account_scope),
+            Flow::Choosing(choosing) => Some(choosing.account_scope),
+            Flow::Requoting { previous, .. } => Some(previous.account_scope),
             Flow::LoadingSafetyState
             | Flow::Idle
             | Flow::PersistingIntent { .. }
@@ -1217,10 +1190,7 @@ mod tests {
 
     fn ready() -> Commerce {
         let mut commerce = Commerce::new();
-        commerce.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         commerce.marker_loaded(None);
         assert_eq!(commerce.state(), CommerceState::Idle);
         commerce
@@ -1281,7 +1251,10 @@ mod tests {
             b"00112233445566778899aabbccddeeff0".as_slice(),
             b"00112233445566778899aabbccddeefg".as_slice(),
         ] {
-            assert!(AccountScope::from_bytes(invalid).is_err(), "accepted {invalid:?}");
+            assert!(
+                AccountScope::from_bytes(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
         }
     }
 
@@ -1311,7 +1284,10 @@ mod tests {
         ];
 
         for invalid in cases {
-            assert!(decode_marker(invalid.as_bytes()).is_err(), "accepted {invalid}");
+            assert!(
+                decode_marker(invalid.as_bytes()).is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 
@@ -1347,10 +1323,22 @@ mod tests {
         let gift = marker_json(PurchaseType::RentGift);
         let paid = marker_json(PurchaseType::Rent);
 
-        let gift_without_snapshot = gift.replace("\"pre_mutation_title_gifts\":2", "\"pre_mutation_title_gifts\":null");
-        let gift_with_both = gift.replace("\"pre_mutation_spendable_coin\":null", "\"pre_mutation_spendable_coin\":23");
-        let paid_without_snapshot = paid.replace("\"pre_mutation_spendable_coin\":23", "\"pre_mutation_spendable_coin\":null");
-        let paid_with_both = paid.replace("\"pre_mutation_title_gifts\":null", "\"pre_mutation_title_gifts\":2");
+        let gift_without_snapshot = gift.replace(
+            "\"pre_mutation_title_gifts\":2",
+            "\"pre_mutation_title_gifts\":null",
+        );
+        let gift_with_both = gift.replace(
+            "\"pre_mutation_spendable_coin\":null",
+            "\"pre_mutation_spendable_coin\":23",
+        );
+        let paid_without_snapshot = paid.replace(
+            "\"pre_mutation_spendable_coin\":23",
+            "\"pre_mutation_spendable_coin\":null",
+        );
+        let paid_with_both = paid.replace(
+            "\"pre_mutation_title_gifts\":null",
+            "\"pre_mutation_title_gifts\":2",
+        );
 
         for invalid in [
             gift_without_snapshot,
@@ -1358,7 +1346,10 @@ mod tests {
             paid_without_snapshot,
             paid_with_both,
         ] {
-            assert!(decode_marker(invalid.as_bytes()).is_err(), "accepted {invalid}");
+            assert!(
+                decode_marker(invalid.as_bytes()).is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 
@@ -1380,10 +1371,7 @@ mod tests {
     #[test]
     fn safety_loading_waits_for_marker_authentication_scope_and_connectivity() {
         let mut commerce = Commerce::new();
-        commerce.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         assert_eq!(commerce.state(), CommerceState::LoadingSafetyState);
         assert!(commerce
             .begin_quote(selection(), PurchaseType::Possession)
@@ -1397,10 +1385,7 @@ mod tests {
         let mut reverse = Commerce::new();
         reverse.marker_loaded(None);
         assert_eq!(reverse.state(), CommerceState::LoadingSafetyState);
-        reverse.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        reverse.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         assert_eq!(reverse.state(), CommerceState::Idle);
     }
 
@@ -1431,7 +1416,6 @@ mod tests {
                     .is_none(),
                 "unsafe case emitted a quote"
             );
-            assert!(!commerce.can_emit_post());
         }
     }
 
@@ -1447,7 +1431,6 @@ mod tests {
             .command;
         assert!(matches!(save, Some(CommerceCommand::SaveMarker(_))));
         assert_eq!(commerce.state(), CommerceState::PersistingIntent);
-        assert!(!commerce.can_emit_post());
 
         assert!(commerce.marker_saved("other.key").command.is_none());
         assert_eq!(commerce.state(), CommerceState::PersistingIntent);
@@ -1463,7 +1446,6 @@ mod tests {
         let effects = commerce.store_denied(StoreError::Unwritable);
         assert!(effects.command.is_none());
         assert_eq!(commerce.state(), CommerceState::Choosing);
-        assert!(!commerce.can_emit_post());
     }
 
     #[test]
@@ -1559,10 +1541,8 @@ mod tests {
         let bytes = encode_marker(&marker(PurchaseType::Rent)).expect("marker");
         let mut same = Commerce::new();
         same.marker_loaded(Some(&bytes));
-        let effects = same.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        let effects =
+            same.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         assert!(matches!(
             effects.command,
             Some(CommerceCommand::RefreshContent(_))
@@ -1589,10 +1569,8 @@ mod tests {
     fn malformed_restart_marker_locks_without_reconcile_clear_or_post() {
         let mut commerce = Commerce::new();
         commerce.marker_loaded(Some(b"not a marker"));
-        let effects = commerce.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        let effects =
+            commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         assert!(effects.command.is_none());
         assert_eq!(commerce.state(), CommerceState::AcceptedButStale);
         assert!(commerce.refresh_status().command.is_none());
@@ -1637,12 +1615,7 @@ mod tests {
     ) -> Commerce {
         let mut commerce = ready();
         commerce.begin_quote(selection(), PurchaseType::Possession);
-        commerce.quote_received(
-            quote,
-            spendable_coin,
-            title_gifts,
-            active_rental,
-        );
+        commerce.quote_received(quote, spendable_coin, title_gifts, active_rental);
         commerce
     }
 
@@ -1685,10 +1658,7 @@ mod tests {
             Some("Need 5 coins")
         );
         assert_eq!(
-            presentation
-                .control(Action::Buy)
-                .disabled_reason
-                .as_deref(),
+            presentation.control(Action::Buy).disabled_reason.as_deref(),
             Some("Need 9 coins")
         );
         assert!(insufficient.choose(Action::Rent).command.is_none());
@@ -1804,7 +1774,6 @@ mod tests {
             Some(CommerceCommand::SaveMarker(_))
         ));
         assert_eq!(commerce.state(), CommerceState::PersistingIntent);
-        assert!(!commerce.can_emit_post());
     }
 
     #[test]
@@ -1854,10 +1823,8 @@ mod tests {
             Authentication::Authenticated(scope()),
             Connectivity::Offline,
         );
-        let effects = commerce.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        let effects =
+            commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
 
         assert!(matches!(
             effects.command,
@@ -1896,17 +1863,13 @@ mod tests {
             assert!(commerce.refresh_status().command.is_none());
             assert!(commerce.marker_saved(MARKER_KEY).command.is_none());
             assert!(commerce.marker_forgotten(MARKER_KEY).command.is_none());
-            assert!(!commerce.can_emit_post());
         }
     }
 
     #[test]
     fn denied_marker_load_locks_commerce_without_clear_or_post() {
         let mut commerce = Commerce::new();
-        commerce.safety_changed(
-            Authentication::Authenticated(scope()),
-            Connectivity::Online,
-        );
+        commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         let effects = commerce.store_denied(StoreError::Unwritable);
 
         assert!(effects.command.is_none());
@@ -1950,7 +1913,6 @@ mod tests {
             Connectivity::Online,
         );
         assert!(choosing.choose(Action::Rent).command.is_none());
-        assert!(!choosing.can_emit_post());
 
         let mut quoting = ready();
         quoting.begin_quote(selection(), PurchaseType::Rent);
@@ -1963,7 +1925,6 @@ mod tests {
             .command
             .is_none());
         assert!(quoting.choose(Action::Rent).command.is_none());
-        assert!(!quoting.can_emit_post());
     }
 
     #[test]
@@ -1979,7 +1940,6 @@ mod tests {
             })
         ));
         assert_eq!(commerce.state(), CommerceState::Requoting);
-        assert!(!commerce.can_emit_post());
     }
 
     #[test]
@@ -2022,5 +1982,4 @@ mod tests {
             Some(CommerceCommand::FetchQuote { .. })
         ));
     }
-
 }

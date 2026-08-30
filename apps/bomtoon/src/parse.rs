@@ -374,13 +374,16 @@ pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
     let episodes = array(data, "episodes", "data.episodes")?
         .iter()
         .map(|item| {
-            let coin_kind =
-                optional_bounded_string(item, "coinKind", "episode.coinKind", MAX_REMOTE_CODE_BYTES)?;
+            let coin_kind = optional_bounded_string(
+                item,
+                "coinKind",
+                "episode.coinKind",
+                MAX_REMOTE_CODE_BYTES,
+            )?;
             let possession_coin =
                 optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
             let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
-            let permanent_coin =
-                optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
+            let permanent_coin = optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
             let availability = EpisodeAvailability {
                 status: bounded_nullable_string(
                     item,
@@ -404,20 +407,10 @@ pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
             };
             Ok(Episode {
                 id: unsigned(item, "id", "episode.id")?,
-                alias: bounded_string(
-                    item,
-                    "alias",
-                    "episode.alias",
-                    MAX_COMMERCE_ALIAS_BYTES,
-                )?
-                .to_owned(),
-                title: bounded_string(
-                    item,
-                    "title",
-                    "episode.title",
-                    MAX_EPISODE_TITLE_BYTES,
-                )?
-                .to_owned(),
+                alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?
+                    .to_owned(),
+                title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?
+                    .to_owned(),
                 purchase: PurchaseState::from_remote(availability),
                 rent_expires_at: optional_timestamp(
                     item,
@@ -426,12 +419,8 @@ pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
                 )?,
                 rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
                 purchase_coin,
-                gift_eligible: optional_boolean(
-                    item,
-                    "isRentGift",
-                    "episode.isRentGift",
-                )?
-                .unwrap_or(false),
+                gift_eligible: optional_boolean(item, "isRentGift", "episode.isRentGift")?
+                    .unwrap_or(false),
             })
         })
         .collect::<Result<Vec<_>, ParseError>>()?;
@@ -460,8 +449,7 @@ pub fn gift_balance(bytes: &[u8]) -> Result<GiftBalance, ParseError> {
 
     let mut available = 0usize;
     for gift in received {
-        let gift_type =
-            bounded_string(gift, "giftType", "gift.giftType", MAX_REMOTE_CODE_BYTES)?;
+        let gift_type = bounded_string(gift, "giftType", "gift.giftType", MAX_REMOTE_CODE_BYTES)?;
         let is_received = boolean(gift, "isReceived", "gift.isReceived")?;
         if gift_type != "RENT" || !is_received {
             continue;
@@ -500,22 +488,13 @@ pub fn quote(bytes: &[u8]) -> Result<Quote, ParseError> {
         )?
         .to_owned(),
         is_available: boolean(data, "isAvailable", "quote.isAvailable")?,
-        coin_kind: bounded_string(
-            data,
-            "coinKind",
-            "quote.coinKind",
-            MAX_REMOTE_CODE_BYTES,
-        )?
-        .to_owned(),
+        coin_kind: bounded_string(data, "coinKind", "quote.coinKind", MAX_REMOTE_CODE_BYTES)?
+            .to_owned(),
         rent_coin: unsigned(data, "rentCoin", "quote.rentCoin")?,
         possession_coin: unsigned(data, "possessionCoin", "quote.possessionCoin")?,
         permanent_coin: optional_unsigned(data, "permanentCoin", "quote.permanentCoin")?,
         is_rent_gift: boolean(data, "isRentGift", "quote.isRentGift")?,
-        is_possession_gift: boolean(
-            data,
-            "isPossessionGift",
-            "quote.isPossessionGift",
-        )?,
+        is_possession_gift: boolean(data, "isPossessionGift", "quote.isPossessionGift")?,
     })
 }
 
@@ -590,7 +569,6 @@ pub fn purchase_explicitly_rejected(bytes: &[u8]) -> bool {
     };
     !result.is_empty() && result != "SUCCESS" && root.get("data").is_some()
 }
-
 
 pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
     let root = parse_json(bytes)?;
@@ -1689,9 +1667,7 @@ mod tests {
     #[test]
     fn gift_arrays_are_limited_to_64_entries_each() {
         let entries = (0..65)
-            .map(|_| {
-                r#"{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}"#
-            })
+            .map(|_| r#"{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}"#)
             .collect::<Vec<_>>()
             .join(",");
         let received = format!(

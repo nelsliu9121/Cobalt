@@ -782,13 +782,12 @@ fn valid_pair(pair: &ManagedTokenPair) -> bool {
         && pair
             .account_subject
             .as_deref()
-            .map_or(true, valid_account_subject)
+            .is_none_or(valid_account_subject)
 }
 
 fn valid_provider_pair(pair: &ManagedTokenPair, now: u64) -> bool {
     valid_pair(pair) && pair.access_expires_at_ms > now && pair.refresh_expires_at_ms > now
 }
-
 
 fn valid_lower_hex(value: &str, expected_bytes: usize) -> bool {
     value.len() == expected_bytes
@@ -1256,12 +1255,10 @@ mod tests {
         let (_, clock) = adjustable_clock(1);
         let managed = provider(&directories, clock, Arc::clone(&recipe));
 
-        assert!(
-            managed
-                .resolve(&Credential::bearer("bomtoon-access-token"))
-                .expect("resolve")
-                .is_some()
-        );
+        assert!(managed
+            .resolve(&Credential::bearer("bomtoon-access-token"))
+            .expect("resolve")
+            .is_some());
         assert!(recipe.calls.lock().expect("calls").is_empty());
         assert_eq!(
             read_bound_pair(&directories.managed_state())
@@ -1363,10 +1360,7 @@ mod tests {
             stored_key
         );
         fs::write(directories.cookie(), "cookie-b").expect("replacement cookie");
-        assert_eq!(
-            managed.scope("bomtoon-access-token"),
-            Ok(Some(first))
-        );
+        assert_eq!(managed.scope("bomtoon-access-token"), Ok(Some(first)));
     }
 
     #[test]
@@ -1483,8 +1477,7 @@ mod tests {
     fn unauthorized_v1_refresh_does_not_bootstrap_or_migrate() {
         let directories = TestDirectories::new("v1-unauthorized-refresh");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
-        let legacy_state =
-            "cobalt-managed-v1\ndigest:cookie-a\n100\n4600000\naccess-a\nrefresh-a";
+        let legacy_state = "cobalt-managed-v1\ndigest:cookie-a\n100\n4600000\naccess-a\nrefresh-a";
         fs::write(directories.managed_state(), legacy_state).expect("write v1 state");
         let recipe = Arc::new(FakeRecipe::default());
         recipe
@@ -1496,21 +1489,14 @@ mod tests {
             .bootstrap
             .lock()
             .expect("bootstrap queue")
-            .push_back(Ok(token_pair(
-                "migrated",
-                2_000_000,
-                Some("account-a"),
-            )));
+            .push_back(Ok(token_pair("migrated", 2_000_000, Some("account-a"))));
         let managed = provider(&directories, Arc::new(|| 1), Arc::clone(&recipe));
 
         assert_eq!(
             managed.resolve(&Credential::bearer("bomtoon-access-token")),
             Err(TaskError::Unauthorized)
         );
-        assert_eq!(
-            recipe.calls.lock().expect("calls").as_slice(),
-            &["refresh"]
-        );
+        assert_eq!(recipe.calls.lock().expect("calls").as_slice(), &["refresh"]);
         assert_eq!(
             fs::read_to_string(directories.managed_state()).expect("managed state"),
             legacy_state
@@ -1583,7 +1569,11 @@ mod tests {
             .bootstrap
             .lock()
             .expect("bootstrap queue")
-            .push_back(Ok(token_pair("a", REFRESH_WINDOW_MS + 101, Some("account-a"))));
+            .push_back(Ok(token_pair(
+                "a",
+                REFRESH_WINDOW_MS + 101,
+                Some("account-a"),
+            )));
         recipe
             .refresh
             .lock()
@@ -1994,11 +1984,10 @@ mod tests {
         let directories = TestDirectories::new("unauthorized");
         fs::write(directories.cookie(), "cookie-a").expect("cookie");
         let recipe = Arc::new(FakeRecipe::default());
-        recipe
-            .bootstrap
-            .lock()
-            .expect("bootstrap queue")
-            .extend([Ok(token_pair("a", 1_000_000, Some("account-a"))), Err(TaskError::Unauthorized)]);
+        recipe.bootstrap.lock().expect("bootstrap queue").extend([
+            Ok(token_pair("a", 1_000_000, Some("account-a"))),
+            Err(TaskError::Unauthorized),
+        ]);
         recipe
             .refresh
             .lock()
@@ -2083,12 +2072,20 @@ mod tests {
             .bootstrap
             .lock()
             .expect("bootstrap queue")
-            .push_back(Ok(token_pair("boundary", now + REFRESH_WINDOW_MS, Some("account-a"))));
+            .push_back(Ok(token_pair(
+                "boundary",
+                now + REFRESH_WINDOW_MS,
+                Some("account-a"),
+            )));
         recipe
             .refresh
             .lock()
             .expect("refresh queue")
-            .push_back(Ok(token_pair("rotated", now + 2 * REFRESH_WINDOW_MS, Some("account-a"))));
+            .push_back(Ok(token_pair(
+                "rotated",
+                now + 2 * REFRESH_WINDOW_MS,
+                Some("account-a"),
+            )));
         let boundary_state = directories.managed_state();
         *recipe.refresh_observer.lock().expect("refresh observer") = Some(Box::new(move || {
             assert!(fs::read_to_string(&boundary_state)

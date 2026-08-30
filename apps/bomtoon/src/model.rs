@@ -232,9 +232,7 @@ impl PurchaseState {
         match availability.status {
             Some("POSSESSION") => Self::Owned,
             Some("RENT") => Self::Rented,
-            Some(status) if status != "NONE" => {
-                Self::Other(status.to_owned())
-            }
+            Some(status) if status != "NONE" => Self::Other(status.to_owned()),
             _ if availability.episode_type == Some("PREVIEW") || availability.is_sample => {
                 Self::Sample
             }
@@ -268,7 +266,8 @@ impl PurchaseState {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState, PurchaseType, Quote,
+        display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState, PurchaseType,
+        Quote,
     };
 
     #[test]
@@ -311,10 +310,7 @@ mod tests {
     #[test]
     fn remaining_rental_hours_use_a_whole_hour_ceiling() {
         assert_eq!(rented(Some(HOUR_MS)).remaining_rental_hours(0), Some(1));
-        assert_eq!(
-            rented(Some(HOUR_MS + 1)).remaining_rental_hours(0),
-            Some(2)
-        );
+        assert_eq!(rented(Some(HOUR_MS + 1)).remaining_rental_hours(0), Some(2));
         assert_eq!(
             rented(Some(48 * HOUR_MS)).remaining_rental_hours(0),
             Some(48)
@@ -323,7 +319,10 @@ mod tests {
 
     #[test]
     fn elapsed_and_missing_rentals_have_explicit_remaining_time() {
-        assert_eq!(rented(Some(HOUR_MS)).remaining_rental_hours(HOUR_MS), Some(0));
+        assert_eq!(
+            rented(Some(HOUR_MS)).remaining_rental_hours(HOUR_MS),
+            Some(0)
+        );
         assert_eq!(
             rented(Some(HOUR_MS)).remaining_rental_hours(2 * HOUR_MS),
             Some(0)

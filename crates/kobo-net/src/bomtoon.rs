@@ -566,23 +566,18 @@ mod tests {
 
     #[test]
     fn account_scope_is_stable_and_subject_specific() {
-        let recipe = Recipe::with_transport(Arc::new(FakeTransport::new(
-            std::iter::empty::<Result<Vec<u8>, TaskError>>(),
-        )));
+        let recipe = Recipe::with_transport(Arc::new(FakeTransport::new(std::iter::empty::<
+            Result<Vec<u8>, TaskError>,
+        >())));
         let key = recipe.derive_scope_key("high-entropy-cookie-a");
         assert_eq!(
             key,
-            crate::sha256::hex_digest(
-                b"cobalt-managed-scope-key-v1\0high-entropy-cookie-a"
-            )
+            crate::sha256::hex_digest(b"cobalt-managed-scope-key-v1\0high-entropy-cookie-a")
         );
         let first = recipe.derive_account_scope(&key, "account-a");
         assert_eq!(
             first,
-            crate::sha256::hmac_hex(
-                key.as_bytes(),
-                b"bomtoon-account-scope-v1\0account-a"
-            )[..32]
+            crate::sha256::hmac_hex(key.as_bytes(), b"bomtoon-account-scope-v1\0account-a")[..32]
         );
         assert_eq!(first, recipe.derive_account_scope(&key, "account-a"));
         assert_ne!(first, recipe.derive_account_scope(&key, "account-b"));

@@ -392,7 +392,6 @@ fn bomtoon_asset_summary_url(url: &str) -> bool {
     url == "https://www.bomtoon.tw/api/balcony-api/asset/user"
 }
 
-
 fn bomtoon_library_url(url: &str) -> bool {
     const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=";
     const SUFFIX: &str = "&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE";
@@ -1738,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn bomtoon_credential_allows_commerce_routes() {
+    fn bomtoon_credential_allows_approved_commerce_routes() {
         use kobo_protocol::Credential;
 
         let access = Credential::bearer("bomtoon-access-token");
@@ -1778,7 +1777,13 @@ mod tests {
                 "{method:?} {url}"
             );
         }
+    }
 
+    #[test]
+    fn bomtoon_credential_denies_wrong_method_origin_and_gift_variants() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
         let denied = [
             (
                 RequestMethod::Post,
@@ -1856,6 +1861,21 @@ mod tests {
                 RequestMethod::Get,
                 "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41#fragment",
             ),
+        ];
+        for (method, url) in denied {
+            assert!(
+                !super::credential_allowed("bomtoon", &access, method, url),
+                "{method:?} {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn bomtoon_credential_denies_quote_and_purchase_variants() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let denied = [
             (
                 RequestMethod::Get,
                 "https://www.bomtoon.tw/api/balcony-api-v2/contents/price//ep-1?purchaseType=RENT",
@@ -1939,7 +1959,13 @@ mod tests {
                 "{method:?} {url}"
             );
         }
+    }
 
+    #[test]
+    fn bomtoon_credential_enforces_quote_alias_length_boundary() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
         let alias_at_limit = "a".repeat(128);
         let quote_at_limit = format!(
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/{alias_at_limit}/{alias_at_limit}?purchaseType=RENT"
@@ -1960,7 +1986,42 @@ mod tests {
             RequestMethod::Get,
             &quote_over_limit
         ));
+    }
 
+    #[test]
+    fn bomtoon_commerce_routes_reject_wrong_credential_kinds() {
+        use kobo_protocol::Credential;
+
+        let approved = [
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/asset/user",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=TICKET",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=POSSESSION",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchase",
+            ),
+        ];
         for credential in [
             Credential::in_header("bomtoon-access-token", "Authorization"),
             Credential::basic("bomtoon-access-token"),

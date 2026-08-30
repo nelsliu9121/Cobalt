@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved design. Written specification awaiting final review. Implementation has not started.
+Implemented on `feature/bomtoon-coin-ticket-redemption`. Automated repository gates and non-spending simulator checks pass. Final operator-attended post-implementation backend checks remain a release gate.
 
 ## Goal
 
@@ -523,6 +523,26 @@ Record only sanitized business fields. Revoke capture sessions afterward. No liv
 - browser simulator evidence
 - runtime simulator evidence
 - staged-path check proving no `evidences/` path is included
+
+### Implementation evidence
+
+Verified on 2026-08-31:
+
+- `cargo fmt --all --check` exited zero.
+- `cargo test --workspace --all-targets --all-features` passed 2,671 tests across 55 suites, with 2 ignored and no failures.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited zero.
+- Focused commerce, managed-account, protocol, catalog, runtime-compatibility, and BOMTOON package tests all passed before the workspace gates.
+- The browser simulator rendered the Clara BW Featured surface, switched among public destinations, and exercised an offline title open. The offline surface displayed `Join Wi-Fi` guidance and a retry action; no live mutation was submitted.
+- The runtime simulator connected the BOMTOON application, rendered the signed-out `Sign in` surface, wrote a frame, and exited zero. Its one-frame runner did not provide interactive runtime navigation.
+- Existing revoked attended captures establish Gift delta `-1` with refreshed `RENT`, Coin rental delta `-2`, and Coin purchase delta `-3`. They do not establish refreshed paid `RENT`/`POSSESSION` or the post-implementation restart/failure scenarios below.
+- `git ls-files evidences` and the staged evidence-path checks produced no output.
+
+Still operator-attended and pending:
+
+- refreshed `RENT` after the lowest-cost Coin rental;
+- refreshed `POSSESSION` after the lowest-cost Coin purchase;
+- one accepted mutation with a controlled refresh failure, restart reconciliation, and proof that no second POST occurs;
+- marker preservation across sign-out, offline startup, expired credentials, and different-account login on the post-implementation build.
 
 ## Documentation and clean cutover
 
