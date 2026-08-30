@@ -1426,6 +1426,7 @@ mod tests {
 
         let access = Credential::bearer("bomtoon-access-token");
         for url in [
+            "https://www.bomtoon.tw/comic/main",
             "https://www.bomtoon.tw/api/auth/session",
             "https://www.bomtoon.tw/detail/hunter_q",
             "https://www.bomtoon.tw/_next/data/BUILD_ID/detail/hunter_q.json",

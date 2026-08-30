@@ -1,18 +1,29 @@
 use crate::model::AssetKind;
 use kobo_sdk::{Credential, Header, Task};
 
+const HOMEPAGE_URL: &str = "https://www.bomtoon.tw/comic/main";
+const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
 const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
 const ASSET_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/asset/user";
 const CHARGE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge";
+const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
 const CONTENT_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
 const ASSET_HISTORY_BYTES: u32 = 512 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
+
+pub fn homepage() -> Task {
+    public_fetch(HOMEPAGE_URL.to_owned())
+}
+
+pub fn public_detail(alias: &str) -> Task {
+    public_fetch(format!("{DETAIL_URL}{alias}"))
+}
 
 pub fn asset_summary() -> Task {
     fetch(
@@ -120,6 +131,16 @@ fn balcony_headers() -> Vec<Header> {
     headers
 }
 
+fn public_fetch(url: String) -> Task {
+    Task::Fetch {
+        url,
+        offset: 0,
+        max_bytes: PUBLIC_HTML_BYTES,
+        credential: None,
+        headers: response_headers("text/html"),
+    }
+}
+
 fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Header>) -> Task {
     Task::Fetch {
         url,
@@ -133,10 +154,61 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_summary, content, expiration_history, image, images, library, recent, ACCEPT_LANGUAGE,
+        asset_summary, content, expiration_history, homepage, image, images, library, public_detail,
+        recent, ACCEPT_LANGUAGE,
     };
     use crate::model::AssetKind;
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
+
+    #[test]
+    fn homepage_is_public_and_bounded() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = homepage()
+        else {
+            panic!("homepage must be a fetch");
+        };
+        assert_eq!(url, "https://www.bomtoon.tw/comic/main");
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 512 * 1024);
+        assert_eq!(credential, None);
+        assert_eq!(
+            headers,
+            vec![
+                Header::new("Accept", "text/html"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+            ]
+        );
+    }
+
+    #[test]
+    fn public_detail_is_public_and_exact() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = public_detail("hunter_q")
+        else {
+            panic!("detail must be a fetch");
+        };
+        assert_eq!(url, "https://www.bomtoon.tw/detail/hunter_q");
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 512 * 1024);
+        assert_eq!(credential, None);
+        assert_eq!(
+            headers,
+            vec![
+                Header::new("Accept", "text/html"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+            ]
+        );
+    }
 
     #[test]
     fn content_uses_exact_bearer_json_endpoint() {
