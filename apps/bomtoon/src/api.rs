@@ -1,13 +1,40 @@
+use crate::model::AssetKind;
 use kobo_sdk::{Credential, Header, Task};
 
 const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
+const ASSET_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/asset/user";
+const CHARGE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge";
 const CONTENT_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
+const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
+const ASSET_HISTORY_BYTES: u32 = 512 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
+
+pub fn asset_summary() -> Task {
+    fetch(
+        ASSET_URL.to_owned(),
+        ASSET_SUMMARY_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
+    )
+}
+
+pub fn expiration_history(kind: AssetKind, created_at: i64) -> Task {
+    let coin_kind = match kind {
+        AssetKind::Coin => "COIN",
+        AssetKind::Ticket => "TICKET",
+    };
+    fetch(
+        format!("{CHARGE_URL}?createdAt={created_at}&sort=EXPIRE&coinKind={coin_kind}"),
+        ASSET_HISTORY_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
+    )
+}
 
 pub fn library(page: usize) -> Task {
     fetch(
@@ -105,7 +132,10 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 
 #[cfg(test)]
 mod tests {
-    use super::{content, image, images, library, recent, ACCEPT_LANGUAGE};
+    use super::{
+        asset_summary, content, expiration_history, image, images, library, recent, ACCEPT_LANGUAGE,
+    };
+    use crate::model::AssetKind;
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
 
     #[test]
@@ -160,8 +190,68 @@ mod tests {
     }
 
     #[test]
+    fn asset_summary_uses_exact_bearer_endpoint_and_ceiling() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = asset_summary()
+        else {
+            panic!("expected fetch task");
+        };
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user"
+        );
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 64 * 1024);
+        assert_eq!(
+            credential,
+            Some(Credential::bearer("bomtoon-access-token"))
+        );
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("accept") && header.value == "application/json"
+        }));
+    }
+
+    #[test]
+    fn expiration_history_fixes_kind_sort_window_and_ceiling() {
+        for (kind, value) in [(AssetKind::Coin, "COIN"), (AssetKind::Ticket, "TICKET")] {
+            let Task::Fetch {
+                url,
+                max_bytes,
+                credential,
+                ..
+            } = expiration_history(kind, 1_725_000_000_000)
+            else {
+                panic!("expected fetch task");
+            };
+            assert_eq!(
+                url,
+                format!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind={value}"
+                )
+            );
+            assert_eq!(max_bytes, 512 * 1024);
+            assert_eq!(
+                credential,
+                Some(Credential::bearer("bomtoon-access-token"))
+            );
+        }
+    }
+
+    #[test]
     fn credentials_never_enter_urls_or_regular_headers() {
-        for task in [content("hunter_q"), library(2), recent(0)] {
+        for task in [
+            content("hunter_q"),
+            library(2),
+            recent(0),
+            asset_summary(),
+            expiration_history(AssetKind::Coin, 1_725_000_000_000),
+            expiration_history(AssetKind::Ticket, 1_725_000_000_000),
+        ] {
             let Task::Fetch {
                 url,
                 credential,
