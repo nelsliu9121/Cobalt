@@ -18,11 +18,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TITLE: &str = "BOMTOON";
 const RETRY: &str = "retry";
+const SIGN_IN: &str = "sign-in";
 const SIGN_OUT: &str = "sign-out";
 const PREVIOUS: &str = "previous";
 const NEXT: &str = "next";
-const LIBRARY_SHELF: &str = "library-shelf";
-const RECENT_SHELF: &str = "recent-shelf";
+const FEATURED: &str = "featured";
+const RECENT: &str = "recent";
+const LIBRARY: &str = "library";
 const ACCOUNT: &str = "account";
 const RETRY_BALANCES: &str = "retry-balances";
 const ACCOUNT_PREVIOUS: &str = "account-previous";
@@ -34,22 +36,43 @@ const HISTORY_WINDOW_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const READER_PREVIOUS: &str = "reader-previous";
 const READER_NEXT: &str = "reader-next";
 const READER_CHROME: &str = "reader-chrome";
+const MAIN_DESTINATIONS: [(&str, &str); 3] =
+    [(FEATURED, "Featured"), (RECENT, "Recent"), (LIBRARY, "Library")];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum View {
     #[default]
     Status,
-    Library,
+    Main,
     Account,
     Episodes,
     Reader,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum Shelf {
+enum MainDestination {
     #[default]
-    Library,
+    Featured,
     Recent,
+    Library,
+}
+
+impl MainDestination {
+    const fn index(self) -> usize {
+        match self {
+            Self::Featured => 0,
+            Self::Recent => 1,
+            Self::Library => 2,
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Featured => "Featured",
+            Self::Recent => "Recent",
+            Self::Library => "Library",
+        }
+    }
 }
 
 fn unix_time_ms() -> Option<i64> {
@@ -376,6 +399,7 @@ struct RebasedReaderWindow {
 struct Bomtoon {
     account: AccountState,
     view: View,
+    destination: MainDestination,
     pending: Option<Pending>,
     task: Option<TaskId>,
     wallet: WalletState,
@@ -392,15 +416,12 @@ struct Bomtoon {
     retry: Retry,
     next_picture_handle: u32,
     page: usize,
-    library_view_page: usize,
-    recent_view_page: usize,
     next_library_page: Option<usize>,
     next_recent_page: Option<usize>,
     total_library_titles: usize,
     total_recent_titles: usize,
     library_loaded: bool,
     recent_loaded: bool,
-    shelf: Shelf,
     problem: Option<String>,
 }
 
@@ -410,7 +431,7 @@ impl Bomtoon {
             && match self.view {
                 View::Account | View::Episodes => self.pending.is_none() && self.problem.is_none(),
                 View::Reader => true,
-                View::Status | View::Library => false,
+                View::Status | View::Main => false,
             };
         context.set_screen(self.screen().with_own_back(owns_back));
     }
@@ -456,16 +477,14 @@ impl Bomtoon {
                 .primary_button(RETRY, "Try again")
                 .build();
         }
-        if self.account != AccountState::Active {
-            return self.signed_out_screen();
-        }
         match self.view {
+            View::Status if self.account != AccountState::Active => self.signed_out_screen(),
             View::Status => ScreenBuilder::new("bomtoon-status")
                 .top_bar(TITLE)
                 .text("No request has started.")
                 .primary_button(RETRY, "Connect")
                 .build(),
-            View::Library => self.library_screen(),
+            View::Main => self.main_screen(),
             View::Account => self.account_screen(),
             View::Episodes => self.episode_screen(),
             View::Reader => self.reader_screen(),
@@ -496,12 +515,11 @@ impl Bomtoon {
             .build()
     }
 
-    fn library_title(&self) -> String {
-        let title = if self.shelf == Shelf::Recent {
-            "Recent"
-        } else {
-            "Library"
-        };
+    fn main_title(&self) -> String {
+        let title = self.destination.title();
+        if self.account != AccountState::Active {
+            return title.to_owned();
+        }
         match self
             .wallet
             .summary
@@ -513,63 +531,71 @@ impl Bomtoon {
         }
     }
 
-    fn library_screen(&self) -> Screen {
-        let count = self.shelf_len();
-        let mut screen = ScreenBuilder::new("bomtoon-library")
-            .top_bar(self.library_title())
-            .text(format!(
-                "{} of {} titles loaded.",
-                count,
-                self.shelf_total()
-            ))
-            .button(
-                LIBRARY_SHELF,
-                if self.shelf == Shelf::Library {
-                    "Library (selected)"
-                } else {
-                    "Library"
-                },
-            )
-            .button(
-                RECENT_SHELF,
-                if self.shelf == Shelf::Recent {
-                    "Recent (selected)"
-                } else {
-                    "Recent"
-                },
-            );
-        let (start, end) = page_bounds(self.page, count, LIBRARY_ITEMS_PER_PAGE);
-        for index in start..end {
-            let label = if self.shelf == Shelf::Recent {
-                let recent = &self.recent[index];
-                let fallback = format!("Title {}", recent.content_alias);
-                let episode_fallback = format!("Episode {}", recent.episode_alias);
-                format!(
-                    "{} - {}",
-                    display_text(&recent.content_title, &fallback),
-                    display_text(&recent.episode_title, &episode_fallback)
-                )
-            } else {
-                let comic = &self.comics[index];
-                let fallback = format!("Title {}", comic.alias);
-                format!(
-                    "{}  ({}/{})",
-                    display_text(&comic.title, &fallback),
-                    comic.owned_episodes,
-                    comic.total_episodes
-                )
-            };
-            screen = screen.button(format!("comic-{index}"), label);
+    fn main_screen(&self) -> Screen {
+        let mut screen = ScreenBuilder::new(match self.destination {
+            MainDestination::Featured => "bomtoon-featured",
+            MainDestination::Recent => "bomtoon-recent",
+            MainDestination::Library => "bomtoon-library",
+        })
+        .top_bar(self.main_title());
+        if self.account != AccountState::Active {
+            screen = screen.top_bar_action(SIGN_IN, "Sign in");
         }
-        if self.page > 0 {
-            screen = screen.button(PREVIOUS, "Previous page");
+
+        match self.destination {
+            MainDestination::Featured => {
+                screen = screen.text("Featured");
+            }
+            MainDestination::Recent | MainDestination::Library => {
+                let count = self.destination_len();
+                screen = screen.text(format!(
+                    "{} of {} titles loaded.",
+                    count,
+                    self.destination_total()
+                ));
+                let (start, end) = page_bounds(self.page, count, LIBRARY_ITEMS_PER_PAGE);
+                for index in start..end {
+                    let label = if self.destination == MainDestination::Recent {
+                        let recent = &self.recent[index];
+                        let fallback = format!("Title {}", recent.content_alias);
+                        let episode_fallback = format!("Episode {}", recent.episode_alias);
+                        format!(
+                            "{} - {}",
+                            display_text(&recent.content_title, &fallback),
+                            display_text(&recent.episode_title, &episode_fallback)
+                        )
+                    } else {
+                        let comic = &self.comics[index];
+                        let fallback = format!("Title {}", comic.alias);
+                        format!(
+                            "{}  ({}/{})",
+                            display_text(&comic.title, &fallback),
+                            comic.owned_episodes,
+                            comic.total_episodes
+                        )
+                    };
+                    screen = screen.button(format!("comic-{index}"), label);
+                }
+                if self.page > 0 {
+                    screen = screen.button(PREVIOUS, "Previous page");
+                }
+                if library_has_next_page(
+                    self.page,
+                    count,
+                    self.destination_next_page().is_some(),
+                ) {
+                    screen = screen.button(NEXT, "Next page");
+                }
+                if self.account == AccountState::Active {
+                    screen = screen
+                        .button(ACCOUNT, "Account")
+                        .button(SIGN_OUT, "Sign out");
+                }
+            }
         }
-        if library_has_next_page(self.page, count, self.shelf_next_page().is_some()) {
-            screen = screen.button(NEXT, "Next page");
-        }
+
         screen
-            .button(ACCOUNT, "Account")
-            .button(SIGN_OUT, "Sign out")
+            .nav_bar(self.destination.index(), MAIN_DESTINATIONS)
             .build()
     }
 
@@ -731,56 +757,54 @@ impl Bomtoon {
         screen.build()
     }
 
-    fn shelf_len(&self) -> usize {
-        match self.shelf {
-            Shelf::Library => self.comics.len(),
-            Shelf::Recent => self.recent.len(),
+    fn destination_len(&self) -> usize {
+        match self.destination {
+            MainDestination::Featured => 0,
+            MainDestination::Recent => self.recent.len(),
+            MainDestination::Library => self.comics.len(),
         }
     }
 
-    fn shelf_total(&self) -> usize {
-        match self.shelf {
-            Shelf::Library => self.total_library_titles,
-            Shelf::Recent => self.total_recent_titles,
+    fn destination_total(&self) -> usize {
+        match self.destination {
+            MainDestination::Featured => 0,
+            MainDestination::Recent => self.total_recent_titles,
+            MainDestination::Library => self.total_library_titles,
         }
     }
 
-    fn shelf_next_page(&self) -> Option<usize> {
-        match self.shelf {
-            Shelf::Library => self.next_library_page,
-            Shelf::Recent => self.next_recent_page,
+    fn destination_next_page(&self) -> Option<usize> {
+        match self.destination {
+            MainDestination::Featured => None,
+            MainDestination::Recent => self.next_recent_page,
+            MainDestination::Library => self.next_library_page,
         }
     }
 
-    fn shelf_is_loaded(&self, target: Shelf) -> bool {
+    fn destination_is_loaded(&self, target: MainDestination) -> bool {
         match target {
-            Shelf::Library => self.library_loaded,
-            Shelf::Recent => self.recent_loaded,
+            MainDestination::Featured => true,
+            MainDestination::Recent => self.recent_loaded,
+            MainDestination::Library => self.library_loaded,
         }
     }
 
-    fn remember_shelf_page(&mut self) {
-        match self.shelf {
-            Shelf::Library => self.library_view_page = self.page,
-            Shelf::Recent => self.recent_view_page = self.page,
-        }
-    }
-
-    fn switch_shelf(&mut self, context: &mut Context, target: Shelf) {
-        if self.shelf == target {
+    fn select_destination(&mut self, context: &mut Context, target: MainDestination) {
+        self.page = 0;
+        self.problem = None;
+        if target != MainDestination::Featured && self.account != AccountState::Active {
+            self.destination = MainDestination::Featured;
+            self.view = View::Status;
             return;
         }
-        self.remember_shelf_page();
-        self.shelf = target;
-        self.page = match target {
-            Shelf::Library => self.library_view_page,
-            Shelf::Recent => self.recent_view_page,
-        };
-        self.problem = None;
-        if !self.shelf_is_loaded(target) {
+
+        self.destination = target;
+        self.view = View::Main;
+        if !self.destination_is_loaded(target) {
             let (pending, work) = match target {
-                Shelf::Library => (Pending::Library(0), api::library(0)),
-                Shelf::Recent => (Pending::Recent(0), api::recent(0)),
+                MainDestination::Recent => (Pending::Recent(0), api::recent(0)),
+                MainDestination::Library => (Pending::Library(0), api::library(0)),
+                MainDestination::Featured => return,
             };
             self.spawn(context, pending, work);
         }
@@ -1020,7 +1044,6 @@ impl Bomtoon {
     }
 
     fn open_account(&mut self, context: &mut Context) {
-        self.remember_shelf_page();
         self.page = 0;
         self.problem = None;
         self.view = View::Account;
@@ -1064,8 +1087,6 @@ impl Bomtoon {
         self.problem = None;
         self.retry = Retry::Restart;
         self.page = 0;
-        self.library_view_page = 0;
-        self.recent_view_page = 0;
         self.next_library_page = None;
         self.next_recent_page = None;
         self.total_library_titles = 0;
@@ -1074,14 +1095,19 @@ impl Bomtoon {
         self.recent_loaded = false;
     }
 
+    fn open_public_main(&mut self, context: &mut Context) {
+        self.destination = MainDestination::Featured;
+        self.view = View::Main;
+        self.page = 0;
+        let _ = context.spawn(api::homepage());
+        self.refresh_asset_summary(context);
+    }
+
     fn restart(&mut self, context: &mut Context) {
         self.problem = None;
         self.account = AccountState::Active;
         self.clear_account_data(context);
-        self.shelf = Shelf::Library;
-        self.view = View::Status;
-        self.spawn(context, Pending::Library(0), api::library(0));
-        self.refresh_asset_summary(context);
+        self.open_public_main(context);
     }
 
     fn spawn(&mut self, context: &mut Context, pending: Pending, work: kobo_sdk::Task) {
@@ -1761,6 +1787,8 @@ impl Bomtoon {
                 if bytes.is_empty() {
                     self.clear_account_data(context);
                     self.account = AccountState::SignedOut;
+                    self.destination = MainDestination::Featured;
+                    self.view = View::Status;
                 } else {
                     self.problem = Some("BOMTOON returned unexpected sign-out data.".to_owned());
                 }
@@ -1776,12 +1804,8 @@ impl Bomtoon {
                     if !first_page {
                         self.page = self.page.saturating_add(1);
                     }
-                    self.library_view_page = self.page;
-                    self.shelf = Shelf::Library;
-                    self.view = View::Library;
-                    if should_load_recent(page.number, page.total_items) {
-                        self.switch_shelf(context, Shelf::Recent);
-                    }
+                    self.destination = MainDestination::Library;
+                    self.view = View::Main;
                 }
                 Ok(_) => {
                     self.problem = Some("BOMTOON returned a different library page.".to_owned());
@@ -1799,9 +1823,8 @@ impl Bomtoon {
                     if !first_page {
                         self.page = self.page.saturating_add(1);
                     }
-                    self.recent_view_page = self.page;
-                    self.shelf = Shelf::Recent;
-                    self.view = View::Library;
+                    self.destination = MainDestination::Recent;
+                    self.view = View::Main;
                 }
                 Ok(_) => {
                     self.problem = Some("BOMTOON returned a different recent page.".to_owned());
@@ -1821,12 +1844,21 @@ impl Bomtoon {
     }
 
     fn open_comic(&mut self, context: &mut Context, index: usize) {
-        let selected = match self.shelf {
-            Shelf::Library => self
+        if self.account != AccountState::Active {
+            self.destination = MainDestination::Featured;
+            self.view = View::Status;
+            self.page = 0;
+            self.problem = None;
+            self.show(context);
+            return;
+        }
+        let selected = match self.destination {
+            MainDestination::Featured => None,
+            MainDestination::Library => self
                 .comics
                 .get(index)
                 .map(|comic| (comic.alias.clone(), comic.title.clone())),
-            Shelf::Recent => self
+            MainDestination::Recent => self
                 .recent
                 .get(index)
                 .map(|recent| (recent.content_alias.clone(), recent.content_title.clone())),
@@ -1834,7 +1866,7 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
-        self.remember_shelf_page();
+        self.page = 0;
         self.selected_content_alias.clone_from(&alias);
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
         self.problem = None;
@@ -2074,6 +2106,8 @@ impl Bomtoon {
             (Pending::Logout, TaskError::RevocationUnconfirmed) => {
                 self.clear_account_data(context);
                 self.account = AccountState::RevocationUnconfirmed;
+                self.destination = MainDestination::Featured;
+                self.view = View::Status;
                 self.problem = None;
             }
             (Pending::Logout, TaskError::LocalStorage) => {
@@ -2085,6 +2119,8 @@ impl Bomtoon {
             ) => {
                 self.clear_account_data(context);
                 self.account = AccountState::SignedOut;
+                self.destination = MainDestination::Featured;
+                self.view = View::Status;
                 self.problem = None;
             }
             (
@@ -2093,6 +2129,8 @@ impl Bomtoon {
             ) => {
                 self.clear_account_data(context);
                 self.account = AccountState::Expired;
+                self.destination = MainDestination::Featured;
+                self.view = View::Status;
                 self.problem = None;
             }
             (_, error) => {
@@ -2108,6 +2146,12 @@ impl Bomtoon {
         self.pending = None;
         self.clear_account_data(context);
         self.account = account;
+        self.destination = MainDestination::Featured;
+        self.view = if account == AccountState::SignedOut {
+            View::Main
+        } else {
+            View::Status
+        };
         self.problem = None;
         self.show(context);
     }
@@ -2389,7 +2433,8 @@ impl Bomtoon {
 
 impl KoboApp for Bomtoon {
     fn on_start(&mut self, context: &mut Context) {
-        self.restart(context);
+        self.problem = None;
+        self.open_public_main(context);
         self.show(context);
     }
 
@@ -2431,22 +2476,43 @@ impl KoboApp for Bomtoon {
             && self.foreground_reader_task.is_none();
         if action == ActionId::BACK && ready && matches!(self.view, View::Account | View::Episodes)
         {
-            self.view = View::Library;
-            self.page = match self.shelf {
-                Shelf::Library => self.library_view_page,
-                Shelf::Recent => self.recent_view_page,
-            };
+            self.view = View::Main;
+            self.page = 0;
             self.show(context);
             return;
         }
-        let retry_visible = self.problem.is_some()
-            || self.account != AccountState::Active
-            || self.view == View::Status;
+        let retry_visible = self.problem.is_some() || self.view == View::Status;
         if action == action_id(RETRY) && self.pending.is_none() && retry_visible {
             if !self.retry(context) {
                 self.show(context);
             }
             return;
+        }
+        if self.view == View::Main
+            && self.account != AccountState::Active
+            && action == action_id(SIGN_IN)
+        {
+            self.destination = MainDestination::Featured;
+            self.page = 0;
+            self.view = View::Status;
+            self.show(context);
+            return;
+        }
+        if self.view == View::Main {
+            let target = if action == action_id(FEATURED) {
+                Some(MainDestination::Featured)
+            } else if action == action_id(RECENT) {
+                Some(MainDestination::Recent)
+            } else if action == action_id(LIBRARY) {
+                Some(MainDestination::Library)
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                self.select_destination(context, target);
+                self.show(context);
+                return;
+            }
         }
         if !ready {
             self.show(context);
@@ -2482,41 +2548,35 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        if self.view == View::Library && action == action_id(SIGN_OUT) {
+        if self.view == View::Main && action == action_id(SIGN_OUT) {
             self.spawn(context, Pending::Logout, api::logout());
-        } else if self.view == View::Library && action == action_id(LIBRARY_SHELF) {
-            self.switch_shelf(context, Shelf::Library);
-        } else if self.view == View::Library && action == action_id(RECENT_SHELF) {
-            self.switch_shelf(context, Shelf::Recent);
-        } else if self.view == View::Library && action == action_id(ACCOUNT) {
+        } else if self.view == View::Main && action == action_id(ACCOUNT) {
             self.open_account(context);
             return;
         } else if action == action_id(PREVIOUS) {
             self.page = self.page.saturating_sub(1);
         } else if action == action_id(NEXT) {
-            let items_per_page = if self.view == View::Library {
+            let items_per_page = if self.view == View::Main {
                 LIBRARY_ITEMS_PER_PAGE
             } else {
                 EPISODE_ITEMS_PER_PAGE
             };
             let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
-            if self.view != View::Library || next_start < self.shelf_len() {
+            if self.view != View::Main || next_start < self.destination_len() {
                 self.page = self.page.saturating_add(1);
-            } else if let Some(next) = self.shelf_next_page() {
-                let pending = if self.shelf == Shelf::Recent {
-                    Pending::Recent(next)
-                } else {
-                    Pending::Library(next)
-                };
-                let work = if self.shelf == Shelf::Recent {
-                    api::recent(next)
-                } else {
-                    api::library(next)
+            } else if let Some(next) = self.destination_next_page() {
+                let (pending, work) = match self.destination {
+                    MainDestination::Recent => (Pending::Recent(next), api::recent(next)),
+                    MainDestination::Library => (Pending::Library(next), api::library(next)),
+                    MainDestination::Featured => {
+                        self.show(context);
+                        return;
+                    }
                 };
                 self.spawn(context, pending, work);
             }
-        } else if self.view == View::Library {
-            for index in 0..self.shelf_len() {
+        } else if self.view == View::Main {
+            for index in 0..self.destination_len() {
                 if action == action_id(&format!("comic-{index}")) {
                     self.open_comic(context, index);
                     return;
@@ -3262,9 +3322,6 @@ fn library_has_next_page(page: usize, loaded: usize, remote_more: bool) -> bool 
         || remote_more
 }
 
-fn should_load_recent(page: usize, total_items: usize) -> bool {
-    page == 0 && total_items == 0
-}
 
 fn page_controls(mut screen: ScreenBuilder, page: usize, count: usize) -> Screen {
     if page > 0 {
@@ -3294,7 +3351,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use kobo_sdk::{
-        AppRunner, Chrome, Command, Credential, DisplayMetrics, Node, PictureHandle, ReadingChrome,
+        AppRunner, Chrome, Command, DisplayMetrics, Node, PictureHandle, ReadingChrome,
         SecretHeader, Task, TilePicture, CLARA_BW_METRICS,
     };
 
@@ -3956,9 +4013,16 @@ mod tests {
     fn loaded_library_with_metrics(metrics: DisplayMetrics) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let mut runner = AppRunner::with_metrics(Bomtoon::default(), metrics);
         let commands = runner.start();
+        let (homepage_task, _) = fetch_task_with(&commands, "/comic/main");
+        runner.task_outcome(
+            homepage_task,
+            TaskOutcome::Completed(b"<html></html>".to_vec()),
+        );
+        let commands = runner.action(action_id(LIBRARY));
         let (task, _) = fetch_task_with(&commands, "/library?");
         let commands = runner.task_outcome(task, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
-        assert_eq!(runner.app().view, View::Library);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Library);
         (runner, commands)
     }
 
@@ -4459,8 +4523,6 @@ mod tests {
         });
         app.selected_title = "Hunter Q".to_owned();
         app.page = 3;
-        app.library_view_page = 2;
-        app.recent_view_page = 1;
         app.next_library_page = Some(4);
         app.next_recent_page = Some(5);
         app.total_library_titles = 91;
@@ -4475,8 +4537,6 @@ mod tests {
         assert!(app.episodes.is_empty());
         assert!(app.selected_title.is_empty());
         assert_eq!(app.page, 0);
-        assert_eq!(app.library_view_page, 0);
-        assert_eq!(app.recent_view_page, 0);
         assert_eq!(app.next_library_page, None);
         assert_eq!(app.next_recent_page, None);
         assert_eq!(app.total_library_titles, 0);
@@ -4491,8 +4551,6 @@ mod tests {
         assert_eq!(app.episodes.len(), 1);
         assert_eq!(app.selected_title, "Hunter Q");
         assert_eq!(app.page, 3);
-        assert_eq!(app.library_view_page, 2);
-        assert_eq!(app.recent_view_page, 1);
         assert_eq!(app.next_library_page, Some(4));
         assert_eq!(app.next_recent_page, Some(5));
         assert_eq!(app.total_library_titles, 91);
@@ -4515,7 +4573,7 @@ mod tests {
 
     fn failed_start(error: TaskError) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let (mut runner, commands) = started();
-        let (task, _) = fetch_task_with(&commands, "/library?");
+        let (task, _) = fetch_task_with(&commands, "/asset/user");
         let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
         (runner, commands)
     }
@@ -4526,6 +4584,282 @@ mod tests {
         let (task, _) = only_spawn(&commands);
         let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
         (runner, commands)
+    }
+
+    fn is_homepage_fetch(command: &Command) -> bool {
+        matches!(
+            command,
+            Command::Spawn {
+                work: Task::Fetch { url, .. },
+                ..
+            } if url == "https://www.bomtoon.tw/comic/main"
+        )
+    }
+
+    fn is_library_or_recent_fetch(command: &Command) -> bool {
+        matches!(
+            command,
+            Command::Spawn {
+                work: Task::Fetch { url, .. },
+                ..
+            } if url.contains("/library?") || url.contains("/recent?")
+        )
+    }
+
+    #[test]
+    fn signed_out_start_opens_public_featured_without_protected_shelves() {
+        let mut runner = AppRunner::new(Bomtoon {
+            account: AccountState::SignedOut,
+            ..Bomtoon::default()
+        });
+
+        let commands = runner.start();
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(commands.iter().any(is_homepage_fetch));
+        assert!(!commands.iter().any(is_library_or_recent_fetch));
+    }
+
+    #[test]
+    fn signed_in_start_opens_public_featured_with_independent_account_probe() {
+        let (runner, commands) = started();
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(commands.iter().any(is_homepage_fetch));
+        assert!(!commands.iter().any(is_library_or_recent_fetch));
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::asset_summary()));
+    }
+
+    #[test]
+    fn navigation_uses_one_fixed_featured_recent_library_bar() {
+        for (destination, selected) in [
+            (MainDestination::Featured, 0),
+            (MainDestination::Recent, 1),
+            (MainDestination::Library, 2),
+        ] {
+            let screen = Bomtoon {
+                view: View::Main,
+                destination,
+                library_loaded: true,
+                recent_loaded: true,
+                ..Bomtoon::default()
+            }
+            .screen();
+            let bar = screen
+                .nav_bar
+                .as_ref()
+                .expect("one fixed destination bar");
+
+            assert_eq!(bar.selected, Some(selected));
+            assert_eq!(
+                bar.destinations
+                    .iter()
+                    .map(|destination| destination.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["Featured", "Recent", "Library"]
+            );
+            assert_eq!(
+                bar.destinations
+                    .iter()
+                    .map(|destination| destination.action)
+                    .collect::<Vec<_>>(),
+                [action_id(FEATURED), action_id(RECENT), action_id(LIBRARY)]
+            );
+            let layout =
+                screen.layout_with(&CLARA_BW_METRICS, &Chrome::measuring(true));
+            let y = CLARA_BW_METRICS.height - CLARA_BW_METRICS.nav_bar_height() / 2;
+            for (x, action) in [
+                (CLARA_BW_METRICS.width / 6, action_id(FEATURED)),
+                (CLARA_BW_METRICS.width / 2, action_id(RECENT)),
+                (
+                    CLARA_BW_METRICS.width - CLARA_BW_METRICS.width / 6,
+                    action_id(LIBRARY),
+                ),
+            ] {
+                assert_eq!(
+                    layout.hit_test(x, y),
+                    Some(action),
+                    "destination is not centered in its third"
+                );
+            }
+            assert!(
+                screen.nodes.iter().all(|node| {
+                    !matches!(
+                        node,
+                        Node::Button { action, .. }
+                            if *action == action_id(FEATURED)
+                                || *action == action_id(RECENT)
+                                || *action == action_id(LIBRARY)
+                    )
+                }),
+                "destinations must not be in-flow pseudo-tabs"
+            );
+            assert_fits(&screen);
+        }
+    }
+
+    #[test]
+    fn navigation_lazy_protected_destinations_fetch_only_the_selected_shelf() {
+        for (action, destination, expected_path, other_path) in [
+            (
+                RECENT,
+                MainDestination::Recent,
+                "/recent?",
+                "/library?",
+            ),
+            (
+                LIBRARY,
+                MainDestination::Library,
+                "/library?",
+                "/recent?",
+            ),
+        ] {
+            let mut runner = AppRunner::new(Bomtoon {
+                view: View::Main,
+                destination: MainDestination::Featured,
+                ..Bomtoon::default()
+            });
+
+            let commands = runner.action(action_id(action));
+
+            assert_eq!(runner.app().view, View::Main);
+            assert_eq!(runner.app().destination, destination);
+            assert_eq!(runner.app().page, 0);
+            assert_eq!(spawns(&commands).len(), 1);
+            assert!(spawns(&commands).iter().any(
+                |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains(expected_path))
+            ));
+            assert!(spawns(&commands).iter().all(
+                |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains(other_path))
+            ));
+        }
+
+        let mut runner = AppRunner::new(Bomtoon {
+            view: View::Main,
+            destination: MainDestination::Recent,
+            recent_loaded: true,
+            page: 4,
+            ..Bomtoon::default()
+        });
+        let commands = runner.action(action_id(RECENT));
+        assert_eq!(runner.app().page, 0);
+        assert!(spawns(&commands).is_empty());
+    }
+
+    #[test]
+    fn authentication_gating_blocks_signed_out_main_actions() {
+        for action in [RECENT, LIBRARY] {
+            let mut runner = AppRunner::new(Bomtoon {
+                account: AccountState::SignedOut,
+                view: View::Main,
+                destination: MainDestination::Featured,
+                ..Bomtoon::default()
+            });
+
+            let commands = runner.action(action_id(action));
+
+            assert_eq!(runner.app().view, View::Status);
+            assert_eq!(runner.app().destination, MainDestination::Featured);
+            assert_eq!(runner.app().page, 0);
+            assert!(!commands.iter().any(is_library_or_recent_fetch));
+        }
+
+        let mut app = Bomtoon {
+            account: AccountState::SignedOut,
+            view: View::Main,
+            destination: MainDestination::Featured,
+            page: 3,
+            ..Bomtoon::default()
+        };
+        let mut context = Context::default();
+        app.open_comic(&mut context, 0);
+        assert_eq!(app.view, View::Status);
+        assert_eq!(app.destination, MainDestination::Featured);
+        assert_eq!(app.page, 0);
+        assert!(spawns(&context.take_commands()).is_empty());
+
+        let signed_out_main = Bomtoon {
+            account: AccountState::SignedOut,
+            view: View::Main,
+            ..Bomtoon::default()
+        }
+        .screen();
+        assert_eq!(
+            signed_out_main
+                .top_bar
+                .expect("main top bar")
+                .actions
+                .iter()
+                .map(|action| action.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Sign in"]
+        );
+        let signed_in_main = Bomtoon {
+            view: View::Main,
+            ..Bomtoon::default()
+        }
+        .screen();
+        assert!(signed_in_main
+            .top_bar
+            .expect("main top bar")
+            .actions
+            .iter()
+            .all(|action| action.label != "Sign in"));
+    }
+
+    #[test]
+    fn authentication_gating_sign_in_returns_to_featured_without_resuming_action() {
+        let mut runner = AppRunner::new(Bomtoon {
+            account: AccountState::SignedOut,
+            view: View::Main,
+            destination: MainDestination::Featured,
+            page: 4,
+            ..Bomtoon::default()
+        });
+
+        runner.action(action_id(RECENT));
+        let commands = runner.action(action_id(RETRY));
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert_eq!(runner.app().page, 0);
+        assert!(commands.iter().any(is_homepage_fetch));
+        assert!(!commands.iter().any(is_library_or_recent_fetch));
+        assert!(!spawns(&commands)
+            .iter()
+            .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/"))));
+    }
+
+    #[test]
+    fn destination_returns_to_page_one_after_switch_account_and_episodes() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.app_mut().destination = MainDestination::Recent;
+        runner.app_mut().recent_loaded = true;
+        runner.app_mut().page = 4;
+
+        runner.action(action_id(LIBRARY));
+        runner.action(action_id(RECENT));
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert_eq!(runner.app().page, 0);
+
+        runner.app_mut().page = 3;
+        runner.action(action_id(ACCOUNT));
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert_eq!(runner.app().page, 0);
+
+        runner.app_mut().page = 2;
+        runner.app_mut().view = View::Episodes;
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Recent);
+        assert_eq!(runner.app().page, 0);
     }
 
     #[test]
@@ -5744,15 +6078,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_loads_library_and_asset_summary_independently() {
+    fn startup_loads_homepage_and_asset_summary_independently() {
         let (_, commands) = started();
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 2);
         assert!(spawned
             .iter()
-            .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/library?"))));
-        assert!(spawned.iter().any(
-            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with("/asset/user"))
+            .any(|(_, work)| *work == api::homepage()));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::asset_summary()));
+        assert!(spawned.iter().all(
+            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/library?") || url.contains("/recent?"))
         ));
     }
 
@@ -5994,7 +6331,7 @@ mod tests {
         assert!(!drawn.contains("Tickets"));
         assert_fits(&screen);
 
-        runner.app_mut().shelf = Shelf::Recent;
+        runner.app_mut().destination = MainDestination::Recent;
         let screen = runner.app().screen();
         let drawn = format!("{screen:?}");
         assert!(drawn.contains("Recent · Coins 10"));
@@ -6014,7 +6351,7 @@ mod tests {
         assert!(!drawn.contains("Tickets"));
         assert_fits(&screen);
 
-        runner.app_mut().shelf = Shelf::Recent;
+        runner.app_mut().destination = MainDestination::Recent;
         let screen = runner.app().screen();
         let drawn = format!("{screen:?}");
         assert!(drawn.contains("Recent · Coins…"));
@@ -6035,7 +6372,7 @@ mod tests {
         assert!(!drawn.contains("Tickets"));
         assert_fits(&screen);
 
-        runner.app_mut().shelf = Shelf::Recent;
+        runner.app_mut().destination = MainDestination::Recent;
         let screen = runner.app().screen();
         let drawn = format!("{screen:?}");
         assert!(drawn.contains("Recent · Coins unavailable"));
@@ -6221,25 +6558,6 @@ mod tests {
         assert_fits(&screen);
     }
 
-    #[test]
-    fn account_back_restores_the_exact_library_or_recent_page() {
-        for (shelf, page) in [(Shelf::Library, 2), (Shelf::Recent, 4)] {
-            let (mut runner, _) = loaded_library();
-            complete_initial_summary(&mut runner);
-            runner.app_mut().shelf = shelf;
-            runner.app_mut().page = page;
-
-            runner.action(action_id(ACCOUNT));
-            assert_eq!(runner.app().view, View::Account);
-            assert_eq!(runner.app().shelf, shelf);
-
-            let commands = runner.action(ActionId::BACK);
-            assert_eq!(runner.app().view, View::Library);
-            assert_eq!(runner.app().shelf, shelf);
-            assert_eq!(runner.app().page, page);
-            assert!(!last_screen(&commands).owns_back);
-        }
-    }
 
     #[test]
     fn account_stale_detail_generation_cannot_replace_cached_rows() {
@@ -6624,32 +6942,34 @@ mod tests {
     }
 
     #[test]
-    fn wallet_credential_failure_cancels_library_and_ignores_its_late_outcome() {
+    fn wallet_credential_failure_keeps_public_featured_and_ignores_homepage_outcome() {
         let (mut runner, commands) = started();
-        let (library_task, _) = fetch_task_with(&commands, "/library?");
+        let (homepage_task, _) = fetch_task_with(&commands, "/comic/main");
         let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
         runner.task_outcome(summary_task, TaskOutcome::Failed(TaskError::NoCredential));
         assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
         assert_eq!(runner.app().task, None);
         assert_eq!(runner.app().pending, None);
 
         runner.task_outcome(
-            library_task,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+            homepage_task,
+            TaskOutcome::Completed(b"<html></html>".to_vec()),
         );
         assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().view, View::Main);
         assert!(runner.app().comics.is_empty());
     }
 
     #[test]
     fn sign_out_clears_wallet_and_ignores_late_summary() {
-        let (mut runner, commands) = started();
-        let (library_task, _) = fetch_task_with(&commands, "/library?");
-        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
-        runner.task_outcome(
-            library_task,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
-        );
+        let (mut runner, _) = loaded_library();
+        let summary_task = runner
+            .app()
+            .wallet
+            .summary_task
+            .expect("startup summary task");
         let logout_task = begin_logout(&mut runner);
         runner.task_outcome(logout_task, TaskOutcome::Completed(Vec::new()));
         assert!(runner.app().wallet.summary.is_none());
@@ -6663,32 +6983,39 @@ mod tests {
     }
 
     #[test]
-    fn startup_requests_library_without_a_session_task() {
+    fn startup_requests_public_homepage_without_a_credential() {
         let (_, commands) = started();
-        let (_, work) = fetch_task_with(&commands, "/library?");
+        let (_, work) = fetch_task_with(&commands, "/comic/main");
         let Task::Fetch {
             url, credential, ..
         } = work
         else {
-            panic!("startup did not request the library");
+            panic!("startup did not request the homepage");
         };
-        assert!(url.starts_with("https://www.bomtoon.tw/api/balcony-api-v2/library?"));
-        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+        assert_eq!(url, "https://www.bomtoon.tw/comic/main");
+        assert_eq!(credential, None);
     }
 
     #[test]
-    fn missing_credentials_show_login_instructions_and_try_again() {
+    fn missing_credentials_leave_featured_available_and_sign_in_retries_cleanly() {
         let (mut runner, commands) = started();
-        let (task, _) = fetch_task_with(&commands, "/library?");
+        let (task, _) = fetch_task_with(&commands, "/asset/user");
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
 
         assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().view, View::Main);
+        assert!(format!("{:?}", last_screen(&commands)).contains("Sign in"));
+
+        let commands = runner.action(action_id(SIGN_IN));
         assert_login_instructions(&last_screen(&commands));
 
         let commands = runner.action(action_id(RETRY));
-        let (_, work) = fetch_task_with(&commands, "/library?");
-        assert!(matches!(work, Task::Fetch { .. }));
+        let (_, work) = fetch_task_with(&commands, "/comic/main");
+        assert_eq!(work, api::homepage());
         assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert!(!commands.iter().any(is_library_or_recent_fetch));
     }
 
     #[test]
@@ -6802,7 +7129,7 @@ mod tests {
                 .all(|command| !matches!(command, Command::Spawn { .. })),
             "a hidden retry started work"
         );
-        assert_eq!(runner.app().view, View::Library);
+        assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().comics.len(), 1);
         assert_eq!(runner.app().total_library_titles, 1);
         assert!(runner.app().library_loaded);
@@ -6857,9 +7184,11 @@ mod tests {
         assert_fits(&screen);
 
         let commands = runner.action(action_id(RETRY));
-        let (_, work) = fetch_task_with(&commands, "/library?");
-        assert!(matches!(work, Task::Fetch { .. }));
+        let (_, work) = fetch_task_with(&commands, "/comic/main");
+        assert_eq!(work, api::homepage());
         assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
         assert_all_account_data_cleared(runner.app());
     }
 
@@ -6899,9 +7228,17 @@ mod tests {
             (TaskError::NoCredential, AccountState::SignedOut),
             (TaskError::Unauthorized, AccountState::Expired),
         ] {
+            let (runner, commands) = failed_start(error);
+            assert_eq!(runner.app().account, expected);
+            if expected == AccountState::SignedOut {
+                assert_eq!(runner.app().view, View::Main);
+                assert!(format!("{:?}", last_screen(&commands)).contains("Sign in"));
+            } else {
+                assert_login_instructions(&last_screen(&commands));
+            }
+
             for (runner, commands) in [
-                failed_start(error),
-                failed_library_action(RECENT_SHELF, error),
+                failed_library_action(RECENT, error),
                 failed_library_action("comic-0", error),
             ] {
                 assert_eq!(runner.app().account, expected);
@@ -6929,7 +7266,7 @@ mod tests {
 
         let commands = runner.action(ActionId::BACK);
         let screen = last_screen(&commands);
-        assert_eq!(runner.app().view, View::Library);
+        assert_eq!(runner.app().view, View::Main);
         assert!(!screen.owns_back);
         assert_fits(&screen);
     }
@@ -6974,12 +7311,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_owned_library_uses_recent_reading() {
-        assert!(should_load_recent(0, 0));
-        assert!(!should_load_recent(0, 1));
-        assert!(!should_load_recent(1, 0));
-    }
     #[test]
     fn modeled_reader_memory_bounds_are_byte_exact() {
         assert_eq!(gray8_conservative_bytes(), 96_079_168);
