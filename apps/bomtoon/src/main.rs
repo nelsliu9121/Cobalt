@@ -65,12 +65,18 @@ fn history_start_ms() -> Option<i64> {
     history_start_ms_at(unix_time_ms()?)
 }
 
-fn taipei_date(timestamp_ms: i64) -> Option<String> {
+fn taipei_day(timestamp_ms: i64) -> Option<i64> {
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
     const TAIPEI_OFFSET_MS: i64 = 8 * 60 * 60 * 1_000;
-    let days = timestamp_ms
-        .checked_add(TAIPEI_OFFSET_MS)?
-        .div_euclid(DAY_MS);
+    Some(
+        timestamp_ms
+            .checked_add(TAIPEI_OFFSET_MS)?
+            .div_euclid(DAY_MS),
+    )
+}
+
+fn taipei_date(timestamp_ms: i64) -> Option<String> {
+    let days = taipei_day(timestamp_ms)?;
     let shifted = days.checked_add(719_468)?;
     let era = if shifted >= 0 {
         shifted
@@ -618,17 +624,23 @@ impl Bomtoon {
             AssetSubtype::Bonus => "Bonus",
             AssetSubtype::Free => "Free",
         };
-        let expiration = match (row.expires_at, now_ms.and_then(taipei_date)) {
-            (Some(timestamp), Some(current_date)) => taipei_date(timestamp).map_or_else(
-                || "Expiration unavailable".to_owned(),
-                |expiration_date| {
-                    if expiration_date <= current_date {
-                        format!("Expired {expiration_date}")
-                    } else {
-                        format!("Expires {expiration_date}")
+        let expiration = match (row.expires_at, now_ms) {
+            (Some(timestamp), Some(now)) => {
+                match (
+                    taipei_day(timestamp),
+                    taipei_day(now),
+                    taipei_date(timestamp),
+                ) {
+                    (Some(expiration_day), Some(current_day), Some(expiration_date)) => {
+                        if expiration_day <= current_day {
+                            format!("Expired {expiration_date}")
+                        } else {
+                            format!("Expires {expiration_date}")
+                        }
                     }
-                },
-            ),
+                    _ => "Expiration unavailable".to_owned(),
+                }
+            }
             (Some(_), None) => "Expiration unavailable".to_owned(),
             (None, _) => "No expiry".to_owned(),
         };
@@ -869,12 +881,12 @@ impl Bomtoon {
             self.wallet.summary_refresh_queued = true;
             return;
         }
+        self.wallet.summary_refresh_queued = false;
         let Some(generation) = self.wallet.request_summary_generation() else {
             return;
         };
         let Some(task) = context.spawn(api::asset_summary()) else {
-            self.wallet.summary_error = true;
-            self.wallet.summary_stale = self.wallet.summary.is_some();
+            self.wallet.summary_refresh_queued = true;
             return;
         };
         self.wallet.summary_error = false;
@@ -882,6 +894,12 @@ impl Bomtoon {
         self.wallet
             .tasks
             .insert(task, WalletTaskPurpose::Summary { generation });
+    }
+
+    fn resume_deferred_summary(&mut self, context: &mut Context) {
+        if self.view != View::Reader && self.wallet.summary_refresh_queued {
+            self.refresh_asset_summary(context);
+        }
     }
 
     fn set_history_error(&mut self, kind: AssetKind, error: bool) {
@@ -1814,9 +1832,7 @@ impl Bomtoon {
         self.view = View::Episodes;
         self.show(context);
         self.cancel_reader(context);
-        if self.wallet.take_queued_summary_refresh() {
-            self.refresh_asset_summary(context);
-        }
+        self.resume_deferred_summary(context);
     }
 
     fn take_ready_page(&mut self, page: usize) -> Option<Picture> {
@@ -2350,12 +2366,13 @@ impl KoboApp for Bomtoon {
                 self.view = View::Episodes;
             }
             self.cancel_reader(context);
+            self.resume_deferred_summary(context);
         }
     }
 
     fn on_exit(&mut self, context: &mut Context) {
-        self.on_suspend(context);
         self.cancel_wallet(context);
+        self.on_suspend(context);
     }
 
     #[allow(
@@ -2480,6 +2497,7 @@ impl KoboApp for Bomtoon {
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
         if let Some(purpose) = self.wallet.tasks.remove(&task) {
             self.handle_wallet_outcome(context, task, purpose, outcome);
+            self.resume_deferred_summary(context);
             return;
         }
         if let Some(entry) = self.reader_tasks.remove(&task) {
@@ -2487,9 +2505,11 @@ impl KoboApp for Bomtoon {
                 self.foreground_reader_task = None;
             }
             self.handle_reader_outcome(context, task, entry, outcome);
+            self.resume_deferred_summary(context);
             return;
         }
         if self.task != Some(task) {
+            self.resume_deferred_summary(context);
             return;
         }
         self.task = None;
@@ -2510,6 +2530,7 @@ impl KoboApp for Bomtoon {
         if !shown {
             self.show(context);
         }
+        self.resume_deferred_summary(context);
     }
 }
 
@@ -5711,6 +5732,97 @@ mod tests {
         assert!(!runner.app().wallet.summary_refresh_queued);
     }
 
+    fn saturated_reader_with_deferred_summary() -> (AppRunner<Bomtoon>, Vec<TaskId>) {
+        let metrics = reader_metrics(PictureFormat::Gray8, 1);
+        let (mut runner, _) = loaded_library_with_metrics(metrics);
+        complete_initial_summary(&mut runner);
+        let commands = runner.action(action_id(ACCOUNT));
+        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        runner.app_mut().wallet.summary_refresh_queued = true;
+        runner.action(ActionId::BACK);
+
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+        runner.task_outcome(
+            content_task,
+            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
+        );
+        let commands = runner.action(action_id("episode-0"));
+        let (manifest_task, _) = only_spawn(&commands);
+        assert_eq!(runner.tasks_in_flight(), 4);
+
+        runner.task_outcome(
+            summary_task,
+            TaskOutcome::Completed(ASSET_RESPONSE.to_vec()),
+        );
+        assert!(runner.app().wallet.summary_refresh_queued);
+        let commands = runner.task_outcome(
+            manifest_task,
+            TaskOutcome::Completed(image_manifest_sources(8)),
+        );
+        let (source_task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(source_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let (maintenance_task, _) = only_spawn(&commands);
+        runner.task_outcome(maintenance_task, TaskOutcome::Completed(Vec::new()));
+
+        assert_eq!(runner.tasks_in_flight(), 4);
+        let reader_tasks = runner
+            .app()
+            .reader_tasks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(reader_tasks.len(), 2);
+        (runner, reader_tasks)
+    }
+
+    #[test]
+    fn full_reader_capacity_keeps_deferred_summary_until_cancel_settles() {
+        let (mut runner, reader_tasks) = saturated_reader_with_deferred_summary();
+        let commands = runner.action(ActionId::BACK);
+
+        assert!(spawns(&commands).is_empty());
+        assert!(runner.app().wallet.summary_refresh_queued);
+        assert_eq!(runner.app().wallet.summary_task, None);
+        assert!(!runner.app().wallet.summary_error);
+        assert_eq!(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::Cancel(task) => Some(*task),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>(),
+            reader_tasks.iter().copied().collect()
+        );
+
+        let commands = runner.task_outcome(reader_tasks[0], TaskOutcome::Cancelled);
+        assert_eq!(spawns(&commands).len(), 1);
+        assert_eq!(
+            fetch_task_with(&commands, "/asset/user").1,
+            api::asset_summary()
+        );
+        assert!(!runner.app().wallet.summary_refresh_queued);
+    }
+
+    #[test]
+    fn suspend_resumes_deferred_summary_after_reader_cancel_settles() {
+        let (mut runner, reader_tasks) = saturated_reader_with_deferred_summary();
+        let commands = runner.suspend();
+
+        assert!(spawns(&commands).is_empty());
+        assert!(runner.app().wallet.summary_refresh_queued);
+        assert_eq!(runner.app().view, View::Episodes);
+
+        let commands = runner.task_outcome(reader_tasks[0], TaskOutcome::Cancelled);
+        assert_eq!(spawns(&commands).len(), 1);
+        assert_eq!(
+            fetch_task_with(&commands, "/asset/user").1,
+            api::asset_summary()
+        );
+        assert!(!runner.app().wallet.summary_refresh_queued);
+    }
+
     #[test]
     fn cancelled_wallet_outcomes_preserve_cached_data_without_errors() {
         let (mut runner, commands) = started();
@@ -5903,6 +6015,12 @@ mod tests {
             2,
             Some(1_735_660_800_000),
         );
+        let far_future = expiration_row(
+            model::AssetKind::Coin,
+            model::AssetSubtype::Bonus,
+            4,
+            Some(253_402_300_800_000),
+        );
         let no_expiry =
             expiration_row(model::AssetKind::Ticket, model::AssetSubtype::Free, 3, None);
         let now = Some(1_735_660_800_000);
@@ -5910,6 +6028,10 @@ mod tests {
         assert_eq!(
             Bomtoon::history_row_label_at(&future, now),
             "Coin · Standard · 1 · Expires 2027-09-01"
+        );
+        assert_eq!(
+            Bomtoon::history_row_label_at(&far_future, now),
+            "Coin · Bonus · 4 · Expires 10000-01-01"
         );
         assert_eq!(
             Bomtoon::history_row_label_at(&expired, now),
