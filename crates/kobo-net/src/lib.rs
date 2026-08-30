@@ -213,17 +213,31 @@ pub fn credential_allowed(
     url: &str,
 ) -> bool {
     if app == "bomtoon" {
-        return matches!(
+        if !matches!(
             (&*credential.secret, &credential.header),
             ("bomtoon-access-token", SecretHeader::Bearer)
-        ) && method == RequestMethod::Get
-            && has_origin(url, "www.bomtoon.tw", 443)
-            && (bomtoon_asset_summary_url(url)
-                || bomtoon_expiration_history_url(url)
-                || bomtoon_library_url(url)
-                || bomtoon_recent_url(url)
-                || bomtoon_content_url(url)
-                || bomtoon_images_url(url));
+        ) {
+            return false;
+        }
+        if url.contains('#') {
+            return false;
+        }
+        let Ok(address) = parse(url) else {
+            return false;
+        };
+        if !address.authority.eq_ignore_ascii_case("www.bomtoon.tw") {
+            return false;
+        }
+        return match method {
+            RequestMethod::Get => {
+                bomtoon_existing_get(url)
+                    || bomtoon_asset_url(&address.path)
+                    || bomtoon_history_url(&address.path)
+                    || bomtoon_gift_url(&address.path)
+                    || bomtoon_quote_url(&address.path)
+            }
+            RequestMethod::Post => bomtoon_purchase_url(&address.path),
+        };
     }
     if app == "audiobook" {
         return match (&*credential.secret, &credential.header) {
@@ -278,6 +292,66 @@ fn bomtoon_alias(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn bomtoon_commerce_alias(value: &str) -> bool {
+    value.len() <= 96 && bomtoon_alias(value)
+}
+
+fn bomtoon_existing_get(url: &str) -> bool {
+    bomtoon_asset_summary_url(url)
+        || bomtoon_library_url(url)
+        || bomtoon_recent_url(url)
+        || bomtoon_content_url(url)
+        || bomtoon_images_url(url)
+}
+
+fn bomtoon_asset_url(path: &str) -> bool {
+    path == "/api/balcony-api-v2/asset/user"
+}
+
+fn bomtoon_history_url(path: &str) -> bool {
+    const PREFIX: &str = "/api/balcony-api-v2/payment/charge?createdAt=";
+    const SUFFIX: &str = "&sort=EXPIRE&coinKind=";
+
+    let Some((created_at, coin_kind)) = path
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.split_once(SUFFIX))
+    else {
+        return false;
+    };
+    !created_at.is_empty()
+        && created_at.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(coin_kind, "COIN" | "TICKET")
+}
+
+fn bomtoon_gift_url(path: &str) -> bool {
+    const PREFIX: &str = "/api/balcony-api-v2/gift/contents/detail?contentsId=";
+
+    path.strip_prefix(PREFIX).is_some_and(|content_id| {
+        !content_id.is_empty() && content_id.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn bomtoon_quote_url(path: &str) -> bool {
+    const PREFIX: &str = "/api/balcony-api-v2/contents/price/";
+
+    let Some((aliases, purchase_type)) = path
+        .strip_prefix(PREFIX)
+        .and_then(|rest| rest.split_once("?purchaseType="))
+    else {
+        return false;
+    };
+    matches!(purchase_type, "RENT" | "POSSESSION")
+        && aliases.split_once('/').is_some_and(|(content, episode)| {
+            !episode.contains('/')
+                && bomtoon_commerce_alias(content)
+                && bomtoon_commerce_alias(episode)
+        })
+}
+
+fn bomtoon_purchase_url(path: &str) -> bool {
+    path == "/api/balcony-api/purchase"
+}
+
 fn bomtoon_content_url(url: &str) -> bool {
     const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
     const SUFFIX: &str = "?isNotLoginAdult=false&isPorch=false";
@@ -318,20 +392,6 @@ fn bomtoon_asset_summary_url(url: &str) -> bool {
     url == "https://www.bomtoon.tw/api/balcony-api/asset/user"
 }
 
-fn bomtoon_expiration_history_url(url: &str) -> bool {
-    const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=";
-    const SUFFIX: &str = "&sort=EXPIRE&coinKind=";
-
-    let Some((created_at, coin_kind)) = url
-        .strip_prefix(PREFIX)
-        .and_then(|rest| rest.split_once(SUFFIX))
-    else {
-        return false;
-    };
-    !created_at.is_empty()
-        && created_at.bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(coin_kind, "COIN" | "TICKET")
-}
 
 fn bomtoon_library_url(url: &str) -> bool {
     const PREFIX: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=";
@@ -1678,6 +1738,246 @@ mod tests {
     }
 
     #[test]
+    fn bomtoon_credential_allows_commerce_routes() {
+        use kobo_protocol::Credential;
+
+        let access = Credential::bearer("bomtoon-access-token");
+        let approved = [
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/asset/user",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=TICKET",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=POSSESSION",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchase",
+            ),
+        ];
+        for (method, url) in approved {
+            assert!(
+                super::credential_allowed("bomtoon", &access, method, url),
+                "{method:?} {url}"
+            );
+        }
+
+        let denied = [
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api-v2/asset/user",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge?createdAt=1725000000000&sort=EXPIRE&coinKind=COIN",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Get,
+                "https://attacker.invalid/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw:443/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw:444/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "http://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/details?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/prefix/api/balcony-api-v2/gift/contents/detail?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail/suffix?contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=forty-one",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41&contentsId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41&extra=true",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentId=41",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41#fragment",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price//ep-1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter%2fq/ep-1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep.1?purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT_GIFT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT&purchaseType=RENT",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT&extra=true",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType=RENT#fragment",
+            ),
+            (
+                RequestMethod::Post,
+                "https://attacker.invalid/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw:443/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw:444/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Post,
+                "http://www.bomtoon.tw/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchases",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/prefix/api/balcony-api/purchase",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchase/suffix",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchase?extra=true",
+            ),
+            (
+                RequestMethod::Post,
+                "https://www.bomtoon.tw/api/balcony-api/purchase#fragment",
+            ),
+        ];
+        for (method, url) in denied {
+            assert!(
+                !super::credential_allowed("bomtoon", &access, method, url),
+                "{method:?} {url}"
+            );
+        }
+
+        let alias_at_limit = "a".repeat(96);
+        let quote_at_limit = format!(
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/{alias_at_limit}/{alias_at_limit}?purchaseType=RENT"
+        );
+        assert!(super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Get,
+            &quote_at_limit
+        ));
+        let alias_over_limit = "a".repeat(97);
+        let quote_over_limit = format!(
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/{alias_over_limit}/ep-1?purchaseType=RENT"
+        );
+        assert!(!super::credential_allowed(
+            "bomtoon",
+            &access,
+            RequestMethod::Get,
+            &quote_over_limit
+        ));
+
+        for credential in [
+            Credential::in_header("bomtoon-access-token", "Authorization"),
+            Credential::basic("bomtoon-access-token"),
+            Credential::bearer("another-secret"),
+        ] {
+            for (method, url) in approved {
+                assert!(!super::credential_allowed(
+                    "bomtoon",
+                    &credential,
+                    method,
+                    url
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn bomtoon_asset_summary_requires_exact_get_bearer_origin_path_and_no_query() {
         use kobo_protocol::Credential;
 
@@ -1693,7 +1993,6 @@ mod tests {
             "https://attacker.invalid/api/balcony-api/asset/user",
             "https://www.bomtoon.tw/api/balcony-api/assets/user",
             "https://www.bomtoon.tw/api/balcony-api/asset/user?extra=true",
-            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user",
         ] {
             assert!(!super::credential_allowed(
                 "bomtoon",

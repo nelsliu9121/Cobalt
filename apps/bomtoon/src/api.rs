@@ -1,4 +1,5 @@
-use crate::model::AssetKind;
+use crate::model::{AssetKind, PurchaseType};
+use kobo_json::ObjectBuilder;
 use kobo_sdk::{Credential, Header, Task};
 
 const HOMEPAGE_URL: &str = "https://www.bomtoon.tw/comic/main";
@@ -9,12 +10,16 @@ const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
 const ASSET_URL: &str = "https://www.bomtoon.tw/api/balcony-api/asset/user";
 const CHARGE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge";
+const GIFTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail";
+const QUOTE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/";
+const PURCHASE_URL: &str = "https://www.bomtoon.tw/api/balcony-api/purchase";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
 const CONTENT_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
 const ASSET_HISTORY_BYTES: u32 = 512 * 1024;
+const COMMERCE_BYTES: u32 = 64 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
 
 pub fn homepage() -> Task {
@@ -97,6 +102,61 @@ pub fn images(content: &str, episode: &str, panel_width: u32) -> Task {
     )
 }
 
+pub fn account_scope() -> Task {
+    Task::CredentialScope {
+        credential: "bomtoon-access-token".to_owned(),
+    }
+}
+
+pub fn title_gifts(content_id: usize) -> Task {
+    fetch(
+        format!("{GIFTS_URL}?contentsId={content_id}"),
+        COMMERCE_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
+    )
+}
+
+pub fn quote(content_alias: &str, episode_alias: &str, purchase: PurchaseType) -> Task {
+    let purchase_type = match purchase {
+        PurchaseType::RentGift | PurchaseType::Rent => PurchaseType::Rent.as_remote(),
+        PurchaseType::Possession => PurchaseType::Possession.as_remote(),
+    };
+    fetch(
+        format!(
+            "{QUOTE_URL}{content_alias}/{episode_alias}?purchaseType={purchase_type}"
+        ),
+        COMMERCE_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
+    )
+}
+
+pub fn purchase(content_alias: &str, episode_id: usize, purchase: PurchaseType) -> Task {
+    let episode_id_text = episode_id.to_string();
+    let episode_id =
+        kobo_json::parse(&episode_id_text).expect("a usize is always a JSON integer");
+    let body = ObjectBuilder::new()
+        .set("id", episode_id)
+        .set("purchaseType", purchase.as_remote())
+        .set("isMobile", false)
+        .build()
+        .to_json();
+    let mut headers = balcony_headers();
+    headers.push(Header::new(
+        "x-referer",
+        format!("{DETAIL_URL}{content_alias}"),
+    ));
+    Task::Post {
+        url: PURCHASE_URL.to_owned(),
+        body,
+        content_type: "application/json".to_owned(),
+        credential: Some(Credential::bearer("bomtoon-access-token")),
+        headers,
+        max_bytes: COMMERCE_BYTES,
+    }
+}
+
 pub fn image(url: &str) -> Task {
     Task::Fetch {
         url: url.to_owned(),
@@ -154,10 +214,10 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_summary, content, expiration_history, homepage, image, images, library,
-        public_detail, recent, ACCEPT_LANGUAGE,
+        account_scope, asset_summary, content, expiration_history, homepage, image, images,
+        library, public_detail, purchase, quote, recent, title_gifts, ACCEPT_LANGUAGE,
     };
-    use crate::model::AssetKind;
+    use crate::model::{AssetKind, PurchaseType};
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
 
     #[test]
@@ -406,6 +466,131 @@ mod tests {
                 Header::new("x-referer", "https://www.bomtoon.tw/viewer/hunter_q/ep-1"),
             ]
         );
+    }
+
+    #[test]
+    fn account_scope_uses_the_managed_bomtoon_credential() {
+        assert_eq!(
+            account_scope(),
+            Task::CredentialScope {
+                credential: "bomtoon-access-token".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn title_gifts_uses_exact_bearer_route_headers_and_ceiling() {
+        let Task::Fetch {
+            url,
+            offset,
+            max_bytes,
+            credential,
+            headers,
+        } = title_gifts(41)
+        else {
+            panic!("expected Gift fetch");
+        };
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail?contentsId=41"
+        );
+        assert_eq!(offset, 0);
+        assert_eq!(max_bytes, 64 * 1024);
+        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+        assert_eq!(
+            headers,
+            vec![
+                Header::new("Accept", "application/json"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+                Header::new("x-balcony-id", "BOMTOON_TW"),
+                Header::new("x-balcony-timezone", "Asia/Taipei"),
+                Header::new("x-platform", "MOBILE_IOS"),
+            ]
+        );
+    }
+
+    #[test]
+    fn quotes_use_exact_action_specific_route_and_bounded_fetch() {
+        for (purchase_type, remote) in [
+            (PurchaseType::RentGift, "RENT"),
+            (PurchaseType::Rent, "RENT"),
+            (PurchaseType::Possession, "POSSESSION"),
+        ] {
+            let Task::Fetch {
+                url,
+                offset,
+                max_bytes,
+                credential,
+                headers,
+            } = quote("hunter_q", "ep-1", purchase_type)
+            else {
+                panic!("expected quote fetch");
+            };
+            assert_eq!(
+                url,
+                format!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/hunter_q/ep-1?purchaseType={remote}"
+                )
+            );
+            assert_eq!(offset, 0);
+            assert_eq!(max_bytes, 64 * 1024);
+            assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+            assert_eq!(
+                headers,
+                vec![
+                    Header::new("Accept", "application/json"),
+                    Header::new("Accept-Language", ACCEPT_LANGUAGE),
+                    Header::new("x-balcony-id", "BOMTOON_TW"),
+                    Header::new("x-balcony-timezone", "Asia/Taipei"),
+                    Header::new("x-platform", "MOBILE_IOS"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn purchases_use_exact_json_mutation_and_no_application_secrets() {
+        for (purchase_type, remote) in [
+            (PurchaseType::RentGift, "RENT_GIFT"),
+            (PurchaseType::Rent, "RENT"),
+            (PurchaseType::Possession, "POSSESSION"),
+        ] {
+            let Task::Post {
+                url,
+                body,
+                content_type,
+                credential,
+                headers,
+                max_bytes,
+            } = purchase("hunter_q", 6800, purchase_type)
+            else {
+                panic!("expected purchase POST");
+            };
+            assert_eq!(url, "https://www.bomtoon.tw/api/balcony-api/purchase");
+            assert_eq!(
+                body,
+                format!(r#"{{"id":6800,"purchaseType":"{remote}","isMobile":false}}"#)
+            );
+            assert_eq!(content_type, "application/json");
+            assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+            assert_eq!(max_bytes, 64 * 1024);
+            assert_eq!(
+                headers,
+                vec![
+                    Header::new("Accept", "application/json"),
+                    Header::new("Accept-Language", ACCEPT_LANGUAGE),
+                    Header::new("x-balcony-id", "BOMTOON_TW"),
+                    Header::new("x-balcony-timezone", "Asia/Taipei"),
+                    Header::new("x-platform", "MOBILE_IOS"),
+                    Header::new("x-referer", "https://www.bomtoon.tw/detail/hunter_q"),
+                ]
+            );
+            assert!(headers.iter().all(|header| {
+                !header.name.eq_ignore_ascii_case("cookie")
+                    && !header.name.eq_ignore_ascii_case("origin")
+                    && !header.name.eq_ignore_ascii_case("authorization")
+            }));
+        }
     }
 
     #[test]
