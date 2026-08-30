@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented on `feature/bomtoon-coin-ticket-redemption`. Automated repository gates and non-spending simulator checks pass. Final operator-attended post-implementation backend checks remain a release gate.
+Implementation complete. Automated gates pass. Limited non-spending simulator smoke passes. Remaining simulator and operator-attended release checks are pending.
 
 ## Goal
 
@@ -537,12 +537,16 @@ Verified on 2026-08-31:
 - Existing revoked attended captures establish Gift delta `-1` with refreshed `RENT`, Coin rental delta `-2`, and Coin purchase delta `-3`. They do not establish refreshed paid `RENT`/`POSSESSION` or the post-implementation restart/failure scenarios below.
 - `git ls-files evidences` and the staged evidence-path checks produced no output.
 
+Still pending in non-spending simulators:
+
+- interactive browser quote, cancel, and disabled-action scenarios;
+- runtime action, Back, progress, and store-callback scenarios;
+- interruption, restart, no-second-POST, and account-isolation scenarios.
+
 Still operator-attended and pending:
 
-- refreshed `RENT` after the lowest-cost Coin rental;
-- refreshed `POSSESSION` after the lowest-cost Coin purchase;
-- one accepted mutation with a controlled refresh failure, restart reconciliation, and proof that no second POST occurs;
-- marker preservation across sign-out, offline startup, expired credentials, and different-account login on the post-implementation build.
+- fresh paid `RENT` and `POSSESSION` refresh checks;
+- one accepted live refresh-failure check proving no repost.
 
 ## Documentation and clean cutover
 
