@@ -69,7 +69,12 @@ fn local_day_for(
     discover_system_zone: impl FnOnce() -> Option<TimeZone>,
 ) -> Option<LocalDay> {
     match explicit_time_zone {
-        Some(posix_rule) => explicit_local_day_for(Some(timestamp), Some(posix_rule)),
+        Some(value) => {
+            let time_zone = TimeZone::get(value)
+                .or_else(|_| TimeZone::posix(value))
+                .ok()?;
+            local_day_at(timestamp, &time_zone)
+        }
         None => local_day_at(timestamp, &discover_system_zone()?),
     }
 }
@@ -1049,6 +1054,18 @@ mod tests {
             super::local_day_for(now, None, || None),
             None,
             "failed system-zone discovery must not substitute UTC"
+        );
+    }
+
+    #[test]
+    fn local_day_host_accepts_an_explicit_named_timezone() {
+        let now: Timestamp = "2026-08-30T03:30:00Z".parse().expect("timestamp");
+
+        assert_eq!(
+            super::local_day_for(now, Some("America/New_York"), || {
+                panic!("explicit TZ must not invoke system discovery")
+            }),
+            LocalDay::new(2026, 8, 29)
         );
     }
 
