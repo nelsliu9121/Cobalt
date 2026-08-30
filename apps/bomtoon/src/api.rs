@@ -7,7 +7,7 @@ const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
-const ASSET_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/asset/user";
+const ASSET_URL: &str = "https://www.bomtoon.tw/api/balcony-api/asset/user";
 const CHARGE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/charge";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
 const CONTENT_BYTES: u32 = 512 * 1024;
@@ -273,7 +273,7 @@ mod tests {
         else {
             panic!("expected fetch task");
         };
-        assert_eq!(url, "https://www.bomtoon.tw/api/balcony-api-v2/asset/user");
+        assert_eq!(url, "https://www.bomtoon.tw/api/balcony-api/asset/user");
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 64 * 1024);
         assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));

@@ -315,7 +315,7 @@ fn bomtoon_images_url(url: &str) -> bool {
 }
 
 fn bomtoon_asset_summary_url(url: &str) -> bool {
-    url == "https://www.bomtoon.tw/api/balcony-api-v2/asset/user"
+    url == "https://www.bomtoon.tw/api/balcony-api/asset/user"
 }
 
 fn bomtoon_expiration_history_url(url: &str) -> bool {
@@ -1682,7 +1682,7 @@ mod tests {
         use kobo_protocol::Credential;
 
         let access = Credential::bearer("bomtoon-access-token");
-        let exact = "https://www.bomtoon.tw/api/balcony-api-v2/asset/user";
+        let exact = "https://www.bomtoon.tw/api/balcony-api/asset/user";
         assert!(super::credential_allowed(
             "bomtoon",
             &access,
@@ -1690,9 +1690,10 @@ mod tests {
             exact
         ));
         for url in [
-            "https://attacker.invalid/api/balcony-api-v2/asset/user",
-            "https://www.bomtoon.tw/api/balcony-api-v2/assets/user",
-            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user?extra=true",
+            "https://attacker.invalid/api/balcony-api/asset/user",
+            "https://www.bomtoon.tw/api/balcony-api/assets/user",
+            "https://www.bomtoon.tw/api/balcony-api/asset/user?extra=true",
+            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user",
         ] {
             assert!(!super::credential_allowed(
                 "bomtoon",
