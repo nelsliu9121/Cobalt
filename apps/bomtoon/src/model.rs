@@ -60,7 +60,9 @@ pub struct AssetAmounts {
 
 impl AssetAmounts {
     pub fn total(self) -> Option<usize> {
-        self.standard.checked_add(self.bonus)?.checked_add(self.free)
+        self.standard
+            .checked_add(self.bonus)?
+            .checked_add(self.free)
     }
 }
 
@@ -146,9 +148,7 @@ impl PurchaseState {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState,
-    };
+    use super::{display_text, AssetAmounts, Episode, EpisodeAvailability, PurchaseState};
 
     #[test]
     fn asset_amounts_total_is_checked() {

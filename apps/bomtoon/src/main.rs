@@ -52,14 +52,17 @@ enum Shelf {
     Recent,
 }
 
+fn unix_time_ms() -> Option<i64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
+}
+
 fn history_start_ms_at(now_ms: i64) -> Option<i64> {
     now_ms.checked_sub(HISTORY_WINDOW_MS)
 }
 
 fn history_start_ms() -> Option<i64> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    let now = i64::try_from(elapsed.as_millis()).ok()?;
-    history_start_ms_at(now)
+    history_start_ms_at(unix_time_ms()?)
 }
 
 fn taipei_date(timestamp_ms: i64) -> Option<String> {
@@ -78,8 +81,7 @@ fn taipei_date(timestamp_ms: i64) -> Option<String> {
     let year_of_era =
         (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
@@ -226,6 +228,10 @@ enum WalletTaskPurpose {
     TicketHistory { generation: u64 },
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent wallet request and section states can fail and refresh separately"
+)]
 #[derive(Default)]
 struct WalletState {
     summary: Option<WalletSummary>,
@@ -288,7 +294,6 @@ impl WalletState {
         true
     }
 }
-
 
 enum PageEntry {
     Building(PageBuild),
@@ -388,9 +393,7 @@ impl Bomtoon {
     fn show(&self, context: &mut Context) {
         let owns_back = self.account == AccountState::Active
             && match self.view {
-                View::Account | View::Episodes => {
-                    self.pending.is_none() && self.problem.is_none()
-                }
+                View::Account | View::Episodes => self.pending.is_none() && self.problem.is_none(),
                 View::Reader => true,
                 View::Status | View::Library => false,
             };
@@ -479,7 +482,7 @@ impl Bomtoon {
     }
 
     fn library_title(&self) -> String {
-        let shelf = if self.shelf == Shelf::Recent {
+        let title = if self.shelf == Shelf::Recent {
             "Recent"
         } else {
             "Library"
@@ -489,9 +492,9 @@ impl Bomtoon {
             .summary
             .and_then(|summary| summary.coins.total())
         {
-            Some(total) => format!("{shelf} · Coins {total}"),
-            None if self.wallet.summary_task.is_some() => format!("{shelf} · Coins…"),
-            None => format!("{shelf} · Coins unavailable"),
+            Some(total) => format!("{title} · Coins {total}"),
+            None if self.wallet.summary_task.is_some() => format!("{title} · Coins…"),
+            None => format!("{title} · Coins unavailable"),
         }
     }
 
@@ -594,7 +597,10 @@ impl Bomtoon {
                 format!("Unavailable · {rows} cached")
             }
         } else if rows == 0 {
-            "Empty".to_owned()
+            match kind {
+                AssetKind::Coin => "No coin expiration records".to_owned(),
+                AssetKind::Ticket => "No ticket expiration records".to_owned(),
+            }
         } else if rows == 1 {
             "1 entry".to_owned()
         } else {
@@ -602,7 +608,7 @@ impl Bomtoon {
         }
     }
 
-    fn history_row_label(row: &ExpirationRow) -> String {
+    fn history_row_label_at(row: &ExpirationRow, now_ms: Option<i64>) -> String {
         let kind = match row.kind {
             AssetKind::Coin => "Coin",
             AssetKind::Ticket => "Ticket",
@@ -612,14 +618,22 @@ impl Bomtoon {
             AssetSubtype::Bonus => "Bonus",
             AssetSubtype::Free => "Free",
         };
-        let expiration = match row.expires_at {
-            Some(timestamp) => taipei_date(timestamp)
-                .map_or_else(|| "Expiration unavailable".to_owned(), |date| format!("Expires {date}")),
-            None => "No expiration".to_owned(),
+        let expiration = match (row.expires_at, now_ms.and_then(taipei_date)) {
+            (Some(timestamp), Some(current_date)) => taipei_date(timestamp).map_or_else(
+                || "Expiration unavailable".to_owned(),
+                |expiration_date| {
+                    if expiration_date <= current_date {
+                        format!("Expired {expiration_date}")
+                    } else {
+                        format!("Expires {expiration_date}")
+                    }
+                },
+            ),
+            (Some(_), None) => "Expiration unavailable".to_owned(),
+            (None, _) => "No expiry".to_owned(),
         };
         format!("{kind} · {subtype} · {} · {expiration}", row.quantity)
     }
-
 
     fn account_screen(&self) -> Screen {
         let mut screen = ScreenBuilder::new("bomtoon-account").top_bar("Account");
@@ -668,8 +682,8 @@ impl Bomtoon {
             .coin_history
             .len()
             .saturating_add(self.wallet.ticket_history.len());
-        let (start, end) =
-            page_bounds(self.page, row_count, ACCOUNT_HISTORY_ITEMS_PER_PAGE);
+        let (start, end) = page_bounds(self.page, row_count, ACCOUNT_HISTORY_ITEMS_PER_PAGE);
+        let now_ms = unix_time_ms();
         if start < end {
             screen = screen.paged_list(
                 u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
@@ -679,7 +693,7 @@ impl Bomtoon {
                     .chain(&self.wallet.ticket_history)
                     .skip(start)
                     .take(end - start)
-                    .map(Self::history_row_label),
+                    .map(|row| Self::history_row_label_at(row, now_ms)),
             );
         }
         if self.page > 0 {
@@ -851,6 +865,10 @@ impl Bomtoon {
     }
 
     fn refresh_asset_summary(&mut self, context: &mut Context) {
+        if self.view == View::Reader {
+            self.wallet.summary_refresh_queued = true;
+            return;
+        }
         let Some(generation) = self.wallet.request_summary_generation() else {
             return;
         };
@@ -896,11 +914,7 @@ impl Bomtoon {
         self.refresh_account_details_from(context, history_start_ms());
     }
 
-    fn refresh_account_details_from(
-        &mut self,
-        context: &mut Context,
-        start_ms: Option<i64>,
-    ) {
+    fn refresh_account_details_from(&mut self, context: &mut Context, start_ms: Option<i64>) {
         self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
         let generation = self.wallet.detail_generation;
         let old_details = self
@@ -910,8 +924,7 @@ impl Bomtoon {
             .filter_map(|(task, purpose)| {
                 matches!(
                     purpose,
-                    WalletTaskPurpose::CoinHistory { .. }
-                        | WalletTaskPurpose::TicketHistory { .. }
+                    WalletTaskPurpose::CoinHistory { .. } | WalletTaskPurpose::TicketHistory { .. }
                 )
                 .then_some(*task)
             })
@@ -1801,6 +1814,9 @@ impl Bomtoon {
         self.view = View::Episodes;
         self.show(context);
         self.cancel_reader(context);
+        if self.wallet.take_queued_summary_refresh() {
+            self.refresh_asset_summary(context);
+        }
     }
 
     fn take_ready_page(&mut self, page: usize) -> Option<Picture> {
@@ -2029,11 +2045,7 @@ impl Bomtoon {
             }
         }
     }
-    fn handle_wallet_credential_failure(
-        &mut self,
-        context: &mut Context,
-        account: AccountState,
-    ) {
+    fn handle_wallet_credential_failure(&mut self, context: &mut Context, account: AccountState) {
         if let Some(task) = self.task.take() {
             context.cancel(task);
         }
@@ -2079,10 +2091,11 @@ impl Bomtoon {
                                 self.wallet.summary_stale = self.wallet.summary.is_some();
                             }
                         }
-                        TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
+                        TaskOutcome::Failed(_) => {
                             self.wallet.summary_error = true;
                             self.wallet.summary_stale = self.wallet.summary.is_some();
                         }
+                        TaskOutcome::Cancelled => {}
                     }
                 }
                 if self.wallet.take_queued_summary_refresh() {
@@ -2108,9 +2121,8 @@ impl Bomtoon {
                                 Err(_) => self.set_history_error(kind, true),
                             }
                         }
-                        TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {
-                            self.set_history_error(kind, true);
-                        }
+                        TaskOutcome::Failed(_) => self.set_history_error(kind, true),
+                        TaskOutcome::Cancelled => {}
                     }
                     self.clamp_account_history_page();
                 }
@@ -2120,7 +2132,6 @@ impl Bomtoon {
             self.show(context);
         }
     }
-
 
     fn handle_reader_action(&mut self, context: &mut Context, action: ActionId) {
         if action == action_id(READER_CHROME) {
@@ -2344,8 +2355,13 @@ impl KoboApp for Bomtoon {
 
     fn on_exit(&mut self, context: &mut Context) {
         self.on_suspend(context);
+        self.cancel_wallet(context);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered action dispatcher keeps Back, retry, and view ownership explicit"
+    )]
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
         let can_leave_reader = self.account == AccountState::Active && self.view == View::Reader;
         if action == ActionId::BACK && can_leave_reader {
@@ -2356,9 +2372,7 @@ impl KoboApp for Bomtoon {
             && self.problem.is_none()
             && self.pending.is_none()
             && self.foreground_reader_task.is_none();
-        if action == ActionId::BACK
-            && ready
-            && matches!(self.view, View::Account | View::Episodes)
+        if action == ActionId::BACK && ready && matches!(self.view, View::Account | View::Episodes)
         {
             self.view = View::Library;
             self.page = match self.shelf {
@@ -3870,7 +3884,11 @@ mod tests {
     }
 
     fn complete_initial_summary(runner: &mut AppRunner<Bomtoon>) {
-        let task = runner.app().wallet.summary_task.expect("initial summary task");
+        let task = runner
+            .app()
+            .wallet
+            .summary_task
+            .expect("initial summary task");
         runner.task_outcome(task, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         assert_eq!(runner.app().wallet.summary, Some(test_wallet_summary()));
     }
@@ -4519,17 +4537,22 @@ mod tests {
 
     #[test]
     fn ticket_comic_maximum_quantity_fits_clara_bw() {
-        let mut app = Bomtoon::default();
-        app.view = View::Episodes;
-        app.selected_title = "Maximum Tickets".to_owned();
-        app.wallet.summary = Some(WalletSummary {
-            coins: model::AssetAmounts::default(),
-            tickets: model::AssetAmounts {
-                standard: usize::MAX,
-                bonus: 0,
-                free: 0,
+        let mut app = Bomtoon {
+            view: View::Episodes,
+            selected_title: "Maximum Tickets".to_owned(),
+            wallet: WalletState {
+                summary: Some(WalletSummary {
+                    coins: model::AssetAmounts::default(),
+                    tickets: model::AssetAmounts {
+                        standard: usize::MAX,
+                        bonus: 0,
+                        free: 0,
+                    },
+                }),
+                ..WalletState::default()
             },
-        });
+            ..Bomtoon::default()
+        };
         app.episodes.push(Episode {
             alias: "maximum-ticket".to_owned(),
             title: "Maximum Ticket Episode".to_owned(),
@@ -5641,9 +5664,9 @@ mod tests {
         let (_, commands) = started();
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 2);
-        assert!(spawned.iter().any(
-            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/library?"))
-        ));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/library?"))));
         assert!(spawned.iter().any(
             |(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with("/asset/user"))
         ));
@@ -5651,8 +5674,10 @@ mod tests {
 
     #[test]
     fn summary_refresh_requests_coalesce_into_one_follow_up() {
-        let mut wallet = WalletState::default();
-        wallet.summary_task = Some(TaskId(7));
+        let mut wallet = WalletState {
+            summary_task: Some(TaskId(7)),
+            ..WalletState::default()
+        };
         assert_eq!(wallet.request_summary_generation(), None);
         assert_eq!(wallet.request_summary_generation(), None);
         assert!(wallet.summary_refresh_queued);
@@ -5660,6 +5685,85 @@ mod tests {
         wallet.summary_task = None;
         assert!(wallet.take_queued_summary_refresh());
         assert!(!wallet.take_queued_summary_refresh());
+    }
+
+    #[test]
+    fn queued_summary_refresh_waits_until_reader_releases_task_capacity() {
+        let (mut runner, commands) = started();
+        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        runner.app_mut().view = View::Reader;
+        runner.app_mut().wallet.summary_refresh_queued = true;
+
+        let commands = runner.task_outcome(
+            summary_task,
+            TaskOutcome::Completed(ASSET_RESPONSE.to_vec()),
+        );
+        assert!(spawns(&commands).is_empty());
+        assert!(runner.app().wallet.summary_refresh_queued);
+
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(spawns(&commands).len(), 1);
+        assert_eq!(
+            fetch_task_with(&commands, "/asset/user").1,
+            api::asset_summary()
+        );
+        assert!(!runner.app().wallet.summary_refresh_queued);
+    }
+
+    #[test]
+    fn cancelled_wallet_outcomes_preserve_cached_data_without_errors() {
+        let (mut runner, commands) = started();
+        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        runner.app_mut().wallet.summary = Some(test_wallet_summary());
+        runner.task_outcome(summary_task, TaskOutcome::Cancelled);
+        assert_eq!(runner.app().wallet.summary, Some(test_wallet_summary()));
+        assert!(!runner.app().wallet.summary_error);
+        assert!(!runner.app().wallet.summary_stale);
+
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        let commands = runner.action(action_id(ACCOUNT));
+        let (coin_task, _) = fetch_task_with(&commands, "coinKind=COIN");
+        let cached = expiration_row(
+            model::AssetKind::Coin,
+            model::AssetSubtype::Standard,
+            5,
+            None,
+        );
+        runner.app_mut().wallet.coin_history = vec![cached.clone()];
+        runner.task_outcome(coin_task, TaskOutcome::Cancelled);
+        assert_eq!(runner.app().wallet.coin_history, [cached]);
+        assert!(!runner.app().wallet.coin_history_error);
+    }
+
+    #[test]
+    fn exit_cancels_and_invalidates_all_wallet_tasks() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        let commands = runner.action(action_id(ACCOUNT));
+        let wallet_tasks = spawns(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(wallet_tasks.len(), 3);
+        let summary_generation = runner.app().wallet.summary_generation;
+        let detail_generation = runner.app().wallet.detail_generation;
+
+        let commands = runner.exit();
+        let cancelled = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Cancel(task) => Some(*task),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cancelled, wallet_tasks);
+        assert!(runner.app().wallet.tasks.is_empty());
+        assert_eq!(runner.app().wallet.summary_task, None);
+        assert!(!runner.app().wallet.summary_refresh_queued);
+        assert_ne!(runner.app().wallet.summary_generation, summary_generation);
+        assert_ne!(runner.app().wallet.detail_generation, detail_generation);
     }
 
     #[test]
@@ -5767,10 +5871,7 @@ mod tests {
     #[test]
     fn wallet_date_history_window_is_exactly_ninety_days_and_checked() {
         assert_eq!(HISTORY_WINDOW_MS, 7_776_000_000);
-        assert_eq!(
-            history_start_ms_at(HISTORY_WINDOW_MS + 42),
-            Some(42)
-        );
+        assert_eq!(history_start_ms_at(HISTORY_WINDOW_MS + 42), Some(42));
         assert_eq!(history_start_ms_at(i64::MIN), None);
     }
 
@@ -5786,6 +5887,38 @@ mod tests {
             Some("2025-01-01".to_owned())
         );
         assert_eq!(taipei_date(i64::MAX), None);
+    }
+
+    #[test]
+    fn account_history_classifies_future_expired_and_no_expiry_rows() {
+        let future = expiration_row(
+            model::AssetKind::Coin,
+            model::AssetSubtype::Standard,
+            1,
+            Some(1_819_728_000_000),
+        );
+        let expired = expiration_row(
+            model::AssetKind::Ticket,
+            model::AssetSubtype::Bonus,
+            2,
+            Some(1_735_660_800_000),
+        );
+        let no_expiry =
+            expiration_row(model::AssetKind::Ticket, model::AssetSubtype::Free, 3, None);
+        let now = Some(1_735_660_800_000);
+
+        assert_eq!(
+            Bomtoon::history_row_label_at(&future, now),
+            "Coin · Standard · 1 · Expires 2027-09-01"
+        );
+        assert_eq!(
+            Bomtoon::history_row_label_at(&expired, now),
+            "Ticket · Bonus · 2 · Expired 2025-01-01"
+        );
+        assert_eq!(
+            Bomtoon::history_row_label_at(&no_expiry, now),
+            "Ticket · Free · 3 · No expiry"
+        );
     }
 
     #[test]
@@ -5811,14 +5944,8 @@ mod tests {
                 summary_task: Some(summary_task),
                 detail_generation: 8,
                 tasks: BTreeMap::from([
-                    (
-                        summary_task,
-                        WalletTaskPurpose::Summary { generation: 3 },
-                    ),
-                    (
-                        coin_task,
-                        WalletTaskPurpose::CoinHistory { generation: 8 },
-                    ),
+                    (summary_task, WalletTaskPurpose::Summary { generation: 3 }),
+                    (coin_task, WalletTaskPurpose::CoinHistory { generation: 8 }),
                     (
                         ticket_task,
                         WalletTaskPurpose::TicketHistory { generation: 8 },
@@ -5839,10 +5966,7 @@ mod tests {
         assert_eq!(app.wallet.summary_task, Some(summary_task));
         assert_eq!(
             app.wallet.tasks,
-            BTreeMap::from([(
-                summary_task,
-                WalletTaskPurpose::Summary { generation: 3 }
-            )])
+            BTreeMap::from([(summary_task, WalletTaskPurpose::Summary { generation: 3 })])
         );
         assert_eq!(app.wallet.coin_history, [cached_coin]);
         assert_eq!(app.wallet.ticket_history, [cached_ticket]);
@@ -5868,7 +5992,9 @@ mod tests {
         assert_eq!(runner.app().view, View::Account);
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 3);
-        assert!(spawned.iter().any(|(_, work)| *work == api::asset_summary()));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::asset_summary()));
         let (_, coin_work) = fetch_task_with(&commands, "coinKind=COIN");
         let (_, ticket_work) = fetch_task_with(&commands, "coinKind=TICKET");
         let start = expiration_request_start(&coin_work);
@@ -5958,11 +6084,7 @@ mod tests {
 
         assert!(!wallet.accept_history(1, model::AssetKind::Coin, vec![stale]));
         assert_eq!(wallet.coin_history, [cached]);
-        assert!(wallet.accept_history(
-            2,
-            model::AssetKind::Ticket,
-            vec![current.clone()]
-        ));
+        assert!(wallet.accept_history(2, model::AssetKind::Ticket, vec![current.clone()]));
         assert_eq!(wallet.ticket_history, [current]);
     }
 
@@ -5979,10 +6101,7 @@ mod tests {
             coin_task,
             TaskOutcome::Completed(COIN_HISTORY_RESPONSE.to_vec()),
         );
-        let commands = runner.task_outcome(
-            ticket_task,
-            TaskOutcome::Failed(TaskError::Offline),
-        );
+        let commands = runner.task_outcome(ticket_task, TaskOutcome::Failed(TaskError::Offline));
 
         assert_eq!(runner.app().wallet.coin_history.len(), 1);
         assert!(runner.app().wallet.ticket_history.is_empty());
@@ -6003,7 +6122,9 @@ mod tests {
         let commands = runner.action(action_id(RETRY_BALANCES));
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 2);
-        assert!(spawned.iter().any(|(_, work)| *work == api::asset_summary()));
+        assert!(spawned
+            .iter()
+            .any(|(_, work)| *work == api::asset_summary()));
         assert!(spawned.iter().any(
             |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("coinKind=TICKET"))
         ));
@@ -6064,9 +6185,9 @@ mod tests {
         let screen = runner.app().screen();
         let first = format!("{screen:?}");
         assert!(first.contains("Coin · Standard · 101 · Expires 2027-09-01"));
-        assert!(first.contains("Coin · Bonus · 102 · No expiration"));
+        assert!(first.contains("Coin · Bonus · 102 · No expiry"));
         assert!(first.contains("Coin · Free · 103 · Expires 2027-09-01"));
-        assert!(!first.contains("Coin · Standard · 104 · No expiration"));
+        assert!(!first.contains("Coin · Standard · 104 · No expiry"));
         assert!(first.contains("Next history"));
         assert_fits(&screen);
 
@@ -6074,18 +6195,16 @@ mod tests {
         let screen = last_screen(&commands);
         let second = format!("{screen:?}");
         assert!(!second.contains("Coin · Standard · 101 · Expires 2027-09-01"));
-        assert!(second.contains("Coin · Standard · 104 · No expiration"));
+        assert!(second.contains("Coin · Standard · 104 · No expiry"));
         assert!(second.contains("Ticket · Standard · 201 · Expires 2027-09-01"));
-        assert!(second.contains("Ticket · Free · 202 · No expiration"));
+        assert!(second.contains("Ticket · Free · 202 · No expiry"));
         assert!(second.contains("Previous history"));
         assert_fits(&screen);
 
         let commands = runner.action(action_id(ACCOUNT_PREVIOUS));
         assert_eq!(runner.app().page, 0);
-        assert!(
-            format!("{:?}", last_screen(&commands))
-                .contains("Coin · Standard · 101 · Expires 2027-09-01")
-        );
+        assert!(format!("{:?}", last_screen(&commands))
+            .contains("Coin · Standard · 101 · Expires 2027-09-01"));
     }
 
     #[test]
@@ -6111,7 +6230,8 @@ mod tests {
         let drawn = format!("{:?}", last_screen(&commands));
         assert!(drawn.contains("Coin history"));
         assert!(drawn.contains("Ticket history"));
-        assert!(drawn.matches("Empty").count() >= 2);
+        assert!(drawn.contains("No coin expiration records"));
+        assert!(drawn.contains("No ticket expiration records"));
 
         let commands = runner.action(action_id("account-redraw"));
         assert!(spawns(&commands).is_empty(), "Account must not poll");
@@ -6124,6 +6244,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one layout matrix keeps every Account boundary state under the same metrics"
+    )]
     fn account_stale_summary_and_all_boundary_layout_states_fit_clara() {
         let maximum = Bomtoon {
             view: View::Account,
@@ -6175,7 +6299,9 @@ mod tests {
             ..Bomtoon::default()
         }
         .screen();
-        assert!(format!("{empty:?}").matches("Empty").count() >= 2);
+        let empty_drawn = format!("{empty:?}");
+        assert!(empty_drawn.contains("No coin expiration records"));
+        assert!(empty_drawn.contains("No ticket expiration records"));
 
         let loading_generation = 7;
         let loading = Bomtoon {
@@ -6245,10 +6371,7 @@ mod tests {
         let (mut runner, commands) = started();
         let (library_task, _) = fetch_task_with(&commands, "/library?");
         let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
-        runner.task_outcome(
-            summary_task,
-            TaskOutcome::Failed(TaskError::NoCredential),
-        );
+        runner.task_outcome(summary_task, TaskOutcome::Failed(TaskError::NoCredential));
         assert_eq!(runner.app().account, AccountState::SignedOut);
         assert_eq!(runner.app().task, None);
         assert_eq!(runner.app().pending, None);

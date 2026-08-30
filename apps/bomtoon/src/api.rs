@@ -201,16 +201,10 @@ mod tests {
         else {
             panic!("expected fetch task");
         };
-        assert_eq!(
-            url,
-            "https://www.bomtoon.tw/api/balcony-api-v2/asset/user"
-        );
+        assert_eq!(url, "https://www.bomtoon.tw/api/balcony-api-v2/asset/user");
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 64 * 1024);
-        assert_eq!(
-            credential,
-            Some(Credential::bearer("bomtoon-access-token"))
-        );
+        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
         assert!(headers.iter().any(|header| {
             header.name.eq_ignore_ascii_case("accept") && header.value == "application/json"
         }));
@@ -235,10 +229,7 @@ mod tests {
                 )
             );
             assert_eq!(max_bytes, 512 * 1024);
-            assert_eq!(
-                credential,
-                Some(Credential::bearer("bomtoon-access-token"))
-            );
+            assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
         }
     }
 

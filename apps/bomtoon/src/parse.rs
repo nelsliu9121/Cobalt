@@ -156,10 +156,7 @@ pub fn asset_summary(bytes: &[u8]) -> Result<WalletSummary, ParseError> {
     })
 }
 
-pub fn expiration_history(
-    bytes: &[u8],
-    kind: AssetKind,
-) -> Result<Vec<ExpirationRow>, ParseError> {
+pub fn expiration_history(bytes: &[u8], kind: AssetKind) -> Result<Vec<ExpirationRow>, ParseError> {
     let root = parse_json(bytes)?;
     if string(&root, "result", "result")? != "SUCCESS" {
         return Err(ParseError::InvalidValue("result"));
@@ -363,9 +360,7 @@ fn optional_timestamp(
     if matches!(value, Value::Null) {
         return Ok(None);
     }
-    let text = value
-        .as_integer_str()
-        .ok_or(ParseError::WrongType(name))?;
+    let text = value.as_integer_str().ok_or(ParseError::WrongType(name))?;
     let timestamp = text
         .parse::<i64>()
         .map_err(|_| ParseError::InvalidValue(name))?;
@@ -536,9 +531,7 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        asset_summary, episodes, expiration_history, images, library, recent, ParseError,
-    };
+    use super::{asset_summary, episodes, expiration_history, images, library, recent, ParseError};
     use crate::model::{AssetKind, AssetSubtype, PurchaseState};
 
     const CONTENT: &[u8] = br#"{
@@ -730,8 +723,7 @@ mod tests {
     fn expiration_history_bounds_descriptions_by_utf8_bytes() {
         let valid = coin_history(&[coin_history_entry(&"é".repeat(128), 1, 0, 0)]);
         assert_eq!(
-            expiration_history(&valid, AssetKind::Coin)
-                .expect("256-byte description")[0]
+            expiration_history(&valid, AssetKind::Coin).expect("256-byte description")[0]
                 .description
                 .as_deref(),
             Some("é".repeat(128).as_str())
