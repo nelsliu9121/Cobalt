@@ -1,4 +1,7 @@
-use crate::model::{Comic, Episode, EpisodeAvailability, EpisodeImage, PurchaseState, RecentEntry};
+use crate::model::{
+    AssetAmounts, AssetKind, AssetSubtype, Comic, Episode, EpisodeAvailability, EpisodeImage,
+    ExpirationRow, PurchaseState, RecentEntry, WalletSummary,
+};
 use http::Uri;
 use kobo_json::Value;
 use std::{error::Error, fmt, str};
@@ -6,6 +9,9 @@ use std::{error::Error, fmt, str};
 const MAX_LIBRARY_PAGES: usize = 100;
 const MAX_IMAGES: usize = 256;
 const MAX_SIGNED_URL_BYTES: usize = 1024;
+const MAX_HISTORY_ENTRIES: usize = 256;
+const MAX_HISTORY_ROWS: usize = 256;
+const MAX_HISTORY_DESCRIPTION_BYTES: usize = 256;
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -124,6 +130,125 @@ pub fn recent(bytes: &[u8]) -> Result<RecentPage, ParseError> {
     })
 }
 
+pub fn asset_summary(bytes: &[u8]) -> Result<WalletSummary, ParseError> {
+    let root = parse_json(bytes)?;
+    if string(&root, "result", "result")? != "SUCCESS" {
+        return Err(ParseError::InvalidValue("result"));
+    }
+    let data = field(&root, "data", "data")?;
+    let coin_balance = field(data, "coinBalance", "data.coinBalance")?;
+    let ticket_balance = field(data, "ticketBalance", "data.ticketBalance")?;
+    Ok(WalletSummary {
+        coins: asset_amounts(
+            coin_balance,
+            ("coin", "coinBalance.coin"),
+            ("bonusCoin", "coinBalance.bonusCoin"),
+            ("freeCoin", "coinBalance.freeCoin"),
+            "coin total",
+        )?,
+        tickets: asset_amounts(
+            ticket_balance,
+            ("ticket", "ticketBalance.ticket"),
+            ("bonusTicket", "ticketBalance.bonusTicket"),
+            ("freeTicket", "ticketBalance.freeTicket"),
+            "ticket total",
+        )?,
+    })
+}
+
+pub fn expiration_history(
+    bytes: &[u8],
+    kind: AssetKind,
+) -> Result<Vec<ExpirationRow>, ParseError> {
+    let root = parse_json(bytes)?;
+    if string(&root, "result", "result")? != "SUCCESS" {
+        return Err(ParseError::InvalidValue("result"));
+    }
+    let entries = field(&root, "data", "data")?
+        .as_array()
+        .ok_or(ParseError::WrongType("data"))?;
+    if entries.len() > MAX_HISTORY_ENTRIES {
+        return Err(ParseError::InvalidValue("history entry count"));
+    }
+    let components = match kind {
+        AssetKind::Coin => [
+            (
+                AssetSubtype::Standard,
+                "coin",
+                "history.coin",
+                "coinExpiredAt",
+                "history.coinExpiredAt",
+            ),
+            (
+                AssetSubtype::Bonus,
+                "bonusCoin",
+                "history.bonusCoin",
+                "bonusCoinExpiredAt",
+                "history.bonusCoinExpiredAt",
+            ),
+            (
+                AssetSubtype::Free,
+                "freeCoin",
+                "history.freeCoin",
+                "freeCoinExpiredAt",
+                "history.freeCoinExpiredAt",
+            ),
+        ],
+        AssetKind::Ticket => [
+            (
+                AssetSubtype::Standard,
+                "ticket",
+                "history.ticket",
+                "ticketExpiredAt",
+                "history.ticketExpiredAt",
+            ),
+            (
+                AssetSubtype::Bonus,
+                "bonusTicket",
+                "history.bonusTicket",
+                "bonusTicketExpiredAt",
+                "history.bonusTicketExpiredAt",
+            ),
+            (
+                AssetSubtype::Free,
+                "freeTicket",
+                "history.freeTicket",
+                "freeTicketExpiredAt",
+                "history.freeTicketExpiredAt",
+            ),
+        ],
+    };
+    let capacity = entries
+        .len()
+        .saturating_mul(components.len())
+        .min(MAX_HISTORY_ROWS);
+    let mut rows = Vec::with_capacity(capacity);
+    for entry in entries {
+        let description = optional_string(entry, "title", "history.title")?;
+        if description.is_some_and(|text| text.len() > MAX_HISTORY_DESCRIPTION_BYTES) {
+            return Err(ParseError::InvalidValue("history.title"));
+        }
+        for &(subtype, amount_key, amount_name, expiry_key, expiry_name) in &components {
+            let quantity = unsigned(entry, amount_key, amount_name)?;
+            let expires_at = optional_timestamp(entry, expiry_key, expiry_name)?;
+            if quantity == 0 {
+                continue;
+            }
+            if rows.len() == MAX_HISTORY_ROWS {
+                return Err(ParseError::InvalidValue("history row count"));
+            }
+            rows.push(ExpirationRow {
+                kind,
+                subtype,
+                quantity,
+                expires_at,
+                description: description.map(str::to_owned),
+            });
+        }
+    }
+    Ok(rows)
+}
+
 pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
     let root = parse_json(bytes)?;
     if string(&root, "result", "result")? != "SUCCESS" {
@@ -135,6 +260,7 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
     values
         .iter()
         .map(|item| {
+            let coin_kind = optional_string(item, "coinKind", "episode.coinKind")?;
             let availability = EpisodeAvailability {
                 status: nullable_string(item, "purchaseStatus", "episode.purchaseStatus")?,
                 episode_type: optional_string(item, "type", "episode.type")?,
@@ -147,11 +273,21 @@ pub fn episodes(bytes: &[u8]) -> Result<Vec<Episode>, ParseError> {
                 )?,
                 rent_coin: optional_unsigned(item, "rentCoin", "episode.rentCoin")?,
             };
+            let ticket_quantity = if coin_kind == Some("TICKET") {
+                Some(
+                    availability
+                        .rent_coin
+                        .or(availability.possession_coin)
+                        .ok_or(ParseError::Missing("episode ticket quantity"))?,
+                )
+            } else {
+                None
+            };
             Ok(Episode {
                 alias: string(item, "alias", "episode.alias")?.to_owned(),
                 title: string(item, "title", "episode.title")?.to_owned(),
                 purchase: PurchaseState::from_remote(availability),
-                ticket_quantity: None,
+                ticket_quantity,
             })
         })
         .collect()
@@ -196,6 +332,48 @@ pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
             })
         })
         .collect()
+}
+
+fn asset_amounts(
+    value: &Value,
+    standard: (&str, &'static str),
+    bonus: (&str, &'static str),
+    free: (&str, &'static str),
+    total_name: &'static str,
+) -> Result<AssetAmounts, ParseError> {
+    let amounts = AssetAmounts {
+        standard: unsigned(value, standard.0, standard.1)?,
+        bonus: unsigned(value, bonus.0, bonus.1)?,
+        free: unsigned(value, free.0, free.1)?,
+    };
+    amounts
+        .total()
+        .ok_or(ParseError::InvalidValue(total_name))?;
+    Ok(amounts)
+}
+
+fn optional_timestamp(
+    value: &Value,
+    key: &str,
+    name: &'static str,
+) -> Result<Option<i64>, ParseError> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let text = value
+        .as_integer_str()
+        .ok_or(ParseError::WrongType(name))?;
+    let timestamp = text
+        .parse::<i64>()
+        .map_err(|_| ParseError::InvalidValue(name))?;
+    match timestamp {
+        0 => Ok(None),
+        1.. => Ok(Some(timestamp)),
+        _ => Err(ParseError::InvalidValue(name)),
+    }
 }
 
 fn parse_json(bytes: &[u8]) -> Result<Value, ParseError> {
@@ -262,10 +440,11 @@ fn array<'a>(value: &'a Value, key: &str, name: &'static str) -> Result<&'a [Val
 }
 
 fn unsigned(value: &Value, key: &str, name: &'static str) -> Result<usize, ParseError> {
-    let number = field(value, key, name)?
-        .as_i64()
+    let text = field(value, key, name)?
+        .as_integer_str()
         .ok_or(ParseError::WrongType(name))?;
-    usize::try_from(number).map_err(|_| ParseError::InvalidValue(name))
+    text.parse::<usize>()
+        .map_err(|_| ParseError::InvalidValue(name))
 }
 
 fn optional_unsigned(
@@ -275,12 +454,12 @@ fn optional_unsigned(
 ) -> Result<Option<usize>, ParseError> {
     match value.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => {
-            let number = value.as_i64().ok_or(ParseError::WrongType(name))?;
-            usize::try_from(number)
-                .map(Some)
-                .map_err(|_| ParseError::InvalidValue(name))
-        }
+        Some(value) => value
+            .as_integer_str()
+            .ok_or(ParseError::WrongType(name))?
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| ParseError::InvalidValue(name)),
     }
 }
 
@@ -357,8 +536,10 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{episodes, images, library, recent, ParseError};
-    use crate::model::PurchaseState;
+    use super::{
+        asset_summary, episodes, expiration_history, images, library, recent, ParseError,
+    };
+    use crate::model::{AssetKind, AssetSubtype, PurchaseState};
 
     const CONTENT: &[u8] = br#"{
       "result":"SUCCESS",
@@ -403,6 +584,261 @@ mod tests {
             "{prefix}{}{suffix}",
             "p".repeat(length - prefix.len() - suffix.len())
         )
+    }
+
+    fn coin_history_entry(title: &str, coin: usize, bonus: usize, free: usize) -> String {
+        format!(
+            "{{\"title\":\"{title}\",\"coin\":{coin},\"bonusCoin\":{bonus},\"freeCoin\":{free}}}"
+        )
+    }
+
+    fn coin_history(entries: &[String]) -> Vec<u8> {
+        format!(
+            "{{\"result\":\"SUCCESS\",\"data\":[{}]}}",
+            entries.join(",")
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn asset_summary_parses_remote_buckets_and_checked_totals() {
+        let summary = asset_summary(
+            br#"{
+              "result":"SUCCESS",
+              "data":{
+                "coinBalance":{"coin":7,"bonusCoin":2,"freeCoin":1},
+                "ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}
+              }
+            }"#,
+        )
+        .expect("summary");
+        assert_eq!(summary.coins.total(), Some(10));
+        assert_eq!(summary.tickets.total(), Some(4));
+    }
+
+    #[test]
+    fn asset_summary_rejects_missing_wrong_and_negative_amounts() {
+        for body in [
+            br#"{"result":"SUCCESS","data":{"coinBalance":{},"ticketBalance":{"ticket":0,"bonusTicket":0,"freeTicket":0}}}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":"7","bonusCoin":0,"freeCoin":0},"ticketBalance":{"ticket":0,"bonusTicket":0,"freeTicket":0}}}"#.as_slice(),
+            br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":-1,"bonusCoin":0,"freeCoin":0},"ticketBalance":{"ticket":0,"bonusTicket":0,"freeTicket":0}}}"#.as_slice(),
+        ] {
+            assert!(asset_summary(body).is_err());
+        }
+    }
+
+    #[test]
+    fn asset_summary_rejects_overflowing_totals() {
+        let body = format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":{{",
+                "\"coinBalance\":{{\"coin\":{},\"bonusCoin\":1,\"freeCoin\":0}},",
+                "\"ticketBalance\":{{\"ticket\":0,\"bonusTicket\":0,\"freeTicket\":0}}",
+                "}}}}"
+            ),
+            usize::MAX,
+        );
+        assert!(matches!(
+            asset_summary(body.as_bytes()),
+            Err(ParseError::InvalidValue("coin total"))
+        ));
+    }
+
+    #[test]
+    fn expiration_history_flattens_nonzero_components_in_server_order() {
+        let rows = expiration_history(
+            br#"{
+              "result":"SUCCESS",
+              "data":[{
+                "title":"Signup gift",
+                "coin":2,
+                "coinExpiredAt":1756684800000,
+                "bonusCoin":1,
+                "bonusCoinExpiredAt":0,
+                "freeCoin":0
+              }]
+            }"#,
+            AssetKind::Coin,
+        )
+        .expect("history");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].subtype, AssetSubtype::Standard);
+        assert_eq!(rows[0].quantity, 2);
+        assert_eq!(rows[0].expires_at, Some(1_756_684_800_000));
+        assert_eq!(rows[0].description.as_deref(), Some("Signup gift"));
+        assert_eq!(rows[1].subtype, AssetSubtype::Bonus);
+        assert_eq!(rows[1].expires_at, None);
+    }
+
+    #[test]
+    fn expiration_history_parses_ticket_fields() {
+        let rows = expiration_history(
+            br#"{"result":"SUCCESS","data":[{
+              "ticket":2,"ticketExpiredAt":1,
+              "bonusTicket":1,"bonusTicketExpiredAt":2,
+              "freeTicket":3,"freeTicketExpiredAt":3
+            }]}"#,
+            AssetKind::Ticket,
+        )
+        .expect("ticket history");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.subtype, row.quantity, row.expires_at))
+                .collect::<Vec<_>>(),
+            [
+                (AssetSubtype::Standard, 2, Some(1)),
+                (AssetSubtype::Bonus, 1, Some(2)),
+                (AssetSubtype::Free, 3, Some(3)),
+            ]
+        );
+        assert!(rows.iter().all(|row| row.kind == AssetKind::Ticket));
+        assert!(rows.iter().all(|row| row.description.is_none()));
+    }
+
+    #[test]
+    fn expiration_history_rejects_more_than_256_remote_entries() {
+        let accepted = (0..256)
+            .map(|index| coin_history_entry(&index.to_string(), 0, 0, 0))
+            .collect::<Vec<_>>();
+        assert!(expiration_history(&coin_history(&accepted), AssetKind::Coin).is_ok());
+
+        let rejected = (0..257)
+            .map(|index| coin_history_entry(&index.to_string(), 0, 0, 0))
+            .collect::<Vec<_>>();
+        assert!(expiration_history(&coin_history(&rejected), AssetKind::Coin).is_err());
+    }
+
+    #[test]
+    fn expiration_history_rejects_more_than_256_flattened_rows() {
+        let mut entries = (0..85)
+            .map(|index| coin_history_entry(&index.to_string(), 1, 1, 1))
+            .collect::<Vec<_>>();
+        entries.push(coin_history_entry("last", 1, 0, 0));
+        assert_eq!(
+            expiration_history(&coin_history(&entries), AssetKind::Coin)
+                .expect("256 flattened rows")
+                .len(),
+            256
+        );
+
+        entries.pop();
+        entries.push(coin_history_entry("last", 1, 1, 0));
+        assert!(expiration_history(&coin_history(&entries), AssetKind::Coin).is_err());
+    }
+
+    #[test]
+    fn expiration_history_bounds_descriptions_by_utf8_bytes() {
+        let valid = coin_history(&[coin_history_entry(&"é".repeat(128), 1, 0, 0)]);
+        assert_eq!(
+            expiration_history(&valid, AssetKind::Coin)
+                .expect("256-byte description")[0]
+                .description
+                .as_deref(),
+            Some("é".repeat(128).as_str())
+        );
+
+        let too_long = coin_history(&[coin_history_entry(
+            &format!("{}a", "é".repeat(128)),
+            1,
+            0,
+            0,
+        )]);
+        assert!(expiration_history(&too_long, AssetKind::Coin).is_err());
+    }
+
+    #[test]
+    fn expiration_history_rejects_invalid_timestamp_types() {
+        let body = br#"{"result":"SUCCESS","data":[{
+          "coin":1,"coinExpiredAt":"tomorrow","bonusCoin":0,"freeCoin":0
+        }]}"#;
+        assert!(matches!(
+            expiration_history(body, AssetKind::Coin),
+            Err(ParseError::WrongType("history.coinExpiredAt"))
+        ));
+    }
+
+    #[test]
+    fn expiration_history_rejects_negative_fractional_and_oversized_timestamps() {
+        for timestamp in ["-1", "1.0", "9223372036854775808"] {
+            let body = format!(
+                concat!(
+                    "{{\"result\":\"SUCCESS\",\"data\":[{{",
+                    "\"coin\":1,\"coinExpiredAt\":{},\"bonusCoin\":0,\"freeCoin\":0",
+                    "}}]}}"
+                ),
+                timestamp
+            );
+            assert!(
+                expiration_history(body.as_bytes(), AssetKind::Coin).is_err(),
+                "timestamp {timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn expiration_history_treats_missing_expiry_as_none() {
+        let rows = expiration_history(
+            br#"{"result":"SUCCESS","data":[{"coin":1,"bonusCoin":0,"freeCoin":0}]}"#,
+            AssetKind::Coin,
+        )
+        .expect("missing expiry");
+        assert_eq!(rows[0].expires_at, None);
+    }
+
+    #[test]
+    fn expiration_history_omits_zero_quantities() {
+        let rows = expiration_history(
+            br#"{"result":"SUCCESS","data":[{
+              "title":"empty","coin":0,"coinExpiredAt":0,"bonusCoin":0,"freeCoin":0
+            }]}"#,
+            AssetKind::Coin,
+        )
+        .expect("zero quantities");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn ticket_coin_kind_requires_and_retains_effective_quantity() {
+        let parsed = episodes(
+            br#"{
+              "result":"SUCCESS",
+              "data":{"episodes":[
+                {"alias":"rent","title":"Rent ticket","purchaseStatus":"NONE","isSample":false,"coinKind":"TICKET","rentCoin":1,"possessionCoin":4},
+                {"alias":"possession","title":"Possession ticket","purchaseStatus":"NONE","isSample":false,"coinKind":"TICKET","possessionCoin":2},
+                {"alias":"coin","title":"Coin","purchaseStatus":"NONE","isSample":false,"coinKind":"COIN","rentCoin":3},
+                {"alias":"lower","title":"Lowercase","purchaseStatus":"NONE","isSample":false,"coinKind":"ticket","rentCoin":5}
+              ]}
+            }"#,
+        )
+        .expect("episodes");
+        assert_eq!(parsed[0].ticket_quantity, Some(1));
+        assert_eq!(parsed[1].ticket_quantity, Some(2));
+        assert_eq!(parsed[2].ticket_quantity, None);
+        assert_eq!(parsed[3].ticket_quantity, None);
+    }
+
+    #[test]
+    fn ticket_coin_kind_rejects_missing_quantity() {
+        let body = br#"{"result":"SUCCESS","data":{"episodes":[{
+          "alias":"ticket","title":"Ticket","purchaseStatus":"NONE","isSample":false,
+          "coinKind":"TICKET"
+        }]}}"#;
+        assert!(matches!(
+            episodes(body),
+            Err(ParseError::Missing("episode ticket quantity"))
+        ));
+    }
+
+    #[test]
+    fn coin_kind_requires_an_observed_type_when_present() {
+        let body = br#"{"result":"SUCCESS","data":{"episodes":[{
+          "alias":"ticket","title":"Ticket","purchaseStatus":"NONE","isSample":false,
+          "coinKind":false
+        }]}}"#;
+        assert!(matches!(
+            episodes(body),
+            Err(ParseError::WrongType("episode.coinKind"))
+        ));
     }
 
     #[test]
