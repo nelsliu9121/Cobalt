@@ -32,6 +32,7 @@
 |---|---|---|
 | Wire value | `crates/kobo-protocol/src/lib.rs` `DeviceRequest`, `DeviceResult`, encoder/decoder | `LocalDay::new`, `year/month/day`, `ReadLocalDay`, `DeviceResult::LocalDay` |
 | SDK facade | `crates/kobo-sdk/src/lib.rs` `Device<'_>` and `KoboApp::on_device_result` | `Device::read_local_day()` |
+| Runtime request policy | `crates/kobo-policy/src/services.rs` exhaustive device request handling | no-capability `ReadLocalDay`, generic `None` result |
 | Device producer | `crates/kobod/src/device.rs` `local_offset_seconds`, device request dispatch | fresh `TZ` → Jiff → `Option<LocalDay>` |
 | Non-device daemon | `crates/kobod/src/main.rs` simulated device request dispatch | host local-day result for daemon simulation |
 | Browser simulator | `crates/kobo-sim/src/lib.rs` `handle_device_request` | explicit `TZ` or fallible system zone → `Option<LocalDay>` |
@@ -50,6 +51,7 @@
 **Files:**
 - Modify: `crates/kobo-protocol/src/lib.rs`
 - Modify: `crates/kobo-sdk/src/lib.rs`
+- Modify: `crates/kobo-policy/src/services.rs`
 
 **Interfaces:**
 
@@ -119,7 +121,7 @@ Expected: compile errors because `LocalDay`, `ReadLocalDay`, and `DeviceResult::
 
 - [ ] **Step 3: Implement the bounded wire value and variants**
 
-Add `LocalDay` near the other small protocol values. Validate a complete Gregorian date with a small private `days_in_month` helper; do not add Jiff to `kobo-protocol`. Runtime Jiff conversion remains the authoritative producer, while the wire decoder independently refuses invalid values. Add request/result discriminants, encoded lengths, encoder branches, decoder branches, fixtures, exhaustive matches, and bump `kobo_protocol::VERSION` from 12 to 13.
+Add `LocalDay` near the other small protocol values. Validate a complete Gregorian date with a small private `days_in_month` helper; do not add Jiff to `kobo-protocol`. Runtime Jiff conversion remains the authoritative producer, while the wire decoder independently refuses invalid values. Add request/result discriminants, encoded lengths, encoder branches, decoder branches, fixtures, exhaustive matches, and bump `kobo_protocol::VERSION` from 12 to 13. Extend `kobo-policy`'s exhaustive request handling with a generic `LocalDay(None)` response and no required capability; Task 2 supplies real host values.
 
 - [ ] **Step 4: Add the failing SDK facade test**
 
