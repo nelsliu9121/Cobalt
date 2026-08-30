@@ -1060,8 +1060,9 @@ mod tests {
         fn binding_digest(&self, secret: &str) -> String {
             format!("digest:{secret}")
         }
-        fn derive_scope_key(&self, _binding_secret: &str) -> String {
-            "a".repeat(64)
+        fn derive_scope_key(&self, binding_secret: &str) -> String {
+            let quarter = fingerprint(binding_secret);
+            format!("{quarter:016x}{quarter:016x}{quarter:016x}{quarter:016x}")
         }
         fn derive_account_scope(&self, scope_key: &str, account_subject: &str) -> String {
             if self.malformed_scope.load(Ordering::SeqCst) {
@@ -1282,6 +1283,10 @@ mod tests {
         let directories = TestDirectories::new("scope-cookie-replacement");
         fs::write(directories.cookie(), "cookie-a").expect("cookie a");
         let recipe = Arc::new(FakeRecipe::default());
+        assert_ne!(
+            recipe.derive_scope_key("cookie-a"),
+            recipe.derive_scope_key("cookie-b")
+        );
         for pair in [
             token_pair("a", 1_000_000, Some("account-a")),
             token_pair("b", 1_000_000, Some("account-a")),
