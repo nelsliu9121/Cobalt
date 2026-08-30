@@ -33,6 +33,7 @@ The app must quote before spending, fail closed when affordability or eligibilit
 - Clear an unresolved marker only after conclusive same-account reconciliation and an acknowledged atomic delete.
 - Disable commerce while authentication, account scope, or connectivity is unknown.
 - Preserve unresolved markers across offline periods, sign-out, credential expiry, app exit, and device restart.
+- Bump the wire protocol to version 13 and the coordinated Cobalt workspace/runtime release to `0.4.0`; publish BOMTOON app version `0.5.0` with minimum Cobalt `0.4.0` so older runtimes reject installation rather than fail on an unknown task.
 - Keep an active rental readable until BOMTOON removes `RENT`, even if the local clock reaches its expiry.
 - Show rental time as ceiling-rounded whole hours and refresh elapsed rentals on interaction rather than with a timer.
 - Keep active rentals read-only; do not offer permanent purchase while BOMTOON reports `RENT`.
@@ -461,6 +462,8 @@ Conclusive accepted entitlement, conclusive explicit rejection, or same-account 
 - POST uses the exact purchase route, JSON content type, managed bearer credential, Balcony headers, title-detail referer, response ceiling, and observed `isMobile=false` body.
 - Remote strings cannot add query parameters, change the origin, or select an unsupported purchase type.
 - Credential policy permits BOMTOON bearer GET only for the existing library/content/image routes plus exact asset-summary, fixed-shape expiration-history, numeric title-Gift, and enumerated quote URLs. It permits POST only to `/api/balcony-api/purchase` with no query or fragment. Wrong methods, origins, paths, aliases, IDs, query keys, query values, and suffixes remain denied.
+- Protocol version 13 documents the new task tag and rejects v12 peers through the existing handshake/version checks.
+- `apps/catalog.json` advertises BOMTOON `0.5.0`, minimum Cobalt `0.4.0`, with the existing `network` capability.
 
 ### Parsing and domain tests
 
@@ -551,5 +554,9 @@ Expected narrow account-scope integration files:
 - focused provider, protocol, and managed-credential tests.
 - exact BOMTOON credential method/URL policy in `kobo-net`;
 - focused allowlist tests for every accepted and denied route shape.
+- protocol version-history and compatibility tests;
+- BOMTOON catalog version `0.5.0` and minimum Cobalt `0.4.0`.
+- workspace package version `0.4.0`, internal path-version constraints, and regenerated `Cargo.lock`;
+- runtime app-store compatibility tests proving the built runtime accepts the BOMTOON minimum.
 
-No dependency, workspace member, catalog, capability, origin, or device-policy change is planned. Shared protocol, policy/runtime, network-provider, SDK-visible task, and exact BOMTOON credential-allowlist changes are limited to account scoping and the approved commerce routes.
+No dependency, workspace member, capability, origin, or device-policy change is planned. The coordinated Cobalt `0.4.0` release, protocol v13, BOMTOON catalog compatibility bump, policy/runtime, network-provider, SDK-visible task, and exact credential-allowlist changes are limited to account scoping and the approved commerce routes.

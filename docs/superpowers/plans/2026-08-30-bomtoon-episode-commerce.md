@@ -21,6 +21,7 @@
 - Gift, quote, and receipt responses are capped at 64 KiB; Gift arrays are capped at 64 entries each.
 - Aliases are capped at 128 UTF-8 bytes; titles at 512 UTF-8 bytes; safe result codes at 128 UTF-8 bytes.
 - Expand the BOMTOON bearer allowlist only for exact wallet/Gift/quote GET shapes and exact `/api/balcony-api/purchase` POST with no query or fragment. Keep all other methods, paths, and origins denied.
+- Bump `kobo_protocol::VERSION` from 12 to 13 and the coordinated workspace/runtime version from `0.3.0` to `0.4.0`. Publish BOMTOON app `0.5.0` with `minimum_cobalt_version` `0.4.0`; keep its capability list exactly `["network"]`.
 - Raw HARs remain outside the worktree. Before every commit run `git diff --cached --name-only -- evidences` and require no output.
 - Do not add dependencies, workspace members, capabilities, origins, device-policy changes, general credential-reading APIs, shims, or deprecated Ticket-commerce paths.
 - Real Coin/Gift spending is operator-attended only; automated tests and agents never submit live mutations.
@@ -32,9 +33,10 @@
 - `crates/kobo-policy/src/managed.rs`: retain bounded provider subject; persist provider-local scope key; derive and resolve opaque scopes.
 - `crates/kobo-net/src/bomtoon.rs`: parse `user.id` during bootstrap, preserve it during refresh, and derive account scope.
 - `crates/kobo-net/src/sha256.rs`: dependency-free HMAC-SHA-256.
-- `crates/kobo-protocol/src/lib.rs`: wire-stable `Task::CredentialScope { credential }` using task-kind tag `5`.
+- `crates/kobo-protocol/src/lib.rs`: protocol v13 plus wire-stable `Task::CredentialScope { credential }` using task-kind tag `5`.
 - `crates/kobo-policy/src/tasks.rs`: execute `CredentialScope` through the managed provider.
 - `crates/kobo-net/src/lib.rs`: exact method/URL allowlist for wallet and commerce routes.
+- Root `Cargo.toml`, `Cargo.lock`, and explicit internal path-version constraints in `kobo-policy`, `kobo-protocol`, `kobo-sdk`, and `kobo-text`: coordinated Cobalt `0.4.0` release identity.
 
 ### BOMTOON app
 
@@ -43,6 +45,7 @@
 - `apps/bomtoon/src/api.rs`: exact scope, Gift, quote, and purchase tasks.
 - `apps/bomtoon/src/commerce.rs`: pure state machine, marker codec, account/connectivity gates, Gift generation, quote policy.
 - `apps/bomtoon/src/main.rs`: lifecycle/store/task wiring, quote screen, action dispatch, reconciliation, reader transition, library invalidation.
+- `apps/catalog.json`: BOMTOON `0.5.0`, minimum Cobalt `0.4.0`, unchanged `network` capability.
 
 ---
 
@@ -199,6 +202,12 @@ git commit -m "feat(auth): retain managed account subject"
 - Modify: `crates/kobo-policy/src/managed.rs`
 - Modify: `crates/kobo-policy/src/tasks.rs`
 - Modify: `crates/kobo-protocol/src/lib.rs`
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
+- Modify: `crates/kobo-policy/Cargo.toml`
+- Modify: `crates/kobo-protocol/Cargo.toml`
+- Modify: `crates/kobo-sdk/Cargo.toml`
+- Modify: `crates/kobo-text/Cargo.toml`
 
 **Interfaces:**
 - Consumes: `ManagedTokenPair::account_subject: Option<String>`.
@@ -261,9 +270,15 @@ Cover same subject with a replacement cookie → same scope; different subject �
 
 Reuse managed-state private-directory, synchronized temp-write, rename, and permission patterns. `ManagedCredentials::scope` verifies the name, acquires the managed lease, obtains the current pair, rejects `account_subject: None` with `TaskError::Denied`, reads or atomically creates the scope key, derives/validates the scope, and returns only the scope. Revocation must not delete the scope-key file.
 
-- [ ] **Step 5: Add protocol task tag 5**
+- [ ] **Step 5: Add protocol v13 and coordinate Cobalt 0.4.0**
 
-Extend `Task`, `is_sendable`, frame length, encode, and decode:
+Extend the protocol version-history comment and change:
+
+```rust
+pub const VERSION: u8 = 13;
+```
+
+Document that v13 adds `CredentialScope`, which v12 runtimes cannot decode. Extend `Task`, `is_sendable`, frame length, encode, and decode:
 
 ```rust
 Task::CredentialScope {
@@ -271,7 +286,18 @@ Task::CredentialScope {
 }
 ```
 
-Encode kind byte `5` plus one bounded credential-name string. Add round-trip, oversize, truncation, and unknown-tag tests.
+Encode kind byte `5` plus one bounded credential-name string. Add round-trip, oversize, truncation, unknown-tag, v12-rejection, and v13-handshake tests. Do not make v12 decode or ignore the new task.
+
+Set `[workspace.package] version = "0.4.0"` in the root manifest. Change only the explicit internal path constraints found in:
+
+```text
+crates/kobo-policy/Cargo.toml
+crates/kobo-protocol/Cargo.toml
+crates/kobo-sdk/Cargo.toml
+crates/kobo-text/Cargo.toml
+```
+
+from `0.3.0` to `0.4.0`. Regenerate `Cargo.lock` through Cargo; do not globally replace the unrelated registry package `cpufeatures 0.3.0`.
 
 - [ ] **Step 6: Execute through managed policy**
 
@@ -302,14 +328,17 @@ cargo test -p kobo-protocol credential_scope
 cargo test -p kobo-policy managed
 cargo test -p kobo-policy credential_scope
 cargo test -p kobo-sdk task
+cargo test -p kobo-protocol version
+cargo metadata --no-deps --format-version 1
+cargo test -p kobod app_store
 ```
 
-Expected: all pass; same-account scope survives cookie replacement; valid v1 credentials still read but cannot obtain commerce scope.
+Expected: all pass; same-account scope survives cookie replacement; valid v1 credentials still read but cannot obtain commerce scope; workspace packages and `kobod` report `0.4.0`; unrelated registry `cpufeatures` remains `0.3.0`.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/kobo-net/src/sha256.rs crates/kobo-net/src/bomtoon.rs crates/kobo-policy/src/managed.rs crates/kobo-policy/src/tasks.rs crates/kobo-protocol/src/lib.rs
+git add Cargo.toml Cargo.lock crates/kobo-policy/Cargo.toml crates/kobo-protocol/Cargo.toml crates/kobo-sdk/Cargo.toml crates/kobo-text/Cargo.toml crates/kobo-net/src/sha256.rs crates/kobo-net/src/bomtoon.rs crates/kobo-policy/src/managed.rs crates/kobo-policy/src/tasks.rs crates/kobo-protocol/src/lib.rs
 git diff --cached --name-only -- evidences
 git diff --cached --check
 git commit -m "feat(auth): expose opaque account scope"
@@ -708,6 +737,8 @@ git commit -m "feat(bomtoon): restore pending commerce"
 - Modify: `apps/bomtoon/src/commerce.rs`
 - Modify: `apps/bomtoon/src/api.rs`
 - Modify: `apps/bomtoon/src/parse.rs`
+- Modify: `apps/catalog.json`
+- Modify: `crates/kobod/src/app_store.rs`
 
 **Interfaces:**
 - Consumes: Tasks 3–6.
@@ -741,11 +772,23 @@ Explicit rejection clears only through acknowledged Forget. Gift success refresh
 
 After Forgotten, retain Episodes view/title/page and refreshed balances. Permanent purchase invalidates library cache so Back refreshes owned count. Active Rent has no purchase action; `0 hrs` refreshes before reader open.
 
-- [ ] **Step 8: Add financial integration tests**
+- [ ] **Step 8: Publish the compatible app version**
+
+In the BOMTOON catalog entry set:
+
+```json
+"version": "0.5.0",
+"minimum_cobalt_version": "0.4.0",
+"capabilities": ["network"]
+```
+
+Add or update catalog and `kobod::app_store` tests proving a runtime reporting `0.3.x` refuses this app, the built `0.4.0` runtime accepts it, and the capability list remains exactly `network`. Do not change any other app entry.
+
+- [ ] **Step 9: Add financial integration tests**
 
 Cover Gift `-1`+RENT, receipt-backed Coin delta+RENT/POSSESSION, no double-counting, lost response with entitlement, lost response with unchanged state, refresh failure, cross-account/offline lock, stale generations, and task-capacity failure.
 
-- [ ] **Step 9: Test and commit**
+- [ ] **Step 10: Test and commit**
 
 Run:
 
@@ -758,7 +801,7 @@ cargo clippy -p kobo-bomtoon --all-targets --all-features -- -D warnings
 Then:
 
 ```bash
-git add apps/bomtoon/src/main.rs apps/bomtoon/src/commerce.rs apps/bomtoon/src/api.rs apps/bomtoon/src/parse.rs
+git add apps/bomtoon/src/main.rs apps/bomtoon/src/commerce.rs apps/bomtoon/src/api.rs apps/bomtoon/src/parse.rs apps/catalog.json crates/kobod/src/app_store.rs
 git diff --cached --name-only -- evidences
 git diff --cached --check
 git commit -m "feat(bomtoon): enable episode transactions"
@@ -781,6 +824,9 @@ cargo fmt --all --check
 cargo test -p kobo-net bomtoon
 cargo test -p kobo-policy managed
 cargo test -p kobo-protocol credential_scope
+cargo test -p kobo-protocol version
+cargo test -p kobo-app-store catalog
+cargo test -p kobod app_store
 cargo test -p kobo-bomtoon
 cargo clippy -p kobo-bomtoon --all-targets --all-features -- -D warnings
 ```
@@ -850,6 +896,7 @@ git commit -m "test(bomtoon): verify episode commerce"
 - Marker save is acknowledged before POST; deletion is acknowledged before another mutation.
 - Same-account restart reconciles; different-account, signed-out, expired, and offline states cannot bypass the marker.
 - Exact credential policy permits approved GET/POST shapes and denies every tested variant.
+- Protocol v13 rejects v12 peers before task dispatch; the built runtime reports Cobalt `0.4.0`; BOMTOON `0.5.0` requires Cobalt `0.4.0` and retains only `network`.
 - Gift rental, Coin rental, and Coin purchase refresh authoritative entitlement and balances.
 - Ticket remains Account-only; no episode Ticket field, label, action, alias, or compatibility path remains.
 - Browser and runtime simulators exercise the actual UI.
