@@ -2498,7 +2498,7 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
-        if self.view == View::Main {
+        if self.view == View::Main && self.pending.is_none() {
             let target = if action == action_id(FEATURED) {
                 Some(MainDestination::Featured)
             } else if action == action_id(RECENT) {
@@ -4748,6 +4748,80 @@ mod tests {
         let commands = runner.action(action_id(RECENT));
         assert_eq!(runner.app().page, 0);
         assert!(spawns(&commands).is_empty());
+    }
+
+    #[test]
+    fn navigation_pending_protected_shelf_ignores_destination_taps() {
+        let empty_recent_response = br#"{
+            "result":"SUCCESS",
+            "data":{
+                "content":[],
+                "number":0,
+                "totalPages":1,
+                "totalElements":0
+            }
+        }"#;
+        for (open, queued, destination, pending, response) in [
+            (
+                RECENT,
+                LIBRARY,
+                MainDestination::Recent,
+                Pending::Recent(0),
+                empty_recent_response.as_slice(),
+            ),
+            (
+                LIBRARY,
+                RECENT,
+                MainDestination::Library,
+                Pending::Library(0),
+                LIBRARY_RESPONSE,
+            ),
+        ] {
+            let mut runner = AppRunner::new(Bomtoon {
+                view: View::Main,
+                destination: MainDestination::Featured,
+                ..Bomtoon::default()
+            });
+            let commands = runner.action(action_id(open));
+            let (task, _) = only_spawn(&commands);
+            assert_eq!(runner.app().pending, Some(pending));
+
+            let commands = runner.action(action_id(queued));
+
+            assert_eq!(runner.app().view, View::Main);
+            assert_eq!(runner.app().destination, destination);
+            assert_eq!(runner.app().pending, Some(pending));
+            assert_eq!(runner.app().task, Some(task));
+            assert!(spawns(&commands).is_empty());
+
+            runner.task_outcome(task, TaskOutcome::Completed(response.to_vec()));
+            assert_eq!(runner.app().view, View::Main);
+            assert_eq!(runner.app().destination, destination);
+            assert_eq!(runner.app().pending, None);
+            assert_eq!(runner.app().task, None);
+        }
+    }
+
+    #[test]
+    fn navigation_pending_comic_ignores_destination_taps() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (task, _) = only_spawn(&commands);
+        assert_eq!(runner.app().pending, Some(Pending::Content(0)));
+
+        let commands = runner.action(action_id(FEATURED));
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Library);
+        assert_eq!(runner.app().pending, Some(Pending::Content(0)));
+        assert_eq!(runner.app().task, Some(task));
+        assert!(spawns(&commands).is_empty());
+
+        runner.task_outcome(task, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(runner.app().destination, MainDestination::Library);
+        assert_eq!(runner.app().pending, None);
+        assert_eq!(runner.app().task, None);
     }
 
     #[test]
