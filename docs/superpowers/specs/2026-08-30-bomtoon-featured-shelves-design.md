@@ -246,57 +246,80 @@ The existing `taipei_day(timestamp_ms)` in `apps/bomtoon/src/main.rs` deliberate
 
 `crates/kobod/src/device.rs` has a private `local_offset_seconds()` for the daemon clock. It reads the firmware's `TZ` environment variable, but it is not available to applications and currently falls back to UTC for missing or malformed input. Copying that helper into BOMTOON would create a second timezone convention and would turn invalid configuration into a plausible but wrong day.
 
-### Decision
+### Crate choice
 
-Add one central, safe app-facing local-calendar facility to `kobo-sdk` before wiring Featured refresh:
+Use `jiff` 0.2 for timezone and civil-date manipulation. Jiff 0.2.35 has an MSRV of Rust 1.70, below this workspace's Rust 1.85.1 requirement. Its system-timezone implementation:
+
+- reads `TZ` when present;
+- accepts IANA identifiers, TZif paths, and POSIX timezone rules;
+- otherwise detects Unix `/etc/localtime`;
+- applies historical and daylight-saving transitions when converting an instant;
+- exposes `TimeZone::try_system()` so unavailable timezone data is an error rather than an implicit UTC value.
+
+Use Jiff with the minimal Unix-capable features needed for `std`, system-timezone discovery, and the system zoneinfo database. Do not bundle the complete timezone database into the Kobo binary unless target verification proves the firmware lacks both a usable `TZ` value and TZif data. The firmware's POSIX `TZ` value is sufficient without a bundled database.
+
+Jiff is preferable here to:
+
+- a copied fixed-offset parser, which would duplicate daemon policy and mishandle IANA zones or daylight-saving rules;
+- `chrono::Local`, which can obtain local time but provides a less explicit fallible system-timezone boundary for this SDK contract;
+- `time`'s `local-offset` feature, which exposes an offset rather than the timezone and transition model needed for deterministic boundary tests.
+
+The SDK must not expose Jiff types as application API. Jiff remains the implementation detail behind a small copyable SDK value:
 
 ```text
-device_local_day() -> Option<i64>
+LocalDay
+  year
+  month
+  day
+
+device_local_day() -> Option<LocalDay>
 ```
 
-The facility owns:
+`LocalDay` supports equality and ordering but no timezone arithmetic. The SDK converts `Timestamp::now()` through `TimeZone::try_system()` and copies the resulting civil year, month, and day. A private pure helper accepts a timestamp and `TimeZone` for deterministic tests.
 
-- reading the actual device `TZ` source on every call, so a timezone change does not require restarting the app;
-- reading the system clock;
-- converting the instant into a local calendar-day key with checked arithmetic;
-- parsing the firmware's supported POSIX fixed-offset form, including inverted POSIX signs and optional minute offsets;
-- accepting explicit UTC/GMT zero-offset forms;
-- rejecting missing, malformed, trailing, out-of-range, or overflowing input with `None`.
-
-It must not default to Taipei or UTC. It must not expose a guessed date. A private pure conversion helper accepts an instant and timezone text for deterministic unit tests; the public operation owns environment and system-clock access.
-
-The initial implementation is deliberately limited to the fixed-offset POSIX form the Kobo firmware already supplies. If the runtime later needs named IANA zones or POSIX DST transition rules, that is a separate SDK design. Unsupported forms return `None` rather than silently computing the wrong day.
-
-The existing wallet-specific `taipei_day` remains for wallet semantics and is not renamed or reused. BOMTOON consumes only `kobo_sdk::device_local_day()` for Featured refresh.
+If system-timezone discovery fails or the clock is invalid, `device_local_day()` returns `None`. It must not default to Taipei, UTC, a compiled zone, or a last-known offset. The existing wallet-specific `taipei_day` remains for wallet semantics and is not renamed or reused.
 
 ### Refresh state machine
 
-- A successful initial Featured load records the current optional local-day key.
-- On app resume and on entry to Featured, call `device_local_day()`.
-- If either the recorded key or current key is `None`, do not infer that a day changed. Keep the current feed. A later event may retry the observation.
-- If both keys exist and differ, start exactly one Featured metadata refresh for the new observed key.
-- Repeated events while that refresh is active coalesce; they do not spawn duplicate refreshes.
-- A successful refresh atomically replaces Featured and Recommended, records the new key, clears stale warnings, resets Featured to page 1, and reprioritizes visible covers.
-- A failed refresh keeps the previous feed and completed pictures, records a nonblocking stale warning, and exposes Retry.
+Featured stores an optional observed `LocalDay` baseline independently from feed readiness.
+
+- A successful initial Featured load records `device_local_day()` when it is available. An unavailable observation leaves the baseline unknown.
+- On app resume and on entry to Featured, observe `device_local_day()` again.
+- Current `None`: keep the feed and baseline unchanged. Do not infer a date.
+- Baseline `None` plus current `Some(day)`: record `Some(day)` as the baseline without refreshing. This is the first trustworthy observation, not evidence that a day was crossed.
+- Baseline `Some(day)` plus the same current day: do nothing.
+- Baseline `Some(old)` plus current `Some(new)` where they differ: start exactly one Featured metadata refresh targeted at `new`.
+- Repeated observations for the active target coalesce.
+- If a different trustworthy day is observed while a refresh is active, retain it as the desired day and re-evaluate once the active request settles. Do not lose a timezone or midnight transition.
+- A successful refresh atomically replaces Featured and Recommended, records its target day unless a newer desired day exists, clears stale warnings, resets Featured to page 1, and reprioritizes visible covers.
+- A failed refresh keeps the previous feed and completed pictures, leaves the last successful baseline unchanged, records a nonblocking stale warning, and exposes Retry.
 - Retry uses the same refresh operation. It does not create a second refresh path.
-- A system clock moving backward or a timezone change can produce a different key and therefore one refresh. This is intentional: the device's local calendar context changed.
+- A system clock moving backward or a timezone change can produce a different trustworthy `LocalDay` and therefore one refresh. This is intentional: the device's local calendar context changed.
+
+This baseline transition is required: if initial loading sees no timezone but a later observation succeeds, recording that first `Some(day)` without a request enables subsequent day changes to refresh. Leaving the baseline as `None` would disable automatic refresh forever.
 
 ### Required boundary tests
 
-The SDK local-calendar facility must be implemented and verified before Featured daily refresh is wired. Tests cover:
+The SDK local-calendar facility must be implemented and verified before Featured daily refresh is wired. Tests use injected Jiff timestamps and timezones and cover:
 
-- the millisecond immediately before and exactly at local midnight;
-- positive and negative offsets;
-- POSIX sign inversion (`CST-8` means UTC+8 and `EST5` means UTC-5);
-- a non-hour offset;
-- UTC/GMT;
-- two timezone strings mapping one instant to different day keys;
-- a timezone change between observations;
-- missing, malformed, trailing, and out-of-range timezone text returning `None`;
-- checked-add overflow returning `None`;
-- a clock before the Unix epoch returning `None` from the public clock path.
+- the instant immediately before and exactly at local midnight;
+- positive, negative, and non-hour fixed offsets;
+- a POSIX timezone rule with spring-forward and fall-back transitions;
+- an IANA/TZif timezone when the test environment supplies the database;
+- two timezones mapping one instant to different civil dates;
+- unavailable system-timezone discovery returning `None`, never UTC;
+- invalid or out-of-range system time returning `None`;
+- dates around the Unix epoch without unchecked arithmetic.
 
-BOMTOON tests separately prove that same-day observations do not refresh, a changed device-local day refreshes once, unknown local day never substitutes Taipei/UTC, and refresh failure retains stale content with a warning.
+BOMTOON tests separately prove:
+
+- same-day observations do not refresh;
+- `None → Some(day)` establishes the baseline without refreshing;
+- a later differing `Some(day)` refreshes exactly once;
+- current `None` never replaces a known baseline;
+- a newer day observed during an active refresh is not lost;
+- unknown local day never substitutes Taipei or UTC;
+- refresh failure retains stale content and the last successful baseline with a warning.
 
 ## Loading, failure, and retry behavior
 
@@ -375,7 +398,8 @@ After that prerequisite, implement the homepage parser/model, public network pol
 
 The implementation plan is expected to touch only the responsible layers:
 
-- `crates/kobo-sdk/src/` for the central safe local-calendar facility and tests;
+- the root dependency configuration and lockfile for `jiff` 0.2;
+- `crates/kobo-sdk/src/` for the central safe `LocalDay` facility and tests;
 - `apps/bomtoon/src/api.rs` for public homepage/detail/image tasks and protected thumbnail query handling;
 - `apps/bomtoon/src/parse.rs` for bounded homepage and thumbnail parsing;
 - `apps/bomtoon/src/model.rs` for shelf comic and thumbnail fields;
@@ -383,4 +407,4 @@ The implementation plan is expected to touch only the responsible layers:
 - `crates/kobo-net/` and policy tests for exact public no-credential routes and image paths;
 - focused BOMTOON and SDK tests.
 
-A new dependency, protocol message, persistent store, shared scrolling primitive, or runtime service is not planned.
+`jiff` is the only planned new dependency. A protocol message, persistent store, shared scrolling primitive, bundled timezone database, or runtime service is not planned.
