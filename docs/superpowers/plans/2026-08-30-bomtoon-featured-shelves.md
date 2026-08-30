@@ -369,6 +369,7 @@ git commit -m "feat(bomtoon): add public shelf requests"
 **Files:**
 - Modify: `apps/bomtoon/src/model.rs`
 - Modify: `apps/bomtoon/src/parse.rs`
+- Modify: `apps/bomtoon/src/main.rs` only for mechanical `cover_url: None` additions to existing `Comic` and `RecentEntry` literals required by the clean model cutover
 
 **Interfaces:**
 
