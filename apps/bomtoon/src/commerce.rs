@@ -595,6 +595,20 @@ impl Commerce {
             | Flow::AcceptedButStale => None,
         }
     }
+    pub fn cancel_unpersisted(&mut self) -> CommerceEffects {
+        let flow = std::mem::replace(&mut self.flow, Flow::LoadingSafetyState);
+        match flow {
+            Flow::Quoting { .. } | Flow::Choosing(_) | Flow::Requoting { .. } => {
+                self.flow = Flow::Idle;
+                CommerceEffects::redraw()
+            }
+            other => {
+                self.flow = other;
+                CommerceEffects::default()
+            }
+        }
+    }
+
 
     #[must_use]
     pub fn reconciliation_marker(&self) -> Option<&UnresolvedMutationV1> {

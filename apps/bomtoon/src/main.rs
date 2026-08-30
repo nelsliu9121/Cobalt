@@ -1073,9 +1073,8 @@ impl Bomtoon {
     }
 
     fn quote_episode_title(&self) -> String {
-        self.episodes
-            .iter()
-            .find(|episode| episode.purchase == model::PurchaseState::NotOwned)
+        self.commerce_episode
+            .and_then(|index| self.episodes.get(index))
             .map_or_else(
                 || "Episode options".to_owned(),
                 |episode| {
@@ -1798,6 +1797,21 @@ impl Bomtoon {
         self.show(context);
     }
 
+    fn cancel_account_history(&mut self, context: &mut Context) {
+        self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
+        self.wallet.detail_queue.clear();
+        let history_tasks = self
+            .wallet
+            .tasks
+            .iter()
+            .filter_map(|(task, purpose)| purpose.history().map(|_| *task))
+            .collect::<Vec<_>>();
+        for task in history_tasks {
+            self.wallet.tasks.remove(&task);
+            context.cancel(task);
+        }
+    }
+
     fn cancel_wallet(&mut self, context: &mut Context) {
         self.wallet.summary_generation = self.wallet.summary_generation.wrapping_add(1);
         self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
@@ -2366,6 +2380,10 @@ impl Bomtoon {
         context: &mut Context,
         effects: commerce::CommerceEffects,
     ) {
+        if self.commerce.state() == commerce::CommerceState::Idle {
+            self.retained_quote = None;
+            self.commerce_episode = None;
+        }
         let redraw = effects.redraw;
         let refresh_wallet = effects.refresh_wallet;
         let refresh_gifts = effects.refresh_gifts;
@@ -2526,11 +2544,16 @@ impl Bomtoon {
                                         && episode.alias == selection.episode_alias
                                         && episode.purchase == model::PurchaseState::Rented
                                 });
+                                let title_gifts = (!self.gifts.error
+                                    && self.gifts.task.is_none()
+                                    && self.gifts.title_id == Some(selection.title_id))
+                                    .then_some(self.gifts.available)
+                                    .flatten();
                                 let _ = purchase;
                                 self.commerce.quote_received(
                                     quote,
                                     spendable,
-                                    self.gifts.available,
+                                    title_gifts,
                                     active_rental,
                                 )
                             }
@@ -3178,7 +3201,7 @@ impl Bomtoon {
             return;
         }
         self.begin_shelf_load(pending);
-        if matches!(pending, Pending::Content(_) | Pending::Logout) {
+        if matches!(pending, Pending::Content(_)) {
             self.preempt_cover_tasks(context);
         }
         if self.task.is_some() {
@@ -4022,7 +4045,7 @@ impl Bomtoon {
         }) else {
             return;
         };
-        self.clear_title_gifts(context);
+        self.cancel_title_gift_task(context);
         self.reader_selection = Some(EpisodeSelection {
             content_alias: self.selected_content_alias.clone(),
             episode_alias,
@@ -4075,6 +4098,7 @@ impl Bomtoon {
         self.view = View::Episodes;
         self.show(context);
         self.cancel_reader(context);
+        self.refresh_title_gifts(context, GiftTaskPurpose::Display);
         self.resume_deferred_summary(context);
     }
 
@@ -4683,6 +4707,33 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
+        if self.view == View::Episodes && action == ActionId::BACK {
+            match self.commerce.state() {
+                commerce::CommerceState::Quoting
+                | commerce::CommerceState::Choosing
+                | commerce::CommerceState::Requoting => {
+                    if let Some(task) = self.commerce_task.take() {
+                        context.cancel(task.id);
+                    }
+                    self.commerce_generation = self.commerce_generation.wrapping_add(1);
+                    self.retained_quote = None;
+                    self.commerce_episode = None;
+                    let effects = self.commerce.cancel_unpersisted();
+                    self.apply_commerce_effects(context, effects);
+                    return;
+                }
+                commerce::CommerceState::PersistingIntent
+                | commerce::CommerceState::Mutating
+                | commerce::CommerceState::Reconciling
+                | commerce::CommerceState::ClearingIntent
+                | commerce::CommerceState::AcceptedButStale => {
+                    self.show(context);
+                    return;
+                }
+                commerce::CommerceState::LoadingSafetyState
+                | commerce::CommerceState::Idle => {}
+            }
+        }
         if self.commerce.state() == commerce::CommerceState::AcceptedButStale {
             if action == action_id(REFRESH_COMMERCE) {
                 let effects = self.commerce.refresh_status();
@@ -4719,7 +4770,7 @@ impl KoboApp for Bomtoon {
                 return;
             }
         }
-        let can_leave_reader = self.account == AccountState::Active && self.view == View::Reader;
+        let can_leave_reader = self.view == View::Reader;
         if action == ActionId::BACK && can_leave_reader {
             self.leave_reader(context);
             return;
@@ -4731,6 +4782,9 @@ impl KoboApp for Bomtoon {
             && self.foreground_reader_task.is_none();
         if action == ActionId::BACK && ready && matches!(self.view, View::Account | View::Episodes)
         {
+            if self.view == View::Account {
+                self.cancel_account_history(context);
+            }
             self.view = View::Main;
             self.page = 0;
             self.featured.page = 0;
@@ -6393,6 +6447,40 @@ mod tests {
         (runner, commands)
     }
 
+    fn started_ready_for_homepage() -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, commands) = started();
+        let homepage = fetch_task_with(&commands, "/comic/main").0;
+        let scope = scope_task(&commands);
+        let library = fetch_task_with(&commands, "/library?").0;
+        let summary = fetch_task_with(&commands, "/asset/user").0;
+        runner.task_outcome(
+            scope,
+            TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
+        );
+        runner.task_outcome(
+            library,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
+        runner.task_outcome(
+            summary,
+            TaskOutcome::Completed(ASSET_RESPONSE.to_vec()),
+        );
+        (runner, homepage)
+    }
+
+    fn signed_out_ready_for_homepage() -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, commands) = started();
+        let homepage = fetch_task_with(&commands, "/comic/main").0;
+        let scope = scope_task(&commands);
+        let library = fetch_task_with(&commands, "/library?").0;
+        let summary = fetch_task_with(&commands, "/asset/user").0;
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        runner.task_outcome(library, TaskOutcome::Cancelled);
+        runner.task_outcome(summary, TaskOutcome::Cancelled);
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        (runner, homepage)
+    }
+
     fn spawns(commands: &[Command]) -> Vec<(TaskId, Task)> {
         commands
             .iter()
@@ -6817,10 +6905,14 @@ mod tests {
     #[test]
     fn unresolved_marker_store_callbacks_require_exact_key_and_operation() {
         let scope = test_scope(b"00112233445566778899aabbccddeeff");
-        let (mut runner, _) = started();
-
-        runner.app_mut().commerce = persisting_commerce(scope);
-        runner.app_mut().marker_store = Some(MarkerStoreOperation::Save);
+        let mut runner = AppRunner::new(Bomtoon {
+            account: AccountState::Active,
+            connection: ConnectionState::Online,
+            account_scope: Some(scope),
+            commerce: persisting_commerce(scope),
+            marker_store: Some(MarkerStoreOperation::Save),
+            ..Bomtoon::default()
+        });
 
         runner.store_result(StoreResult::Saved {
             key: "other".to_owned(),
@@ -7220,6 +7312,7 @@ mod tests {
         }
         AppRunner::with_metrics(
             Bomtoon {
+                account: AccountState::Active,
                 view: View::Reader,
                 selected_content_alias: "hunter_q".to_owned(),
                 reader_selection: Some(EpisodeSelection {
@@ -7544,6 +7637,7 @@ mod tests {
         let picture = TilePicture::new(PictureHandle(7), 1, 2);
         let runner = AppRunner::with_metrics(
             Bomtoon {
+                account: AccountState::Active,
                 view: View::Reader,
                 selected_content_alias: "hunter_q".to_owned(),
                 reader_selection: Some(EpisodeSelection {
@@ -7657,7 +7751,7 @@ mod tests {
 
     fn failed_start(error: TaskError) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let (mut runner, commands) = started();
-        let (task, _) = fetch_task_with(&commands, "/asset/user");
+        let task = scope_task(&commands);
         let commands = runner.task_outcome(task, TaskOutcome::Failed(error));
         (runner, commands)
     }
@@ -7698,6 +7792,7 @@ mod tests {
             MainDestination::Library,
         ] {
             let screen = Bomtoon {
+                account: AccountState::Active,
                 view: View::Main,
                 destination,
                 library_loaded: true,
@@ -7735,6 +7830,7 @@ mod tests {
             (WalletState::default(), "Coins unavailable"),
         ] {
             let screen = Bomtoon {
+                account: AccountState::Active,
                 view: View::Main,
                 wallet,
                 ..Bomtoon::default()
@@ -7861,6 +7957,7 @@ mod tests {
             (LIBRARY, MainDestination::Library, "/library?", "/recent?"),
         ] {
             let mut runner = AppRunner::new(Bomtoon {
+                account: AccountState::Active,
                 view: View::Main,
                 destination: MainDestination::Featured,
                 ..Bomtoon::default()
@@ -7881,6 +7978,7 @@ mod tests {
         }
 
         let mut runner = AppRunner::new(Bomtoon {
+            account: AccountState::Active,
             view: View::Main,
             destination: MainDestination::Recent,
             recent_loaded: true,
@@ -7894,7 +7992,7 @@ mod tests {
 
     #[test]
     fn recent_load_failure_retry_and_late_success_stay_destination_local() {
-        let (mut runner, _) = started();
+        let (mut runner, _) = started_ready_for_homepage();
 
         let commands = runner.action(action_id(RECENT));
         let (first, _) = fetch_task_with(&commands, "/recent?");
@@ -7939,7 +8037,9 @@ mod tests {
 
     #[test]
     fn protected_shelf_work_allows_destination_switches_and_serializes_one_next_shelf() {
-        let (mut runner, _) = started();
+        let (mut runner, _) = started_ready_for_homepage();
+        runner.app_mut().library_loaded = false;
+        runner.app_mut().comics.clear();
 
         let recent_commands = runner.action(action_id(RECENT));
         let (recent, _) = fetch_task_with(&recent_commands, "/recent?");
@@ -8035,6 +8135,7 @@ mod tests {
             ["Sign in"]
         );
         let signed_in_main = Bomtoon {
+            account: AccountState::Active,
             view: View::Main,
             ..Bomtoon::default()
         }
@@ -8064,7 +8165,9 @@ mod tests {
         assert_eq!(runner.app().destination, MainDestination::Featured);
         assert_eq!(runner.app().page, 0);
         assert!(commands.iter().any(is_homepage_fetch));
-        assert!(!commands.iter().any(is_library_or_recent_fetch));
+        assert!(!spawns(&commands)
+            .iter()
+            .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/recent?"))));
         assert!(!spawns(&commands).iter().any(
             |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/"))
         ));
@@ -8196,7 +8299,11 @@ mod tests {
             content_task,
             TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
         );
-        assert!(spawns(&commands).is_empty());
+        let (_, gift_work) = only_spawn(&commands);
+        assert_eq!(gift_work, api::title_gifts(41));
+        assert!(spawns(&commands).iter().all(
+            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/asset/user"))
+        ));
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets"));
@@ -9415,8 +9522,13 @@ mod tests {
         complete_initial_summary(&mut runner);
         let commands = runner.action(action_id(ACCOUNT));
         let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
+        let (coin_task, _) = fetch_task_with(&commands, "coinKind=COIN");
+        let (ticket_task, _) = fetch_task_with(&commands, "coinKind=TICKET");
         runner.app_mut().wallet.summary_refresh_queued = true;
-        runner.action(ActionId::BACK);
+        let back = runner.action(ActionId::BACK);
+        assert!(back.contains(&Command::Cancel(coin_task)));
+        assert!(back.contains(&Command::Cancel(ticket_task)));
+        runner.task_outcome(coin_task, TaskOutcome::Cancelled);
 
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
@@ -10015,40 +10127,29 @@ mod tests {
     }
 
     #[test]
-    fn account_saturated_reentry_defers_ticket_and_preserves_server_order() {
+    fn account_reentry_after_back_starts_fresh_histories_in_server_order() {
         let (mut runner, _) = loaded_library();
         let first_open = runner.action(action_id(ACCOUNT));
         let (old_coin, _) = fetch_task_with(&first_open, "coinKind=COIN");
         let (old_ticket, _) = fetch_task_with(&first_open, "coinKind=TICKET");
 
-        runner.action(ActionId::BACK);
-        let second_open = runner.action(action_id(ACCOUNT));
-        assert!(second_open.contains(&Command::Cancel(old_coin)));
-        assert!(second_open.contains(&Command::Cancel(old_ticket)));
-        let (current_coin, _) = fetch_task_with(&second_open, "coinKind=COIN");
-        assert!(
-            spawns(&second_open)
-                .iter()
-                .all(|(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("coinKind=TICKET"))),
-            "the fourth occupied slot must defer the replacement ticket"
-        );
-        assert!(!runner.app().wallet.coin_history_error);
-        assert!(!runner.app().wallet.ticket_history_error);
-        let loading = format!("{:?}", last_screen(&second_open));
-        assert!(loading.contains("Coin history"));
-        assert!(loading.contains("Ticket history"));
-        assert!(loading.matches("Loading…").count() >= 2);
+        let back = runner.action(ActionId::BACK);
+        assert!(back.contains(&Command::Cancel(old_coin)));
+        assert!(back.contains(&Command::Cancel(old_ticket)));
+        runner.task_outcome(old_coin, TaskOutcome::Cancelled);
+        runner.task_outcome(old_ticket, TaskOutcome::Cancelled);
 
-        let resumed = runner.task_outcome(old_coin, TaskOutcome::Cancelled);
-        let (current_ticket, work) = only_spawn(&resumed);
+        let second_open = runner.action(action_id(ACCOUNT));
+        let (current_coin, _) = fetch_task_with(&second_open, "coinKind=COIN");
+        let (current_ticket, work) = fetch_task_with(&second_open, "coinKind=TICKET");
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. } if url.contains("coinKind=TICKET")
         ));
         assert_ne!(current_coin, current_ticket);
+        assert!(!runner.app().wallet.coin_history_error);
         assert!(!runner.app().wallet.ticket_history_error);
 
-        runner.task_outcome(old_ticket, TaskOutcome::Cancelled);
         runner.task_outcome(
             current_ticket,
             TaskOutcome::Completed(MULTI_TICKET_HISTORY_RESPONSE.to_vec()),
@@ -10059,14 +10160,9 @@ mod tests {
                 .wallet
                 .ticket_history
                 .iter()
-                .map(|row| (row.subtype, row.quantity))
+                .map(|row| row.quantity)
                 .collect::<Vec<_>>(),
-            [
-                (model::AssetSubtype::Standard, 11),
-                (model::AssetSubtype::Bonus, 12),
-                (model::AssetSubtype::Standard, 21),
-                (model::AssetSubtype::Free, 22),
-            ]
+            vec![11, 12, 21, 22]
         );
     }
 
@@ -10075,10 +10171,18 @@ mod tests {
         let (mut runner, image_task) = reader_waiting_for_first_image();
         let commands = runner.action(ActionId::BACK);
         assert!(commands.contains(&Command::Cancel(image_task)));
+        let gift = fetch_task_with(&commands, "/gift/contents/detail?").0;
+        runner.task_outcome(image_task, TaskOutcome::Cancelled);
+        runner.task_outcome(
+            gift,
+            TaskOutcome::Completed(
+                br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#
+                    .to_vec(),
+            ),
+        );
         runner.action(ActionId::BACK);
 
         let commands = runner.action(action_id(ACCOUNT));
-
         assert_eq!(runner.app().view, View::Account);
         fetch_task_with(&commands, "coinKind=COIN");
         fetch_task_with(&commands, "coinKind=TICKET");
@@ -10716,7 +10820,10 @@ mod tests {
             }
         );
         assert!(!commands.contains(&Command::Cancel(scenario.public_homepage_task)));
-        assert!(!commands.contains(&Command::Cancel(scenario.public_cover_task)));
+        assert!(
+            !commands.contains(&Command::Cancel(scenario.public_cover_task)),
+            "public cover cancellation leaked into sign-out: {commands:?}"
+        );
 
         let commands = runner.task_outcome(logout_task, TaskOutcome::Completed(Vec::new()));
         assert_signed_out_public_state(
@@ -10797,22 +10904,31 @@ mod tests {
     fn missing_credentials_leave_featured_available_and_sign_in_retries_cleanly() {
         let (mut runner, commands) = started();
         let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let (task, _) = fetch_task_with(&commands, "/asset/user");
-        let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
+        let task = scope_task(&commands);
+        let library = fetch_task_with(&commands, "/library?").0;
+        let summary = fetch_task_with(&commands, "/asset/user").0;
+        let _commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
 
         assert_eq!(runner.app().account, AccountState::SignedOut);
         assert_eq!(runner.app().view, View::Main);
-        assert!(format!("{:?}", last_screen(&commands)).contains("Sign in"));
+        assert!(format!("{:?}", runner.app().screen()).contains("Sign in"));
+        runner.task_outcome(library, TaskOutcome::Cancelled);
+        runner.task_outcome(summary, TaskOutcome::Cancelled);
 
         let commands = runner.action(action_id(SIGN_IN));
         assert_login_instructions(&last_screen(&commands));
 
         let commands = runner.action(action_id(RETRY));
+        let scope = scope_task(&commands);
         assert!(commands.contains(&Command::Cancel(homepage)));
         assert!(!commands.iter().any(is_homepage_fetch));
         let commands = runner.task_outcome(homepage, TaskOutcome::Cancelled);
         let (_, work) = fetch_task_with(&commands, "/comic/main");
         assert_eq!(work, api::homepage());
+        runner.task_outcome(
+            scope,
+            TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
+        );
         assert_eq!(runner.app().account, AccountState::Active);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
@@ -10998,7 +11114,7 @@ mod tests {
         let commands = runner.action(action_id(RETRY));
         let (_, work) = fetch_task_with(&commands, "/comic/main");
         assert_eq!(work, api::homepage());
-        assert_eq!(runner.app().account, AccountState::Active);
+        assert_eq!(runner.app().account, AccountState::Checking);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
         assert_all_account_data_cleared(runner.app());
@@ -11040,13 +11156,14 @@ mod tests {
             (TaskError::NoCredential, AccountState::SignedOut),
             (TaskError::Unauthorized, AccountState::Expired),
         ] {
-            let (runner, commands) = failed_start(error);
+            let (runner, _commands) = failed_start(error);
             assert_eq!(runner.app().account, expected);
+            let screen = runner.app().screen();
             if expected == AccountState::SignedOut {
                 assert_eq!(runner.app().view, View::Main);
-                assert!(format!("{:?}", last_screen(&commands)).contains("Sign in"));
+                assert!(format!("{screen:?}").contains("Sign in"));
             } else {
-                assert_login_instructions(&last_screen(&commands));
+                assert_login_instructions(&screen);
             }
 
             for (runner, commands) in [
@@ -11130,6 +11247,7 @@ mod tests {
             })
             .collect();
         let mut runner = AppRunner::new(Bomtoon {
+            account: AccountState::Active,
             view: View::Episodes,
             episodes,
             ..Bomtoon::default()
@@ -12523,6 +12641,11 @@ mod tests {
                 _ => None,
             })
             .collect::<BTreeMap<_, _>>();
+        for url in runner.app().covers.visible_urls.clone() {
+            if !cover_tasks.contains_key(&url) {
+                runner.app_mut().covers.entries.insert(url, CoverState::Failed);
+            }
+        }
         let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp";
         let obsolete_urls = [
             "https://image.balcony.studio/tw/contents/feature-c.webp",
@@ -12537,6 +12660,15 @@ mod tests {
                 TaskOutcome::Completed(TINY_WEBP.to_vec()),
             );
         }
+        runner.task_outcome(
+            *cover_tasks
+                .get(obsolete_urls[0])
+                .expect("settled obsolete cover task"),
+            TaskOutcome::Completed(TINY_WEBP.to_vec()),
+        );
+        let _obsolete_picture = ready_cover(&runner.app().covers, Some(obsolete_urls[0]))
+            .expect("settled obsolete cover picture");
+        assert_eq!(runner.tasks_in_flight(), 1);
         let old_featured = runner.app().featured.featured.clone();
         let old_recommended = runner.app().featured.recommended.clone();
         let shared_picture = ready_cover(&runner.app().covers, Some(shared_url));
@@ -12561,7 +12693,6 @@ mod tests {
         assert_eq!(runner.app().featured.featured, old_featured);
         assert_eq!(runner.app().featured.recommended, old_recommended);
         runner.app_mut().featured.page = 7;
-
         let commands = runner.task_outcome(
             fresh_detail,
             TaskOutcome::Completed(detail_response("fresh-b", "Fresh B")),
@@ -12592,9 +12723,11 @@ mod tests {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        assert!(obsolete_urls
-            .into_iter()
-            .all(|url| { cancelled.contains(cover_tasks.get(url).expect("obsolete cover task")) }));
+        assert!(cancelled.contains(
+            cover_tasks
+                .get(obsolete_urls[1])
+                .expect("in-flight obsolete cover task")
+        ));
         assert!(runner
             .app()
             .covers
@@ -12847,8 +12980,7 @@ mod tests {
 
     #[test]
     fn featured_homepage_spawns_only_bounded_public_detail_tasks_with_runner_cap() {
-        let (mut runner, commands) = started();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (mut runner, homepage) = started_ready_for_homepage();
         let response = homepage_response(
             &["banner-a", "banner-b", "banner-c", "banner-d"],
             &[("recommended", "Recommended")],
@@ -12863,17 +12995,12 @@ mod tests {
         assert!(spawns(&commands).iter().all(
             |(_, work)| matches!(work, Task::Fetch { url, credential: None, .. } if url.contains("/detail/"))
         ));
-        assert_eq!(runner.tasks_in_flight(), 4);
+        assert_eq!(runner.tasks_in_flight(), 3);
     }
 
     #[test]
     fn banner_detail_success_enriches_exact_slot_and_waits_for_every_detail() {
-        let mut runner = AppRunner::new(Bomtoon {
-            account: AccountState::SignedOut,
-            ..Bomtoon::default()
-        });
-        let commands = runner.start();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (mut runner, homepage) = signed_out_ready_for_homepage();
         let commands = runner.task_outcome(
             homepage,
             TaskOutcome::Completed(homepage_response(&["first", "second"], &[])),
@@ -12903,12 +13030,7 @@ mod tests {
 
     #[test]
     fn banner_detail_failure_keeps_validated_alias_fallback_and_finishes_featured() {
-        let mut runner = AppRunner::new(Bomtoon {
-            account: AccountState::SignedOut,
-            ..Bomtoon::default()
-        });
-        let commands = runner.start();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (mut runner, homepage) = signed_out_ready_for_homepage();
         let commands = runner.task_outcome(
             homepage,
             TaskOutcome::Completed(homepage_response(&["fallback"], &[])),
@@ -12932,12 +13054,7 @@ mod tests {
 
     #[test]
     fn featured_stale_generation_and_unknown_outcomes_are_no_ops() {
-        let mut runner = AppRunner::new(Bomtoon {
-            account: AccountState::SignedOut,
-            ..Bomtoon::default()
-        });
-        let commands = runner.start();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (mut runner, homepage) = signed_out_ready_for_homepage();
         runner.app_mut().featured.generation = runner.app().featured.generation.wrapping_add(1);
         let before = runner.app().featured.clone();
 
@@ -12955,12 +13072,7 @@ mod tests {
 
     #[test]
     fn featured_initial_failure_is_local_retryable_and_keeps_navigation() {
-        let mut runner = AppRunner::new(Bomtoon {
-            account: AccountState::SignedOut,
-            ..Bomtoon::default()
-        });
-        let commands = runner.start();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (mut runner, homepage) = signed_out_ready_for_homepage();
         let generation = runner.app().featured.generation;
 
         let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
@@ -13203,17 +13315,14 @@ mod tests {
 
     #[test]
     fn featured_restart_defers_and_coalesces_replacement_until_every_cancellation_settles() {
-        let (mut runner, commands) = started();
-        let (old_homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let (old_summary, _) = fetch_task_with(&commands, "/asset/user");
+        let (mut runner, old_homepage) = signed_out_ready_for_homepage();
         let commands = runner.task_outcome(
             old_homepage,
             TaskOutcome::Completed(homepage_response(&["old-a", "old-b"], &[])),
         );
         let (old_a, _) = fetch_task_with(&commands, "/detail/old-a");
         let (old_b, _) = fetch_task_with(&commands, "/detail/old-b");
-        runner.task_outcome(old_summary, TaskOutcome::Failed(TaskError::NoCredential));
-        runner.action(action_id(SIGN_IN));
+        runner.app_mut().featured.status = FeaturedStatus::Failed;
 
         let commands = runner.action(action_id(RETRY));
         let cancelled = commands
@@ -13270,7 +13379,7 @@ mod tests {
                 .iter()
                 .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with(path)))));
         assert_eq!(runner.app().featured.pending_details, 3);
-        assert_eq!(runner.tasks_in_flight(), 4);
+        assert_eq!(runner.tasks_in_flight(), 3);
     }
 
     fn shelf_cover_url(index: usize) -> String {
@@ -13759,7 +13868,17 @@ mod tests {
 
     #[test]
     fn cover_scheduler_shares_the_runner_four_task_cap() {
-        let (mut runner, _) = started();
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+        let library = fetch_task_with(&commands, "/library?").0;
+        runner.task_outcome(
+            scope,
+            TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
+        );
+        runner.task_outcome(
+            library,
+            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
+        );
         runner.app_mut().featured = feed_with_recommendations(6);
 
         let commands = runner.action(action_id(FEATURED));
@@ -13841,6 +13960,7 @@ mod tests {
             selected_content_id: Some(41),
             selected_content_alias: "hunter_q".to_owned(),
             selected_title: "Hunter Q".to_owned(),
+            commerce_episode: Some(0),
             episodes: vec![Episode {
                 id: 105,
                 alias: "paid".to_owned(),
@@ -13998,6 +14118,52 @@ mod tests {
             api::purchase("hunter_q", 105, model::PurchaseType::Rent)
         );
     }
+    fn runner_choosing_paid_episode() -> AppRunner<Bomtoon> {
+        const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        const QUOTE_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
+        let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
+        runner.task_outcome(
+            quote,
+            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
+        );
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Choosing);
+        runner
+    }
+
+    fn runner_waiting_for_buy_post() -> (AppRunner<Bomtoon>, TaskId) {
+        const QUOTE_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let mut runner = runner_choosing_paid_episode();
+        let (requote, work) = only_spawn(&runner.action(action_id(BUY)));
+        assert_eq!(
+            work,
+            api::quote("hunter_q", "paid", model::PurchaseType::Possession)
+        );
+        runner.task_outcome(
+            requote,
+            TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()),
+        );
+        let commands = runner.store_result(StoreResult::Saved {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        let (post, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::purchase("hunter_q", 105, model::PurchaseType::Possession)
+        );
+        (runner, post)
+    }
+
     fn runner_waiting_for_paid_rent_post() -> (AppRunner<Bomtoon>, TaskId) {
         const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
         const QUOTE_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
@@ -14271,5 +14437,339 @@ mod tests {
             |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/gift/"))
         ));
         assert_eq!(runner.app().view, View::Reader);
+    }
+    #[test]
+    fn back_cancels_requote_before_save_and_is_consumed_after_save() {
+        const QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let mut before_save = runner_choosing_paid_episode();
+        let (requote, _) = only_spawn(&before_save.action(action_id(RENT)));
+        let commands = before_save.action(ActionId::BACK);
+        assert!(commands.contains(&Command::Cancel(requote)));
+        assert_eq!(before_save.app().commerce.state(), commerce::CommerceState::Idle);
+        assert_eq!(before_save.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
+        let commands =
+            before_save.task_outcome(requote, TaskOutcome::Completed(QUOTE.to_vec()));
+        assert_no_post_or_marker_forget(&commands);
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Save { .. })
+        )));
+
+        let mut persisting = runner_choosing_paid_episode();
+        let (requote, _) = only_spawn(&persisting.action(action_id(RENT)));
+        let commands = persisting.task_outcome(requote, TaskOutcome::Completed(QUOTE.to_vec()));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Save { .. })
+        )));
+        let commands = persisting.action(ActionId::BACK);
+        assert_eq!(
+            persisting.app().commerce.state(),
+            commerce::CommerceState::PersistingIntent
+        );
+        assert_eq!(persisting.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
+
+        let (mut mutating, _) = runner_waiting_for_paid_rent_post();
+        let commands = mutating.action(ActionId::BACK);
+        assert_eq!(
+            mutating.app().commerce.state(),
+            commerce::CommerceState::Mutating
+        );
+        assert_eq!(mutating.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn back_is_consumed_during_reconciliation_and_marker_clearing() {
+        const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1}}"#;
+        const RENTED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"RENT","rentExpiredAt":1819728000000,"paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
+        const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        let (mut runner, post) = runner_waiting_for_paid_rent_post();
+        let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
+        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (wallet, _) = fetch_task_with(&commands, "/asset/user");
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Reconciling
+        );
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
+
+        runner.task_outcome(content, TaskOutcome::Completed(RENTED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(wallet, TaskOutcome::Completed(NINE_COINS.to_vec()));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::ClearingIntent
+        );
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Forget { .. })
+        )));
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn failed_requote_drops_retained_surface_and_returns_to_episode_actions() {
+        let mut runner = runner_choosing_paid_episode();
+        let (requote, _) = only_spawn(&runner.action(action_id(RENT)));
+
+        let commands = runner.task_outcome(requote, TaskOutcome::Failed(TaskError::TimedOut));
+
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
+        assert!(runner.app().retained_quote.is_none());
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Paid Episode · View options"), "{drawn}");
+        assert!(!drawn.contains("Use Gift"), "{drawn}");
+    }
+
+    #[test]
+    fn quote_heading_names_the_selected_unowned_episode() {
+        const TWO_UNOWNED: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"first","title":"First Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true},{"id":106,"alias":"second","title":"Second Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
+        const NO_GIFTS: &[u8] =
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
+        const SECOND_QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":106,"contentsAlias":"hunter_q","episodeAlias":"second","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(TWO_UNOWNED.to_vec()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
+        let (quote, _) = only_spawn(&runner.action(action_id("episode-1")));
+
+        let commands = runner.task_outcome(quote, TaskOutcome::Completed(SECOND_QUOTE.to_vec()));
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Second Paid"), "{drawn}");
+        assert!(!drawn.contains("heading: \"First Paid\""), "{drawn}");
+    }
+
+    #[test]
+    fn leaving_reader_restores_the_title_gift_balance() {
+        const TWO_GIFTS: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":2,"usedCount":0}],"receivableGifts":[]}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(TWO_GIFTS.to_vec()));
+        assert_eq!(runner.app().gifts.available, Some(2));
+
+        runner.action(action_id("episode-0"));
+        assert_eq!(runner.app().gifts.available, Some(2));
+        let commands = runner.action(ActionId::BACK);
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::title_gifts(41));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(runner.app().gifts.available, Some(2));
+    }
+
+    #[test]
+    fn leaving_account_cancels_only_history_tasks_and_clears_the_queue() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        let commands = runner.action(action_id(ACCOUNT));
+        let (summary, _) = fetch_task_with(&commands, "/asset/user");
+        let (coin, _) = fetch_task_with(&commands, "coinKind=COIN");
+        let (ticket, _) = fetch_task_with(&commands, "coinKind=TICKET");
+        let generation = runner.app().wallet.detail_generation;
+
+        let commands = runner.action(ActionId::BACK);
+
+        assert!(commands.contains(&Command::Cancel(coin)));
+        assert!(commands.contains(&Command::Cancel(ticket)));
+        assert!(!commands.contains(&Command::Cancel(summary)));
+        assert_eq!(
+            runner.app().wallet.detail_generation,
+            generation.wrapping_add(1)
+        );
+        assert!(runner.app().wallet.detail_queue.is_empty());
+        assert_eq!(runner.app().wallet.summary_task, Some(summary));
+        assert!(runner
+            .app()
+            .wallet
+            .tasks
+            .values()
+            .all(|purpose| matches!(purpose, WalletTaskPurpose::Summary { .. })));
+    }
+
+    #[test]
+    fn failed_or_in_progress_gift_refresh_disables_only_gift_purchase() {
+        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        const QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
+        runner.app_mut().gifts.error = true;
+        let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
+        runner.task_outcome(quote, TaskOutcome::Completed(QUOTE.to_vec()));
+
+        let screen = runner.app().screen();
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Button { label, state: ControlState::Disabled, .. } if label == "Use Gift"
+        )));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Button { label, state: ControlState::Enabled, .. } if label == "Rent · 1 coins"
+        )));
+    }
+    #[test]
+    fn accepted_coin_possession_reconciles_and_back_reloads_library() {
+        const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"POSSESSION","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":2,"useGoldCoin":2,"useBonusCoin":0,"useFreeCoin":0}}"#;
+        const OWNED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"POSSESSION","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
+        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        let (mut runner, post) = runner_waiting_for_buy_post();
+
+        let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
+        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (wallet, _) = fetch_task_with(&commands, "/asset/user");
+        assert_eq!(spawns(&commands).len(), 2);
+        runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Forget { .. })
+        )));
+        runner.store_result(StoreResult::Forgotten {
+            key: commerce::MARKER_KEY.to_owned(),
+        });
+        assert!(!runner.app().library_loaded);
+        assert_eq!(runner.app().view, View::Episodes);
+
+        let commands = runner.action(ActionId::BACK);
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::library(0));
+        assert_eq!(runner.app().view, View::Main);
+        assert!(runner.app().comics.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_purchase_with_entitlement_and_exact_delta_clears_without_repost() {
+        const OWNED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"POSSESSION","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
+        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        let (mut runner, post) = runner_waiting_for_buy_post();
+
+        let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
+        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (wallet, _) = fetch_task_with(&commands, "/asset/user");
+        let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
+        assert_eq!(spawns(&commands).len(), 3);
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| !matches!(work, Task::Post { .. })));
+        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
+        runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Forget { .. })
+        )));
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| !matches!(work, Task::Post { .. })));
+    }
+
+    #[test]
+    fn mismatched_receipt_total_is_ambiguous_and_contradiction_stays_locked() {
+        const MISMATCHED: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"POSSESSION","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1,"useGoldCoin":1,"useBonusCoin":0,"useFreeCoin":0}}"#;
+        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        let (mut runner, post) = runner_waiting_for_buy_post();
+
+        let commands = runner.task_outcome(post, TaskOutcome::Completed(MISMATCHED.to_vec()));
+        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (wallet, _) = fetch_task_with(&commands, "/asset/user");
+        let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
+        assert_eq!(spawns(&commands).len(), 3);
+        assert_no_post_or_marker_forget(&commands);
+        runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
+        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_no_post_or_marker_forget(&commands);
+    }
+
+    #[test]
+    fn offline_and_different_account_leave_accepted_mutations_locked() {
+        let (mut offline, post) = runner_waiting_for_paid_rent_post();
+        let commands = offline.task_outcome(post, TaskOutcome::Failed(TaskError::Offline));
+        assert_eq!(
+            offline.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_no_post_or_marker_forget(&commands);
+        assert!(spawns(&commands).is_empty());
+
+        let (mut switched, post) = runner_waiting_for_paid_rent_post();
+        let commands = switched.lifecycle(Lifecycle::Background);
+        assert!(commands.contains(&Command::Cancel(post)));
+        let commands = switched.lifecycle(Lifecycle::Foreground);
+        let (scope_task, work) = only_spawn(&commands);
+        assert_eq!(work, api::account_scope());
+        switched.task_outcome(
+            scope_task,
+            TaskOutcome::Completed(b"ffeeddccbbaa99887766554433221100".to_vec()),
+        );
+        assert_eq!(
+            switched.app().commerce.state(),
+            commerce::CommerceState::AcceptedButStale
+        );
+        assert_eq!(
+            switched.app().account_scope,
+            Some(test_scope(b"ffeeddccbbaa99887766554433221100"))
+        );
+        assert_eq!(switched.app().view, View::Episodes);
+    }
+
+    #[test]
+    fn saturated_task_capacity_fails_quote_closed_without_save_or_post() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands =
+            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        fetch_task_with(&commands, "/gift/contents/detail?");
+        runner.app_mut().view = View::Main;
+        runner.action(action_id(ACCOUNT));
+        assert_eq!(runner.tasks_in_flight(), 4);
+        let app = runner.app_mut();
+        app.view = View::Episodes;
+        app.problem = None;
+
+        let commands = runner.action(action_id("episode-4"));
+
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(spawns(&commands).is_empty());
+        assert_no_post_or_marker_forget(&commands);
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::Save { .. })
+        )));
     }
 }
