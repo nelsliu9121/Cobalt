@@ -293,7 +293,7 @@ fn bomtoon_alias(value: &str) -> bool {
 }
 
 fn bomtoon_commerce_alias(value: &str) -> bool {
-    value.len() <= 96 && bomtoon_alias(value)
+    value.len() <= 128 && bomtoon_alias(value)
 }
 
 fn bomtoon_existing_get(url: &str) -> bool {
@@ -1940,7 +1940,7 @@ mod tests {
             );
         }
 
-        let alias_at_limit = "a".repeat(96);
+        let alias_at_limit = "a".repeat(128);
         let quote_at_limit = format!(
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/{alias_at_limit}/{alias_at_limit}?purchaseType=RENT"
         );
@@ -1950,7 +1950,7 @@ mod tests {
             RequestMethod::Get,
             &quote_at_limit
         ));
-        let alias_over_limit = "a".repeat(97);
+        let alias_over_limit = "a".repeat(129);
         let quote_over_limit = format!(
             "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/{alias_over_limit}/ep-1?purchaseType=RENT"
         );
