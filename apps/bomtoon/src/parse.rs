@@ -674,13 +674,7 @@ fn next_open_tag<'a>(
             continue;
         }
         let bytes = html.as_bytes();
-        let mut name_start = start + 1;
-        while bytes
-            .get(name_start)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            name_start += 1;
-        }
+        let name_start = start + 1;
         if matches!(bytes.get(name_start), Some(b'/' | b'!' | b'?')) {
             cursor = find_tag_end(html, name_start + 1)? + 1;
             continue;
@@ -710,22 +704,32 @@ fn next_open_tag<'a>(
 }
 
 fn is_inert_html_element(name: &str) -> bool {
+    name.eq_ignore_ascii_case("template") || is_raw_text_html_element(name)
+}
+
+fn is_raw_text_html_element(name: &str) -> bool {
     [
-        "script", "style", "noscript", "title", "textarea", "template", "xmp", "iframe",
-        "noembed",
+        "script", "style", "noscript", "title", "textarea", "xmp", "iframe", "noembed",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-fn closing_element(html: &str, mut cursor: usize, name: &str) -> Option<(usize, usize)> {
+fn closing_element(html: &str, cursor: usize, name: &str) -> Option<(usize, usize)> {
+    if name.eq_ignore_ascii_case("template") {
+        closing_template_element(html, cursor)
+    } else {
+        closing_raw_element(html, cursor, name)
+    }
+}
+
+fn closing_raw_element(html: &str, mut cursor: usize, name: &str) -> Option<(usize, usize)> {
     let needle = [
         ("script", "</script"),
         ("style", "</style"),
         ("noscript", "</noscript"),
         ("title", "</title"),
         ("textarea", "</textarea"),
-        ("template", "</template"),
         ("xmp", "</xmp"),
         ("iframe", "</iframe"),
         ("noembed", "</noembed"),
@@ -741,6 +745,53 @@ fn closing_element(html: &str, mut cursor: usize, name: &str) -> Option<(usize, 
         }
         cursor = close + needle.len();
     }
+}
+
+fn closing_template_element(html: &str, mut cursor: usize) -> Option<(usize, usize)> {
+    let mut depth = 1usize;
+    while cursor < html.len() {
+        let start = cursor + html[cursor..].find('<')?;
+        if html[start..].starts_with("<!--") {
+            cursor = start + html[start + 4..].find("-->")? + 7;
+            continue;
+        }
+        let bytes = html.as_bytes();
+        let mut name_start = start + 1;
+        let closing = bytes.get(name_start) == Some(&b'/');
+        if closing {
+            name_start += 1;
+        }
+        let mut name_end = name_start;
+        while bytes.get(name_end).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':')
+        }) {
+            name_end += 1;
+        }
+        if name_start == name_end {
+            cursor = start + 1;
+            continue;
+        }
+        let tag_end = find_tag_end(html, name_end)?;
+        let name = &html[name_start..name_end];
+        if name.eq_ignore_ascii_case("template") {
+            if closing {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, tag_end + 1));
+                }
+            } else {
+                depth = depth.checked_add(1)?;
+            }
+            cursor = tag_end + 1;
+            continue;
+        }
+        cursor = if !closing && is_raw_text_html_element(name) {
+            closing_raw_element(html, tag_end + 1, name)?.1
+        } else {
+            tag_end + 1
+        };
+    }
+    None
 }
 
 fn find_tag_end(html: &str, mut cursor: usize) -> Option<usize> {
@@ -1734,6 +1785,40 @@ mod tests {
     }
 
     #[test]
+    fn homepage_ignores_whitespace_prefixed_tag_text() {
+        let body = br#"
+          < script id="__NEXT_DATA__">not-json</script>
+          <script id="__NEXT_DATA__">{"props":{"pageProps":{"main":{"banners":[],"newest":[],"weekDay":[],"onlyBom":[]}}}}</script>
+        "#;
+
+        let parsed = homepage(body).expect("whitespace-prefixed text is not a tag");
+
+        assert!(parsed.banners.is_empty());
+        assert!(parsed.newest.is_empty());
+        assert!(parsed.week_day.is_empty());
+        assert!(parsed.only_bom.is_empty());
+    }
+
+    #[test]
+    fn homepage_ignores_complete_nested_template_content() {
+        let body = br#"
+          <template>
+            <script>const close = '</template>';</script>
+            <template></template>
+            <script id="__NEXT_DATA__">not-json</script>
+          </template>
+          <script id="__NEXT_DATA__">{"props":{"pageProps":{"main":{"banners":[],"newest":[],"weekDay":[],"onlyBom":[]}}}}</script>
+        "#;
+
+        let parsed = homepage(body).expect("nested template content is inert");
+
+        assert!(parsed.banners.is_empty());
+        assert!(parsed.newest.is_empty());
+        assert!(parsed.week_day.is_empty());
+        assert!(parsed.only_bom.is_empty());
+    }
+
+    #[test]
     fn homepage_reads_only_next_data_main_and_filters_banner_targets() {
         let banners = [
             banner_json("CONTENTS", "COMIC", "featured_a"),
@@ -1908,7 +1993,13 @@ mod tests {
             shelf_json(
                 "cover_too_long",
                 "Cover too long",
-                Some(("COVER", &format!("{cover_at_cap}a"))),
+                Some((
+                    "COVER",
+                    &format!(
+                        "{cover_prefix}{}{cover_suffix}",
+                        "a".repeat(2049 - cover_prefix.len() - cover_suffix.len())
+                    ),
+                )),
             ),
         ]
         .join(",");
@@ -1950,6 +2041,34 @@ mod tests {
 
         assert_eq!(parsed.newest.len(), urls.len());
         assert!(parsed.newest.iter().all(|comic| comic.cover_url.is_none()));
+    }
+
+    #[test]
+    fn public_detail_ignores_whitespace_prefixed_tag_text() {
+        let body = r#"
+          < meta property="og:title" content="Fake - 漫畫 - BOMTOON">
+          <meta property="og:title" content="Real - 漫畫 - BOMTOON">
+        "#;
+
+        let comic =
+            public_detail(body.as_bytes(), "real").expect("whitespace-prefixed text is not a tag");
+        assert_eq!(comic.title, "Real");
+    }
+
+    #[test]
+    fn public_detail_ignores_complete_nested_template_content() {
+        let body = r#"
+          <template>
+            <script>const close = '</template>';</script>
+            <template></template>
+            <meta property="og:title" content="Fake - 漫畫 - BOMTOON">
+          </template>
+          <meta property="og:title" content="Real - 漫畫 - BOMTOON">
+        "#;
+
+        let comic =
+            public_detail(body.as_bytes(), "real").expect("nested template content is inert");
+        assert_eq!(comic.title, "Real");
     }
 
     #[test]
