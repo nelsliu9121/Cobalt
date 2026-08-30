@@ -570,6 +570,18 @@ impl Commerce {
     }
 
     #[must_use]
+    pub fn marker_belongs_to_another_account(&self) -> bool {
+        matches!(
+            (&self.flow, self.authentication, &self.marker),
+            (
+                Flow::AcceptedButStale,
+                Authentication::Authenticated(current_scope),
+                MarkerLoad::Valid(marker)
+            ) if marker.account_scope != current_scope
+        )
+    }
+
+    #[must_use]
     pub fn quote_presentation(&self) -> Option<&QuotePresentation> {
         match &self.flow {
             Flow::Choosing(choosing) => Some(&choosing.presentation),
@@ -1503,6 +1515,7 @@ mod tests {
 
         commerce.reconciled(scope(), Reconciliation::Incomplete);
         assert_eq!(commerce.state(), CommerceState::AcceptedButStale);
+        assert!(!commerce.marker_belongs_to_another_account());
         assert!(commerce.marker_saved(MARKER_KEY).command.is_none());
         assert!(matches!(
             commerce.refresh_status().command,
@@ -1550,6 +1563,7 @@ mod tests {
         assert!(effects.refresh_wallet);
         assert!(effects.refresh_gifts);
         assert_eq!(same.state(), CommerceState::Reconciling);
+        assert!(!same.marker_belongs_to_another_account());
 
         let other_scope =
             AccountScope::from_bytes(b"ffeeddccbbaa99887766554433221100").expect("other scope");
@@ -1561,6 +1575,7 @@ mod tests {
         );
         assert!(effects.command.is_none());
         assert_eq!(different.state(), CommerceState::AcceptedButStale);
+        assert!(different.marker_belongs_to_another_account());
         assert!(different.refresh_status().command.is_none());
         assert!(different.marker_forgotten(MARKER_KEY).command.is_none());
     }
@@ -1573,6 +1588,7 @@ mod tests {
             commerce.safety_changed(Authentication::Authenticated(scope()), Connectivity::Online);
         assert!(effects.command.is_none());
         assert_eq!(commerce.state(), CommerceState::AcceptedButStale);
+        assert!(!commerce.marker_belongs_to_another_account());
         assert!(commerce.refresh_status().command.is_none());
         assert!(commerce.marker_saved(MARKER_KEY).command.is_none());
         assert!(commerce.marker_forgotten(MARKER_KEY).command.is_none());

@@ -1082,6 +1082,9 @@ impl Bomtoon {
 
     fn quote_screen(&self) -> Option<Screen> {
         if self.commerce.state() == commerce::CommerceState::AcceptedButStale {
+            if self.commerce.marker_belongs_to_another_account() {
+                return None;
+            }
             return Some(
                 ScreenBuilder::new("bomtoon-commerce-stale")
                     .top_bar(self.selected_title.clone())
@@ -1580,6 +1583,12 @@ impl Bomtoon {
         if let Some(result) = self.purchase_rejection_notice {
             screen = screen.text(format!("Purchase rejected: {result}"));
         }
+        let marker_belongs_to_another_account = self.commerce.marker_belongs_to_another_account();
+        if marker_belongs_to_another_account {
+            screen = screen.text(
+                "A purchase is unresolved for another account. Restore the original account to refresh its status.",
+            );
+        }
         let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
         let now_ms = unix_time_ms();
         for (index, episode) in self.episodes[start..end].iter().enumerate() {
@@ -1600,6 +1609,9 @@ impl Bomtoon {
                     model::PurchaseState::Owned
                     | model::PurchaseState::Sample
                     | model::PurchaseState::Free => "Read".to_owned(),
+                    model::PurchaseState::NotOwned if marker_belongs_to_another_account => {
+                        "Purchase locked".to_owned()
+                    }
                     model::PurchaseState::NotOwned => "View options".to_owned(),
                     model::PurchaseState::Rented => unreachable!(),
                     model::PurchaseState::Other(_) => {
@@ -1611,7 +1623,9 @@ impl Bomtoon {
                 "{} · {status}",
                 display_text(&episode.title, &title_fallback),
             );
-            if episode.purchase.is_readable() || episode.purchase == model::PurchaseState::NotOwned
+            if episode.purchase.is_readable()
+                || (episode.purchase == model::PurchaseState::NotOwned
+                    && !marker_belongs_to_another_account)
             {
                 screen = screen.button(format!("episode-{index}"), label);
             } else {
@@ -4036,15 +4050,26 @@ impl Bomtoon {
     }
 
     fn open_episode(&mut self, context: &mut Context, index: usize) {
-        if !matches!(
-            self.commerce.state(),
-            commerce::CommerceState::LoadingSafetyState | commerce::CommerceState::Idle
-        ) {
-            return;
-        }
         let Some(episode) = self.episodes.get(index) else {
             return;
         };
+        let commerce_state = self.commerce.state();
+        let active_transaction = matches!(
+            commerce_state,
+            commerce::CommerceState::Quoting
+                | commerce::CommerceState::Choosing
+                | commerce::CommerceState::Requoting
+                | commerce::CommerceState::PersistingIntent
+                | commerce::CommerceState::Mutating
+                | commerce::CommerceState::Reconciling
+                | commerce::CommerceState::ClearingIntent
+        );
+        if active_transaction
+            || (episode.purchase == model::PurchaseState::NotOwned
+                && commerce_state != commerce::CommerceState::Idle)
+        {
+            return;
+        }
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
         if episode.purchase == model::PurchaseState::NotOwned {
@@ -4743,15 +4768,22 @@ impl KoboApp for Bomtoon {
                 commerce::CommerceState::PersistingIntent
                 | commerce::CommerceState::Mutating
                 | commerce::CommerceState::Reconciling
-                | commerce::CommerceState::ClearingIntent
-                | commerce::CommerceState::AcceptedButStale => {
+                | commerce::CommerceState::ClearingIntent => {
                     self.show(context);
                     return;
+                }
+                commerce::CommerceState::AcceptedButStale => {
+                    if !self.commerce.marker_belongs_to_another_account() {
+                        self.show(context);
+                        return;
+                    }
                 }
                 commerce::CommerceState::LoadingSafetyState | commerce::CommerceState::Idle => {}
             }
         }
-        if self.commerce.state() == commerce::CommerceState::AcceptedButStale {
+        if self.commerce.state() == commerce::CommerceState::AcceptedButStale
+            && !self.commerce.marker_belongs_to_another_account()
+        {
             if action == action_id(REFRESH_COMMERCE) {
                 let effects = self.commerce.refresh_status();
                 self.apply_commerce_effects(context, effects);
@@ -6648,6 +6680,63 @@ mod tests {
             runner.app().commerce.state(),
             commerce::CommerceState::AcceptedButStale
         );
+        assert!(runner.app().commerce.marker_belongs_to_another_account());
+        assert_no_post_or_marker_forget(&commands);
+
+        seed_all_account_data(&mut runner);
+        let app = runner.app_mut();
+        app.view = View::Episodes;
+        app.selected_content_alias = "hunter_q".to_owned();
+        app.page = 0;
+        app.pending = None;
+        app.task = None;
+        app.episodes.push(Episode {
+            id: 105,
+            alias: "paid".to_owned(),
+            title: "Paid Episode".to_owned(),
+            purchase: model::PurchaseState::NotOwned,
+            rent_expires_at: None,
+            rent_coin: Some(1),
+            purchase_coin: Some(2),
+            gift_eligible: true,
+        });
+
+        let screen = runner.app().screen();
+        let drawn = format!("{screen:?}");
+        assert!(
+            drawn.contains(
+                "A purchase is unresolved for another account. Restore the original account"
+            ),
+            "{drawn}"
+        );
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Button { action, .. } if *action == action_id("episode-0")
+        )));
+        assert!(!screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Button { action, .. } if *action == action_id("episode-1")
+        )));
+        assert!(drawn.contains("Paid Episode · Purchase locked"), "{drawn}");
+
+        let commands = runner.action(action_id("episode-1"));
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert!(commands
+            .iter()
+            .all(|command| !matches!(command, Command::Store(_))));
+        assert_no_post_or_marker_forget(&commands);
+        assert_eq!(runner.app().view, View::Episodes);
+
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Main);
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert_no_post_or_marker_forget(&commands);
+
+        runner.app_mut().view = View::Episodes;
+        let commands = runner.action(action_id("episode-0"));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::images("hunter_q", "ep-1", 1072));
+        assert_eq!(runner.app().view, View::Reader);
         assert_no_post_or_marker_forget(&commands);
     }
 
@@ -14417,6 +14506,11 @@ mod tests {
         assert_eq!(buttons, ["Refresh status"]);
         assert!(format!("{screen:?}").contains("Accepted, refresh needed"));
         assert_fits(&screen);
+        assert!(screen.owns_back);
+        assert!(!runner.app().commerce.marker_belongs_to_another_account());
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_no_post_or_marker_forget(&commands);
 
         let commands = runner.action(action_id(REFRESH_COMMERCE));
         assert_eq!(spawns(&commands).len(), 3, "{commands:?}");
