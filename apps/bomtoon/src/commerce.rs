@@ -583,13 +583,34 @@ impl Commerce {
     pub fn quote_presentation(&self) -> Option<&QuotePresentation> {
         match &self.flow {
             Flow::Choosing(choosing) => Some(&choosing.presentation),
+            Flow::Requoting { previous, .. } | Flow::PersistingIntent { previous, .. } => {
+                Some(&previous.presentation)
+            }
             Flow::LoadingSafetyState
             | Flow::Idle
             | Flow::Quoting { .. }
+            | Flow::Mutating(_)
+            | Flow::Reconciling { .. }
+            | Flow::ClearingIntent(_)
+            | Flow::AcceptedButStale => None,
+        }
+    }
+
+    #[must_use]
+    pub fn reconciliation_marker(&self) -> Option<&UnresolvedMutationV1> {
+        match &self.flow {
+            Flow::Reconciling {
+                marker: Some(marker),
+                ..
+            } => Some(marker),
+            Flow::LoadingSafetyState
+            | Flow::Idle
+            | Flow::Quoting { .. }
+            | Flow::Choosing(_)
             | Flow::Requoting { .. }
             | Flow::PersistingIntent { .. }
             | Flow::Mutating(_)
-            | Flow::Reconciling { .. }
+            | Flow::Reconciling { marker: None, .. }
             | Flow::ClearingIntent(_)
             | Flow::AcceptedButStale => None,
         }

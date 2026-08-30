@@ -1460,4 +1460,40 @@ mod tests {
         assert!(!kobo_app_store::cobalt_version_at_least("0.1.8", "0.1.9"));
         assert!(!kobo_app_store::cobalt_version_at_least("nightly", "0.1.9"));
     }
+    #[test]
+    fn bomtoon_catalog_requires_compatible_runtime_and_only_network() {
+        let catalog =
+            kobo_json::parse(include_str!("../../../apps/catalog.json")).expect("app catalog");
+        let apps = catalog
+            .get("apps")
+            .and_then(kobo_json::Value::as_array)
+            .expect("apps");
+        let bomtoon = apps
+            .iter()
+            .find(|app| app.get("id").and_then(kobo_json::Value::as_str) == Some("bomtoon"))
+            .expect("BOMTOON registry entry");
+        let version = bomtoon
+            .get("version")
+            .and_then(kobo_json::Value::as_str)
+            .expect("version");
+        let minimum = bomtoon
+            .get("minimum_cobalt_version")
+            .and_then(kobo_json::Value::as_str)
+            .expect("minimum runtime");
+        let capabilities = bomtoon
+            .get("capabilities")
+            .and_then(kobo_json::Value::as_array)
+            .expect("capabilities");
+
+        assert_eq!(version, "0.5.0");
+        assert_eq!(minimum, "0.4.0");
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].as_str(), Some("network"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+        assert!(kobo_app_store::cobalt_version_at_least(
+            env!("CARGO_PKG_VERSION"),
+            minimum
+        ));
+        assert!(!kobo_app_store::cobalt_version_at_least("0.3.9", minimum));
+    }
 }

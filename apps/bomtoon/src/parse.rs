@@ -581,6 +581,16 @@ pub fn purchase_receipt(bytes: &[u8]) -> Result<PurchaseReceipt, ParseError> {
         },
     })
 }
+pub fn purchase_explicitly_rejected(bytes: &[u8]) -> bool {
+    let Ok(root) = parse_commerce_json(bytes) else {
+        return false;
+    };
+    let Ok(result) = bounded_string(&root, "result", "result", MAX_REMOTE_CODE_BYTES) else {
+        return false;
+    };
+    !result.is_empty() && result != "SUCCESS" && root.get("data").is_some()
+}
+
 
 pub fn images(bytes: &[u8]) -> Result<Vec<EpisodeImage>, ParseError> {
     let root = parse_json(bytes)?;

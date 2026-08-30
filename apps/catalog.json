@@ -18,8 +18,8 @@
       "display_name": "BOMTOON",
       "short_label": "BOMTOON",
       "summary": "Read owned and free BOMTOON episodes on your Kobo.",
-      "version": "0.4.0",
-      "minimum_cobalt_version": "0.3.0",
+      "version": "0.5.0",
+      "minimum_cobalt_version": "0.4.0",
       "glyph": "book",
       "capabilities": ["network"]
     },
