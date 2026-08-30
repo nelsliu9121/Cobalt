@@ -244,47 +244,45 @@ No artwork is persisted to device storage. A new app process fetches metadata an
 
 The existing `taipei_day(timestamp_ms)` in `apps/bomtoon/src/main.rs` deliberately applies a fixed UTC+8 offset for BOMTOON wallet-date presentation. It cannot implement the confirmed device-local homepage refresh. Reusing it would silently refresh according to Taipei midnight when the Kobo is configured for another timezone.
 
-`crates/kobod/src/device.rs` has a private `local_offset_seconds()` for the daemon clock. It reads the firmware's `TZ` environment variable, but it is not available to applications and currently falls back to UTC for missing or malformed input. Copying that helper into BOMTOON would create a second timezone convention and would turn invalid configuration into a plausible but wrong day.
+Applications also cannot discover the device timezone themselves. `kobod` launches each app with `env_clear()` and only `KOBO_SOCKET`, then chroots a sandboxed app into a jail containing `/app` and `/runtime.sock`. An SDK helper based on `TZ`, `/etc/localtime`, or a zoneinfo directory would therefore return no timezone on real hardware. Inheriting `TZ` into the app would weaken the runtime boundary and would still leave a long-running app with a stale value after a timezone change.
+
+`crates/kobod/src/device.rs` already owns the visible wall clock and reads the firmware's `TZ` setting on each call. Device-local calendar discovery belongs at that same runtime boundary, not in BOMTOON or `kobo-sdk`.
 
 ### Crate choice
 
-Use `jiff` 0.2 for timezone and civil-date manipulation. Jiff 0.2.35 has an MSRV of Rust 1.70, below this workspace's Rust 1.85.1 requirement. Its system-timezone implementation:
+Use `jiff` 0.2 for timezone and civil-date manipulation in runtime producers. Jiff 0.2.35 has an MSRV of Rust 1.70, below this workspace's Rust 1.85.1 requirement. It accepts POSIX timezone rules, applies daylight-saving transitions, and converts a `Timestamp` through a `TimeZone` to a checked civil date.
 
-- reads `TZ` when present;
-- accepts IANA identifiers, TZif paths, and POSIX timezone rules;
-- otherwise detects Unix `/etc/localtime`;
-- applies historical and daylight-saving transitions when converting an instant;
-- exposes `TimeZone::try_system()` so unavailable timezone data is an error rather than an implicit UTC value.
+On device, read the firmware's `TZ` value afresh for every local-day request and parse that explicit value with Jiff. Do not use a process-global cached system-zone lookup on this path: the answer must reflect a timezone changed while the runtime and app remain alive. If `TZ`, the clock, or the timezone rule is invalid, answer `None`; do not substitute UTC or Taipei.
 
-Use Jiff with the minimal Unix-capable features needed for `std`, system-timezone discovery, and the system zoneinfo database. Do not bundle the complete timezone database into the Kobo binary unless target verification proves the firmware lacks both a usable `TZ` value and TZif data. The firmware's POSIX `TZ` value is sufficient without a bundled database.
+The simulator implements the same request. It first honors an explicit `TZ` value and may use Jiff's fallible host system-zone discovery when no override exists, so browser and runtime simulator sessions receive a real host-local day without weakening the device rule. Tests call a pure timestamp-plus-timezone helper and do not depend on the developer machine's clock or zone.
 
 Jiff is preferable here to:
 
-- a copied fixed-offset parser, which would duplicate daemon policy and mishandle IANA zones or daylight-saving rules;
-- `chrono::Local`, which can obtain local time but provides a less explicit fallible system-timezone boundary for this SDK contract;
+- extending the daemon's fixed-offset parser, which would mishandle daylight-saving rules;
+- `chrono::Local`, which provides a less explicit fallible timezone boundary;
 - `time`'s `local-offset` feature, which exposes an offset rather than the timezone and transition model needed for deterministic boundary tests.
 
-The SDK must not expose Jiff types as application API. Jiff remains the implementation detail behind a small copyable SDK value:
+### Runtime-owned API boundary
+
+Jiff types never cross the application protocol. Add a small copyable `LocalDay` wire value with a checked constructor and equality/ordering:
 
 ```text
 LocalDay
   year
   month
   day
-
-device_local_day() -> Option<LocalDay>
 ```
 
-`LocalDay` supports equality and ordering but no timezone arithmetic. The SDK converts `Timestamp::now()` through `TimeZone::try_system()` and copies the resulting civil year, month, and day. A private pure helper accepts a timestamp and `TimeZone` for deterministic tests.
+Extend the existing device request/result channel with `ReadLocalDay` and `LocalDay(Option<LocalDay>)`. Expose it through `Context::device().read_local_day()`. The request is asynchronous, carries no capability, storage, or timezone identifier, and returns only the current civil date. A fresh request is made on initial Featured startup, app resume/foreground, and entry to Featured; a BOMTOON `local_day_pending` flag coalesces overlapping requests.
 
-If system-timezone discovery fails or the clock is invalid, `device_local_day()` returns `None`. It must not default to Taipei, UTC, a compiled zone, or a last-known offset. The existing wallet-specific `taipei_day` remains for wallet semantics and is not renamed or reused.
+This request boundary is required instead of putting a value only in the startup handshake or `Context`: a startup snapshot would be stale if midnight or a timezone change occurs while the app remains alive. The existing wallet-specific `taipei_day` remains for wallet semantics and is not renamed or reused.
 
 ### Refresh state machine
 
 Featured stores an optional observed `LocalDay` baseline independently from feed readiness.
 
-- A successful initial Featured load records `device_local_day()` when it is available. An unavailable observation leaves the baseline unknown.
-- On app resume and on entry to Featured, observe `device_local_day()` again.
+- Initial Featured startup requests the runtime-owned local day. The first available observation establishes the baseline whether it arrives before or after the metadata task; unavailable observations leave the baseline unknown.
+- On app resume, foreground, and entry to Featured, request the runtime-owned local day again.
 - Current `None`: keep the feed and baseline unchanged. Do not infer a date.
 - Baseline `None` plus current `Some(day)`: record `Some(day)` as the baseline without refreshing. This is the first trustworthy observation, not evidence that a day was crossed.
 - Baseline `Some(day)` plus the same current day: do nothing.
@@ -300,16 +298,19 @@ This baseline transition is required: if initial loading sees no timezone but a 
 
 ### Required boundary tests
 
-The SDK local-calendar facility must be implemented and verified before Featured daily refresh is wired. Tests use injected Jiff timestamps and timezones and cover:
+The runtime local-calendar facility and protocol boundary must be implemented and verified before Featured daily refresh is wired. Tests use injected Jiff timestamps and timezones and cover:
 
 - the instant immediately before and exactly at local midnight;
 - positive, negative, and non-hour fixed offsets;
 - a POSIX timezone rule with spring-forward and fall-back transitions;
-- an IANA/TZif timezone when the test environment supplies the database;
 - two timezones mapping one instant to different civil dates;
-- unavailable system-timezone discovery returning `None`, never UTC;
+- unavailable or malformed firmware `TZ` returning `None`, never UTC;
 - invalid or out-of-range system time returning `None`;
-- dates around the Unix epoch without unchecked arithmetic.
+- dates around the Unix epoch without unchecked arithmetic;
+- `LocalDay` request/result protocol round trips for `Some` and `None`;
+- the SDK emitting exactly one `ReadLocalDay` device request;
+- the device and simulator request handlers returning the runtime-produced value;
+- a changed explicit `TZ` being re-read on a later request rather than cached.
 
 BOMTOON tests separately prove:
 
@@ -390,7 +391,7 @@ Exercise the final UI in the browser simulator and runtime simulator. Record Cla
 
 ## Implementation order constraint
 
-The implementation plan must place the central SDK local-calendar facility and its boundary tests before BOMTOON daily-refresh wiring. No BOMTOON refresh code may call `taipei_day`, copy the daemon's private timezone parser, or introduce a fallback timezone.
+The implementation plan must place the runtime-owned local-calendar request, its protocol/SDK surface, device and simulator producers, and boundary tests before BOMTOON daily-refresh wiring. No BOMTOON refresh code may call `taipei_day`, inspect timezone files or environment, copy the daemon's private offset parser, or introduce a fallback timezone.
 
 After that prerequisite, implement the homepage parser/model, public network policy, navigation/state cutover, shelf layouts, cover scheduler, authentication transitions, and refresh integration in dependency order.
 
@@ -399,12 +400,16 @@ After that prerequisite, implement the homepage parser/model, public network pol
 The implementation plan is expected to touch only the responsible layers:
 
 - the root dependency configuration and lockfile for `jiff` 0.2;
-- `crates/kobo-sdk/src/` for the central safe `LocalDay` facility and tests;
+- `crates/kobo-protocol/src/lib.rs` for `LocalDay` and its request/result wire variants;
+- `crates/kobo-sdk/src/lib.rs` for the safe `Context::device().read_local_day()` application surface;
+- `crates/kobod/src/device.rs` for fresh firmware-`TZ` local-day production and request handling;
+- `crates/kobod/src/main.rs` for the non-device daemon request path;
+- `crates/kobo-sim/src/lib.rs` for simulator local-day production and request handling;
 - `apps/bomtoon/src/api.rs` for public homepage/detail/image tasks and protected thumbnail query handling;
 - `apps/bomtoon/src/parse.rs` for bounded homepage and thumbnail parsing;
 - `apps/bomtoon/src/model.rs` for shelf comic and thumbnail fields;
-- `apps/bomtoon/src/main.rs` for destination state, bottom navigation, paging, progressive covers, auth transitions, and daily refresh;
-- `crates/kobo-net/` and policy tests for exact public no-credential routes and image paths;
-- focused BOMTOON and SDK tests.
+- `apps/bomtoon/src/main.rs` for navigation, authentication gating, feed state, shelf layouts, cover scheduling, runtime local-day requests, refresh state, and tests;
+- `crates/kobo-net/src/lib.rs` for exact public BOMTOON task-policy coverage;
+- `apps/bomtoon/Cargo.toml` and `Cargo.lock` only when dependency wiring requires them.
 
-`jiff` is the only planned new dependency. A protocol message, persistent store, shared scrolling primitive, bundled timezone database, or runtime service is not planned.
+`jiff` is the only planned new external dependency. One bounded device request/result pair and its `LocalDay` value are added to the existing protocol; no persistent store, shared scrolling primitive, bundled timezone database, or new runtime service is planned.
