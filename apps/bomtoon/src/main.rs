@@ -68,11 +68,9 @@ fn history_start_ms() -> Option<i64> {
 fn taipei_day(timestamp_ms: i64) -> Option<i64> {
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
     const TAIPEI_OFFSET_MS: i64 = 8 * 60 * 60 * 1_000;
-    Some(
-        timestamp_ms
-            .checked_add(TAIPEI_OFFSET_MS)?
-            .div_euclid(DAY_MS),
-    )
+    let utc_day = timestamp_ms.div_euclid(DAY_MS);
+    let utc_day_ms = timestamp_ms.rem_euclid(DAY_MS);
+    utc_day.checked_add(i64::from(utc_day_ms >= DAY_MS - TAIPEI_OFFSET_MS))
 }
 
 fn taipei_date(timestamp_ms: i64) -> Option<String> {
@@ -234,6 +232,16 @@ enum WalletTaskPurpose {
     TicketHistory { generation: u64 },
 }
 
+impl WalletTaskPurpose {
+    const fn history(self) -> Option<(AssetKind, u64)> {
+        match self {
+            Self::CoinHistory { generation } => Some((AssetKind::Coin, generation)),
+            Self::TicketHistory { generation } => Some((AssetKind::Ticket, generation)),
+            Self::Summary { .. } => None,
+        }
+    }
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent wallet request and section states can fail and refresh separately"
@@ -249,6 +257,7 @@ struct WalletState {
     detail_generation: u64,
     tasks: BTreeMap<TaskId, WalletTaskPurpose>,
     coin_history: Vec<ExpirationRow>,
+    detail_queue: VecDeque<(WalletTaskPurpose, i64)>,
     ticket_history: Vec<ExpirationRow>,
     coin_history_error: bool,
     ticket_history_error: bool,
@@ -565,18 +574,12 @@ impl Bomtoon {
     }
 
     fn history_is_loading(&self, kind: AssetKind) -> bool {
-        self.wallet.tasks.values().any(|purpose| {
-            matches!(
-                (kind, purpose),
-                (
-                    AssetKind::Coin,
-                    WalletTaskPurpose::CoinHistory { generation },
-                ) | (
-                    AssetKind::Ticket,
-                    WalletTaskPurpose::TicketHistory { generation },
-                ) if *generation == self.wallet.detail_generation
-            )
-        })
+        self.wallet
+            .tasks
+            .values()
+            .copied()
+            .chain(self.wallet.detail_queue.iter().map(|(purpose, _)| *purpose))
+            .any(|purpose| purpose.history() == Some((kind, self.wallet.detail_generation)))
     }
 
     fn history_status(&self, kind: AssetKind) -> String {
@@ -869,6 +872,7 @@ impl Bomtoon {
     fn cancel_wallet(&mut self, context: &mut Context) {
         self.wallet.summary_generation = self.wallet.summary_generation.wrapping_add(1);
         self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
+        self.wallet.detail_queue.clear();
         for task in std::mem::take(&mut self.wallet.tasks).into_keys() {
             context.cancel(task);
         }
@@ -909,23 +913,56 @@ impl Bomtoon {
         }
     }
 
-    fn spawn_history(
-        &mut self,
-        context: &mut Context,
-        generation: u64,
-        kind: AssetKind,
-        start_ms: i64,
-    ) {
+    fn queue_history(&mut self, generation: u64, kind: AssetKind, start_ms: i64) {
         let purpose = match kind {
             AssetKind::Coin => WalletTaskPurpose::CoinHistory { generation },
             AssetKind::Ticket => WalletTaskPurpose::TicketHistory { generation },
         };
-        let Some(task) = context.spawn(api::expiration_history(kind, start_ms)) else {
-            self.set_history_error(kind, true);
+        let already_requested = self
+            .wallet
+            .detail_queue
+            .iter()
+            .any(|(queued, _)| *queued == purpose)
+            || self.wallet.tasks.values().any(|active| *active == purpose);
+        if already_requested {
             return;
-        };
+        }
         self.set_history_error(kind, false);
-        self.wallet.tasks.insert(task, purpose);
+        self.wallet.detail_queue.push_back((purpose, start_ms));
+    }
+
+    fn drain_deferred_details(&mut self, context: &mut Context) -> bool {
+        let mut error_changed = false;
+        while let Some((purpose, start_ms)) = self.wallet.detail_queue.front().copied() {
+            let Some((kind, generation)) = purpose.history() else {
+                self.wallet.detail_queue.pop_front();
+                continue;
+            };
+            if generation != self.wallet.detail_generation {
+                self.wallet.detail_queue.pop_front();
+                continue;
+            }
+            let work = api::expiration_history(kind, start_ms);
+            if !work.is_sendable() {
+                self.wallet.detail_queue.pop_front();
+                self.set_history_error(kind, true);
+                error_changed = true;
+                continue;
+            }
+            let Some(task) = context.spawn(work) else {
+                break;
+            };
+            self.wallet.detail_queue.pop_front();
+            self.wallet.tasks.insert(task, purpose);
+        }
+        error_changed
+    }
+
+    fn resume_deferred_wallet(&mut self, context: &mut Context) {
+        self.resume_deferred_summary(context);
+        if self.drain_deferred_details(context) {
+            self.show(context);
+        }
     }
 
     fn refresh_account_details(&mut self, context: &mut Context) {
@@ -935,6 +972,7 @@ impl Bomtoon {
     fn refresh_account_details_from(&mut self, context: &mut Context, start_ms: Option<i64>) {
         self.wallet.detail_generation = self.wallet.detail_generation.wrapping_add(1);
         let generation = self.wallet.detail_generation;
+        self.wallet.detail_queue.clear();
         let old_details = self
             .wallet
             .tasks
@@ -956,8 +994,9 @@ impl Bomtoon {
             self.wallet.ticket_history_error = true;
             return;
         };
-        self.spawn_history(context, generation, AssetKind::Coin, start_ms);
-        self.spawn_history(context, generation, AssetKind::Ticket, start_ms);
+        self.queue_history(generation, AssetKind::Coin, start_ms);
+        self.queue_history(generation, AssetKind::Ticket, start_ms);
+        self.drain_deferred_details(context);
     }
 
     fn retry_account_balances(&mut self, context: &mut Context) {
@@ -972,11 +1011,12 @@ impl Bomtoon {
         };
         let generation = self.wallet.detail_generation;
         if retry_coin {
-            self.spawn_history(context, generation, AssetKind::Coin, start_ms);
+            self.queue_history(generation, AssetKind::Coin, start_ms);
         }
         if retry_ticket {
-            self.spawn_history(context, generation, AssetKind::Ticket, start_ms);
+            self.queue_history(generation, AssetKind::Ticket, start_ms);
         }
+        self.drain_deferred_details(context);
     }
 
     fn open_account(&mut self, context: &mut Context) {
@@ -2497,7 +2537,7 @@ impl KoboApp for Bomtoon {
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
         if let Some(purpose) = self.wallet.tasks.remove(&task) {
             self.handle_wallet_outcome(context, task, purpose, outcome);
-            self.resume_deferred_summary(context);
+            self.resume_deferred_wallet(context);
             return;
         }
         if let Some(entry) = self.reader_tasks.remove(&task) {
@@ -2505,15 +2545,16 @@ impl KoboApp for Bomtoon {
                 self.foreground_reader_task = None;
             }
             self.handle_reader_outcome(context, task, entry, outcome);
-            self.resume_deferred_summary(context);
+            self.resume_deferred_wallet(context);
             return;
         }
         if self.task != Some(task) {
-            self.resume_deferred_summary(context);
+            self.resume_deferred_wallet(context);
             return;
         }
         self.task = None;
         let Some(pending) = self.pending.take() else {
+            self.resume_deferred_wallet(context);
             return;
         };
         let shown = match outcome {
@@ -2530,7 +2571,7 @@ impl KoboApp for Bomtoon {
         if !shown {
             self.show(context);
         }
-        self.resume_deferred_summary(context);
+        self.resume_deferred_wallet(context);
     }
 }
 
@@ -3289,6 +3330,27 @@ mod tests {
         }]
     }"#;
     const EMPTY_HISTORY_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":[]}"#;
+    const MULTI_TICKET_HISTORY_RESPONSE: &[u8] = br#"{
+        "result":"SUCCESS",
+        "data":[
+            {
+                "title":"First grant",
+                "ticket":11,
+                "ticketExpiredAt":1819728000000,
+                "bonusTicket":12,
+                "bonusTicketExpiredAt":0,
+                "freeTicket":0
+            },
+            {
+                "title":"Second grant",
+                "ticket":21,
+                "ticketExpiredAt":1819728000000,
+                "bonusTicket":0,
+                "freeTicket":22,
+                "freeTicketExpiredAt":0
+            }
+        ]
+    }"#;
     const REMOTE_LIBRARY_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
         "data":{
@@ -5998,7 +6060,7 @@ mod tests {
             taipei_date(1_735_660_800_000),
             Some("2025-01-01".to_owned())
         );
-        assert_eq!(taipei_date(i64::MAX), None);
+        assert_eq!(taipei_date(i64::MAX), Some("292278994-08-17".to_owned()));
     }
 
     #[test]
@@ -6327,6 +6389,78 @@ mod tests {
         assert_eq!(runner.app().page, 0);
         assert!(format!("{:?}", last_screen(&commands))
             .contains("Coin · Standard · 101 · Expires 2027-09-01"));
+    }
+
+    #[test]
+    fn account_saturated_reentry_defers_ticket_and_preserves_server_order() {
+        let (mut runner, _) = loaded_library();
+        let first_open = runner.action(action_id(ACCOUNT));
+        let (old_coin, _) = fetch_task_with(&first_open, "coinKind=COIN");
+        let (old_ticket, _) = fetch_task_with(&first_open, "coinKind=TICKET");
+
+        runner.action(ActionId::BACK);
+        let second_open = runner.action(action_id(ACCOUNT));
+        assert!(second_open.contains(&Command::Cancel(old_coin)));
+        assert!(second_open.contains(&Command::Cancel(old_ticket)));
+        let (current_coin, _) = fetch_task_with(&second_open, "coinKind=COIN");
+        assert!(
+            spawns(&second_open)
+                .iter()
+                .all(|(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("coinKind=TICKET"))),
+            "the fourth occupied slot must defer the replacement ticket"
+        );
+        assert!(!runner.app().wallet.coin_history_error);
+        assert!(!runner.app().wallet.ticket_history_error);
+        let loading = format!("{:?}", last_screen(&second_open));
+        assert!(loading.contains("Coin history"));
+        assert!(loading.contains("Ticket history"));
+        assert!(loading.matches("Loading…").count() >= 2);
+
+        let resumed = runner.task_outcome(old_coin, TaskOutcome::Cancelled);
+        let (current_ticket, work) = only_spawn(&resumed);
+        assert!(matches!(
+            work,
+            Task::Fetch { ref url, .. } if url.contains("coinKind=TICKET")
+        ));
+        assert_ne!(current_coin, current_ticket);
+        assert!(!runner.app().wallet.ticket_history_error);
+
+        runner.task_outcome(old_ticket, TaskOutcome::Cancelled);
+        runner.task_outcome(
+            current_ticket,
+            TaskOutcome::Completed(MULTI_TICKET_HISTORY_RESPONSE.to_vec()),
+        );
+        assert_eq!(
+            runner
+                .app()
+                .wallet
+                .ticket_history
+                .iter()
+                .map(|row| (row.subtype, row.quantity))
+                .collect::<Vec<_>>(),
+            [
+                (model::AssetSubtype::Standard, 11),
+                (model::AssetSubtype::Bonus, 12),
+                (model::AssetSubtype::Standard, 21),
+                (model::AssetSubtype::Free, 22),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_open_uses_capacity_left_by_cancelled_reader_work() {
+        let (mut runner, image_task) = reader_waiting_for_first_image();
+        let commands = runner.action(ActionId::BACK);
+        assert!(commands.contains(&Command::Cancel(image_task)));
+        runner.action(ActionId::BACK);
+
+        let commands = runner.action(action_id(ACCOUNT));
+
+        assert_eq!(runner.app().view, View::Account);
+        fetch_task_with(&commands, "coinKind=COIN");
+        fetch_task_with(&commands, "coinKind=TICKET");
+        assert!(!runner.app().wallet.coin_history_error);
+        assert!(!runner.app().wallet.ticket_history_error);
     }
 
     #[test]
