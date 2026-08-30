@@ -629,6 +629,8 @@ struct Bomtoon {
     wallet: WalletState,
     featured: FeaturedState,
     shelf_tasks: BTreeMap<TaskId, ShelfTaskPurpose>,
+    superseded_shelf_tasks: BTreeSet<TaskId>,
+    queued_homepage: Option<(u64, Option<LocalDay>)>,
     comics: Vec<Comic>,
     recent: Vec<RecentEntry>,
     episodes: Vec<Episode>,
@@ -1332,18 +1334,12 @@ impl Bomtoon {
         self.recent_loaded = false;
     }
 
-    fn start_homepage(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
-        for task in std::mem::take(&mut self.shelf_tasks).into_keys() {
-            context.cancel(task);
-        }
-        self.featured.generation = self.featured.generation.wrapping_add(1);
-        self.featured.status = FeaturedStatus::Loading;
-        self.featured.featured.clear();
-        self.featured.recommended.clear();
-        self.featured.pending_details = 0;
-        self.featured.page = 0;
-        self.featured.stale_warning = None;
-        let generation = self.featured.generation;
+    fn spawn_homepage_task(
+        &mut self,
+        context: &mut Context,
+        generation: u64,
+        refresh_day: Option<LocalDay>,
+    ) {
         if let Some(task) = context.spawn(api::homepage()) {
             self.shelf_tasks.insert(
                 task,
@@ -1354,6 +1350,43 @@ impl Bomtoon {
             );
         } else {
             self.featured.status = FeaturedStatus::Failed;
+        }
+    }
+
+    fn resume_queued_homepage(&mut self, context: &mut Context) -> bool {
+        if !self.superseded_shelf_tasks.is_empty() {
+            return false;
+        }
+        let Some((generation, refresh_day)) = self.queued_homepage.take() else {
+            return false;
+        };
+        self.spawn_homepage_task(context, generation, refresh_day);
+        true
+    }
+
+    fn start_homepage(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
+        if let Some((_, queued_day)) = self.queued_homepage.as_mut() {
+            *queued_day = refresh_day;
+            self.featured.status = FeaturedStatus::Loading;
+            return;
+        }
+        for &task in self.shelf_tasks.keys() {
+            if self.superseded_shelf_tasks.insert(task) {
+                context.cancel(task);
+            }
+        }
+        self.featured.generation = self.featured.generation.wrapping_add(1);
+        self.featured.status = FeaturedStatus::Loading;
+        self.featured.featured.clear();
+        self.featured.recommended.clear();
+        self.featured.pending_details = 0;
+        self.featured.page = 0;
+        self.featured.stale_warning = None;
+        let generation = self.featured.generation;
+        if self.superseded_shelf_tasks.is_empty() {
+            self.spawn_homepage_task(context, generation, refresh_day);
+        } else {
+            self.queued_homepage = Some((generation, refresh_day));
         }
     }
 
@@ -2845,6 +2878,8 @@ impl KoboApp for Bomtoon {
         for task in std::mem::take(&mut self.shelf_tasks).into_keys() {
             context.cancel(task);
         }
+        self.superseded_shelf_tasks.clear();
+        self.queued_homepage = None;
         self.cancel_wallet(context);
         self.on_suspend(context);
     }
@@ -3016,6 +3051,17 @@ impl KoboApp for Bomtoon {
 
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
         if let Some(purpose) = self.shelf_tasks.remove(&task) {
+            if self.superseded_shelf_tasks.remove(&task) {
+                let changed = self.resume_queued_homepage(context);
+                if changed
+                    && self.view == View::Main
+                    && self.destination == MainDestination::Featured
+                {
+                    self.show(context);
+                }
+                self.resume_deferred_wallet(context);
+                return;
+            }
             let changed = self.handle_shelf_outcome(context, purpose, outcome);
             if changed
                 && self.view == View::Main
@@ -7504,6 +7550,7 @@ mod tests {
     #[test]
     fn missing_credentials_leave_featured_available_and_sign_in_retries_cleanly() {
         let (mut runner, commands) = started();
+        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
         let (task, _) = fetch_task_with(&commands, "/asset/user");
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
 
@@ -7515,6 +7562,9 @@ mod tests {
         assert_login_instructions(&last_screen(&commands));
 
         let commands = runner.action(action_id(RETRY));
+        assert!(commands.contains(&Command::Cancel(homepage)));
+        assert!(!commands.iter().any(is_homepage_fetch));
+        let commands = runner.task_outcome(homepage, TaskOutcome::Cancelled);
         let (_, work) = fetch_task_with(&commands, "/comic/main");
         assert_eq!(work, api::homepage());
         assert_eq!(runner.app().account, AccountState::Active);
@@ -9275,10 +9325,16 @@ mod tests {
     }
 
     #[test]
-    fn featured_restart_cancels_pending_homepage_before_bounded_enrichment() {
+    fn featured_restart_defers_and_coalesces_replacement_until_every_cancellation_settles() {
         let (mut runner, commands) = started();
-        let (stale_homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let (old_homepage, _) = fetch_task_with(&commands, "/comic/main");
         let (old_summary, _) = fetch_task_with(&commands, "/asset/user");
+        let commands = runner.task_outcome(
+            old_homepage,
+            TaskOutcome::Completed(homepage_response(&["old-a", "old-b"], &[])),
+        );
+        let (old_a, _) = fetch_task_with(&commands, "/detail/old-a");
+        let (old_b, _) = fetch_task_with(&commands, "/detail/old-b");
         runner.task_outcome(
             old_summary,
             TaskOutcome::Failed(TaskError::NoCredential),
@@ -9286,17 +9342,48 @@ mod tests {
         runner.action(action_id(SIGN_IN));
 
         let commands = runner.action(action_id(RETRY));
-        let (replacement_homepage, _) = fetch_task_with(&commands, "/comic/main");
+        let cancelled = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Cancel(task) => Some(*task),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
 
-        assert!(commands.contains(&Command::Cancel(stale_homepage)));
+        assert_eq!(cancelled, BTreeSet::from([old_a, old_b]));
+        assert!(!commands.iter().any(is_homepage_fetch));
+        assert_eq!(
+            runner.app().shelf_tasks.keys().copied().collect::<Vec<_>>(),
+            [old_a, old_b]
+        );
+        let generation = runner.app().featured.generation;
+
+        runner.app_mut().featured.status = FeaturedStatus::Failed;
+        let repeated = runner.action(action_id(RETRY));
+        assert!(!repeated
+            .iter()
+            .any(|command| matches!(command, Command::Cancel(_))));
+        assert!(!repeated.iter().any(is_homepage_fetch));
+        assert_eq!(runner.app().featured.generation, generation);
+
+        let commands = runner.task_outcome(old_a, TaskOutcome::Cancelled);
+        assert!(!commands.iter().any(is_homepage_fetch));
+        assert_eq!(
+            runner.app().shelf_tasks.keys().copied().collect::<Vec<_>>(),
+            [old_b]
+        );
+
+        let commands = runner.task_outcome(old_b, TaskOutcome::Completed(Vec::new()));
+        let (replacement_homepage, _) = fetch_task_with(&commands, "/comic/main");
         assert_eq!(runner.app().shelf_tasks.len(), 1);
         assert!(matches!(
             runner.app().shelf_tasks.get(&replacement_homepage),
-            Some(ShelfTaskPurpose::Homepage { generation, .. })
-                if *generation == runner.app().featured.generation
+            Some(ShelfTaskPurpose::Homepage {
+                generation: replacement_generation,
+                ..
+            }) if *replacement_generation == generation
         ));
 
-        runner.task_outcome(stale_homepage, TaskOutcome::Cancelled);
         let commands = runner.task_outcome(
             replacement_homepage,
             TaskOutcome::Completed(homepage_response(&["a", "b", "c", "d"], &[])),
