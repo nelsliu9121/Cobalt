@@ -102,7 +102,7 @@ ExpirationRow
 
 A positive future timestamp produces an `Expires YYYY-MM-DD` row. A missing or zero timestamp produces a `No expiry` row. A timestamp at or before the current date produces an `Expired YYYY-MM-DD` row. These are grant/history classifications, not claims about how the current aggregate balance is allocated.
 
-Coin and ticket histories remain separate result sections so either can succeed independently. Each history response is capped at 512 KiB and 256 remote entries; each retained description is capped at 256 UTF-8 bytes. The summary response is capped at 64 KiB. Amounts must fit `usize`, aggregate addition is checked, and millisecond timestamps must fit `i64`.
+Coin and ticket histories remain separate result sections so either can succeed independently. Each history response is capped at 512 KiB, 256 remote entries, and 256 retained display rows; each retained description is capped at 256 UTF-8 bytes. The summary response is capped at 64 KiB. Amounts must fit `usize`, aggregate addition is checked, and millisecond timestamps must fit `i64`.
 
 ### Episode ticket data
 
@@ -146,7 +146,7 @@ GET /api/balcony-api-v2/payment/charge
 
 The timestamp calculation follows the deployed client. Query construction is typed and fixed; user data cannot add parameters. Both requests use the same credential and Balcony header rules as the summary.
 
-History parsing accepts only the success envelope and at most 256 array entries from a response no larger than 512 KiB. It extracts supported quantity and expiration fields, rejects descriptions longer than 256 UTF-8 bytes, discards zero-quantity components, and preserves the server's `sort=EXPIRE` order. Malformed required data fails only the affected section. History never supplies or implies an unspent balance.
+History parsing accepts only the success envelope, at most 256 array entries, and at most 256 flattened display rows from a response no larger than 512 KiB. It extracts supported quantity and expiration fields, rejects descriptions longer than 256 UTF-8 bytes, discards zero-quantity components, and preserves the server's `sort=EXPIRE` order. Malformed required data fails only the affected section. History never supplies or implies an unspent balance.
 
 ## Task and refresh state
 
@@ -232,7 +232,7 @@ This change displays eligibility and balance only. It does not enable selection 
 
 All wallet requests are read-only GETs to the existing BOMTOON allowlisted origin. No purchase, rent, charge, exchange, or mutation endpoint is introduced.
 
-The summary response ceiling is 64 KiB. Each history response ceiling is 512 KiB, with at most 256 remote entries and 256 UTF-8 bytes per retained description. Parsers apply these limits before retaining display models. Pagination borrows bounded rows instead of cloning the complete response for each page. The summary cache contains six integers plus task/error metadata; the two history caches contain at most 512 display rows in total.
+The summary response ceiling is 64 KiB. Each history response ceiling is 512 KiB, with at most 256 remote entries, 256 retained display rows, and 256 UTF-8 bytes per retained description. Parsers apply these limits before retaining display models. Pagination borrows bounded rows instead of cloning the complete response for each page. The summary cache contains six integers plus task/error metadata; the two history caches contain at most 512 display rows in total.
 
 Credentials remain runtime-managed through `Credential::bearer("bomtoon-access-token")`. The app never receives token bytes and never calls `/api/auth/session`.
 
