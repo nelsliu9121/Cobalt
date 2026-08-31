@@ -18,17 +18,17 @@ pub use kobo_protocol::{
 };
 pub use kobo_ui::QuoteRole;
 pub use kobo_ui::{
-    terminal_grid, terminal_grid_for, typographic_cover, ActionId, BandAlign, BandSlot,
-    BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome, ControlState,
-    DiagnosticSeverity, DisplayMetrics, Emphasis, Fold, FontHandle, Freeform, Glyph, InlineFormula,
-    LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind, ParagraphAlignment,
-    ParagraphPresentation, Percent, PictureFit, PictureHandle, PicturePixelsRef, ProseArea,
-    ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowLineLimits, RowState, Screen,
-    SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape,
-    TileState, TopBar,
-    TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS,
-    MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS, MAX_INLINE_FORMULAE, MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH,
-    MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
+    drawable_text_in, terminal_grid, terminal_grid_for, typographic_cover, ActionId, BandAlign,
+    BandSlot, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome,
+    ControlState, DiagnosticSeverity, DisplayMetrics, Emphasis, Face, Fold, FontHandle, Freeform,
+    Glyph, InlineFormula, LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind,
+    ParagraphAlignment, ParagraphPresentation, Percent, PictureFit, PictureHandle, PicturePixelsRef,
+    ProseArea, ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowLineLimits, RowState,
+    Screen, SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape,
+    TileState, TopBar, TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS,
+    MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS, MAX_INLINE_FORMULAE,
+    MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS,
+    MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
 use std::collections::BTreeMap;
 use std::collections::VecDeque;

@@ -1,11 +1,12 @@
 use crate::model::{
     AssetAmounts, AssetKind, AssetSubtype, BannerComic, CoinUse, Comic, Comment, ContentDetail,
-    Episode, EpisodeAvailability, EpisodeImage, ExpirationRow, GiftBalance, Homepage,
-    PurchaseReceipt, PurchaseState, PurchaseType, Quote, RecentEntry, ShelfComic, WalletSummary,
+    Episode, EpisodeAvailability, EpisodeImage, ExpirationRow, FeatureComic, GiftBalance, Homepage,
+    PublicDetail, PurchaseReceipt, PurchaseState, PurchaseType, Quote, RecentEntry, ThemeCollection,
+    WalletSummary,
 };
 use http::Uri;
 use kobo_json::Value;
-use std::{error::Error, fmt, str};
+use std::{collections::BTreeSet, error::Error, fmt, str};
 
 const MAX_LIBRARY_PAGES: usize = 100;
 const MAX_IMAGES: usize = 256;
@@ -14,7 +15,9 @@ const MAX_HISTORY_ENTRIES: usize = 256;
 const MAX_HISTORY_ROWS: usize = 256;
 const MAX_HISTORY_DESCRIPTION_BYTES: usize = 256;
 const MAX_HOMEPAGE_BANNERS: usize = 64;
-const MAX_HOMEPAGE_LIST: usize = 64;
+const MAX_FEATURE_COMICS: usize = 64;
+const MAX_THEMES: usize = 32;
+const MAX_SYNOPSIS_BYTES: usize = 2048;
 const MAX_ALIAS_BYTES: usize = 96;
 const MAX_TITLE_BYTES: usize = 256;
 const MAX_CREATORS_BYTES: usize = 512;
@@ -175,7 +178,59 @@ pub fn homepage(bytes: &[u8]) -> Result<Homepage, ParseError> {
     })
 }
 
-pub fn public_detail(bytes: &[u8], expected_alias: &str) -> Result<ShelfComic, ParseError> {
+pub fn public_collection(bytes: &[u8]) -> Result<Vec<FeatureComic>, ParseError> {
+    let root = parse_json(bytes)?;
+    require_success(&root)?;
+    let values = bounded_array(&root, "data", "data", MAX_FEATURE_COMICS)?;
+    Ok(values
+        .iter()
+        .filter_map(|value| feature_comic(value, "isAdult"))
+        .collect())
+}
+
+pub fn themes(bytes: &[u8]) -> Result<Vec<ThemeCollection>, ParseError> {
+    let root = parse_json(bytes)?;
+    require_success(&root)?;
+    let values = bounded_array(&root, "data", "data", MAX_THEMES)?;
+    let mut seen = BTreeSet::new();
+    let mut collections = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(contents) = value.get("contentsInfo").and_then(Value::as_array) else {
+            continue;
+        };
+        if contents.len() > MAX_FEATURE_COMICS {
+            return Err(ParseError::InvalidValue("theme contentsInfo"));
+        }
+        let Some(id) = value
+            .get("id")
+            .and_then(Value::as_integer_str)
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(label) = value.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if label.is_empty() || label.len() > MAX_TITLE_BYTES || !seen.insert(id) {
+            continue;
+        }
+        let comics = contents
+            .iter()
+            .filter_map(|comic| feature_comic(comic, "badgeAdult"))
+            .collect::<Vec<_>>();
+        if comics.is_empty() {
+            continue;
+        }
+        collections.push(ThemeCollection {
+            id,
+            label: label.to_owned(),
+            comics,
+        });
+    }
+    Ok(collections)
+}
+
+pub fn public_detail(bytes: &[u8], expected_alias: &str) -> Result<PublicDetail, ParseError> {
     if !valid_alias(expected_alias) {
         return Err(ParseError::InvalidValue("detail alias"));
     }
@@ -192,15 +247,19 @@ pub fn public_detail(bytes: &[u8], expected_alias: &str) -> Result<ShelfComic, P
     if title.trim().is_empty() || title.len() > MAX_TITLE_BYTES {
         return Err(ParseError::InvalidValue("detail title"));
     }
-    let cover_url = open_graph_content(html, "og:image")
-        .filter(|raw| !raw.chars().any(char::is_control))
-        .and_then(|raw| decode_entities_bounded(raw, MAX_COVER_URL_BYTES, "cover URL").ok())
-        .and_then(|url| public_image_url(&url, PUBLIC_IMAGE_PATHS).then_some(url));
+    let synopsis = match open_graph_content(html, "og:description") {
+        Some(raw) => {
+            let synopsis =
+                decode_entities_bounded(raw, MAX_SYNOPSIS_BYTES, "detail synopsis")?;
+            (!synopsis.trim().is_empty()).then_some(synopsis)
+        }
+        None => None,
+    };
 
-    Ok(ShelfComic {
+    Ok(PublicDetail {
         alias: expected_alias.to_owned(),
         title,
-        cover_url,
+        synopsis,
     })
 }
 
@@ -770,39 +829,55 @@ fn homepage_comics(
     main: &Value,
     key: &str,
     name: &'static str,
-) -> Result<Vec<ShelfComic>, ParseError> {
-    let values = bounded_array(main, key, name, MAX_HOMEPAGE_LIST)?;
-    let mut comics = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(alias) = value.get("alias").and_then(Value::as_str) else {
-            continue;
-        };
-        if !valid_alias(alias) {
-            continue;
-        }
-        let Some(title) = value.get("title").and_then(Value::as_str) else {
-            continue;
-        };
-        if title.trim().is_empty() || title.len() > MAX_TITLE_BYTES {
-            continue;
-        }
-        let thumbnail_types: &[&str] = if matches!(value.get("isAdult"), Some(Value::Bool(false))) {
-            match key {
-                "newest" => &["COVER"],
-                "weekDay" => &["VERTICAL"],
-                "onlyBom" => &["SQUARE"],
-                _ => &[],
-            }
-        } else {
-            &[]
-        };
-        comics.push(ShelfComic {
-            alias: alias.to_owned(),
-            title: title.to_owned(),
-            cover_url: public_thumbnail(value, thumbnail_types, PUBLIC_IMAGE_PATHS),
-        });
+) -> Result<Vec<FeatureComic>, ParseError> {
+    let values = bounded_array(main, key, name, MAX_FEATURE_COMICS)?;
+    Ok(values
+        .iter()
+        .filter_map(|value| feature_comic(value, "isAdult"))
+        .collect())
+}
+
+fn feature_comic(value: &Value, adult_key: &str) -> Option<FeatureComic> {
+    let alias = value.get("alias")?.as_str()?;
+    if !valid_alias(alias) {
+        return None;
     }
-    Ok(comics)
+    let title = value.get("title")?.as_str()?;
+    if title.trim().is_empty() || title.len() > MAX_TITLE_BYTES {
+        return None;
+    }
+    let creators = value.get("creators")?.as_str()?;
+    if creators.len() > MAX_CREATORS_BYTES {
+        return None;
+    }
+    let view_count = match value.get("viewCount") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let count = value.as_integer_str()?.parse::<u64>().ok()?;
+            (count > 0).then_some(count)
+        }
+    };
+    let (vertical_url, square_url) =
+        if matches!(value.get(adult_key), Some(Value::Bool(false))) {
+            let vertical_url = public_thumbnail(
+                value,
+                &["VERTICAL_NON_ADULT", "VERTICAL", "COVER"],
+                PUBLIC_IMAGE_PATHS,
+            );
+            let square_url = public_thumbnail(value, &["SQUARE"], PUBLIC_IMAGE_PATHS)
+                .or_else(|| vertical_url.clone());
+            (vertical_url, square_url)
+        } else {
+            (None, None)
+        };
+    Some(FeatureComic {
+        alias: alias.to_owned(),
+        title: title.to_owned(),
+        creators: creators.to_owned(),
+        view_count,
+        vertical_url,
+        square_url,
+    })
 }
 
 fn banner_alias(banner: &Value) -> Option<&str> {
@@ -840,18 +915,17 @@ fn public_thumbnail(
     accepted_paths: &[&str],
 ) -> Option<String> {
     let thumbnails = value.get("thumbnails")?.as_array()?;
-    for thumbnail in thumbnails {
-        let Some(kind) = thumbnail.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if !accepted_types.contains(&kind) {
-            continue;
-        }
-        let Some(url) = thumbnail.get("imagePath").and_then(Value::as_str) else {
-            continue;
-        };
-        if public_image_url(url, accepted_paths) {
-            return Some(url.to_owned());
+    for accepted_type in accepted_types {
+        for thumbnail in thumbnails {
+            if thumbnail.get("type").and_then(Value::as_str) != Some(*accepted_type) {
+                continue;
+            }
+            let Some(url) = thumbnail.get("imagePath").and_then(Value::as_str) else {
+                continue;
+            };
+            if public_image_url(url, accepted_paths) {
+                return Some(url.to_owned());
+            }
         }
     }
     None
@@ -1472,8 +1546,8 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 mod tests {
     use super::{
         asset_summary, comments, content_detail, expiration_history, gift_balance, homepage,
-        images, library, public_detail, purchase_receipt, purchase_rejection_result, quote, recent,
-        replies, ParseError, MAX_CREATORS_BYTES,
+        images, library, public_collection, public_detail, purchase_receipt,
+        purchase_rejection_result, quote, recent, replies, themes, ParseError, MAX_CREATORS_BYTES,
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
@@ -2541,7 +2615,7 @@ mod tests {
             |(kind, url)| format!("[{{\"type\":\"{kind}\",\"imagePath\":\"{url}\"}}]"),
         );
         format!(
-            "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"isAdult\":false,\"thumbnails\":{thumbnails}}}"
+            "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"creators\":\"Creator\",\"isAdult\":false,\"thumbnails\":{thumbnails}}}"
         )
     }
 
@@ -2640,12 +2714,12 @@ mod tests {
                     "https://attacker.example/tw/contents/new_hostile.webp",
                 )),
             ),
-            "{\"alias\":\"missing_maturity\",\"title\":\"Missing maturity\",\"thumbnails\":[{\"type\":\"COVER\",\"imagePath\":\"https://image.balcony.studio/tw/contents/missing.webp\"}]}".to_owned(),
-            "{\"alias\":\"adult_artwork\",\"title\":\"Adult artwork\",\"isAdult\":true,\"thumbnails\":[{\"type\":\"COVER\",\"imagePath\":\"https://image.balcony.studio/tw/contents/adult.webp\"}]}".to_owned(),
-            "{\"alias\":\"bad/slash\",\"title\":\"Bad alias\",\"thumbnails\":[]}".to_owned(),
-            "{\"alias\":\"missing_title\",\"thumbnails\":[]}".to_owned(),
-            "{\"alias\":\"wrong_title\",\"title\":42,\"thumbnails\":[]}".to_owned(),
-            "{\"alias\":\"blank_title\",\"title\":\"   \",\"thumbnails\":[]}".to_owned(),
+            "{\"alias\":\"missing_maturity\",\"title\":\"Missing maturity\",\"creators\":\"Creator\",\"thumbnails\":[{\"type\":\"COVER\",\"imagePath\":\"https://image.balcony.studio/tw/contents/missing.webp\"}]}".to_owned(),
+            "{\"alias\":\"adult_artwork\",\"title\":\"Adult artwork\",\"creators\":\"Creator\",\"isAdult\":true,\"thumbnails\":[{\"type\":\"COVER\",\"imagePath\":\"https://image.balcony.studio/tw/contents/adult.webp\"}]}".to_owned(),
+            "{\"alias\":\"bad/slash\",\"title\":\"Bad alias\",\"creators\":\"Creator\",\"thumbnails\":[]}".to_owned(),
+            "{\"alias\":\"missing_title\",\"creators\":\"Creator\",\"thumbnails\":[]}".to_owned(),
+            "{\"alias\":\"wrong_title\",\"title\":42,\"creators\":\"Creator\",\"thumbnails\":[]}".to_owned(),
+            "{\"alias\":\"blank_title\",\"title\":\"   \",\"creators\":\"Creator\",\"thumbnails\":[]}".to_owned(),
         ]
         .join(",");
         let week_day = shelf_json(
@@ -2657,7 +2731,7 @@ mod tests {
             )),
         );
         let only_bom = concat!(
-            "{\"alias\":\"only_a\",\"title\":\"Only A\",\"isAdult\":false,\"thumbnails\":[",
+            "{\"alias\":\"only_a\",\"title\":\"Only A\",\"creators\":\"Creator\",\"isAdult\":false,\"thumbnails\":[",
             "{\"type\":\"MAIN\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/adult.webp\"},",
             "{\"type\":\"SQUARE\",\"imagePath\":\"https://image.balcony.studio/tw/co_thumbnail/only_a/public.webp\"}",
             "]}"
@@ -2693,17 +2767,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            parsed.newest[0].cover_url.as_deref(),
+            parsed.newest[0].vertical_url.as_deref(),
             Some("https://image.balcony.studio:443/tw/contents/new_a.webp")
         );
-        assert_eq!(parsed.newest[1].cover_url, None);
-        assert_eq!(parsed.newest[2].cover_url, None);
-        assert_eq!(parsed.newest[3].cover_url, None);
-        assert_eq!(parsed.newest[4].cover_url, None);
+        assert_eq!(parsed.newest[0].square_url, parsed.newest[0].vertical_url);
+        assert_eq!(parsed.newest[1].vertical_url, None);
+        assert_eq!(parsed.newest[2].vertical_url, None);
+        assert_eq!(parsed.newest[3].vertical_url, None);
+        assert_eq!(parsed.newest[4].vertical_url, None);
         assert_eq!(parsed.week_day[0].alias, "weekday_a");
         assert_eq!(parsed.only_bom[0].alias, "only_a");
+        assert_eq!(parsed.only_bom[0].vertical_url, None);
         assert_eq!(
-            parsed.only_bom[0].cover_url.as_deref(),
+            parsed.only_bom[0].square_url.as_deref(),
             Some("https://image.balcony.studio/tw/co_thumbnail/only_a/public.webp")
         );
     }
@@ -2795,11 +2871,12 @@ mod tests {
         assert_eq!(parsed.newest[0].alias.len(), 96);
         assert_eq!(parsed.newest[0].title.len(), 256);
         assert_eq!(
-            parsed.newest[0].cover_url.as_deref(),
+            parsed.newest[0].vertical_url.as_deref(),
             Some(cover_at_cap.as_str())
         );
         assert_eq!(parsed.newest[1].alias, "cover_too_long");
-        assert_eq!(parsed.newest[1].cover_url, None);
+        assert_eq!(parsed.newest[1].vertical_url, None);
+        assert_eq!(parsed.newest[1].square_url, None);
     }
 
     #[test]
@@ -2830,7 +2907,10 @@ mod tests {
         let parsed = homepage(homepage_document(&main).as_bytes()).expect("tolerant artwork");
 
         assert_eq!(parsed.newest.len(), urls.len());
-        assert!(parsed.newest.iter().all(|comic| comic.cover_url.is_none()));
+        assert!(parsed
+            .newest
+            .iter()
+            .all(|comic| comic.vertical_url.is_none() && comic.square_url.is_none()));
     }
 
     #[test]
@@ -2895,10 +2975,7 @@ mod tests {
 
         assert_eq!(comic.alias, "hunter_q");
         assert_eq!(comic.title, "Hunter & Q — Co.");
-        assert_eq!(
-            comic.cover_url.as_deref(),
-            Some("https://image.balcony.studio/tw/contents/hunter_q.webp")
-        );
+        assert_eq!(comic.synopsis, None);
     }
 
     #[test]
@@ -2967,16 +3044,14 @@ mod tests {
     }
 
     #[test]
-    fn public_detail_tolerates_missing_or_hostile_images_as_none() {
+    fn public_detail_never_exposes_unproven_image_metadata() {
         let title = r#"<meta property="og:title" content="Hunter Q - 漫畫 - BOMTOON">"#;
-        assert_eq!(
-            public_detail(title.as_bytes(), "hunter_q")
-                .expect("missing image")
-                .cover_url,
-            None
-        );
+        let without_image = public_detail(title.as_bytes(), "hunter_q").expect("missing image");
+        assert_eq!(without_image.title, "Hunter Q");
+        assert_eq!(without_image.synopsis, None);
 
         for url in [
+            "https://image.balcony.studio/tw/contents/hunter_q.webp",
             "http://image.balcony.studio/tw/contents/hunter_q.webp",
             "https://attacker.example/tw/contents/hunter_q.webp",
             "https://image.balcony.studio/tw/ep/hunter_q.webp",
@@ -2989,11 +3064,376 @@ mod tests {
                 url
             );
             assert_eq!(
-                public_detail(body.as_bytes(), "hunter_q")
-                    .expect("hostile image is optional")
-                    .cover_url,
-                None
+                public_detail(body.as_bytes(), "hunter_q").expect("image metadata is ignored"),
+                without_image
             );
         }
+    }
+
+    const PUBLIC_COLLECTION_RESPONSE: &[u8] = br#"{
+      "result":"SUCCESS",
+      "data":[
+        {
+          "alias":"shared",
+          "title":"Shared",
+          "creators":"Writer, Artist",
+          "isAdult":false,
+          "viewCount":1200,
+          "thumbnails":[
+            {"type":"VERTICAL","imagePath":"https://image.balcony.studio/tw/contents/vertical-less-safe.webp"},
+            {"type":"VERTICAL_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/vertical-safe.webp"},
+            {"type":"SQUARE","imagePath":"https://image.balcony.studio/tw/co_thumbnail/square.webp"}
+          ]
+        },
+        {
+          "alias":"second",
+          "title":"Second",
+          "creators":"Creator",
+          "isAdult":false,
+          "viewCount":0,
+          "thumbnails":[
+            {"type":"COVER","imagePath":"https://image.balcony.studio/BOMTOON_TW/contents/second.webp"}
+          ]
+        }
+      ]
+    }"#;
+
+    const ADULT_COLLECTION_RESPONSE: &[u8] = br#"{
+      "result":"SUCCESS",
+      "data":[{
+        "alias":"adult",
+        "title":"Adult",
+        "creators":"Creator",
+        "isAdult":true,
+        "viewCount":1,
+        "thumbnails":[
+          {"type":"VERTICAL_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/adult-vertical.webp"},
+          {"type":"SQUARE","imagePath":"https://image.balcony.studio/tw/co_thumbnail/adult-square.webp"}
+        ]
+      }]
+    }"#;
+
+    fn feature_comic_json(alias: &str, adult_field: &str) -> String {
+        format!(
+            concat!(
+                "{{\"alias\":\"{}\",\"title\":\"Title\",",
+                "\"creators\":\"Creator\",{}",
+                "\"thumbnails\":[]}}"
+            ),
+            alias, adult_field
+        )
+    }
+
+    fn theme_json(id: u64, title: &str, contents: &str) -> String {
+        format!("{{\"id\":{id},\"title\":\"{title}\",\"contentsInfo\":[{contents}]}}")
+    }
+
+    #[test]
+    fn public_collection_preserves_order_membership_and_safe_images() {
+        let comics = public_collection(PUBLIC_COLLECTION_RESPONSE).expect("collection");
+        assert_eq!(
+            comics
+                .iter()
+                .map(|comic| comic.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["shared", "second"]
+        );
+        assert_eq!(comics[0].creators, "Writer, Artist");
+        assert_eq!(comics[0].view_count, Some(1_200));
+        assert!(comics[0]
+            .vertical_url
+            .as_deref()
+            .is_some_and(|url| url.contains("vertical-safe")));
+        assert!(comics[0]
+            .square_url
+            .as_deref()
+            .is_some_and(|url| url.contains("square")));
+        assert_eq!(comics[1].view_count, None);
+        assert_eq!(comics[1].square_url, comics[1].vertical_url);
+    }
+
+    #[test]
+    fn public_collection_preserves_duplicate_placements() {
+        let comic = feature_comic_json("shared", "\"isAdult\":false,");
+        let body = format!(r#"{{"result":"SUCCESS","data":[{comic},{comic}]}}"#);
+        let comics = public_collection(body.as_bytes()).expect("duplicates are placements");
+        assert_eq!(
+            comics
+                .iter()
+                .map(|comic| comic.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["shared", "shared"]
+        );
+    }
+
+    #[test]
+    fn adult_collection_item_never_exposes_a_thumbnail_url() {
+        let comics = public_collection(ADULT_COLLECTION_RESPONSE).expect("collection");
+        assert_eq!(comics[0].vertical_url, None);
+        assert_eq!(comics[0].square_url, None);
+    }
+
+    #[test]
+    fn public_collection_skips_invalid_siblings_and_fails_closed_on_images() {
+        let overlong_creators = "c".repeat(MAX_CREATORS_BYTES + 1);
+        let body = format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":[",
+                "{{\"alias\":\"zero\",\"title\":\"Zero\",\"creators\":\"Creator\",",
+                "\"isAdult\":false,\"viewCount\":0,\"thumbnails\":[]}},",
+                "{{\"alias\":\"missing-count\",\"title\":\"Missing\",\"creators\":\"Creator\",",
+                "\"isAdult\":false,\"thumbnails\":[]}},",
+                "{{\"alias\":\"missing-maturity\",\"title\":\"Missing maturity\",\"creators\":\"Creator\",",
+                "\"thumbnails\":[{{\"type\":\"VERTICAL_NON_ADULT\",\"imagePath\":",
+                "\"https://image.balcony.studio/tw/contents/unproven.webp\"}}]}},",
+                "{{\"alias\":\"wrong-maturity\",\"title\":\"Wrong maturity\",\"creators\":\"Creator\",",
+                "\"isAdult\":\"false\",\"thumbnails\":[{{\"type\":\"VERTICAL_NON_ADULT\",\"imagePath\":",
+                "\"https://image.balcony.studio/tw/contents/unproven-wrong.webp\"}}]}},",
+                "{{\"alias\":\"foreign-image\",\"title\":\"Foreign\",\"creators\":\"Creator\",",
+                "\"isAdult\":false,\"thumbnails\":[{{\"type\":\"VERTICAL\",",
+                "\"imagePath\":\"https://attacker.example/tw/contents/foreign.webp\"}}]}},",
+                "{{\"alias\":\"bad/slash\",\"title\":\"Bad alias\",\"creators\":\"Creator\",",
+                "\"isAdult\":false,\"thumbnails\":[]}},",
+                "{{\"alias\":\"empty-title\",\"title\":\"   \",\"creators\":\"Creator\",",
+                "\"isAdult\":false,\"thumbnails\":[]}},",
+                "{{\"alias\":\"long-creators\",\"title\":\"Long creators\",\"creators\":\"{}\",",
+                "\"isAdult\":false,\"thumbnails\":[]}}",
+                "]}}"
+            ),
+            overlong_creators
+        );
+
+        let comics = public_collection(body.as_bytes()).expect("invalid siblings are skipped");
+
+        assert_eq!(
+            comics
+                .iter()
+                .map(|comic| comic.alias.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "zero",
+                "missing-count",
+                "missing-maturity",
+                "wrong-maturity",
+                "foreign-image",
+            ]
+        );
+        assert!(comics.iter().all(|comic| comic.view_count.is_none()));
+        assert!(comics[2..].iter().all(|comic| {
+            comic.vertical_url.is_none() && comic.square_url.is_none()
+        }));
+    }
+
+    #[test]
+    fn public_collection_rejects_non_success_and_oversized_arrays() {
+        assert!(public_collection(br#"{"result":"ERROR","data":[]}"#).is_err());
+        let comic = feature_comic_json("safe", "\"isAdult\":false,");
+        let accepted = format!(
+            r#"{{"result":"SUCCESS","data":[{}]}}"#,
+            vec![comic.clone(); 64].join(",")
+        );
+        assert_eq!(
+            public_collection(accepted.as_bytes())
+                .expect("64 collection entries")
+                .len(),
+            64
+        );
+        let rejected = format!(
+            r#"{{"result":"SUCCESS","data":[{}]}}"#,
+            vec![comic; 65].join(",")
+        );
+        assert!(public_collection(rejected.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn themes_omit_invalid_duplicate_and_empty_groups() {
+        let comic = feature_comic_json("shared", "\"badgeAdult\":false,");
+        let valid_contents = vec![comic.clone(); 6].join(",");
+        let body = format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":[",
+                "{},",
+                "{},",
+                "{{\"title\":\"Missing ID\",\"contentsInfo\":[{}]}},",
+                "{{\"id\":2,\"contentsInfo\":[{}]}},",
+                "{{\"id\":3,\"title\":\"   \",\"contentsInfo\":[{}]}},",
+                "{{\"id\":4,\"title\":\"Missing list\"}},",
+                "{{\"id\":5,\"title\":\"Empty list\",\"contentsInfo\":[]}}",
+                "]}}"
+            ),
+            theme_json(1785, "  給我一次重來的機會🕙  ", &valid_contents),
+            theme_json(1785, "Duplicate", &comic),
+            comic,
+            comic,
+            comic
+        );
+
+        let themes = themes(body.as_bytes()).expect("themes");
+
+        assert_eq!(
+            themes.iter().map(|theme| theme.id).collect::<Vec<_>>(),
+            [1785]
+        );
+        assert_eq!(themes[0].label, "給我一次重來的機會🕙");
+        assert_eq!(themes[0].comics.len(), 6);
+    }
+
+    #[test]
+    fn themes_skip_invalid_comic_siblings_and_preserve_group_order() {
+        let shared = feature_comic_json("shared", "\"badgeAdult\":false,");
+        let adult = concat!(
+            "{\"alias\":\"adult\",\"title\":\"Adult\",\"creators\":\"Creator\",",
+            "\"badgeAdult\":true,\"viewCount\":7,\"thumbnails\":[",
+            "{\"type\":\"SQUARE\",\"imagePath\":",
+            "\"https://image.balcony.studio/tw/co_thumbnail/adult.webp\"}]}"
+        );
+        let body = format!(
+            r#"{{"result":"SUCCESS","data":[{},{}]}}"#,
+            theme_json(
+                10,
+                "First",
+                &format!(
+                    "{shared},{{\"alias\":\"bad/slash\",\"title\":\"Bad\",\"creators\":\"Creator\",\"badgeAdult\":false,\"thumbnails\":[]}}"
+                )
+            ),
+            theme_json(11, "Second", &format!("{shared},{adult}"))
+        );
+
+        let themes = themes(body.as_bytes()).expect("themes");
+
+        assert_eq!(
+            themes.iter().map(|theme| theme.id).collect::<Vec<_>>(),
+            [10, 11]
+        );
+        assert_eq!(themes[0].comics.len(), 1);
+        assert_eq!(
+            themes[1]
+                .comics
+                .iter()
+                .map(|comic| comic.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["shared", "adult"]
+        );
+        assert_eq!(themes[1].comics[1].view_count, Some(7));
+        assert_eq!(themes[1].comics[1].vertical_url, None);
+        assert_eq!(themes[1].comics[1].square_url, None);
+    }
+
+    #[test]
+    fn themes_reject_non_success_and_oversized_containing_arrays() {
+        assert!(themes(br#"{"result":"ERROR","data":[]}"#).is_err());
+        let comic = feature_comic_json("safe", "\"badgeAdult\":false,");
+        let accepted_groups = (1..=32)
+            .map(|id| theme_json(id, "Theme", &comic))
+            .collect::<Vec<_>>()
+            .join(",");
+        let accepted = format!(r#"{{"result":"SUCCESS","data":[{accepted_groups}]}}"#);
+        assert_eq!(themes(accepted.as_bytes()).expect("32 themes").len(), 32);
+
+        let rejected_groups = (1..=33)
+            .map(|id| theme_json(id, "Theme", &comic))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rejected = format!(r#"{{"result":"SUCCESS","data":[{rejected_groups}]}}"#);
+        assert!(themes(rejected.as_bytes()).is_err());
+
+        let accepted_contents = vec![comic.clone(); 64].join(",");
+        let accepted = format!(
+            r#"{{"result":"SUCCESS","data":[{}]}}"#,
+            theme_json(1, "Theme", &accepted_contents)
+        );
+        assert_eq!(
+            themes(accepted.as_bytes()).expect("64 theme entries")[0]
+                .comics
+                .len(),
+            64
+        );
+        let rejected_contents = vec![comic; 65].join(",");
+        let rejected = format!(
+            r#"{{"result":"SUCCESS","data":[{}]}}"#,
+            theme_json(1, "Theme", &rejected_contents)
+        );
+        assert!(themes(rejected.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn theme_labels_are_bounded_trimmed_and_not_font_filtered() {
+        let comic = feature_comic_json("safe", "\"badgeAdult\":false,");
+        let at_cap = "é".repeat(128);
+        let body = format!(
+            r#"{{"result":"SUCCESS","data":[{},{}]}}"#,
+            theme_json(1, &at_cap, &comic),
+            theme_json(2, &format!("{at_cap}a"), &comic)
+        );
+
+        let parsed = themes(body.as_bytes()).expect("bounded labels");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, at_cap);
+
+        let emoji = format!(
+            r#"{{"result":"SUCCESS","data":[{}]}}"#,
+            theme_json(3, "給我一次重來的機會🕙", &comic)
+        );
+        assert_eq!(
+            themes(emoji.as_bytes()).expect("unfiltered parser")[0].label,
+            "給我一次重來的機會🕙"
+        );
+    }
+
+    #[test]
+    fn public_detail_decodes_and_bounds_synopsis() {
+        const DETAIL_HTML: &str = r#"
+          <meta property="og:title" content="Safe &amp; Sound - 漫畫 - BOMTOON">
+          <meta property="og:description" content="A &amp; B begin again.">
+          <meta property="og:image" content="https://image.balcony.studio/tw/contents/unproven.webp">
+        "#;
+        let detail = public_detail(DETAIL_HTML.as_bytes(), "safe-alias").expect("detail");
+        assert_eq!(detail.alias, "safe-alias");
+        assert_eq!(detail.title, "Safe & Sound");
+        assert_eq!(detail.synopsis.as_deref(), Some("A & B begin again."));
+
+        let at_limit = format!(
+            concat!(
+                "<meta property=\"og:title\" content=\"Safe - 漫畫 - BOMTOON\">",
+                "<meta property=\"og:description\" content=\"{}\">"
+            ),
+            "a".repeat(2048)
+        );
+        assert_eq!(
+            public_detail(at_limit.as_bytes(), "safe")
+                .expect("2048-byte synopsis")
+                .synopsis
+                .expect("synopsis")
+                .len(),
+            2048
+        );
+        let overlong = format!(
+            concat!(
+                "<meta property=\"og:title\" content=\"Safe - 漫畫 - BOMTOON\">",
+                "<meta property=\"og:description\" content=\"{}\">"
+            ),
+            "a".repeat(2049)
+        );
+        assert!(public_detail(overlong.as_bytes(), "safe").is_err());
+    }
+
+    #[test]
+    fn public_detail_treats_missing_or_empty_synopsis_as_none() {
+        let title = r#"<meta property="og:title" content="Safe - 漫畫 - BOMTOON">"#;
+        assert_eq!(
+            public_detail(title.as_bytes(), "safe")
+                .expect("missing synopsis")
+                .synopsis,
+            None
+        );
+        let empty =
+            format!(r#"{title}<meta property="og:description" content="   &nbsp; ">"#);
+        assert_eq!(
+            public_detail(empty.as_bytes(), "safe")
+                .expect("empty synopsis")
+                .synopsis,
+            None
+        );
     }
 }

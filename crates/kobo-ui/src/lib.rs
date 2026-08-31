@@ -8068,6 +8068,28 @@ pub fn measure_text_in(text: &str, size: FontSize, face: Face) -> (i32, i32) {
     )
 }
 
+/// Removes characters the installed face cannot draw.
+///
+/// Without an installed typesetter the input is retained: the built-in
+/// fallback cannot authoritatively describe the runtime face's coverage.
+#[must_use]
+pub fn drawable_text_in(text: &str, face: Face) -> String {
+    with_typesetter(face, |typesetter| {
+        drawable_text_with(text, |character| typesetter.has_glyph(character, face))
+    })
+    .unwrap_or_else(|| text.to_owned())
+}
+
+fn drawable_text_with(text: &str, mut has_glyph: impl FnMut(char) -> bool) -> String {
+    let mut drawable = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_whitespace() || has_glyph(character) {
+            drawable.push(character);
+        }
+    }
+    drawable
+}
+
 /// The first character of `text` the installed face cannot draw, if any.
 ///
 /// A character with no glyph is drawn as an empty box, which on a panel reads
@@ -16388,6 +16410,23 @@ mod loading_tests {
 mod prose_tests {
     use super::tests::PANELS;
     use super::*;
+
+    #[test]
+    fn drawable_text_rejects_an_unsupported_clock_but_retains_cjk() {
+        assert_eq!(
+            drawable_text_with("給我一次重來的機會🕙", |character| character != '🕙'),
+            "給我一次重來的機會"
+        );
+    }
+
+    #[test]
+    fn drawable_text_retains_input_without_an_installed_typesetter() {
+        assert!(!has_typesetter());
+        assert_eq!(
+            drawable_text_in("給我一次重來的機會🕙", Face::Text),
+            "給我一次重來的機會🕙"
+        );
+    }
 
     #[test]
     fn the_fallback_typesetter_treats_crlf_as_one_separator() {

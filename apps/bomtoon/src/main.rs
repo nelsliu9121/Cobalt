@@ -12,7 +12,7 @@ use kobo_sdk::{
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
-    Homepage, RecentEntry, ShelfComic, WalletSummary,
+    FeatureComic, Homepage, RecentEntry, WalletSummary,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
@@ -272,8 +272,8 @@ struct FeaturedRefresh {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StagedFeatured {
-    featured: Vec<ShelfComic>,
-    recommended: Vec<ShelfComic>,
+    featured: Vec<FeatureComic>,
+    recommended: Vec<FeatureComic>,
     pending_details: usize,
 }
 
@@ -281,8 +281,8 @@ struct StagedFeatured {
 struct FeaturedState {
     status: FeaturedStatus,
     generation: u64,
-    featured: Vec<ShelfComic>,
-    recommended: Vec<ShelfComic>,
+    featured: Vec<FeatureComic>,
+    recommended: Vec<FeatureComic>,
     pending_details: usize,
     page: usize,
     stale_warning: Option<String>,
@@ -340,8 +340,8 @@ struct BannerDetailPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FeaturedPlan {
-    featured: Vec<ShelfComic>,
-    recommended: Vec<ShelfComic>,
+    featured: Vec<FeatureComic>,
+    recommended: Vec<FeatureComic>,
     details: Vec<BannerDetailPlan>,
 }
 
@@ -377,10 +377,13 @@ fn plan_featured(homepage: Homepage) -> FeaturedPlan {
                 slot,
                 alias: banner.alias.clone(),
             });
-            featured.push(ShelfComic {
+            featured.push(FeatureComic {
                 title: banner.alias.clone(),
                 alias: banner.alias,
-                cover_url: None,
+                creators: String::new(),
+                view_count: None,
+                vertical_url: None,
+                square_url: None,
             });
         }
     }
@@ -468,7 +471,14 @@ fn add_featured_feed(
                     format!("comic-{index}"),
                     display_text(&comic.title, &comic.alias),
                     Glyph::Book,
-                    ready_cover(covers, comic.cover_url.as_deref()),
+                    ready_cover(
+                        covers,
+                        comic
+                            .vertical_url
+                            .as_ref()
+                            .or(comic.square_url.as_ref())
+                            .map(String::as_str),
+                    ),
                 )
             }),
         );
@@ -482,7 +492,14 @@ fn add_featured_feed(
                 format!("comic-{}", recommended_offset.saturating_add(index)),
                 display_text(&comic.title, &comic.alias),
                 "",
-                cover_lead(covers, comic.cover_url.as_deref()),
+                cover_lead(
+                    covers,
+                    comic
+                        .vertical_url
+                        .as_ref()
+                        .or(comic.square_url.as_ref())
+                        .map(String::as_str),
+                ),
             )
         }));
     let pages = featured_page_count(featured, first_page_rows);
@@ -1060,10 +1077,20 @@ impl Bomtoon {
                 };
                 let page = featured_page(&self.featured, content_page, first_page_rows);
                 for index in page.featured {
-                    push(self.featured.featured[index].cover_url.as_ref());
+                    push(
+                        self.featured.featured[index]
+                            .vertical_url
+                            .as_ref()
+                            .or(self.featured.featured[index].square_url.as_ref()),
+                    );
                 }
                 for index in page.recommended {
-                    push(self.featured.recommended[index].cover_url.as_ref());
+                    push(
+                        self.featured.recommended[index]
+                            .vertical_url
+                            .as_ref()
+                            .or(self.featured.recommended[index].square_url.as_ref()),
+                    );
                 }
             }
             MainDestination::Recent if self.recent_load.loaded => {
@@ -2357,7 +2384,13 @@ impl Bomtoon {
                     .iter()
                     .flat_map(|staged| staged.featured.iter().chain(&staged.recommended)),
             )
-            .filter_map(|comic| comic.cover_url.clone())
+            .filter_map(|comic| {
+                comic
+                    .vertical_url
+                    .as_ref()
+                    .or(comic.square_url.as_ref())
+                    .cloned()
+            })
             .collect()
     }
 
@@ -3324,17 +3357,18 @@ impl Bomtoon {
         if generation != self.featured.generation {
             return false;
         }
-        let comic = bytes.and_then(|bytes| parse::public_detail(bytes, alias).ok());
+        let detail = bytes.and_then(|bytes| parse::public_detail(bytes, alias).ok());
         if self.featured.staged.is_some() {
             let finished = {
                 let staged = self.featured.staged.as_mut().expect("checked staged feed");
-                if let Some(comic) = comic {
-                    if staged
+                if let Some(detail) = detail {
+                    if let Some(selected) = staged
                         .featured
-                        .get(slot)
-                        .is_some_and(|selected| selected.alias == alias)
+                        .get_mut(slot)
+                        .filter(|selected| selected.alias == alias)
                     {
-                        staged.featured[slot] = comic;
+                        selected.alias = detail.alias;
+                        selected.title = detail.title;
                     }
                 }
                 staged.pending_details = staged.pending_details.saturating_sub(1);
@@ -3345,14 +3379,15 @@ impl Bomtoon {
             }
             return true;
         }
-        if let Some(comic) = comic {
-            if self
+        if let Some(detail) = detail {
+            if let Some(selected) = self
                 .featured
                 .featured
-                .get(slot)
-                .is_some_and(|selected| selected.alias == alias)
+                .get_mut(slot)
+                .filter(|selected| selected.alias == alias)
             {
-                self.featured.featured[slot] = comic;
+                selected.alias = detail.alias;
+                selected.title = detail.title;
             }
         }
         self.featured.pending_details = self.featured.pending_details.saturating_sub(1);
@@ -12008,27 +12043,39 @@ mod tests {
             status: FeaturedStatus::Ready,
             generation: 7,
             featured: vec![
-                ShelfComic {
+                FeatureComic {
                     title: "Public".to_owned(),
                     alias: "public".to_owned(),
-                    cover_url: Some(scenario.public_url.clone()),
+                    creators: String::new(),
+                    view_count: None,
+                    vertical_url: Some(scenario.public_url.clone()),
+                    square_url: None,
                 },
-                ShelfComic {
+                FeatureComic {
                     title: "Shared".to_owned(),
                     alias: "shared".to_owned(),
-                    cover_url: Some(scenario.shared_url.clone()),
+                    creators: String::new(),
+                    view_count: None,
+                    vertical_url: Some(scenario.shared_url.clone()),
+                    square_url: None,
                 },
             ],
             recommended: vec![
-                ShelfComic {
+                FeatureComic {
                     title: "Recommended".to_owned(),
                     alias: "recommended".to_owned(),
-                    cover_url: Some(scenario.shared_url.clone()),
+                    creators: String::new(),
+                    view_count: None,
+                    vertical_url: Some(scenario.shared_url.clone()),
+                    square_url: None,
                 },
-                ShelfComic {
+                FeatureComic {
                     title: "Shared loading".to_owned(),
                     alias: "shared-loading".to_owned(),
-                    cover_url: Some(scenario.shared_loading_url.clone()),
+                    creators: String::new(),
+                    view_count: None,
+                    vertical_url: Some(scenario.shared_loading_url.clone()),
+                    square_url: None,
                 },
             ],
             page: 2,
@@ -12183,8 +12230,8 @@ mod tests {
     fn assert_signed_out_public_state(
         app: &Bomtoon,
         scenario: &SignOutScenario,
-        featured: &[ShelfComic],
-        recommended: &[ShelfComic],
+        featured: &[FeatureComic],
+        recommended: &[FeatureComic],
         refresh: &FeaturedRefresh,
     ) {
         assert_eq!(app.account, AccountState::SignedOut);
@@ -12334,10 +12381,13 @@ mod tests {
             task: Some(scenario.pending_task),
             featured: FeaturedState {
                 generation: 4,
-                featured: vec![ShelfComic {
+                featured: vec![FeatureComic {
                     title: "Ready".to_owned(),
                     alias: "ready".to_owned(),
-                    cover_url: Some(scenario.ready_url.clone()),
+                    creators: String::new(),
+                    view_count: None,
+                    vertical_url: Some(scenario.ready_url.clone()),
+                    square_url: None,
                 }],
                 refresh: FeaturedRefresh {
                     local_day_pending: true,
@@ -13927,13 +13977,16 @@ mod tests {
             assert_all_account_data_cleared(runner.app());
         }
     }
-    fn shelf(alias: &str, title: &str) -> model::ShelfComic {
-        model::ShelfComic {
+    fn shelf(alias: &str, title: &str) -> model::FeatureComic {
+        model::FeatureComic {
             alias: alias.to_owned(),
             title: title.to_owned(),
-            cover_url: Some(format!(
+            creators: "Creator".to_owned(),
+            view_count: None,
+            vertical_url: Some(format!(
                 "https://image.balcony.studio/tw/contents/{alias}.webp"
             )),
+            square_url: None,
         }
     }
 
@@ -13954,7 +14007,7 @@ mod tests {
         }
     }
 
-    fn aliases(comics: &[model::ShelfComic]) -> Vec<&str> {
+    fn aliases(comics: &[model::FeatureComic]) -> Vec<&str> {
         comics.iter().map(|comic| comic.alias.as_str()).collect()
     }
 
@@ -13990,7 +14043,7 @@ mod tests {
             .iter()
             .map(|(alias, title)| {
                 format!(
-                    "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"isAdult\":false,\"thumbnails\":[]}}"
+                    "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"creators\":\"Creator\",\"isAdult\":false,\"thumbnails\":[]}}"
                 )
             })
             .collect::<Vec<_>>()
@@ -14407,7 +14460,13 @@ mod tests {
             .featured
             .iter()
             .chain(&runner.app().featured.recommended)
-            .filter_map(|comic| comic.cover_url.clone())
+            .filter_map(|comic| {
+                comic
+                    .vertical_url
+                    .as_ref()
+                    .or(comic.square_url.as_ref())
+                    .cloned()
+            })
             .collect::<Vec<_>>();
         for (index, url) in cached_urls.into_iter().enumerate() {
             runner
@@ -14582,7 +14641,10 @@ mod tests {
             [(1, "banner_b"), (2, "banner_c")]
         );
         assert_eq!(plan.featured[1].title, "banner_b");
-        assert_eq!(plan.featured[1].cover_url, None);
+        assert_eq!(plan.featured[1].creators, "");
+        assert_eq!(plan.featured[1].view_count, None);
+        assert_eq!(plan.featured[1].vertical_url, None);
+        assert_eq!(plan.featured[1].square_url, None);
     }
 
     #[test]
@@ -14661,10 +14723,9 @@ mod tests {
         assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
         assert_eq!(runner.app().featured.pending_details, 1);
         assert_eq!(runner.app().featured.featured[0].title, "First title");
-        assert_eq!(
-            runner.app().featured.featured[0].cover_url.as_deref(),
-            Some("https://image.balcony.studio/tw/contents/first.webp")
-        );
+        assert_eq!(runner.app().featured.featured[0].creators, "");
+        assert_eq!(runner.app().featured.featured[0].vertical_url, None);
+        assert_eq!(runner.app().featured.featured[0].square_url, None);
         assert_eq!(runner.app().featured.featured[1].title, "second");
 
         runner.task_outcome(second, TaskOutcome::Failed(TaskError::TimedOut));
@@ -14686,10 +14747,13 @@ mod tests {
         assert_eq!(runner.app().featured.status, FeaturedStatus::Ready);
         assert_eq!(
             runner.app().featured.featured,
-            [model::ShelfComic {
+            [model::FeatureComic {
                 alias: "fallback".to_owned(),
                 title: "fallback".to_owned(),
-                cover_url: None,
+                creators: String::new(),
+                view_count: None,
+                vertical_url: None,
+                square_url: None,
             }]
         );
         assert!(spawns(&commands).is_empty());
