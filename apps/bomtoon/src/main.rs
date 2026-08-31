@@ -63,6 +63,8 @@ const SYNOPSIS_MODAL_MAX_BYTES: usize = 16 * 1024;
 struct SynopsisState {
     pages: Vec<std::ops::Range<usize>>,
     open_page: Option<usize>,
+    preview: String,
+    preview_truncated: bool,
 }
 
 const MAIN_DESTINATIONS: [(&str, &str); 3] = [
@@ -1100,6 +1102,7 @@ struct Bomtoon {
     selected_creators: String,
     selected_synopsis: String,
     synopsis: SynopsisState,
+    episode_items_per_page: Option<usize>,
     reader_selection: Option<EpisodeSelection>,
     reader_after_content_refresh: Option<usize>,
     reader: Option<ReaderState>,
@@ -1845,14 +1848,16 @@ impl Bomtoon {
         );
         let pages = self.episodes.len().max(1);
         (0..pages).all(|page| {
-            let screen = self.add_episode_body(header.clone(), 1, page).build();
+            let screen = self
+                .add_episode_body(header.clone(), 1, page, true)
+                .build();
             !screen
                 .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
                 .has_errors()
         })
     }
 
-    fn episode_synopsis_preview(&self) -> (String, bool) {
+    fn measure_episode_synopsis_preview(&self) -> (String, bool) {
         let text = &self.selected_synopsis;
         if text.len() <= SYNOPSIS_PREVIEW_BYTES {
             let full = text.clone();
@@ -1897,15 +1902,19 @@ impl Bomtoon {
     }
 
     fn add_episode_header(&self, screen: ScreenBuilder) -> ScreenBuilder {
-        let (preview, truncated) = self.episode_synopsis_preview();
-        self.add_episode_header_preview(screen, preview, truncated)
+        self.add_episode_header_preview(
+            screen,
+            self.synopsis.preview.clone(),
+            self.synopsis.preview_truncated,
+        )
     }
-    fn episode_page_capacity_for_header(&self, header: &ScreenBuilder) -> usize {
+
+    fn measure_episode_page_capacity_for_header(&self, header: &ScreenBuilder) -> usize {
         for items_per_page in (1..=EPISODE_ITEMS_PER_PAGE).rev() {
             let pages = self.episodes.len().div_ceil(items_per_page).max(1);
             let all_pages_fit = (0..pages).all(|page| {
                 let screen = self
-                    .add_episode_body(header.clone(), items_per_page, page)
+                    .add_episode_body(header.clone(), items_per_page, page, true)
                     .build();
                 !screen
                     .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
@@ -1918,11 +1927,19 @@ impl Bomtoon {
         1
     }
 
-    fn episode_page_capacity(&self) -> usize {
+    fn prepare_episode_layout(&mut self) {
+        let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
+        self.synopsis.preview = preview;
+        self.synopsis.preview_truncated = preview_truncated;
         let header = self.add_episode_header(
             ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
         );
-        self.episode_page_capacity_for_header(&header)
+        self.episode_items_per_page =
+            Some(self.measure_episode_page_capacity_for_header(&header));
+    }
+
+    fn episode_page_capacity(&self) -> usize {
+        self.episode_items_per_page.unwrap_or(1)
     }
 
 
@@ -1931,8 +1948,9 @@ impl Bomtoon {
         screen: ScreenBuilder,
         items_per_page: usize,
         page: usize,
+        reserve_transient_space: bool,
     ) -> ScreenBuilder {
-        let mut screen = if self.gifts.error {
+        let mut screen = if reserve_transient_space || self.gifts.error {
             screen.button(
                 RETRY_GIFTS,
                 format!("{} · Retry Gift", self.episode_balance_label()),
@@ -1940,11 +1958,13 @@ impl Bomtoon {
         } else {
             screen.text(self.episode_balance_label())
         };
-        if let Some(result) = self.purchase_rejection_notice {
+        if reserve_transient_space {
+            screen = screen.text("Purchase rejected: FAIL");
+        } else if let Some(result) = self.purchase_rejection_notice {
             screen = screen.text(format!("Purchase rejected: {result}"));
         }
         let marker_belongs_to_another_account = self.commerce.marker_belongs_to_another_account();
-        if marker_belongs_to_another_account {
+        if reserve_transient_space || marker_belongs_to_another_account {
             screen = screen.text(
                 "A purchase is unresolved for another account. Restore the original account to refresh its status.",
             );
@@ -1983,7 +2003,8 @@ impl Bomtoon {
                 "{} · {status}",
                 display_text(&episode.title, &title_fallback),
             );
-            if episode.purchase.is_readable()
+            if reserve_transient_space
+                || episode.purchase.is_readable()
                 || (episode.purchase == model::PurchaseState::NotOwned
                     && !marker_belongs_to_another_account)
             {
@@ -2004,8 +2025,8 @@ impl Bomtoon {
     fn episode_screen(&self) -> Screen {
         let header =
             self.add_episode_header(ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"));
-        let items_per_page = self.episode_page_capacity_for_header(&header);
-        let mut screen = self.add_episode_body(header, items_per_page, self.page);
+        let items_per_page = self.episode_page_capacity();
+        let mut screen = self.add_episode_body(header, items_per_page, self.page, false);
         if let Some((page, range)) = self.synopsis.open_page.and_then(|page| {
             self.synopsis
                 .pages
@@ -2822,11 +2843,13 @@ impl Bomtoon {
                             self.synopsis = SynopsisState {
                                 pages: synopsis_pages(&detail.synopsis),
                                 open_page: None,
+                                ..SynopsisState::default()
                             };
                             self.selected_title = detail.title;
                             self.selected_creators = detail.creators.join(" | ");
                             self.selected_synopsis = detail.synopsis;
                             self.episodes = detail.episodes;
+                            self.prepare_episode_layout();
                             let items_per_page = self.episode_page_capacity();
                             let last_page = self
                                 .episodes
@@ -3337,6 +3360,7 @@ impl Bomtoon {
         self.selected_creators.clear();
         self.selected_synopsis.clear();
         self.synopsis = SynopsisState::default();
+        self.episode_items_per_page = None;
         self.reader_selection = None;
         self.problem = None;
         self.retry = Retry::Restart;
@@ -4562,11 +4586,13 @@ impl Bomtoon {
                         self.synopsis = SynopsisState {
                             pages: synopsis_pages(&detail.synopsis),
                             open_page: None,
+                            ..SynopsisState::default()
                         };
                         self.selected_title = detail.title;
                         self.selected_creators = detail.creators.join(" | ");
                         self.selected_synopsis = detail.synopsis;
                         self.episodes = detail.episodes;
+                        self.prepare_episode_layout();
                         self.page = if reader_after_refresh.is_some() {
                             let items_per_page = self.episode_page_capacity();
                             episode_page.min(
@@ -4639,6 +4665,7 @@ impl Bomtoon {
         self.selected_creators.clear();
         self.selected_synopsis.clear();
         self.synopsis = SynopsisState::default();
+        self.episode_items_per_page = None;
         self.problem = None;
         self.retry = Retry::Restart;
         self.request_foreground(context, Pending::Content(index));
@@ -9108,8 +9135,10 @@ mod tests {
         app.synopsis = SynopsisState {
             pages: synopsis_pages(&app.selected_synopsis),
             open_page: None,
+            ..SynopsisState::default()
         };
         app.selected_content_id = Some(41);
+        app.prepare_episode_layout();
         app.page = 3;
         app.next_library_page = Some(4);
         app.next_recent_page = Some(5);
@@ -9128,6 +9157,7 @@ mod tests {
         assert!(app.selected_creators.is_empty());
         assert!(app.selected_synopsis.is_empty());
         assert_eq!(app.synopsis, SynopsisState::default());
+        assert_eq!(app.episode_items_per_page, None);
         assert_eq!(app.page, 0);
         assert_eq!(app.next_library_page, None);
         assert_eq!(app.next_recent_page, None);
@@ -9651,7 +9681,7 @@ mod tests {
     fn episode_metadata_app(synopsis: String) -> Bomtoon {
         const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
         let pages = synopsis_pages(&synopsis);
-        Bomtoon {
+        let mut app = Bomtoon {
             account: AccountState::Active,
             connection: ConnectionState::Online,
             account_scope: Some(test_scope(SCOPE)),
@@ -9664,6 +9694,7 @@ mod tests {
             synopsis: SynopsisState {
                 pages,
                 open_page: None,
+                ..SynopsisState::default()
             },
             wallet: WalletState {
                 summary: Some(WalletSummary {
@@ -9694,8 +9725,17 @@ mod tests {
                 gift_eligible: false,
             }],
             ..Bomtoon::default()
-        }
+        };
+        app.prepare_episode_layout();
+        app
     }
+    fn episode_metadata_runner(synopsis: String) -> AppRunner<Bomtoon> {
+        let mut runner =
+            AppRunner::with_metrics(episode_metadata_app(synopsis), CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        runner
+    }
+
 
     fn screen_button_actions(screen: &Screen) -> Vec<ActionId> {
         screen
@@ -9755,8 +9795,7 @@ mod tests {
     #[test]
     fn whitespace_collapsed_synopsis_pages_remain_protocol_encodable() {
         let synopsis = format!("Lead{}Tail", " ".repeat(17_000));
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(synopsis.clone()), CLARA_BW_METRICS);
+        let mut runner = episode_metadata_runner(synopsis.clone());
         assert!(runner.app().synopsis.pages.iter().all(|range| {
             range.len() <= SYNOPSIS_MODAL_MAX_BYTES
                 && synopsis.is_char_boundary(range.start)
@@ -9798,8 +9837,8 @@ mod tests {
                 gift_eligible: false,
             })
             .collect();
-
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
         let mut observed = BTreeSet::new();
         loop {
             let screen = runner.app().episode_screen();
@@ -9867,6 +9906,7 @@ mod tests {
             })
             .collect();
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
         let mut observed = BTreeSet::new();
 
         loop {
@@ -9891,6 +9931,69 @@ mod tests {
 
         assert_eq!(observed, (0..12).collect());
     }
+    #[test]
+    fn transient_episode_controls_preserve_later_page_boundaries() {
+        const OWNER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
+        const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+
+        fn snapshot(app: &Bomtoon) -> (usize, (u16, u16), BTreeSet<usize>) {
+            let capacity = app.episode_page_capacity();
+            let screen = app.episode_screen();
+            assert_fits(&screen);
+            let position = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            let drawn = format!("{screen:?}");
+            let indexes = (0..app.episodes.len())
+                .filter(|index| drawn.contains(&format!("Episode {index} ·")))
+                .collect();
+            (capacity, position, indexes)
+        }
+
+        let mut app = episode_metadata_app("Short synopsis.".to_owned());
+        app.selected_creators = "Writer\nArtist\nColorist".to_owned();
+        app.episodes = (0..18)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: Some(1),
+                purchase_coin: Some(2),
+                gift_eligible: true,
+            })
+            .collect();
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        runner.app_mut().page = 1;
+        let baseline = snapshot(runner.app());
+        assert!(baseline.0 > 1, "{baseline:?}");
+        assert!(!baseline.2.is_empty());
+
+        runner.app_mut().gifts.error = true;
+        assert_eq!(snapshot(runner.app()), baseline);
+
+        runner.app_mut().purchase_rejection_notice = Some("FAIL");
+        assert_eq!(snapshot(runner.app()), baseline);
+
+        let marker = marker_for(test_scope(OWNER));
+        let _ = runner.app_mut().commerce.marker_loaded(Some(&marker));
+        let _ = runner.app_mut().commerce.safety_changed(
+            commerce::Authentication::Authenticated(test_scope(READER)),
+            commerce::Connectivity::Online,
+        );
+        assert!(runner
+            .app()
+            .commerce
+            .marker_belongs_to_another_account());
+        assert_eq!(snapshot(runner.app()), baseline);
+    }
+
 
 
     #[test]
@@ -9909,6 +10012,8 @@ mod tests {
         );
         assert_eq!(runner.app().synopsis.open_page, None);
         assert!(!runner.app().synopsis.pages.is_empty());
+        assert!(runner.app().episode_items_per_page.is_some());
+        assert!(!runner.app().synopsis.preview.is_empty());
     }
 
     #[test]
@@ -9930,12 +10035,12 @@ mod tests {
         runner.action(action_id("comic-0"));
 
         assert_eq!(runner.app().synopsis, SynopsisState::default());
+        assert_eq!(runner.app().episode_items_per_page, None);
     }
 
     #[test]
     fn suspending_closes_the_synopsis_modal() {
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(long_synopsis()), CLARA_BW_METRICS);
+        let mut runner = episode_metadata_runner(long_synopsis());
         runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
         assert!(runner.app().screen().overlay.is_some());
 
@@ -9950,8 +10055,7 @@ mod tests {
     #[test]
     fn synopsis_modal_pages_preserve_all_text_and_close_to_same_episode_page() {
         let synopsis = long_synopsis();
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(synopsis.clone()), CLARA_BW_METRICS);
+        let mut runner = episode_metadata_runner(synopsis.clone());
         runner.app_mut().page = 2;
 
         let open = runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
@@ -9990,8 +10094,7 @@ mod tests {
 
     #[test]
     fn back_closes_synopsis_before_leaving_episodes() {
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(long_synopsis()), CLARA_BW_METRICS);
+        let mut runner = episode_metadata_runner(long_synopsis());
         runner.app_mut().page = 2;
         runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
 
@@ -10006,8 +10109,7 @@ mod tests {
     fn open_synopsis_blocks_underlying_episode_actions() {
         const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
         let scope = test_scope(SCOPE);
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(long_synopsis()), CLARA_BW_METRICS);
+        let mut runner = episode_metadata_runner(long_synopsis());
         runner.app_mut().page = 2;
         runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
 
@@ -10151,7 +10253,7 @@ mod tests {
             purchase_coin: None,
             gift_eligible: false,
         };
-        let app = Bomtoon {
+        let mut app = Bomtoon {
             view: View::Episodes,
             selected_title: "Rental labels".to_owned(),
             episodes: vec![
@@ -10162,6 +10264,7 @@ mod tests {
             ],
             ..Bomtoon::default()
         };
+        app.prepare_episode_layout();
 
         let screen = app.episode_screen();
         let drawn = format!("{screen:?}");
@@ -13638,6 +13741,7 @@ mod tests {
             episodes,
             ..Bomtoon::default()
         });
+        runner.app_mut().prepare_episode_layout();
 
         let commands = runner.action(action_id(NEXT_PAGE));
         assert_eq!(runner.app().page, 1);
@@ -16393,7 +16497,7 @@ mod tests {
             purchase_coin: Some(usize::MAX),
             gift_eligible: true,
         };
-        let app = Bomtoon {
+        let mut app = Bomtoon {
             view: View::Episodes,
             selected_title: "Maximum commerce".to_owned(),
             selected_content_id: Some(41),
@@ -16422,6 +16526,7 @@ mod tests {
             ],
             ..Bomtoon::default()
         };
+        app.prepare_episode_layout();
 
         let screen = app.episode_screen();
         let drawn = format!("{screen:?}");
