@@ -1838,20 +1838,18 @@ impl Bomtoon {
     }
 
     fn episode_preview_fits(&self, preview: String, truncated: bool) -> bool {
-        let screen = self
-            .add_episode_body(
-                self.add_episode_header_preview(
-                    ScreenBuilder::new("bomtoon-episode-preview-measure").top_bar("Episodes"),
-                    preview,
-                    truncated,
-                ),
-                1,
-                0,
-            )
-            .build();
-        !screen
-            .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-            .has_errors()
+        let header = self.add_episode_header_preview(
+            ScreenBuilder::new("bomtoon-episode-preview-measure").top_bar("Episodes"),
+            preview,
+            truncated,
+        );
+        let pages = self.episodes.len().max(1);
+        (0..pages).all(|page| {
+            let screen = self.add_episode_body(header.clone(), 1, page).build();
+            !screen
+                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                .has_errors()
+        })
     }
 
     fn episode_synopsis_preview(&self) -> (String, bool) {
@@ -1904,13 +1902,16 @@ impl Bomtoon {
     }
     fn episode_page_capacity_for_header(&self, header: &ScreenBuilder) -> usize {
         for items_per_page in (1..=EPISODE_ITEMS_PER_PAGE).rev() {
-            let screen = self
-                .add_episode_body(header.clone(), items_per_page, 0)
-                .build();
-            if !screen
-                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-                .has_errors()
-            {
+            let pages = self.episodes.len().div_ceil(items_per_page).max(1);
+            let all_pages_fit = (0..pages).all(|page| {
+                let screen = self
+                    .add_episode_body(header.clone(), items_per_page, page)
+                    .build();
+                !screen
+                    .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                    .has_errors()
+            });
+            if all_pages_fit {
                 return items_per_page;
             }
         }
@@ -9843,6 +9844,54 @@ mod tests {
         }
         assert_eq!(modal_text, synopsis);
     }
+    #[test]
+    fn episode_capacity_fits_later_button_pages_without_skips_or_duplicates() {
+        let synopsis = "Line\n".repeat(48);
+        let mut app = episode_metadata_app(synopsis);
+        app.episodes = (0..12)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: if index < EPISODE_ITEMS_PER_PAGE {
+                    model::PurchaseState::Other("Locked".to_owned())
+                } else {
+                    model::PurchaseState::Owned
+                },
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let mut observed = BTreeSet::new();
+
+        loop {
+            let screen = runner.app().episode_screen();
+            let drawn = format!("{screen:?}");
+            for index in 0..runner.app().episodes.len() {
+                if drawn.contains(&format!("Episode {index} ·")) {
+                    assert!(observed.insert(index), "episode {index} was duplicated");
+                }
+            }
+            assert_fits(&screen);
+            let (current, total) = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            if current == total {
+                break;
+            }
+            runner.action(action_id(NEXT_PAGE));
+        }
+
+        assert_eq!(observed, (0..12).collect());
+    }
+
 
     #[test]
     fn accepting_content_precomputes_synopsis_pages() {
