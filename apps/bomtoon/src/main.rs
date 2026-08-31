@@ -56,6 +56,8 @@ const SYNOPSIS_PREVIOUS: &str = "synopsis-previous";
 const SYNOPSIS_NEXT: &str = "synopsis-next";
 const SYNOPSIS_CLOSE: &str = "synopsis-close";
 const SYNOPSIS_PREVIEW_BYTES: usize = 240;
+const EPISODE_TITLE_PREVIEW_BYTES: usize = 160;
+const EPISODE_CREATORS_PREVIEW_BYTES: usize = 160;
 // Mirrors kobo_protocol::MAX_STRING_LEN; kobo-sdk does not expose that ceiling.
 const SYNOPSIS_MODAL_MAX_BYTES: usize = 16 * 1024;
 
@@ -552,6 +554,48 @@ fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
 fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
     ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
         RowLead::Picture(picture, Glyph::Book)
+    })
+}
+
+fn episode_status(episode: &Episode, now_ms: Option<i64>) -> String {
+    match episode.purchase {
+        model::PurchaseState::Owned => "Owned".to_owned(),
+        model::PurchaseState::Rented => now_ms
+            .and_then(|now| episode.remaining_rental_hours(now))
+            .map_or_else(
+                || "Rented".to_owned(),
+                |hours| {
+                    let unit = if hours == 1 { "hr" } else { "hrs" };
+                    format!("{hours} {unit}")
+                },
+            ),
+        model::PurchaseState::Free => "Free".to_owned(),
+        model::PurchaseState::Sample => "Sample".to_owned(),
+        model::PurchaseState::NotOwned => String::new(),
+        model::PurchaseState::Other(_) => {
+            display_text(episode.purchase.label(), "Other status")
+        }
+    }
+}
+
+fn episode_screen_layout_fits(screen: &Screen) -> bool {
+    (0..2).all(|_| {
+        let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+        if diagnostics.has_errors() {
+            return false;
+        }
+        let content = diagnostics.layout.content;
+        screen.nodes.iter().all(|node| match node {
+            kobo_sdk::Node::Rows { rows, .. } => rows.iter().all(|row| {
+                diagnostics.layout.nodes.iter().any(|layout_node| {
+                    layout_node.kind.acts_on() == Some(row.action)
+                        && layout_node.rect.y >= content.y
+                        && layout_node.rect.y.saturating_add(layout_node.rect.height)
+                            <= content.y.saturating_add(content.height)
+                })
+            }),
+            _ => true,
+        })
     })
 }
 
@@ -1829,10 +1873,10 @@ impl Bomtoon {
         preview: String,
         truncated: bool,
     ) -> ScreenBuilder {
-        let screen = screen
-            .heading(self.selected_title.clone())
-            .text(self.selected_creators.clone())
-            .text(preview);
+        let (title, _) = comment_preview(&self.selected_title, EPISODE_TITLE_PREVIEW_BYTES);
+        let (creators, _) =
+            comment_preview(&self.selected_creators, EPISODE_CREATORS_PREVIEW_BYTES);
+        let screen = screen.heading(title).text(creators).text(preview);
         if truncated {
             screen.button(SYNOPSIS_MORE, "More")
         } else {
@@ -1909,44 +1953,88 @@ impl Bomtoon {
         )
     }
 
-    fn measure_episode_page_capacity_for_header(&self, header: &ScreenBuilder) -> usize {
-        for items_per_page in (1..=EPISODE_ITEMS_PER_PAGE).rev() {
-            let pages = self.episodes.len().div_ceil(items_per_page).max(1);
-            let all_pages_fit = (0..pages).all(|page| {
-                let screen = self
-                    .add_episode_body(header.clone(), items_per_page, page, true)
-                    .build();
-                !screen
-                    .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-                    .has_errors()
-            });
-            if all_pages_fit {
-                return items_per_page;
-            }
-        }
-        1
-    }
-
-    fn prepare_episode_layout(&mut self) {
-        let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
-        self.synopsis.preview = preview;
-        self.synopsis.preview_truncated = preview_truncated;
+    fn measure_episode_page_capacity(&mut self) -> usize {
         let header = self.add_episode_header(
             ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
         );
-        self.episode_items_per_page =
-            Some(self.measure_episode_page_capacity_for_header(&header));
+        let mut stable_capacity = EPISODE_ITEMS_PER_PAGE;
+        for _ in 0..2 {
+            let mut measured_capacity = 1;
+            for rows_per_page in (1..=EPISODE_ITEMS_PER_PAGE).rev() {
+                self.episode_items_per_page = Some(rows_per_page);
+                let pages = self.episodes.len().div_ceil(rows_per_page).max(1);
+                let all_pages_fit = (0..pages).all(|page| {
+                    let actual = self.episode_screen_for(page, rows_per_page, false);
+                    if !episode_screen_layout_fits(&actual) {
+                        return false;
+                    }
+                    let reserved = self
+                        .add_episode_body(header.clone(), rows_per_page, page, true)
+                        .build();
+                    episode_screen_layout_fits(&reserved)
+                });
+                if all_pages_fit {
+                    measured_capacity = rows_per_page;
+                    break;
+                }
+            }
+            stable_capacity = stable_capacity.min(measured_capacity);
+        }
+        if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES
+            || self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
+        {
+            1
+        } else {
+            stable_capacity
+        }
     }
 
-    fn episode_page_capacity(&self) -> usize {
+    fn prepare_episode_layout(&mut self) {
+        self.episode_items_per_page = None;
+        let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
+        self.synopsis.preview = preview;
+        self.synopsis.preview_truncated = preview_truncated;
+        let rows_per_page = self.measure_episode_page_capacity();
+        self.episode_items_per_page = Some(rows_per_page);
+    }
+
+    fn episode_rows_per_page(&self) -> usize {
         self.episode_items_per_page.unwrap_or(1)
+    }
+
+    fn visible_episode_anchor(&self) -> Option<usize> {
+        if self.view != View::Episodes {
+            return None;
+        }
+        let (start, end) = page_bounds(
+            self.page,
+            self.episodes.len(),
+            self.episode_rows_per_page(),
+        );
+        (start < end).then(|| self.episodes[start].id)
+    }
+
+    fn restore_episode_page(&mut self, anchor: Option<usize>, fallback_page: usize) {
+        let rows_per_page = self.episode_rows_per_page();
+        let last_page = self
+            .episodes
+            .len()
+            .saturating_sub(1)
+            .checked_div(rows_per_page)
+            .unwrap_or(0);
+        self.page = anchor
+            .and_then(|id| self.episodes.iter().position(|episode| episode.id == id))
+            .map_or_else(
+                || fallback_page.min(last_page),
+                |index| index / rows_per_page,
+            );
     }
 
 
     fn add_episode_body(
         &self,
         screen: ScreenBuilder,
-        items_per_page: usize,
+        rows_per_page: usize,
         page: usize,
         reserve_transient_space: bool,
     ) -> ScreenBuilder {
@@ -1969,51 +2057,28 @@ impl Bomtoon {
                 "A purchase is unresolved for another account. Restore the original account to refresh its status.",
             );
         }
-        let (start, end) = page_bounds(page, self.episodes.len(), items_per_page);
+        let (start, end) = page_bounds(page, self.episodes.len(), rows_per_page);
         let now_ms = unix_time_ms();
-        for (index, episode) in self.episodes[start..end].iter().enumerate() {
-            let index = start + index;
-            let title_fallback = format!("Episode {}", episode.alias);
-            let status = if episode.purchase == model::PurchaseState::Rented {
-                now_ms
-                    .and_then(|now| episode.remaining_rental_hours(now))
-                    .map_or_else(
-                        || "Read · Rented".to_owned(),
-                        |hours| {
-                            let unit = if hours == 1 { "hr" } else { "hrs" };
-                            format!("Read · {hours} {unit}")
-                        },
-                    )
-            } else {
-                match episode.purchase {
-                    model::PurchaseState::Owned
-                    | model::PurchaseState::Sample
-                    | model::PurchaseState::Free => "Read".to_owned(),
-                    model::PurchaseState::NotOwned if marker_belongs_to_another_account => {
-                        "Purchase locked".to_owned()
-                    }
-                    model::PurchaseState::NotOwned => "View options".to_owned(),
-                    model::PurchaseState::Rented => unreachable!(),
-                    model::PurchaseState::Other(_) => {
-                        display_text(episode.purchase.label(), "Other status")
-                    }
-                }
-            };
-            let label = format!(
-                "{} · {status}",
-                display_text(&episode.title, &title_fallback),
-            );
-            if reserve_transient_space
-                || episode.purchase.is_readable()
+        screen = screen.rows_with_trailing((start..end).map(|index| {
+            let episode = &self.episodes[index];
+            let title = display_text(&episode.title, &format!("Episode {}", episode.alias));
+            let action = if episode.purchase.is_readable()
                 || (episode.purchase == model::PurchaseState::NotOwned
                     && !marker_belongs_to_another_account)
             {
-                screen = screen.button(format!("episode-{index}"), label);
+                format!("episode-{index}")
             } else {
-                screen = screen.text(label);
-            }
-        }
-        let episode_pages = self.episodes.len().div_ceil(items_per_page).max(1);
+                format!("episode-disabled-{index}")
+            };
+            (
+                action,
+                title,
+                taipei_date(episode.opened_at).unwrap_or_else(|| "Unknown date".to_owned()),
+                cover_lead(&self.covers, episode.thumbnail_url.as_deref()),
+                episode_status(episode, now_ms),
+            )
+        }));
+        let episode_pages = self.episodes.len().div_ceil(rows_per_page).max(1);
         screen
             .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
             .page_position(
@@ -2022,30 +2087,42 @@ impl Bomtoon {
             )
     }
 
-    fn episode_screen(&self) -> Screen {
+    fn episode_screen_for(&self, page: usize, rows_per_page: usize, modal: bool) -> Screen {
         let header =
             self.add_episode_header(ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"));
-        let items_per_page = self.episode_page_capacity();
-        let mut screen = self.add_episode_body(header, items_per_page, self.page, false);
-        if let Some((page, range)) = self.synopsis.open_page.and_then(|page| {
-            self.synopsis
-                .pages
-                .get(page)
-                .map(|range| (page, range))
-        }) {
-            let synopsis = &self.selected_synopsis[range.clone()];
-            screen = screen.modal("Synopsis", |modal| {
-                let mut modal = modal.text(synopsis);
-                if page > 0 {
-                    modal = modal.button(SYNOPSIS_PREVIOUS, "Previous");
-                }
-                if page.saturating_add(1) < self.synopsis.pages.len() {
-                    modal = modal.button(SYNOPSIS_NEXT, "Next");
-                }
-                modal.button(SYNOPSIS_CLOSE, "Close")
-            });
+        let mut screen = self.add_episode_body(header, rows_per_page, page, false);
+        if modal {
+            if let Some((synopsis_page, range)) = self.synopsis.open_page.and_then(|synopsis_page| {
+                self.synopsis
+                    .pages
+                    .get(synopsis_page)
+                    .map(|range| (synopsis_page, range))
+            }) {
+                let synopsis = &self.selected_synopsis[range.clone()];
+                screen = screen.modal("Synopsis", |modal| {
+                    let mut modal = modal.text(synopsis);
+                    if synopsis_page > 0 {
+                        modal = modal.button(SYNOPSIS_PREVIOUS, "Previous");
+                    }
+                    if synopsis_page.saturating_add(1) < self.synopsis.pages.len() {
+                        modal = modal.button(SYNOPSIS_NEXT, "Next");
+                    }
+                    modal.button(SYNOPSIS_CLOSE, "Close")
+                });
+            }
         }
         screen.build()
+    }
+
+    fn episode_screen(&self) -> Screen {
+        let rows_per_page = self.episode_rows_per_page();
+        let last_page = self
+            .episodes
+            .len()
+            .saturating_sub(1)
+            .checked_div(rows_per_page)
+            .unwrap_or(0);
+        self.episode_screen_for(self.page.min(last_page), rows_per_page, true)
     }
 
     fn reader_screen(&self) -> Screen {
@@ -2840,6 +2917,8 @@ impl Bomtoon {
                         if self.selected_content_id == Some(selection.title_id)
                             && self.selected_content_alias == selection.title_alias
                         {
+                            let episode_anchor = self.visible_episode_anchor();
+                            let episode_page = self.page;
                             self.synopsis = SynopsisState {
                                 pages: synopsis_pages(&detail.synopsis),
                                 open_page: None,
@@ -2850,14 +2929,7 @@ impl Bomtoon {
                             self.selected_synopsis = detail.synopsis;
                             self.episodes = detail.episodes;
                             self.prepare_episode_layout();
-                            let items_per_page = self.episode_page_capacity();
-                            let last_page = self
-                                .episodes
-                                .len()
-                                .saturating_sub(1)
-                                .checked_div(items_per_page)
-                                .unwrap_or(0);
-                            self.page = self.page.min(last_page);
+                            self.restore_episode_page(episode_anchor, episode_page);
                         }
                         Evidence::Value(evidence)
                     }
@@ -4582,6 +4654,10 @@ impl Bomtoon {
                     Ok(detail) => {
                         let reader_after_refresh = self.reader_after_content_refresh.take();
                         let episode_page = self.page;
+                        let episode_anchor = self.visible_episode_anchor();
+                        let refreshed_episode_id = reader_after_refresh
+                            .and_then(|index| self.episodes.get(index))
+                            .map(|episode| episode.id);
                         self.selected_content_id = Some(detail.id);
                         self.synopsis = SynopsisState {
                             pages: synopsis_pages(&detail.synopsis),
@@ -4593,24 +4669,24 @@ impl Bomtoon {
                         self.selected_synopsis = detail.synopsis;
                         self.episodes = detail.episodes;
                         self.prepare_episode_layout();
-                        self.page = if reader_after_refresh.is_some() {
-                            let items_per_page = self.episode_page_capacity();
-                            episode_page.min(
-                                self.episodes
-                                    .len()
-                                    .div_ceil(items_per_page)
-                                    .saturating_sub(1),
-                            )
-                        } else {
-                            0
-                        };
+                        self.restore_episode_page(
+                            episode_anchor,
+                            if reader_after_refresh.is_some() {
+                                episode_page
+                            } else {
+                                0
+                            },
+                        );
                         self.view = View::Episodes;
-                        let refreshed_rental = reader_after_refresh.is_some_and(|index| {
+                        let refreshed_index = refreshed_episode_id.and_then(|id| {
+                            self.episodes.iter().position(|episode| episode.id == id)
+                        });
+                        let refreshed_rental = refreshed_index.is_some_and(|index| {
                             self.episodes.get(index).is_some_and(|episode| {
                                 episode.purchase == model::PurchaseState::Rented
                             })
                         });
-                        if let Some(index) = reader_after_refresh.filter(|_| refreshed_rental) {
+                        if let Some(index) = refreshed_index.filter(|_| refreshed_rental) {
                             self.start_reader_episode(context, index);
                         } else {
                             self.refresh_title_gifts(context, GiftTaskPurpose::Display);
@@ -6251,7 +6327,7 @@ impl KoboApp for Bomtoon {
             self.page = self.page.saturating_sub(1);
         } else if action == action_id(NEXT_PAGE) {
             let items_per_page = if self.view == View::Episodes {
-                self.episode_page_capacity()
+                self.episode_rows_per_page()
             } else {
                 LIBRARY_ITEMS_PER_PAGE
             };
@@ -8075,6 +8151,7 @@ mod tests {
             purchase_coin: Some(2),
             gift_eligible: true,
         });
+        app.prepare_episode_layout();
 
         let screen = runner.app().screen();
         let drawn = format!("{screen:?}");
@@ -8084,15 +8161,22 @@ mod tests {
             ),
             "{drawn}"
         );
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { action, .. } if *action == action_id("episode-0")
-        )));
-        assert!(!screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { action, .. } if *action == action_id("episode-1")
-        )));
-        assert!(drawn.contains("Paid Episode · Purchase locked"), "{drawn}");
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("episode rows");
+        assert!(rows
+            .iter()
+            .any(|row| row.action == action_id("episode-0")));
+        assert!(rows.iter().any(|row| {
+            row.title == "Paid Episode"
+                && row.action == action_id("episode-disabled-1")
+                && row.trailing.is_none()
+        }));
 
         let commands = runner.action(action_id("episode-1"));
         assert!(spawns(&commands).is_empty(), "{commands:?}");
@@ -9844,12 +9928,23 @@ mod tests {
             let screen = runner.app().episode_screen();
             let actions = screen_button_actions(&screen);
             assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+            let rows = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .expect("episode rows");
             for index in 0..EPISODE_ITEMS_PER_PAGE {
-                if actions.contains(&action_id(&format!("episode-{index}"))) {
+                if rows
+                    .iter()
+                    .any(|row| row.action == action_id(&format!("episode-{index}")))
+                {
                     observed.insert(index);
                 }
             }
-            assert!(!observed.is_empty());
+            assert!(!rows.is_empty());
             assert_fits(&screen);
             let (current, total) = screen
                 .page_turns
@@ -9911,11 +10006,18 @@ mod tests {
 
         loop {
             let screen = runner.app().episode_screen();
-            let drawn = format!("{screen:?}");
-            for index in 0..runner.app().episodes.len() {
-                if drawn.contains(&format!("Episode {index} ·")) {
-                    assert!(observed.insert(index), "episode {index} was duplicated");
-                }
+            let rows = screen.nodes.iter().find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            });
+            for row in rows.into_iter().flatten() {
+                let index = runner
+                    .app()
+                    .episodes
+                    .iter()
+                    .position(|episode| episode.title == row.title)
+                    .expect("row identifies an episode");
+                assert!(observed.insert(index), "episode {index} was duplicated");
             }
             assert_fits(&screen);
             let (current, total) = screen
@@ -9937,7 +10039,7 @@ mod tests {
         const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
 
         fn snapshot(app: &Bomtoon) -> (usize, (u16, u16), BTreeSet<usize>) {
-            let capacity = app.episode_page_capacity();
+            let capacity = app.episode_rows_per_page();
             let screen = app.episode_screen();
             assert_fits(&screen);
             let position = screen
@@ -9945,9 +10047,21 @@ mod tests {
                 .as_ref()
                 .and_then(|turns| turns.position)
                 .expect("episode position");
-            let drawn = format!("{screen:?}");
-            let indexes = (0..app.episodes.len())
-                .filter(|index| drawn.contains(&format!("Episode {index} ·")))
+            let indexes = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .into_iter()
+                .flatten()
+                .map(|row| {
+                    app.episodes
+                        .iter()
+                        .position(|episode| episode.title == row.title)
+                        .expect("row identifies an episode")
+                })
                 .collect();
             (capacity, position, indexes)
         }
@@ -9992,6 +10106,265 @@ mod tests {
             .commerce
             .marker_belongs_to_another_account());
         assert_eq!(snapshot(runner.app()), baseline);
+    }
+
+    #[test]
+    fn episode_rows_show_thumbnail_date_and_truthful_access_status() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms().expect("host clock");
+        let thumbnail_url =
+            "https://image.balcony.studio/tw/ep_thumbnail/owned.webp".to_owned();
+        let picture = TilePicture::new(PictureHandle(73), 60, 60);
+        let episode = |id: usize,
+                       title: &str,
+                       purchase: model::PurchaseState,
+                       rent_expires_at: Option<i64>,
+                       thumbnail_url: Option<String>| Episode {
+            id,
+            alias: format!("ep-{id}"),
+            title: title.to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url,
+            purchase,
+            rent_expires_at,
+            rent_coin: Some(1),
+            purchase_coin: Some(2),
+            gift_eligible: false,
+        };
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.episodes = vec![
+            episode(
+                0,
+                "Owned episode",
+                model::PurchaseState::Owned,
+                None,
+                Some(thumbnail_url.clone()),
+            ),
+            episode(
+                1,
+                "Rented episode",
+                model::PurchaseState::Rented,
+                Some(now_ms + 2 * HOUR_MS),
+                None,
+            ),
+            episode(2, "Free episode", model::PurchaseState::Free, None, None),
+            episode(
+                3,
+                "Sample episode",
+                model::PurchaseState::Sample,
+                None,
+                None,
+            ),
+            episode(
+                4,
+                "Unowned episode",
+                model::PurchaseState::NotOwned,
+                None,
+                None,
+            ),
+            episode(
+                5,
+                "Unknown episode",
+                model::PurchaseState::Other("FUTURE".to_owned()),
+                None,
+                None,
+            ),
+        ];
+        app.covers.entries.insert(
+            thumbnail_url,
+            CoverState::Ready(picture),
+        );
+        app.episode_items_per_page = Some(app.episodes.len());
+        let account_scope = app.account_scope.clone().expect("account scope");
+        let _ = app.commerce.marker_loaded(None);
+        let _ = app.commerce.safety_changed(
+            commerce::Authentication::Authenticated(account_scope),
+            commerce::Connectivity::Online,
+        );
+
+        let screen = app.episode_screen();
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("episode rows");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0].title, "Owned episode");
+        assert_eq!(rows[0].summary, "2024-02-29");
+        assert_eq!(rows[0].trailing.as_deref(), Some("Owned"));
+        assert!(matches!(
+            rows[0].lead,
+            RowLead::Picture(lead, Glyph::Book) if lead == picture
+        ));
+        assert_eq!(rows[1].trailing.as_deref(), Some("2 hrs"));
+        assert_eq!(rows[2].trailing.as_deref(), Some("Free"));
+        assert_eq!(rows[3].trailing.as_deref(), Some("Sample"));
+        assert_eq!(rows[4].trailing, None);
+        assert_eq!(rows[5].trailing.as_deref(), Some("FUTURE"));
+        assert_eq!(rows[4].action, action_id("episode-4"));
+        assert_eq!(rows[5].action, action_id("episode-disabled-5"));
+
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id("episode-disabled-5"));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Idle
+        );
+
+        let commands = runner.action(action_id("episode-4"));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Quoting
+        );
+    }
+
+    #[test]
+    fn rich_episode_capacity_fits_every_page_without_skips_or_state_drift() {
+        let mut app = episode_metadata_app("節".repeat(80));
+        app.selected_title = "界".repeat(85);
+        app.selected_creators = "作".repeat(170);
+        app.wallet.summary = Some(WalletSummary {
+            coins: model::AssetAmounts {
+                standard: usize::MAX,
+                bonus: 0,
+                free: 0,
+            },
+            tickets: model::AssetAmounts::default(),
+        });
+        app.episodes = (0..18)
+            .map(|index| Episode {
+                id: 500 + index,
+                alias: format!("ep-{index}"),
+                title: format!("{index}{}", "集".repeat(169)),
+                opened_at: i64::MAX,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Other("未".repeat(42)),
+                rent_expires_at: None,
+                rent_coin: Some(usize::MAX),
+                purchase_coin: Some(usize::MAX),
+                gift_eligible: true,
+            })
+            .collect();
+        app.prepare_episode_layout();
+        let capacity = app.episode_rows_per_page();
+        assert!((1..=EPISODE_ITEMS_PER_PAGE).contains(&capacity));
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let mut observed = BTreeSet::new();
+
+        loop {
+            let screen = runner.app().episode_screen();
+            assert_fits(&screen);
+            let rows = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .expect("episode rows");
+            assert!(!rows.is_empty());
+            for row in rows {
+                let index = (0..runner.app().episodes.len())
+                    .find(|index| {
+                        row.action == action_id(&format!("episode-disabled-{index}"))
+                    })
+                    .expect("row action identifies an episode");
+                assert!(observed.insert(index), "episode {index} was duplicated");
+            }
+            let (current, total) = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            if current == total {
+                let final_page = runner.app().page;
+                runner.action(action_id(NEXT_PAGE));
+                assert_eq!(runner.app().page, final_page);
+                break;
+            }
+            runner.action(action_id(NEXT_PAGE));
+            assert_eq!(runner.app().episode_rows_per_page(), capacity);
+        }
+        assert_eq!(observed, (0..runner.app().episodes.len()).collect());
+
+        runner.app_mut().gifts.error = true;
+        runner.app_mut().purchase_rejection_notice = Some("FAIL");
+        assert_eq!(runner.app().episode_rows_per_page(), capacity);
+        assert_fits(&runner.app().episode_screen());
+    }
+
+    #[test]
+    fn refreshed_episode_data_preserves_the_visible_episode_anchor() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms().expect("host clock");
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.episodes = (0..12)
+            .map(|index| Episode {
+                id: 700 + index,
+                alias: format!("anchor-{index}"),
+                title: format!("Anchor {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        app.prepare_episode_layout();
+        let capacity = app.episode_rows_per_page();
+        assert!(app.episodes.len() > capacity);
+        app.page = 1;
+        let anchor_index = capacity;
+        let anchor_alias = app.episodes[anchor_index].alias.clone();
+        app.episodes[anchor_index].purchase = model::PurchaseState::Rented;
+        app.episodes[anchor_index].rent_expires_at = Some(now_ms - HOUR_MS);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id(&format!("episode-{anchor_index}")));
+        let (refresh_task, _) = only_spawn(&commands);
+        let reordered = (0..12)
+            .filter(|index| *index != anchor_index)
+            .chain(std::iter::once(anchor_index))
+            .map(|index| {
+                format!(
+                    "{{\"id\":{},\"alias\":\"anchor-{index}\",\"title\":\"Anchor {index}\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\"}}",
+                    700 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        runner.task_outcome(
+            refresh_task,
+            TaskOutcome::Completed(detail_response(41, "hunter_q", "Hunter Q", &reordered)),
+        );
+
+        assert_eq!(runner.app().view, View::Episodes);
+        let refreshed_index = runner
+            .app()
+            .episodes
+            .iter()
+            .position(|episode| episode.alias == anchor_alias)
+            .expect("refreshed anchor");
+        let refreshed_capacity = runner.app().episode_rows_per_page();
+        assert_eq!(runner.app().page, refreshed_index / refreshed_capacity);
+        let (start, end) = page_bounds(
+            runner.app().page,
+            runner.app().episodes.len(),
+            refreshed_capacity,
+        );
+        assert!((start..end).contains(&refreshed_index));
     }
 
 
@@ -10148,15 +10521,24 @@ mod tests {
             content_task,
             TaskOutcome::Completed(content_response()),
         );
-        let screen = last_screen(&commands);
-        let actions = screen
-            .nodes
-            .iter()
-            .filter_map(|node| match node {
-                Node::Button { action, .. } => Some(*action),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let capacity = runner.app().episode_rows_per_page();
+        let pages = runner.app().episodes.len().div_ceil(capacity);
+        let mut actions = Vec::new();
+        for page in 0..pages {
+            let screen = runner.app().episode_screen_for(page, capacity, false);
+            actions.extend(
+                screen
+                    .nodes
+                    .iter()
+                    .find_map(|node| match node {
+                        Node::Rows { rows, .. } => Some(rows),
+                        _ => None,
+                    })
+                    .into_iter()
+                    .flatten()
+                    .map(|row| row.action),
+            );
+        }
         assert!(actions.contains(&action_id("episode-0")));
         assert!(actions.contains(&action_id("episode-1")));
         assert!(actions.contains(&action_id("episode-2")));
@@ -10186,10 +10568,12 @@ mod tests {
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets 4"));
         assert!(!drawn.contains("Ticket ·"));
-        assert!(drawn.contains("Read · Rented"));
-        assert!(screen.nodes.iter().any(
-            |node| matches!(node, Node::Button { action, .. } if *action == action_id("episode-3"))
-        ));
+        assert!(drawn.contains("Rented"));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-3"))
+        )));
         assert_fits(&screen);
     }
 
@@ -10233,7 +10617,7 @@ mod tests {
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets"));
         assert!(!drawn.contains("Ticket ·"));
-        assert!(drawn.contains("Read · Rented"));
+        assert!(drawn.contains("Rented"));
         assert_fits(&screen);
     }
 
@@ -10267,19 +10651,23 @@ mod tests {
         app.prepare_episode_layout();
 
         let screen = app.episode_screen();
-        let drawn = format!("{screen:?}");
-        assert!(drawn.contains("Read · 48 hrs"));
-        assert!(drawn.contains("Read · 1 hr"));
-        assert!(drawn.contains("Read · 0 hrs"));
-        assert!(drawn.contains("Read · Rented"));
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("rental rows");
         assert_eq!(
-            screen
-                .nodes
-                .iter()
-                .filter(|node| matches!(node, Node::Button { .. }))
-                .count(),
-            4
+            rows.iter()
+                .map(|row| row.trailing.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("48 hrs"), Some("1 hr"), Some("0 hrs"), Some("Rented")]
         );
+        assert!(rows
+            .iter()
+            .all(|row| row.action != action_id("episode-disabled-0")));
         assert_fits(&screen);
     }
 
@@ -16535,11 +16923,20 @@ mod tests {
             "missing independent balances: {drawn}"
         );
         assert!(!drawn.contains("Tickets"));
-        assert!(drawn.contains("Read"));
-        assert!(drawn.contains("View options"));
-        assert!(screen.nodes.iter().any(
-            |node| matches!(node, Node::Button { label, .. } if label.contains("View options"))
-        ));
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("commerce episode rows");
+        assert!(rows
+            .iter()
+            .any(|row| row.trailing.as_deref() == Some("Owned")));
+        assert!(rows.iter().any(|row| {
+            row.action == action_id("episode-3") && row.trailing.is_none()
+        }));
         assert_fits(&screen);
     }
 
@@ -16639,7 +17036,11 @@ mod tests {
             Node::Button { action, label, .. }
                 if *action == action_id(RETRY_GIFTS) && label.contains("Retry Gift")
         )));
-        assert!(format!("{screen:?}").contains("Paid Episode · View options"));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-0"))
+        )));
         assert_fits(&screen);
 
         let commands = runner.action(action_id(RETRY_GIFTS));
@@ -17227,8 +17628,13 @@ mod tests {
 
         assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
         assert!(runner.app().retained_quote.is_none());
-        let drawn = format!("{:?}", last_screen(&commands));
-        assert!(drawn.contains("Paid Episode · View options"), "{drawn}");
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-0"))
+        )));
         assert!(!drawn.contains("Use Gift"), "{drawn}");
     }
 
