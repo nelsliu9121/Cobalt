@@ -6,9 +6,9 @@ mod parse;
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, ControlState, DeviceRequest, DeviceResult,
-    Failure, Glyph, KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen,
-    ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, TileShape,
-    CLARA_BW_METRICS,
+    DiagnosticSeverity, Failure, Glyph, KoboApp, LayoutIssueKind, LocalDay, PictureHandle,
+    ReadingChrome, RowLead, Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome,
+    TilePicture, TileShape, CLARA_BW_METRICS,
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
@@ -191,9 +191,21 @@ fn comment_preview(text: &str, max_bytes: usize) -> (String, bool) {
 
 fn normalized_header_preview(text: &str, max_bytes: usize, fallback: &str) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let visible = display_text(&normalized, fallback);
-    comment_preview(&visible, max_bytes).0
+    let visible = if normalized.is_empty() {
+        fallback
+    } else {
+        &normalized
+    };
+    comment_preview(visible, max_bytes).0
 }
+fn normalized_header_len(text: &str) -> usize {
+    text.split_whitespace()
+        .map(str::len)
+        .enumerate()
+        .map(|(index, len)| len + usize::from(index > 0))
+        .sum()
+}
+
 fn synopsis_modal_fits(text: &str) -> bool {
     let screen = ScreenBuilder::new("bomtoon-synopsis-measure")
         .top_bar("Episodes")
@@ -587,7 +599,13 @@ fn episode_status(episode: &Episode, now_ms: Option<i64>) -> String {
 fn episode_screen_layout_fits(screen: &Screen) -> bool {
     (0..2).all(|_| {
         let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
-        if diagnostics.has_errors() {
+        if diagnostics.issues.iter().any(|issue| {
+            issue.severity == DiagnosticSeverity::Error
+                && !matches!(
+                    issue.kind,
+                    LayoutIssueKind::UnsupportedCharacter { .. }
+                )
+        }) {
             return false;
         }
         let content = diagnostics.layout.content;
@@ -2004,6 +2022,10 @@ impl Bomtoon {
     }
 
     fn prepare_episode_layout(&mut self) {
+        let title_fits_default =
+            normalized_header_len(&self.selected_title) <= EPISODE_TITLE_PREVIEW_BYTES;
+        let creators_fit_default =
+            normalized_header_len(&self.selected_creators) <= EPISODE_CREATORS_PREVIEW_BYTES;
         for (title_bytes, creator_bytes) in [
             (
                 EPISODE_TITLE_PREVIEW_BYTES,
@@ -2014,6 +2036,16 @@ impl Bomtoon {
             (24, 24),
         ] {
             self.episode_items_per_page = None;
+            let title_bytes = if title_fits_default {
+                EPISODE_TITLE_PREVIEW_BYTES
+            } else {
+                title_bytes
+            };
+            let creator_bytes = if creators_fit_default {
+                EPISODE_CREATORS_PREVIEW_BYTES
+            } else {
+                creator_bytes
+            };
             self.episode_title_preview =
                 normalized_header_preview(&self.selected_title, title_bytes, "Comic");
             self.episode_creators_preview =
@@ -2027,8 +2059,24 @@ impl Bomtoon {
             }
         }
 
-        self.episode_title_preview = "Comic".to_owned();
-        self.episode_creators_preview = "Creators unavailable".to_owned();
+        self.episode_title_preview = normalized_header_preview(
+            &self.selected_title,
+            if title_fits_default {
+                EPISODE_TITLE_PREVIEW_BYTES
+            } else {
+                24
+            },
+            "Comic",
+        );
+        self.episode_creators_preview = normalized_header_preview(
+            &self.selected_creators,
+            if creators_fit_default {
+                EPISODE_CREATORS_PREVIEW_BYTES
+            } else {
+                24
+            },
+            "Creators unavailable",
+        );
         self.synopsis.preview.clear();
         self.synopsis.preview_truncated = !self.selected_synopsis.is_empty();
         self.episode_items_per_page = None;
@@ -10385,6 +10433,35 @@ mod tests {
                 if rows.len() == 1 && rows[0].action == action_id("episode-0")
         )));
         assert_fits(&screen);
+    }
+
+    #[test]
+    fn unicode_episode_header_preserves_korean_and_cjk_copy_while_fitting() {
+        let title = "사냥꾼 Q와 漫畫".to_owned();
+        let creators = "글 김작가 | 그림 林老師".to_owned();
+        let mut app = episode_metadata_app("짧은 줄거리.".to_owned());
+        app.selected_title.clone_from(&title);
+        app.selected_creators.clone_from(&creators);
+
+        app.prepare_episode_layout();
+
+        assert_eq!(app.selected_title, title);
+        assert_eq!(app.selected_creators, creators);
+        let screen = app.episode_screen();
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Heading { text, .. } if text == &title
+        )));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Text { text, .. } if text == &creators
+        )));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.len() == 1 && rows[0].action == action_id("episode-0")
+        )));
+        assert!(episode_screen_layout_fits(&screen));
     }
 
     #[test]
