@@ -13,6 +13,8 @@ const CHARGE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/payment/char
 const GIFTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/gift/contents/detail";
 const QUOTE_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/price/";
 const PURCHASE_URL: &str = "https://www.bomtoon.tw/api/balcony-api/purchase";
+const COMMENTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/contents/";
+const REPLIES_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/reply/CONTENTS/";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
 const CONTENT_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
@@ -20,7 +22,20 @@ const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
 const ASSET_HISTORY_BYTES: u32 = 512 * 1024;
 const COMMERCE_BYTES: u32 = 64 * 1024;
+const COMMENT_BYTES: u32 = 512 * 1024;
 const ACCEPT_LANGUAGE: &str = "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommentOrder {
+    Hot,
+    Newest,
+}
+
+impl CommentOrder {
+    const fn is_best(self) -> bool {
+        matches!(self, Self::Hot)
+    }
+}
 
 pub fn homepage() -> Task {
     public_fetch(HOMEPAGE_URL.to_owned())
@@ -97,6 +112,40 @@ pub fn images(content: &str, episode: &str, panel_width: u32) -> Task {
     fetch(
         format!("{IMAGES_URL}{content}/{episode}?imageWidth={panel_width}"),
         IMAGE_MANIFEST_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        headers,
+    )
+}
+
+pub fn comments(content: &str, episode: &str, order: CommentOrder, page: usize) -> Task {
+    let mut headers = balcony_headers();
+    headers.push(Header::new(
+        "x-referer",
+        format!("https://www.bomtoon.tw/comment/{content}/{episode}"),
+    ));
+    fetch(
+        format!(
+            "{COMMENTS_URL}{content}/{episode}?isBest={}&page={page}",
+            order.is_best()
+        ),
+        COMMENT_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        headers,
+    )
+}
+
+pub fn replies(comment_id: usize, order: CommentOrder, page: usize) -> Task {
+    let mut headers = balcony_headers();
+    headers.push(Header::new(
+        "x-referer",
+        format!("https://www.bomtoon.tw/comment/reply/{comment_id}"),
+    ));
+    fetch(
+        format!(
+            "{REPLIES_URL}{comment_id}?isBest={}&page={page}",
+            order.is_best()
+        ),
+        COMMENT_BYTES,
         Credential::bearer("bomtoon-access-token"),
         headers,
     )
@@ -211,8 +260,9 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        account_scope, asset_summary, content, expiration_history, homepage, image, images,
-        library, public_detail, purchase, quote, recent, title_gifts, ACCEPT_LANGUAGE,
+        account_scope, asset_summary, comments, content, expiration_history, homepage, image,
+        images, library, public_detail, purchase, quote, recent, replies, title_gifts,
+        CommentOrder, ACCEPT_LANGUAGE,
     };
     use crate::model::{AssetKind, PurchaseType};
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
@@ -315,6 +365,58 @@ mod tests {
         assert!(headers.iter().all(|header| {
             !header.name.eq_ignore_ascii_case("cookie")
                 && !header.name.eq_ignore_ascii_case("authorization")
+        }));
+    }
+
+    #[test]
+    fn comments_use_observed_order_endpoint_and_referer() {
+        for (order, flag) in [(CommentOrder::Hot, "true"), (CommentOrder::Newest, "false")] {
+            let Task::Fetch {
+                url,
+                max_bytes,
+                credential,
+                headers,
+                ..
+            } = comments("365", "1", order, 2)
+            else {
+                panic!("expected fetch task");
+            };
+            assert_eq!(
+                url,
+                format!(
+                    "https://www.bomtoon.tw/api/balcony-api/comment/contents/365/1?isBest={flag}&page=2"
+                )
+            );
+            assert_eq!(max_bytes, 512 * 1024);
+            assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+            assert!(headers.iter().any(|header| {
+                header.name.eq_ignore_ascii_case("x-referer")
+                    && header.value == "https://www.bomtoon.tw/comment/365/1"
+            }));
+        }
+    }
+
+    #[test]
+    fn replies_use_observed_contents_route_and_referer() {
+        let Task::Fetch {
+            url,
+            max_bytes,
+            credential,
+            headers,
+            ..
+        } = replies(354_980, CommentOrder::Hot, 3)
+        else {
+            panic!("expected fetch task");
+        };
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api/comment/reply/CONTENTS/354980?isBest=true&page=3"
+        );
+        assert_eq!(max_bytes, 512 * 1024);
+        assert_eq!(credential, Some(Credential::bearer("bomtoon-access-token")));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("x-referer")
+                && header.value == "https://www.bomtoon.tw/comment/reply/354980"
         }));
     }
 

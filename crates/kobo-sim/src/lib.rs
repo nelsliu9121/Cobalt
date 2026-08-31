@@ -43,6 +43,10 @@ fn profile_metrics() -> DisplayMetrics {
     }
 }
 
+fn simulator_chrome(screen: &Screen) -> kobo_ui::Chrome {
+    kobo_ui::Chrome::with_back(screen.owns_back)
+}
+
 fn local_day_at(timestamp: Timestamp, time_zone: &TimeZone) -> Option<LocalDay> {
     let date = time_zone.to_datetime(timestamp).date();
     LocalDay::new(
@@ -423,13 +427,8 @@ impl Simulator {
         let metrics = profile_metrics();
         let format = kobo_ui::surface_format_for(&self.screen, &metrics, &());
         let mut surface = Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
-        kobo_ui::render_with(
-            &self.screen,
-            &metrics,
-            &kobo_ui::Chrome::default(),
-            &mut surface,
-            None,
-        );
+        let chrome = simulator_chrome(&self.screen);
+        kobo_ui::render_with(&self.screen, &metrics, &chrome, &mut surface, None);
         self.panel.update(&surface);
     }
 
@@ -438,7 +437,10 @@ impl Simulator {
         let raw = POSE.display_to_touch(display_x, display_y)?;
         let display = POSE.touch_to_display(raw.0, raw.1)?;
         self.last_touch = Some(SimulatedTouch { display, raw });
-        let action = self.screen.hit_test(
+        let layout = self
+            .screen
+            .layout_with(&profile_metrics(), &simulator_chrome(&self.screen));
+        let action = layout.hit_test(
             i32::try_from(display.0).ok()?,
             i32::try_from(display.1).ok()?,
         )?;
@@ -1223,10 +1225,11 @@ fn render_app_panel(state: &mut AppState) {
     let metrics = profile_metrics();
     let format = kobo_ui::surface_format_for(&state.screen, &metrics, state.active_pictures());
     let mut surface = Surface::new_in(PROFILE.width as usize, PROFILE.height as usize, format);
+    let chrome = simulator_chrome(&state.screen);
     kobo_ui::render_all(
         &state.screen,
         &metrics,
-        &kobo_ui::Chrome::default(),
+        &chrome,
         state.active_pictures(),
         &mut surface,
         None,
@@ -1321,8 +1324,10 @@ impl AppSession {
             display: mapped,
             raw,
         });
+        let chrome = simulator_chrome(&state.screen);
         state
             .screen
+            .layout_with(&profile_metrics(), &chrome)
             .hit_test(i32::try_from(mapped.0).ok()?, i32::try_from(mapped.1).ok()?)
     }
 
@@ -1448,8 +1453,8 @@ impl AppSession {
 }
 
 fn diagnostics_json(screen: &Screen, pictures: &kobo_ui::PictureCache) -> String {
-    let diagnostics =
-        screen.diagnostics_with_pictures(&profile_metrics(), &kobo_ui::Chrome::default(), pictures);
+    let chrome = simulator_chrome(screen);
+    let diagnostics = screen.diagnostics_with_pictures(&profile_metrics(), &chrome, pictures);
     let mut json = String::from("{\"issues\":[");
     for (index, issue) in diagnostics.issues.iter().enumerate() {
         if index > 0 {
@@ -1578,7 +1583,8 @@ fn parse_lifecycle(bytes: &[u8]) -> Option<Lifecycle> {
 /// class of fault worth catching.
 fn layout_json(screen: &Screen, paints: u64) -> String {
     let metrics = profile_metrics();
-    let layout = screen.layout_with(&metrics, &kobo_ui::Chrome::default());
+    let chrome = simulator_chrome(screen);
+    let layout = screen.layout_with(&metrics, &chrome);
     let mut json = format!("{{\"paints\":{paints},\"nodes\":[");
     for (index, node) in layout.nodes.iter().enumerate() {
         if index > 0 {
@@ -3495,6 +3501,34 @@ mod tests {
         assert_eq!(
             session.state.lock().expect("state lock").lifecycle,
             Lifecycle::Background
+        );
+    }
+
+    #[test]
+    fn interactive_layout_includes_app_owned_back() {
+        let screen = Screen::new(1, Vec::new())
+            .with_top_bar(kobo_ui::TopBar::new(NodeId(1), "Reader"))
+            .with_own_back(true);
+
+        let payload = layout_json(&screen, 0);
+
+        assert!(payload.contains("\"kind\":\"Back\""), "{payload}");
+        assert!(
+            payload.contains(&format!("\"action\":{}", ActionId::BACK.0)),
+            "{payload}"
+        );
+        let layout = screen.layout_with(&profile_metrics(), &simulator_chrome(&screen));
+        let back = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == kobo_ui::LayoutKind::Back)
+            .expect("Back layout node")
+            .rect;
+        let mut simulator = Simulator::new();
+        simulator.screen = screen;
+        assert_eq!(
+            simulator.touch(back.x + back.width / 2, back.y + back.height / 2),
+            Some(ActionId::BACK)
         );
     }
 

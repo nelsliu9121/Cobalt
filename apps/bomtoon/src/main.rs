@@ -11,8 +11,8 @@ use kobo_sdk::{
     CLARA_BW_METRICS,
 };
 use model::{
-    display_text, AssetKind, AssetSubtype, Comic, Episode, EpisodeImage, ExpirationRow, Homepage,
-    RecentEntry, ShelfComic, WalletSummary,
+    display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
+    Homepage, RecentEntry, ShelfComic, WalletSummary,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
@@ -42,6 +42,15 @@ const HISTORY_WINDOW_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const READER_PREVIOUS: &str = "reader-previous";
 const READER_NEXT: &str = "reader-next";
 const READER_CHROME: &str = "reader-chrome";
+const ALL_COMMENTS: &str = "all-comments";
+const COMMENTS_PREVIOUS: &str = "comments-previous";
+const COMMENTS_NEXT: &str = "comments-next";
+const REPLIES_PREVIOUS: &str = "replies-previous";
+const REPLIES_NEXT: &str = "replies-next";
+const APPENDIX_COMMENT_LIMIT: usize = 4;
+const APPENDIX_COMMENT_PREVIEW_BYTES: usize = 96;
+const COMMENT_LIST_PREVIEW_BYTES: usize = 320;
+const COMMENT_DETAIL_BYTES: usize = 320;
 const MAIN_DESTINATIONS: [(&str, &str); 3] = [
     (FEATURED, "Featured"),
     (RECENT, "Recent"),
@@ -56,6 +65,18 @@ enum View {
     Account,
     Episodes,
     Reader,
+    CommentAppendix,
+    Comments,
+    Replies,
+}
+
+impl View {
+    const fn is_reader_flow(self) -> bool {
+        matches!(
+            self,
+            Self::Reader | Self::CommentAppendix | Self::Comments | Self::Replies
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -123,6 +144,55 @@ fn taipei_date(timestamp_ms: i64) -> Option<String> {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn taipei_datetime(timestamp_ms: i64) -> Option<String> {
+    const TAIPEI_OFFSET_MS: i64 = 8 * 60 * 60 * 1_000;
+    const HOUR_MS: i64 = 60 * 60 * 1_000;
+    const MINUTE_MS: i64 = 60 * 1_000;
+    let local = timestamp_ms.checked_add(TAIPEI_OFFSET_MS)?;
+    let time = local.rem_euclid(24 * HOUR_MS);
+    let hour = time / HOUR_MS;
+    let minute = time.rem_euclid(HOUR_MS) / MINUTE_MS;
+    Some(format!(
+        "{} {hour:02}:{minute:02}",
+        taipei_date(timestamp_ms)?
+    ))
+}
+
+fn comment_preview(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}...", text[..end].trim_end()), true)
+}
+
+fn comment_detail_page(text: &str, page: usize) -> Option<(&str, usize)> {
+    let page_end = |start: usize| {
+        let mut end = start.saturating_add(COMMENT_DETAIL_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
+    let mut total_pages = usize::from(text.is_empty());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        cursor = page_end(cursor);
+        total_pages += 1;
+    }
+    if page >= total_pages {
+        return None;
+    }
+    let mut start = 0;
+    for _ in 0..page {
+        start = page_end(start);
+    }
+    Some((&text[start..page_end(start)], total_pages))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -805,6 +875,68 @@ struct ReaderState {
     chrome_visible: bool,
 }
 
+#[derive(Default)]
+enum CommentAppendixState {
+    #[default]
+    Unloaded,
+    Loading,
+    Ready {
+        comments: Vec<Comment>,
+        total_items: usize,
+    },
+    Empty,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageArrival {
+    First,
+    Last,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommentTaskPurpose {
+    AppendixHot,
+    AppendixFallback,
+    Comments {
+        page: usize,
+        arrival: PageArrival,
+    },
+    Replies {
+        comment_id: usize,
+        page: usize,
+        arrival: PageArrival,
+        show_parent: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommentTask {
+    id: TaskId,
+    purpose: CommentTaskPurpose,
+}
+
+struct CommentPageState {
+    comments: Vec<Comment>,
+    number: usize,
+    total_pages: usize,
+    total_items: usize,
+    item: usize,
+    error: Option<(usize, String)>,
+}
+
+struct ReplyState {
+    parent: Comment,
+    replies: Vec<Comment>,
+    number: usize,
+    total_pages: usize,
+    total_items: usize,
+    show_parent: bool,
+    text_page: usize,
+    item: usize,
+    error: Option<(usize, String)>,
+}
+
 struct PlannedReaderSpawn {
     source: usize,
     purpose: ReaderTaskPurpose,
@@ -869,6 +1001,10 @@ struct Bomtoon {
     reader_generation: u64,
     reader_tasks: BTreeMap<TaskId, ReaderTaskEntry>,
     foreground_reader_task: Option<TaskId>,
+    comment_appendix: CommentAppendixState,
+    comment_task: Option<CommentTask>,
+    comments: Option<CommentPageState>,
+    replies: Option<ReplyState>,
     retry: Retry,
     next_picture_handle: u32,
     page: usize,
@@ -878,7 +1014,6 @@ struct Bomtoon {
     total_recent_titles: usize,
     problem: Option<String>,
 }
-
 impl Bomtoon {
     fn show(&mut self, context: &mut Context) {
         self.sync_visible_covers(context);
@@ -889,7 +1024,7 @@ impl Bomtoon {
                         && self.queued_foreground.is_none()
                         && self.problem.is_none()
                 }
-                View::Reader => true,
+                View::Reader | View::CommentAppendix | View::Comments | View::Replies => true,
                 View::Status | View::Main => false,
             };
         context.set_screen(self.screen().with_own_back(owns_back));
@@ -1194,7 +1329,7 @@ impl Bomtoon {
                 .build();
         }
         if let Some(problem) = &self.problem {
-            let title = if self.view == View::Reader {
+            let title = if self.view.is_reader_flow() {
                 self.reader_title()
             } else {
                 TITLE
@@ -1219,6 +1354,9 @@ impl Bomtoon {
             View::Account => self.account_screen(),
             View::Episodes => self.episode_screen(),
             View::Reader => self.reader_screen(),
+            View::CommentAppendix => self.comment_appendix_screen(),
+            View::Comments => self.comments_screen(),
+            View::Replies => self.replies_screen(),
         }
     }
 
@@ -1670,6 +1808,200 @@ impl Bomtoon {
             )
             .build()
     }
+    fn comment_context(&self) -> String {
+        let episode = self
+            .reader_selection
+            .as_ref()
+            .map_or("", |selection| selection.title.as_str());
+        match (self.selected_title.is_empty(), episode.is_empty()) {
+            (false, false) => format!("{} | {episode}", self.selected_title),
+            (false, true) => self.selected_title.clone(),
+            (true, false) => episode.to_owned(),
+            (true, true) => String::new(),
+        }
+    }
+
+    fn comment_metadata(comment: &Comment) -> String {
+        let created_at =
+            taipei_datetime(comment.created_at).unwrap_or_else(|| "Unknown date".to_owned());
+        format!(
+            "{created_at} | {} likes | {} replies",
+            comment.like_count, comment.reply_count
+        )
+    }
+
+    fn comment_appendix_screen(&self) -> Screen {
+        let mut screen = ScreenBuilder::new("bomtoon-comment-appendix")
+            .top_bar("Comments")
+            .secondary(self.comment_context());
+        screen = match &self.comment_appendix {
+            CommentAppendixState::Unloaded | CommentAppendixState::Loading => {
+                screen.activity("Loading comments", None)
+            }
+            CommentAppendixState::Failed(problem) => screen
+                .banner(BannerLevel::Attention, problem.clone())
+                .primary_button(RETRY, "Try again"),
+            CommentAppendixState::Empty => screen.text("No comments yet"),
+            CommentAppendixState::Ready {
+                comments,
+                total_items,
+            } => {
+                let rows = comments.iter().map(|comment| {
+                    let (preview, _) =
+                        comment_preview(&comment.text, APPENDIX_COMMENT_PREVIEW_BYTES);
+                    (
+                        comment.author.clone(),
+                        format!("{preview}\n{}", Self::comment_metadata(comment)),
+                    )
+                });
+                screen
+                    .facts(rows)
+                    .button(ALL_COMMENTS, format!("All comments ({total_items})"))
+            }
+        };
+        screen.build()
+    }
+
+    fn comments_screen(&self) -> Screen {
+        let mut screen = ScreenBuilder::new("bomtoon-comments")
+            .top_bar("All comments")
+            .secondary(self.comment_context());
+        let Some(state) = &self.comments else {
+            return screen.activity("Loading comments", None).build();
+        };
+        if let Some((_, problem)) = &state.error {
+            screen = screen
+                .banner(BannerLevel::Attention, problem.clone())
+                .button(RETRY, "Try again");
+        }
+        let Some(comment) = state.comments.get(state.item) else {
+            screen = screen.text("No visible comments on this page");
+            if state.number > 0 {
+                screen = screen.button(COMMENTS_PREVIOUS, "Previous comment");
+            }
+            if state.number.saturating_add(1) < state.total_pages {
+                screen = screen.button(COMMENTS_NEXT, "Next comment");
+            }
+            return screen.build();
+        };
+        let position = state
+            .number
+            .saturating_mul(20)
+            .saturating_add(state.item)
+            .saturating_add(1)
+            .min(state.total_items);
+        let author = if comment.is_best() {
+            format!("BEST | {}", comment.author)
+        } else {
+            comment.author.clone()
+        };
+        let (preview, truncated) = comment_preview(&comment.text, COMMENT_LIST_PREVIEW_BYTES);
+        screen = screen
+            .section_with_value(
+                author,
+                format!("{position}-{} of {}", position, state.total_items),
+            )
+            .secondary(Self::comment_metadata(comment))
+            .text(preview);
+        if comment.reply_count > 0 || truncated {
+            let label = if comment.reply_count > 0 {
+                format!("Replies ({})", comment.reply_count)
+            } else {
+                "Read full comment".to_owned()
+            };
+            screen = screen.button(format!("comment-{}", comment.id), label);
+        }
+        let has_previous = state.item > 0 || state.number > 0;
+        let has_next = state.item + 1 < state.comments.len()
+            || state.number.saturating_add(1) < state.total_pages;
+        if has_previous {
+            screen = screen.button(COMMENTS_PREVIOUS, "Previous comment");
+        }
+        if has_next {
+            screen = screen.button(COMMENTS_NEXT, "Next comment");
+        }
+        screen.build()
+    }
+
+    fn replies_screen(&self) -> Screen {
+        let mut screen = ScreenBuilder::new("bomtoon-replies")
+            .top_bar("Replies")
+            .secondary(self.comment_context());
+        let Some(state) = &self.replies else {
+            return screen.activity("Loading replies", None).build();
+        };
+        if let Some((_, problem)) = &state.error {
+            screen = screen
+                .banner(BannerLevel::Attention, problem.clone())
+                .button(RETRY, "Try again");
+        }
+        if !state.show_parent && state.replies.get(state.item).is_none() {
+            screen = screen.text("No visible replies on this page");
+            if state.number > 0 {
+                screen = screen.button(REPLIES_PREVIOUS, "Previous");
+            }
+            if state.number.saturating_add(1) < state.total_pages {
+                screen = screen.button(REPLIES_NEXT, "Next");
+            }
+            return screen.build();
+        }
+        let (comment, section, position) = if state.show_parent {
+            (&state.parent, "Parent comment".to_owned(), None)
+        } else if let Some(reply) = state.replies.get(state.item) {
+            let position = state
+                .number
+                .saturating_mul(10)
+                .saturating_add(state.item)
+                .saturating_add(1)
+                .min(state.total_items);
+            (
+                reply,
+                "Reply".to_owned(),
+                Some(format!("{position}-{} of {}", position, state.total_items)),
+            )
+        } else {
+            unreachable!("visible reply disappeared")
+        };
+        let (text, text_pages) = comment_detail_page(&comment.text, state.text_page)
+            .expect("reply text page is out of range");
+        let value = position.map_or_else(
+            || format!("Part {} of {text_pages}", state.text_page.saturating_add(1)),
+            |position| {
+                format!(
+                    "{position} | Part {} of {text_pages}",
+                    state.text_page.saturating_add(1)
+                )
+            },
+        );
+        screen = screen
+            .section_with_value(section, value)
+            .heading(comment.author.clone())
+            .secondary(Self::comment_metadata(comment))
+            .text(text.to_owned());
+        if state.show_parent
+            && state.text_page.saturating_add(1) == text_pages
+            && state.replies.is_empty()
+            && state.total_items == 0
+            && state.error.is_none()
+        {
+            screen = screen.text("No replies yet");
+        }
+        let has_previous = state.text_page > 0 || !state.show_parent || state.number > 0;
+        let has_next = state.text_page.saturating_add(1) < text_pages
+            || (state.show_parent
+                && (!state.replies.is_empty()
+                    || state.number.saturating_add(1) < state.total_pages))
+            || (!state.show_parent
+                && (state.item + 1 < state.replies.len()
+                    || state.number.saturating_add(1) < state.total_pages));
+        if has_previous {
+            screen = screen.button(REPLIES_PREVIOUS, "Previous");
+        }
+        if has_next {
+            screen = screen.button(REPLIES_NEXT, "Next");
+        }
+        screen.build()
+    }
 
     fn cancel_reader(&mut self, context: &mut Context) {
         self.reader_generation = self.reader_generation.wrapping_add(1);
@@ -1830,7 +2162,7 @@ impl Bomtoon {
     }
 
     fn refresh_asset_summary(&mut self, context: &mut Context) {
-        if self.view == View::Reader {
+        if self.view.is_reader_flow() {
             self.wallet.summary_refresh_queued = true;
             return;
         }
@@ -1850,7 +2182,7 @@ impl Bomtoon {
     }
 
     fn resume_deferred_summary(&mut self, context: &mut Context) {
-        if self.view != View::Reader && self.wallet.summary_refresh_queued {
+        if !self.view.is_reader_flow() && self.wallet.summary_refresh_queued {
             self.refresh_asset_summary(context);
         }
     }
@@ -2714,6 +3046,7 @@ impl Bomtoon {
         }
         self.pending = None;
         self.queued_foreground = None;
+        self.clear_comment_state(context);
         self.cancel_reader(context);
         self.cancel_wallet(context);
         self.clear_title_gifts(context);
@@ -2762,7 +3095,7 @@ impl Bomtoon {
     }
 
     fn clear_all_state(&mut self, context: &mut Context) {
-        if self.view == View::Reader {
+        if self.view.is_reader_flow() {
             self.view = View::Episodes;
         }
         self.clear_protected_state(context);
@@ -4038,6 +4371,7 @@ impl Bomtoon {
             return;
         };
         self.cancel_title_gift_task(context);
+        self.clear_comment_state(context);
         self.reader_selection = Some(EpisodeSelection {
             content_alias: self.selected_content_alias.clone(),
             episode_alias,
@@ -4106,6 +4440,7 @@ impl Bomtoon {
     }
 
     fn leave_reader(&mut self, context: &mut Context) {
+        self.clear_comment_state(context);
         self.reader_selection = None;
         self.problem = None;
         self.retry = Retry::Restart;
@@ -4427,6 +4762,540 @@ impl Bomtoon {
         }
     }
 
+    fn spawn_comment_task(
+        &mut self,
+        context: &mut Context,
+        purpose: CommentTaskPurpose,
+        work: kobo_sdk::Task,
+    ) -> bool {
+        if self.comment_task.is_some() {
+            return false;
+        }
+        let Some(id) = context.spawn(work) else {
+            return false;
+        };
+        self.comment_task = Some(CommentTask { id, purpose });
+        true
+    }
+
+    fn comment_aliases(&self) -> Option<(String, String)> {
+        self.reader_selection.as_ref().map(|selection| {
+            (
+                selection.content_alias.clone(),
+                selection.episode_alias.clone(),
+            )
+        })
+    }
+
+    fn start_comment_appendix(&mut self, context: &mut Context) {
+        if self.account != AccountState::Active {
+            return;
+        }
+        self.view = View::CommentAppendix;
+        self.comment_appendix = CommentAppendixState::Loading;
+        let Some((content_alias, episode_alias)) = self.comment_aliases() else {
+            self.comment_appendix =
+                CommentAppendixState::Failed("The selected episode is unavailable.".to_owned());
+            self.show(context);
+            return;
+        };
+        if !self.spawn_comment_task(
+            context,
+            CommentTaskPurpose::AppendixHot,
+            api::comments(&content_alias, &episode_alias, api::CommentOrder::Hot, 0),
+        ) {
+            self.comment_appendix =
+                CommentAppendixState::Failed("No task slot is available.".to_owned());
+        }
+        self.show(context);
+    }
+
+    fn start_comment_page(&mut self, context: &mut Context, page: usize, arrival: PageArrival) {
+        self.view = View::Comments;
+        if let Some(state) = self.comments.as_mut() {
+            state.error = None;
+        }
+        let Some((content_alias, episode_alias)) = self.comment_aliases() else {
+            self.comments = Some(CommentPageState {
+                comments: Vec::new(),
+                number: page,
+                total_pages: 0,
+                total_items: 0,
+                item: 0,
+                error: Some((page, "The selected episode is unavailable.".to_owned())),
+            });
+            self.show(context);
+            return;
+        };
+        if !self.spawn_comment_task(
+            context,
+            CommentTaskPurpose::Comments { page, arrival },
+            api::comments(
+                &content_alias,
+                &episode_alias,
+                api::CommentOrder::Newest,
+                page,
+            ),
+        ) {
+            let problem = "No task slot is available.".to_owned();
+            if let Some(state) = self.comments.as_mut() {
+                state.error = Some((page, problem));
+            } else {
+                self.comments = Some(CommentPageState {
+                    comments: Vec::new(),
+                    number: page,
+                    total_pages: 0,
+                    total_items: 0,
+                    item: 0,
+                    error: Some((page, problem)),
+                });
+            }
+        }
+        self.show(context);
+    }
+
+    fn start_replies(&mut self, context: &mut Context, parent: Comment) {
+        self.view = View::Replies;
+        self.replies = Some(ReplyState {
+            parent,
+            replies: Vec::new(),
+            number: 0,
+            total_pages: 0,
+            total_items: 0,
+            show_parent: true,
+            text_page: 0,
+            item: 0,
+            error: None,
+        });
+        self.start_reply_page(context, 0, PageArrival::First, true);
+    }
+
+    fn start_reply_page(
+        &mut self,
+        context: &mut Context,
+        page: usize,
+        arrival: PageArrival,
+        show_parent: bool,
+    ) {
+        let Some(comment_id) = self.replies.as_ref().map(|state| state.parent.id) else {
+            self.show(context);
+            return;
+        };
+        if let Some(state) = self.replies.as_mut() {
+            state.error = None;
+        }
+        if !self.spawn_comment_task(
+            context,
+            CommentTaskPurpose::Replies {
+                comment_id,
+                page,
+                arrival,
+                show_parent,
+            },
+            api::replies(comment_id, api::CommentOrder::Hot, page),
+        ) {
+            if let Some(state) = self.replies.as_mut() {
+                state.error = Some((page, "No task slot is available.".to_owned()));
+            }
+        }
+        self.show(context);
+    }
+
+    fn fail_comment_task(&mut self, purpose: CommentTaskPurpose, problem: String) {
+        match purpose {
+            CommentTaskPurpose::AppendixHot | CommentTaskPurpose::AppendixFallback => {
+                self.comment_appendix = CommentAppendixState::Failed(problem);
+            }
+            CommentTaskPurpose::Comments { page, .. } => {
+                if let Some(state) = self.comments.as_mut() {
+                    state.error = Some((page, problem));
+                } else {
+                    self.comments = Some(CommentPageState {
+                        comments: Vec::new(),
+                        number: page,
+                        total_pages: 0,
+                        total_items: 0,
+                        item: 0,
+                        error: Some((page, problem)),
+                    });
+                }
+            }
+            CommentTaskPurpose::Replies { page, .. } => {
+                if let Some(state) = self.replies.as_mut() {
+                    state.error = Some((page, problem));
+                }
+            }
+        }
+    }
+
+    fn accept_appendix_hot(&mut self, context: &mut Context, bytes: &[u8]) {
+        let purpose = CommentTaskPurpose::AppendixHot;
+        let page = match parse::comments(bytes) {
+            Ok(page) => page,
+            Err(error) => {
+                self.fail_comment_task(purpose, error.to_string());
+                return;
+            }
+        };
+        let comments = page
+            .comments
+            .into_iter()
+            .filter(Comment::is_best)
+            .take(APPENDIX_COMMENT_LIMIT)
+            .collect::<Vec<_>>();
+        if comments.is_empty() && page.total_items > 0 {
+            let Some((content_alias, episode_alias)) = self.comment_aliases() else {
+                self.fail_comment_task(purpose, "The selected episode is unavailable.".to_owned());
+                return;
+            };
+            if !self.spawn_comment_task(
+                context,
+                CommentTaskPurpose::AppendixFallback,
+                api::comments(&content_alias, &episode_alias, api::CommentOrder::Newest, 0),
+            ) {
+                self.fail_comment_task(purpose, "No task slot is available.".to_owned());
+            }
+        } else if comments.is_empty() {
+            self.comment_appendix = CommentAppendixState::Empty;
+        } else {
+            self.comment_appendix = CommentAppendixState::Ready {
+                comments,
+                total_items: page.total_items,
+            };
+        }
+    }
+
+    fn accept_appendix_fallback(&mut self, bytes: &[u8]) {
+        let purpose = CommentTaskPurpose::AppendixFallback;
+        match parse::comments(bytes) {
+            Ok(page) => {
+                let comments = page
+                    .comments
+                    .into_iter()
+                    .take(APPENDIX_COMMENT_LIMIT)
+                    .collect::<Vec<_>>();
+                if comments.is_empty() {
+                    self.comment_appendix = CommentAppendixState::Empty;
+                } else {
+                    self.comment_appendix = CommentAppendixState::Ready {
+                        comments,
+                        total_items: page.total_items,
+                    };
+                }
+            }
+            Err(error) => self.fail_comment_task(purpose, error.to_string()),
+        }
+    }
+
+    fn accept_comments(&mut self, purpose: CommentTaskPurpose, arrival: PageArrival, bytes: &[u8]) {
+        match parse::comments(bytes) {
+            Ok(page) => {
+                let item = match arrival {
+                    PageArrival::First => 0,
+                    PageArrival::Last => page.comments.len().saturating_sub(1),
+                };
+                self.comments = Some(CommentPageState {
+                    comments: page.comments,
+                    number: page.number,
+                    total_pages: page.total_pages,
+                    total_items: page.total_items,
+                    item,
+                    error: None,
+                });
+            }
+            Err(error) => self.fail_comment_task(purpose, error.to_string()),
+        }
+    }
+
+    fn accept_replies(
+        &mut self,
+        purpose: CommentTaskPurpose,
+        arrival: PageArrival,
+        show_parent: bool,
+        bytes: &[u8],
+    ) {
+        match parse::replies(bytes) {
+            Ok(page) => {
+                let item = match arrival {
+                    PageArrival::First => 0,
+                    PageArrival::Last => page.replies.len().saturating_sub(1),
+                };
+                let text_page = if show_parent {
+                    0
+                } else {
+                    page.replies
+                        .get(item)
+                        .and_then(|reply| comment_detail_page(&reply.text, 0))
+                        .map_or(0, |(_, pages)| match arrival {
+                            PageArrival::First => 0,
+                            PageArrival::Last => pages.saturating_sub(1),
+                        })
+                };
+                self.replies = Some(ReplyState {
+                    parent: page.parent,
+                    replies: page.replies,
+                    number: page.number,
+                    total_pages: page.total_pages,
+                    total_items: page.total_items,
+                    show_parent,
+                    text_page,
+                    item,
+                    error: None,
+                });
+            }
+            Err(error) => self.fail_comment_task(purpose, error.to_string()),
+        }
+    }
+
+    fn accept_comment_task(
+        &mut self,
+        context: &mut Context,
+        purpose: CommentTaskPurpose,
+        bytes: &[u8],
+    ) {
+        match purpose {
+            CommentTaskPurpose::AppendixHot => self.accept_appendix_hot(context, bytes),
+            CommentTaskPurpose::AppendixFallback => self.accept_appendix_fallback(bytes),
+            CommentTaskPurpose::Comments { arrival, .. } => {
+                self.accept_comments(purpose, arrival, bytes);
+            }
+            CommentTaskPurpose::Replies {
+                arrival,
+                show_parent,
+                ..
+            } => self.accept_replies(purpose, arrival, show_parent, bytes),
+        }
+    }
+
+    fn handle_comment_outcome(
+        &mut self,
+        context: &mut Context,
+        purpose: CommentTaskPurpose,
+        outcome: TaskOutcome,
+    ) {
+        match outcome {
+            TaskOutcome::Completed(bytes) => self.accept_comment_task(context, purpose, &bytes),
+            TaskOutcome::Failed(TaskError::NoCredential) => {
+                self.transition_after_credential_loss(context, AccountState::SignedOut);
+                self.show(context);
+                return;
+            }
+            TaskOutcome::Failed(TaskError::Unauthorized) => {
+                self.transition_after_credential_loss(context, AccountState::Expired);
+                self.show(context);
+                return;
+            }
+            TaskOutcome::Failed(error) => {
+                self.fail_comment_task(purpose, Failure::of(error).advice.to_owned());
+            }
+            TaskOutcome::Cancelled => {
+                self.fail_comment_task(purpose, "The request was cancelled.".to_owned());
+            }
+        }
+        self.show(context);
+    }
+
+    fn cancel_comment_task(&mut self, context: &mut Context) {
+        if let Some(task) = self.comment_task.take() {
+            context.cancel(task.id);
+        }
+    }
+
+    fn clear_comment_state(&mut self, context: &mut Context) {
+        self.cancel_comment_task(context);
+        self.comment_appendix = CommentAppendixState::default();
+        self.comments = None;
+        self.replies = None;
+    }
+
+    fn retry_comment_action(&mut self, context: &mut Context) {
+        match self.view {
+            View::CommentAppendix => self.start_comment_appendix(context),
+            View::Comments => {
+                let Some(state) = self.comments.as_ref() else {
+                    self.show(context);
+                    return;
+                };
+                let page = state.error.as_ref().map_or(state.number, |(page, _)| *page);
+                let arrival = if page < state.number {
+                    PageArrival::Last
+                } else {
+                    PageArrival::First
+                };
+                self.start_comment_page(context, page, arrival);
+            }
+            View::Replies => {
+                let Some(state) = self.replies.as_ref() else {
+                    self.show(context);
+                    return;
+                };
+                let page = state.error.as_ref().map_or(state.number, |(page, _)| *page);
+                let arrival = if page < state.number {
+                    PageArrival::Last
+                } else {
+                    PageArrival::First
+                };
+                let show_parent =
+                    state.show_parent && state.total_pages == 0 && state.replies.is_empty();
+                self.start_reply_page(context, page, arrival, show_parent);
+            }
+            _ => self.show(context),
+        }
+    }
+
+    fn handle_comment_list_action(&mut self, context: &mut Context, action: ActionId) {
+        if action == action_id(COMMENTS_PREVIOUS) {
+            let target = self.comments.as_mut().and_then(|state| {
+                if state.item > 0 {
+                    state.item -= 1;
+                    None
+                } else {
+                    state.number.checked_sub(1)
+                }
+            });
+            if let Some(page) = target {
+                self.start_comment_page(context, page, PageArrival::Last);
+            } else {
+                self.show(context);
+            }
+            return;
+        }
+        if action == action_id(COMMENTS_NEXT) {
+            let target = self.comments.as_mut().and_then(|state| {
+                if state.item + 1 < state.comments.len() {
+                    state.item += 1;
+                    None
+                } else {
+                    state
+                        .number
+                        .checked_add(1)
+                        .filter(|page| *page < state.total_pages)
+                }
+            });
+            if let Some(page) = target {
+                self.start_comment_page(context, page, PageArrival::First);
+            } else {
+                self.show(context);
+            }
+            return;
+        }
+        if let Some(parent) = self
+            .comments
+            .as_ref()
+            .and_then(|state| state.comments.get(state.item))
+            .filter(|comment| action == action_id(&format!("comment-{}", comment.id)))
+            .cloned()
+        {
+            self.start_replies(context, parent);
+        } else {
+            self.show(context);
+        }
+    }
+
+    fn previous_reply(&mut self, context: &mut Context) {
+        let target = self.replies.as_mut().and_then(|state| {
+            if state.text_page > 0 {
+                state.text_page -= 1;
+                return None;
+            }
+            if state.show_parent {
+                return None;
+            }
+            if state.item > 0 {
+                state.item -= 1;
+                state.text_page = state
+                    .replies
+                    .get(state.item)
+                    .and_then(|reply| comment_detail_page(&reply.text, 0))
+                    .map_or(0, |(_, pages)| pages.saturating_sub(1));
+                return None;
+            }
+            if let Some(page) = state.number.checked_sub(1) {
+                return Some((page, PageArrival::Last));
+            }
+            state.show_parent = true;
+            state.text_page = comment_detail_page(&state.parent.text, 0)
+                .map_or(0, |(_, pages)| pages.saturating_sub(1));
+            None
+        });
+        if let Some((page, arrival)) = target {
+            self.start_reply_page(context, page, arrival, false);
+        } else {
+            self.show(context);
+        }
+    }
+
+    fn next_reply(&mut self, context: &mut Context) {
+        let target = self.replies.as_mut().and_then(|state| {
+            if !state.show_parent && state.replies.get(state.item).is_none() {
+                return state
+                    .number
+                    .checked_add(1)
+                    .filter(|page| *page < state.total_pages)
+                    .map(|page| (page, PageArrival::First));
+            }
+            let comment = if state.show_parent {
+                &state.parent
+            } else {
+                state.replies.get(state.item)?
+            };
+            let pages = comment_detail_page(&comment.text, 0).map_or(1, |(_, pages)| pages);
+            if state.text_page.saturating_add(1) < pages {
+                state.text_page += 1;
+                return None;
+            }
+            if state.show_parent {
+                if !state.replies.is_empty() {
+                    state.show_parent = false;
+                    state.item = 0;
+                    state.text_page = 0;
+                    return None;
+                }
+            } else if state.item + 1 < state.replies.len() {
+                state.item += 1;
+                state.text_page = 0;
+                return None;
+            }
+            state
+                .number
+                .checked_add(1)
+                .filter(|page| *page < state.total_pages)
+                .map(|page| (page, PageArrival::First))
+        });
+        if let Some((page, arrival)) = target {
+            self.start_reply_page(context, page, arrival, false);
+        } else {
+            self.show(context);
+        }
+    }
+
+    fn handle_reply_action(&mut self, context: &mut Context, action: ActionId) {
+        if action == action_id(REPLIES_PREVIOUS) {
+            self.previous_reply(context);
+        } else if action == action_id(REPLIES_NEXT) {
+            self.next_reply(context);
+        } else {
+            self.show(context);
+        }
+    }
+
+    fn handle_comment_action(&mut self, context: &mut Context, action: ActionId) {
+        if self.comment_task.is_some() {
+            self.show(context);
+        } else if action == action_id(RETRY) {
+            self.retry_comment_action(context);
+        } else {
+            match self.view {
+                View::CommentAppendix if action == action_id(ALL_COMMENTS) => {
+                    self.start_comment_page(context, 0, PageArrival::First);
+                }
+                View::Comments => self.handle_comment_list_action(context, action),
+                View::Replies => self.handle_reply_action(context, action),
+                _ => self.show(context),
+            }
+        }
+    }
+
     fn handle_reader_action(&mut self, context: &mut Context, action: ActionId) {
         if action == action_id(READER_CHROME) {
             if let Some(reader) = self.reader.as_mut() {
@@ -4449,6 +5318,13 @@ impl Bomtoon {
         });
         if let Some(target) = target {
             self.request_reader_page(context, target);
+        } else if action == action_id(READER_NEXT)
+            && self
+                .reader
+                .as_ref()
+                .is_some_and(|reader| reader.page.saturating_add(1) == reader.plans.len())
+        {
+            self.start_comment_appendix(context);
         } else if action != action_id(READER_PREVIOUS) && action != action_id(READER_NEXT) {
             self.show(context);
         }
@@ -4696,15 +5572,17 @@ impl KoboApp for Bomtoon {
 
     fn on_suspend(&mut self, context: &mut Context) {
         self.clear_commerce_access(context);
-        if self.view == View::Reader
+        if self.view.is_reader_flow()
             || self.reader_selection.is_some()
             || self.reader.is_some()
             || !self.reader_tasks.is_empty()
+            || self.comment_task.is_some()
         {
+            self.clear_comment_state(context);
             self.reader_selection = None;
             self.problem = None;
             self.retry = Retry::Restart;
-            if self.view == View::Reader {
+            if self.view.is_reader_flow() {
                 self.view = View::Episodes;
             }
             self.cancel_reader(context);
@@ -4818,9 +5696,39 @@ impl KoboApp for Bomtoon {
                 return;
             }
         }
-        let can_leave_reader = self.view == View::Reader;
-        if action == ActionId::BACK && can_leave_reader {
-            self.leave_reader(context);
+        if action == ActionId::BACK {
+            match self.view {
+                View::Reader => {
+                    self.leave_reader(context);
+                    return;
+                }
+                View::CommentAppendix => {
+                    self.cancel_comment_task(context);
+                    self.view = View::Reader;
+                    self.show(context);
+                    return;
+                }
+                View::Comments => {
+                    self.cancel_comment_task(context);
+                    self.view = View::CommentAppendix;
+                    self.show(context);
+                    return;
+                }
+                View::Replies => {
+                    self.cancel_comment_task(context);
+                    self.replies = None;
+                    self.view = View::Comments;
+                    self.show(context);
+                    return;
+                }
+                View::Status | View::Main | View::Account | View::Episodes => {}
+            }
+        }
+        if matches!(
+            self.view,
+            View::CommentAppendix | View::Comments | View::Replies
+        ) {
+            self.handle_comment_action(context, action);
             return;
         }
         let ready = self.account == AccountState::Active
@@ -5045,6 +5953,17 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_task(&mut self, context: &mut Context, task: TaskId, outcome: TaskOutcome) {
+        if self.comment_task.is_some_and(|active| active.id == task) {
+            let purpose = self
+                .comment_task
+                .take()
+                .expect("matching comment task disappeared")
+                .purpose;
+            self.observe_connectivity(context, &outcome);
+            self.handle_comment_outcome(context, purpose, outcome);
+            self.resume_capacity_work(context);
+            return;
+        }
         if self.scope_task == Some(task) {
             self.scope_task = None;
             self.handle_scope_outcome(context, outcome);
@@ -6004,6 +6923,84 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!("{{\"result\":\"SUCCESS\",\"data\":[{images}]}}").into_bytes()
+    }
+
+    fn comment_entry(
+        id: usize,
+        author: &str,
+        text: &str,
+        likes: usize,
+        replies: usize,
+        created_at: i64,
+    ) -> String {
+        format!(
+            concat!(
+                "{{\"commentManageId\":40615,\"commentId\":{id},\"title\":\"Hunter Q\",",
+                "\"subTitle\":\"Episode One\",\"nickname\":\"{author}\",\"profileImage\":null,",
+                "\"isHighLightProfile\":false,\"comment\":\"{text}\",\"commentImagePath\":null,",
+                "\"emoticonImageId\":null,\"emoticonUrl\":null,\"emoticonContentsId\":null,",
+                "\"replyCount\":{replies},\"likeCount\":{likes},\"createdAt\":{created_at},",
+                "\"pageNumber\":0,\"status\":{{\"like\":false,\"delete\":false,",
+                "\"blind\":false,\"block\":false,\"report\":false,\"mine\":false}}}}"
+            ),
+            id = id,
+            author = author,
+            text = text,
+            replies = replies,
+            likes = likes,
+            created_at = created_at,
+        )
+    }
+
+    fn comments_response(
+        entries: &[String],
+        number: usize,
+        total_pages: usize,
+        total: usize,
+    ) -> Vec<u8> {
+        let content = entries.join(",");
+        format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":{{\"commentManageId\":40615,",
+                "\"contentsIsAdult\":false,\"comment\":{{\"content\":[{content}],",
+                "\"pageable\":{{}},\"totalPages\":{total_pages},\"last\":false,",
+                "\"totalElements\":{total},\"first\":{first},\"size\":20,\"number\":{number},",
+                "\"sort\":{{}},\"numberOfElements\":{count},\"empty\":{empty}}}}}}}"
+            ),
+            content = content,
+            total_pages = total_pages,
+            total = total,
+            first = number == 0,
+            number = number,
+            count = entries.len(),
+            empty = entries.is_empty(),
+        )
+        .into_bytes()
+    }
+
+    fn replies_response(parent: &str, replies: &[String], total: usize) -> Vec<u8> {
+        let replies = replies.join(",");
+        let page = format!(
+            concat!(
+                "{{\"content\":[{replies}],\"pageable\":{{}},\"totalPages\":1,",
+                "\"last\":true,\"totalElements\":{total},\"first\":true,\"size\":10,",
+                "\"number\":0,\"sort\":{{}},\"numberOfElements\":{count},",
+                "\"empty\":{empty}}}"
+            ),
+            replies = replies,
+            total = total,
+            count = usize::from(total > 0),
+            empty = total == 0,
+        );
+        [
+            r#"{"result":"SUCCESS","data":{"comment":"#,
+            parent,
+            r#","reply":"#,
+            &page,
+            "}}",
+        ]
+        .concat()
+        .into_bytes()
     }
 
     fn reader_metrics(format: PictureFormat, height: i32) -> DisplayMetrics {
@@ -8473,7 +9470,7 @@ mod tests {
     }
 
     #[test]
-    fn center_toggles_chrome_and_boundary_noop_preserves_it() {
+    fn center_toggles_chrome_and_previous_boundary_noop_preserves_it() {
         let mut runner = seeded_reader(1, 0, false);
         let commands = runner.action(action_id(READER_CHROME));
         assert_eq!(
@@ -8483,7 +9480,6 @@ mod tests {
                 .chrome,
             ReadingChrome::Overlay
         );
-        assert!(runner.action(action_id(READER_NEXT)).is_empty());
         assert!(runner.action(action_id(READER_PREVIOUS)).is_empty());
         assert!(runner.app().reader.as_ref().expect("reader").chrome_visible);
         let commands = runner.action(action_id(READER_CHROME));
@@ -8494,6 +9490,467 @@ mod tests {
                 .chrome,
             ReadingChrome::Hidden
         );
+    }
+
+    #[test]
+    fn final_image_requests_hot_comments_only_when_next_is_pressed() {
+        let mut runner = seeded_reader(1, 0, false);
+
+        let commands = runner.action(action_id(READER_NEXT));
+
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Hot, 0)
+        );
+    }
+
+    #[test]
+    fn best_comments_append_after_images_without_reader_progress_or_badges() {
+        let mut runner = seeded_reader(1, 0, false);
+        runner.app_mut().selected_title = "Hunter Q".to_owned();
+        let commands = runner.action(action_id(READER_NEXT));
+        let (task, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            task,
+            TaskOutcome::Completed(comments_response(
+                &[
+                    comment_entry(1, "Best reader", "Loved this episode", 40, 1, 10),
+                    comment_entry(2, "Ordinary reader", "Me too", 39, 0, 9),
+                ],
+                0,
+                1,
+                2,
+            )),
+        );
+
+        assert_eq!(runner.app().view, View::CommentAppendix);
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Comments"));
+        assert!(drawn.contains("Hunter Q"));
+        assert!(drawn.contains("Episode One"));
+        assert!(drawn.contains("Best reader"));
+        assert!(!drawn.contains("Ordinary reader"));
+        assert!(!drawn.contains("BEST"));
+        assert!(drawn.contains("All comments (2)"));
+        assert!(screen.page_turns.is_none());
+        assert!(screen.reading_surface.is_none());
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn all_comments_and_replies_restore_the_exact_navigation_stack() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (appendix_task, _) = only_spawn(&commands);
+        runner.task_outcome(
+            appendix_task,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(1, "Best reader", "Hot", 40, 0, 10)],
+                0,
+                1,
+                2,
+            )),
+        );
+
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (comments_task, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Newest, 0)
+        );
+        runner.task_outcome(
+            comments_task,
+            TaskOutcome::Completed(comments_response(
+                &[
+                    comment_entry(11, "Newest", "A comment", 41, 1, 20),
+                    comment_entry(12, "Older", "Another comment", 0, 0, 19),
+                ],
+                0,
+                1,
+                2,
+            )),
+        );
+        assert_eq!(runner.app().view, View::Comments);
+
+        let commands = runner.action(action_id("comment-11"));
+        let (reply_task, work) = only_spawn(&commands);
+        assert_eq!(work, api::replies(11, api::CommentOrder::Hot, 0));
+        let parent = comment_entry(11, "Newest", "A comment", 41, 1, 20);
+        let commands = runner.task_outcome(
+            reply_task,
+            TaskOutcome::Completed(replies_response(
+                &parent,
+                &[comment_entry(21, "Reply", "Answer", 0, 0, 21)],
+                1,
+            )),
+        );
+        assert_eq!(runner.app().view, View::Replies);
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Replies"));
+        assert!(drawn.contains("A comment"));
+        assert!(!drawn.contains("Answer"));
+        assert!(!drawn.contains("BEST"));
+        let commands = runner.action(action_id(REPLIES_NEXT));
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Answer"));
+        assert!(!drawn.contains("BEST"));
+
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Comments);
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::CommentAppendix);
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Reader);
+        assert_eq!(runner.app().reader.as_ref().expect("reader").page, 0);
+    }
+
+    #[test]
+    fn long_parent_comment_is_paged_in_full_before_replies() {
+        let long_parent = "Parent ".repeat(100);
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (appendix, _) = only_spawn(&commands);
+        runner.task_outcome(
+            appendix,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(11, "Author", &long_parent, 40, 1, 20)],
+                0,
+                1,
+                1,
+            )),
+        );
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (comments, _) = only_spawn(&commands);
+        runner.task_outcome(
+            comments,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(11, "Author", &long_parent, 40, 1, 20)],
+                0,
+                1,
+                1,
+            )),
+        );
+        let commands = runner.action(action_id("comment-11"));
+        let (replies, _) = only_spawn(&commands);
+        let parent = comment_entry(11, "Author", &long_parent, 40, 1, 20);
+        runner.task_outcome(
+            replies,
+            TaskOutcome::Completed(replies_response(
+                &parent,
+                &[comment_entry(21, "Reply", "Answer", 0, 0, 21)],
+                1,
+            )),
+        );
+        let screen = runner.app().screen();
+        assert!(!format!("{screen:?}").contains("Answer"));
+        assert_fits(&screen);
+
+        for _ in 0..2 {
+            let commands = runner.action(action_id(REPLIES_NEXT));
+            assert!(!format!("{:?}", last_screen(&commands)).contains("Answer"));
+            assert_fits(&last_screen(&commands));
+        }
+        let commands = runner.action(action_id(REPLIES_NEXT));
+        assert!(format!("{:?}", last_screen(&commands)).contains("Answer"));
+        assert_fits(&last_screen(&commands));
+    }
+
+    #[test]
+    fn appendix_falls_back_to_newest_when_hot_has_no_best_comments() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            hot,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(
+                    1,
+                    "Ordinary reader",
+                    "Still useful",
+                    39,
+                    0,
+                    10,
+                )],
+                0,
+                1,
+                1,
+            )),
+        );
+        let (newest, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Newest, 0)
+        );
+
+        let commands = runner.task_outcome(
+            newest,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(
+                    1,
+                    "Ordinary reader",
+                    "Still useful",
+                    39,
+                    0,
+                    10,
+                )],
+                0,
+                1,
+                1,
+            )),
+        );
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Ordinary reader"));
+        assert!(drawn.contains("All comments (1)"));
+        assert!(!drawn.contains("BEST"));
+    }
+
+    #[test]
+    fn maximum_length_comment_previews_fit_clara() {
+        let long = "Long comment ".repeat(1_000);
+        let entries = [
+            comment_entry(1, "One", &long, 43, 0, 10),
+            comment_entry(2, "Two", &long, 42, 0, 9),
+            comment_entry(3, "Three", &long, 41, 0, 8),
+            comment_entry(4, "Four", &long, 40, 0, 7),
+        ];
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            hot,
+            TaskOutcome::Completed(comments_response(&entries, 0, 1, 4)),
+        );
+        let screen = last_screen(&commands);
+        assert!(format!("{screen:?}").contains("All comments (4)"));
+        assert_fits(&screen);
+
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (newest, _) = only_spawn(&commands);
+        runner.task_outcome(
+            newest,
+            TaskOutcome::Completed(comments_response(&entries[..1], 0, 1, 1)),
+        );
+        let screen = runner.app().screen();
+        assert!(format!("{screen:?}").contains("Read full comment"));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn empty_appendix_omits_all_comments_action() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        let commands =
+            runner.task_outcome(hot, TaskOutcome::Completed(comments_response(&[], 0, 0, 0)));
+
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("No comments yet"));
+        assert!(!drawn.contains("All comments"));
+        assert_eq!(runner.tasks_in_flight(), 0);
+    }
+
+    #[test]
+    fn comment_credential_loss_redraws_the_signed_out_state() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (comments, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(comments, TaskOutcome::Failed(TaskError::Unauthorized));
+
+        assert_eq!(runner.app().account, AccountState::Expired);
+        assert_eq!(runner.app().view, View::Status);
+        let screen = last_screen(&commands);
+        assert!(format!("{screen:?}").contains("expired"));
+    }
+
+    #[test]
+    fn failed_later_comment_page_keeps_rows_and_retries_the_same_page() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        runner.task_outcome(
+            hot,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(1, "Best", "Hot", 40, 0, 10)],
+                0,
+                1,
+                21,
+            )),
+        );
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (page_zero, _) = only_spawn(&commands);
+        runner.task_outcome(
+            page_zero,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(11, "Newest", "Cached comment", 0, 0, 20)],
+                0,
+                2,
+                21,
+            )),
+        );
+
+        let commands = runner.action(action_id(COMMENTS_NEXT));
+        let (page_one, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Newest, 1)
+        );
+        let commands = runner.task_outcome(page_one, TaskOutcome::Failed(TaskError::TimedOut));
+        let drawn = format!("{:?}", last_screen(&commands));
+        assert!(drawn.contains("Cached comment"));
+        assert!(drawn.contains("Try again"));
+
+        let commands = runner.action(action_id(RETRY));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Newest, 1)
+        );
+    }
+
+    #[test]
+    fn retrying_a_previous_comment_page_restores_its_last_item() {
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        runner.task_outcome(
+            hot,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(1, "Best", "Hot", 40, 0, 10)],
+                0,
+                1,
+                21,
+            )),
+        );
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (page_zero, _) = only_spawn(&commands);
+        runner.task_outcome(
+            page_zero,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(11, "Page zero", "Newest", 0, 0, 20)],
+                0,
+                2,
+                21,
+            )),
+        );
+        let commands = runner.action(action_id(COMMENTS_NEXT));
+        let (page_one, _) = only_spawn(&commands);
+        runner.task_outcome(
+            page_one,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(21, "Page one", "Older", 0, 0, 1)],
+                1,
+                2,
+                21,
+            )),
+        );
+
+        let commands = runner.action(action_id(COMMENTS_PREVIOUS));
+        let (previous, _) = only_spawn(&commands);
+        runner.task_outcome(previous, TaskOutcome::Failed(TaskError::TimedOut));
+        let commands = runner.action(action_id(RETRY));
+        let (retry, _) = only_spawn(&commands);
+        runner.task_outcome(
+            retry,
+            TaskOutcome::Completed(comments_response(
+                &[
+                    comment_entry(11, "First", "Newest", 0, 0, 20),
+                    comment_entry(12, "Last", "Next", 0, 0, 19),
+                ],
+                0,
+                2,
+                21,
+            )),
+        );
+
+        let state = runner.app().comments.as_ref().expect("comments");
+        assert_eq!(state.item, 1);
+        assert_eq!(state.comments[state.item].author, "Last");
+    }
+
+    #[test]
+    fn filtered_comment_page_can_advance_to_the_next_server_page() {
+        let hidden = comment_entry(11, "Hidden", "Removed", 0, 0, 20).replacen(
+            "\"delete\":false",
+            "\"delete\":true",
+            1,
+        );
+        let mut runner = seeded_reader(1, 0, false);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (hot, _) = only_spawn(&commands);
+        runner.task_outcome(
+            hot,
+            TaskOutcome::Completed(comments_response(
+                &[comment_entry(1, "Best", "Hot", 40, 0, 10)],
+                0,
+                1,
+                21,
+            )),
+        );
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (page_zero, _) = only_spawn(&commands);
+        let commands = runner.task_outcome(
+            page_zero,
+            TaskOutcome::Completed(comments_response(&[hidden], 0, 2, 21)),
+        );
+        assert!(format!("{:?}", last_screen(&commands)).contains("Next comment"));
+
+        let commands = runner.action(action_id(COMMENTS_NEXT));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::comments("hunter_q", "ep-1", api::CommentOrder::Newest, 1)
+        );
+    }
+
+    #[test]
+    fn filtered_reply_page_can_advance_to_the_next_server_page() {
+        let mut runner = seeded_reader(1, 0, false);
+        let parent = comment_entry(11, "Author", "Parent", 40, 11, 20);
+        let commands = runner.action(action_id(READER_NEXT));
+        let (appendix, _) = only_spawn(&commands);
+        runner.task_outcome(
+            appendix,
+            TaskOutcome::Completed(comments_response(std::slice::from_ref(&parent), 0, 1, 1)),
+        );
+        let commands = runner.action(action_id(ALL_COMMENTS));
+        let (comments, _) = only_spawn(&commands);
+        runner.task_outcome(
+            comments,
+            TaskOutcome::Completed(comments_response(std::slice::from_ref(&parent), 0, 1, 1)),
+        );
+        let commands = runner.action(action_id("comment-11"));
+        let (replies, _) = only_spawn(&commands);
+        let hidden = comment_entry(21, "Hidden", "Removed", 0, 0, 21).replacen(
+            "\"blind\":false",
+            "\"blind\":true",
+            1,
+        );
+        let response =
+            String::from_utf8(replies_response(&parent, std::slice::from_ref(&hidden), 11))
+                .expect("reply fixture")
+                .replacen("\"totalPages\":1", "\"totalPages\":3", 1)
+                .into_bytes();
+        runner.task_outcome(replies, TaskOutcome::Completed(response));
+        let screen = runner.app().screen();
+        assert!(format!("{screen:?}").contains("Next"));
+
+        let commands = runner.action(action_id(REPLIES_NEXT));
+        let (page_one, work) = only_spawn(&commands);
+        assert_eq!(work, api::replies(11, api::CommentOrder::Hot, 1));
+        let response = String::from_utf8(replies_response(&parent, &[hidden], 11))
+            .expect("reply fixture")
+            .replacen("\"totalPages\":1", "\"totalPages\":3", 1)
+            .replacen("\"number\":0", "\"number\":1", 1)
+            .into_bytes();
+        runner.task_outcome(page_one, TaskOutcome::Completed(response));
+        let screen = runner.app().screen();
+        assert!(format!("{screen:?}").contains("Previous"));
+        assert!(format!("{screen:?}").contains("Next"));
+        let commands = runner.action(action_id(REPLIES_NEXT));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::replies(11, api::CommentOrder::Hot, 2));
     }
 
     #[test]
@@ -9857,6 +11314,43 @@ mod tests {
             Some("2025-01-01".to_owned())
         );
         assert_eq!(taipei_date(i64::MAX), Some("292278994-08-17".to_owned()));
+    }
+
+    #[test]
+    fn comment_datetime_uses_the_configured_taipei_timezone() {
+        assert_eq!(
+            taipei_datetime(1_754_582_509_710),
+            Some("2025-08-08 00:01".to_owned())
+        );
+        assert_eq!(taipei_datetime(i64::MAX), None);
+    }
+
+    #[test]
+    fn comment_preview_is_bounded_without_splitting_utf8() {
+        assert_eq!(
+            comment_preview("Short", COMMENT_LIST_PREVIEW_BYTES),
+            ("Short".to_owned(), false)
+        );
+        let text = "界".repeat(300);
+        let (preview, truncated) = comment_preview(&text, COMMENT_LIST_PREVIEW_BYTES);
+        assert!(truncated);
+        assert!(preview.ends_with("..."));
+        assert!(preview.len() <= COMMENT_LIST_PREVIEW_BYTES + 3);
+        assert!(str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn comment_detail_pages_preserve_full_utf8_text() {
+        let text = format!("{} end", "界".repeat(300));
+        let mut rebuilt = String::new();
+        let mut page = 0;
+        while let Some((part, total_pages)) = comment_detail_page(&text, page) {
+            assert!(total_pages > 1);
+            assert!(part.len() <= COMMENT_DETAIL_BYTES);
+            rebuilt.push_str(part);
+            page += 1;
+        }
+        assert_eq!(rebuilt, text);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::model::{
-    AssetAmounts, AssetKind, AssetSubtype, BannerComic, CoinUse, Comic, ContentDetail, Episode,
-    EpisodeAvailability, EpisodeImage, ExpirationRow, GiftBalance, Homepage, PurchaseReceipt,
-    PurchaseState, PurchaseType, Quote, RecentEntry, ShelfComic, WalletSummary,
+    AssetAmounts, AssetKind, AssetSubtype, BannerComic, CoinUse, Comic, Comment, ContentDetail,
+    Episode, EpisodeAvailability, EpisodeImage, ExpirationRow, GiftBalance, Homepage,
+    PurchaseReceipt, PurchaseState, PurchaseType, Quote, RecentEntry, ShelfComic, WalletSummary,
 };
 use http::Uri;
 use kobo_json::Value;
@@ -23,6 +23,10 @@ const MAX_GIFT_ENTRIES: usize = 64;
 const MAX_COMMERCE_ALIAS_BYTES: usize = 128;
 const MAX_EPISODE_TITLE_BYTES: usize = 512;
 const MAX_REMOTE_CODE_BYTES: usize = 128;
+const MAX_COMMENT_PAGES: usize = 10_000;
+const MAX_COMMENTS_PER_RESPONSE: usize = 20;
+const MAX_COMMENT_AUTHOR_BYTES: usize = 256;
+const MAX_COMMENT_TEXT_BYTES: usize = 16 * 1024;
 const BOMTOON_TITLE_SUFFIX: &str = " - 漫畫 - BOMTOON";
 const HTML_ENTITIES: &[(&str, &str)] = &[
     ("amp", "&"),
@@ -115,6 +119,21 @@ pub struct LibraryPage {
 
 pub struct RecentPage {
     pub entries: Vec<RecentEntry>,
+    pub number: usize,
+    pub total_pages: usize,
+    pub total_items: usize,
+}
+
+pub struct CommentPage {
+    pub comments: Vec<Comment>,
+    pub number: usize,
+    pub total_pages: usize,
+    pub total_items: usize,
+}
+
+pub struct ReplyPage {
+    pub parent: Comment,
+    pub replies: Vec<Comment>,
     pub number: usize,
     pub total_pages: usize,
     pub total_items: usize,
@@ -249,6 +268,85 @@ pub fn recent(bytes: &[u8]) -> Result<RecentPage, ParseError> {
         total_pages,
         total_items,
     })
+}
+
+pub fn comments(bytes: &[u8]) -> Result<CommentPage, ParseError> {
+    let root = parse_json(bytes)?;
+    require_success(&root)?;
+    let data = field(&root, "data", "data")?;
+    parse_comment_page(field(data, "comment", "data.comment")?)
+}
+
+pub fn replies(bytes: &[u8]) -> Result<ReplyPage, ParseError> {
+    let root = parse_json(bytes)?;
+    require_success(&root)?;
+    let data = field(&root, "data", "data")?;
+    let parent = parse_comment(field(data, "comment", "data.comment")?)?
+        .ok_or(ParseError::InvalidValue("reply parent"))?;
+    let page = parse_comment_page(field(data, "reply", "data.reply")?)?;
+    Ok(ReplyPage {
+        parent,
+        replies: page.comments,
+        number: page.number,
+        total_pages: page.total_pages,
+        total_items: page.total_items,
+    })
+}
+
+fn parse_comment_page(value: &Value) -> Result<CommentPage, ParseError> {
+    let content = bounded_array(
+        value,
+        "content",
+        "comment page content",
+        MAX_COMMENTS_PER_RESPONSE,
+    )?;
+    let number = unsigned(value, "number", "comment page number")?;
+    let total_pages = unsigned(value, "totalPages", "comment page count")?;
+    let total_items = unsigned(value, "totalElements", "comment total")?;
+    if total_pages > MAX_COMMENT_PAGES
+        || total_items > MAX_COMMENT_PAGES.saturating_mul(MAX_COMMENTS_PER_RESPONSE)
+        || number >= total_pages.max(1)
+    {
+        return Err(ParseError::InvalidValue("comment pagination"));
+    }
+    let comments = content
+        .iter()
+        .filter_map(|value| parse_comment(value).transpose())
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    Ok(CommentPage {
+        comments,
+        number,
+        total_pages,
+        total_items,
+    })
+}
+
+fn parse_comment(value: &Value) -> Result<Option<Comment>, ParseError> {
+    let status = field(value, "status", "comment.status")?;
+    if boolean(status, "delete", "comment.status.delete")?
+        || boolean(status, "blind", "comment.status.blind")?
+        || boolean(status, "block", "comment.status.block")?
+    {
+        return Ok(None);
+    }
+    let author = bounded_string(
+        value,
+        "nickname",
+        "comment.nickname",
+        MAX_COMMENT_AUTHOR_BYTES,
+    )?;
+    let text = bounded_string(value, "comment", "comment.comment", MAX_COMMENT_TEXT_BYTES)?;
+    if author.trim().is_empty() || text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Comment {
+        id: unsigned(value, "commentId", "comment.commentId")?,
+        author: author.to_owned(),
+        text: text.to_owned(),
+        reply_count: unsigned(value, "replyCount", "comment.replyCount")?,
+        like_count: unsigned(value, "likeCount", "comment.likeCount")?,
+        created_at: positive_i64(value, "createdAt", "comment.createdAt")?,
+    }))
 }
 
 pub fn asset_summary(bytes: &[u8]) -> Result<WalletSummary, ParseError> {
@@ -1278,6 +1376,19 @@ fn optional_unsigned(
     }
 }
 
+fn positive_i64(value: &Value, key: &str, name: &'static str) -> Result<i64, ParseError> {
+    let text = field(value, key, name)?
+        .as_integer_str()
+        .ok_or(ParseError::WrongType(name))?;
+    let number = text
+        .parse::<i64>()
+        .map_err(|_| ParseError::InvalidValue(name))?;
+    if number <= 0 {
+        return Err(ParseError::InvalidValue(name));
+    }
+    Ok(number)
+}
+
 fn positive_u32(value: &Value, key: &str, name: &'static str) -> Result<u32, ParseError> {
     let number = field(value, key, name)?
         .as_i64()
@@ -1352,8 +1463,9 @@ fn signed_image_path(url: &str) -> Result<String, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_summary, content_detail, expiration_history, gift_balance, homepage, images, library,
-        public_detail, purchase_receipt, purchase_rejection_result, quote, recent, ParseError,
+        asset_summary, comments, content_detail, expiration_history, gift_balance, homepage,
+        images, library, public_detail, purchase_receipt, purchase_rejection_result, quote, recent,
+        replies, ParseError,
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
@@ -1416,6 +1528,137 @@ mod tests {
             entries.join(",")
         )
         .into_bytes()
+    }
+
+    fn comment_entry(
+        id: usize,
+        nickname: &str,
+        comment: &str,
+        like_count: usize,
+        reply_count: usize,
+        created_at: i64,
+        removed: &str,
+    ) -> String {
+        format!(
+            concat!(
+                "{{\"commentManageId\":40615,\"commentId\":{id},",
+                "\"title\":\"Comic\",\"subTitle\":\"Episode 1\",\"nickname\":\"{nickname}\",",
+                "\"profileImage\":null,\"isHighLightProfile\":false,\"comment\":\"{comment}\",",
+                "\"commentImagePath\":null,\"emoticonImageId\":null,\"emoticonUrl\":null,",
+                "\"emoticonContentsId\":null,\"replyCount\":{reply_count},",
+                "\"likeCount\":{like_count},\"createdAt\":{created_at},\"pageNumber\":0,",
+                "\"status\":{{\"like\":false,\"delete\":{deleted},\"blind\":{blind},",
+                "\"block\":{blocked},\"report\":false,\"mine\":false}}}}"
+            ),
+            id = id,
+            nickname = nickname,
+            comment = comment,
+            reply_count = reply_count,
+            like_count = like_count,
+            created_at = created_at,
+            deleted = removed == "delete",
+            blind = removed == "blind",
+            blocked = removed == "block",
+        )
+    }
+
+    fn comment_page(
+        entries: &[String],
+        number: usize,
+        total_pages: usize,
+        total: usize,
+    ) -> Vec<u8> {
+        let content = entries.join(",");
+        format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":{{\"commentManageId\":40615,",
+                "\"contentsIsAdult\":false,\"comment\":{{\"content\":[{content}],",
+                "\"pageable\":{{}},\"totalPages\":{total_pages},\"last\":false,",
+                "\"totalElements\":{total},\"first\":{first},\"size\":20,\"number\":{number},",
+                "\"sort\":{{}},\"numberOfElements\":{count},\"empty\":{empty}}}}}}}"
+            ),
+            content = content,
+            total_pages = total_pages,
+            total = total,
+            first = number == 0,
+            number = number,
+            count = entries.len(),
+            empty = entries.is_empty(),
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn comments_preserve_server_order_and_remove_unavailable_rows() {
+        let body = comment_page(
+            &[
+                comment_entry(1, "First", "Hot", 40, 2, 1_754_582_509_710, ""),
+                comment_entry(2, "Deleted", "Gone", 90, 0, 1_754_582_509_711, "delete"),
+                comment_entry(3, "Third", "Ordinary", 39, 0, 1_754_582_509_712, ""),
+                comment_entry(4, "Blind", "Gone", 80, 0, 1_754_582_509_713, "blind"),
+                comment_entry(5, "Blocked", "Gone", 70, 0, 1_754_582_509_714, "block"),
+            ],
+            0,
+            5,
+            89,
+        );
+
+        let page = comments(&body).expect("valid comments");
+
+        assert_eq!(
+            page.comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(page.comments[0].is_best());
+        assert!(!page.comments[1].is_best());
+        assert_eq!(page.comments[0].author, "First");
+        assert_eq!(page.comments[0].text, "Hot");
+        assert_eq!(page.comments[0].like_count, 40);
+        assert_eq!(page.comments[0].reply_count, 2);
+        assert_eq!(page.comments[0].created_at, 1_754_582_509_710);
+        assert_eq!(page.number, 0);
+        assert_eq!(page.total_pages, 5);
+        assert_eq!(page.total_items, 89);
+    }
+
+    #[test]
+    fn comments_bound_remote_rows_and_text() {
+        let entries = (0..=20)
+            .map(|id| comment_entry(id, "Reader", "Text", 0, 0, 1, ""))
+            .collect::<Vec<_>>();
+        assert!(comments(&comment_page(&entries, 0, 2, 21)).is_err());
+
+        let oversized = comment_entry(1, "Reader", &"x".repeat(16 * 1024 + 1), 0, 0, 1, "");
+        assert!(comments(&comment_page(&[oversized], 0, 1, 1)).is_err());
+    }
+
+    #[test]
+    fn replies_parse_full_parent_and_bounded_reply_page() {
+        let parent = comment_entry(1, "Parent", "Full parent", 40, 1, 10, "");
+        let reply = comment_entry(2, "Reply", "Answer", 3, 0, 11, "");
+        let body = format!(
+            concat!(
+                "{{\"result\":\"SUCCESS\",\"data\":{{\"comment\":{parent},",
+                "\"reply\":{{\"content\":[{reply}],\"pageable\":{{}},\"totalPages\":1,",
+                "\"last\":true,\"totalElements\":1,\"first\":true,\"size\":10,",
+                "\"number\":0,\"sort\":{{}},\"numberOfElements\":1,\"empty\":false}}}}}}"
+            ),
+            parent = parent,
+            reply = reply,
+        );
+
+        let page = replies(body.as_bytes()).expect("valid replies");
+
+        assert_eq!(page.parent.id, 1);
+        assert_eq!(page.parent.text, "Full parent");
+        assert_eq!(page.replies.len(), 1);
+        assert_eq!(page.replies[0].id, 2);
+        assert_eq!(page.number, 0);
+        assert_eq!(page.total_pages, 1);
+        assert_eq!(page.total_items, 1);
     }
 
     #[test]

@@ -69,6 +69,25 @@ pub struct EpisodeImage {
     pub url: String,
 }
 
+const BEST_COMMENT_LIKES: usize = 40;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Comment {
+    pub id: usize,
+    pub author: String,
+    pub text: String,
+    pub reply_count: usize,
+    pub like_count: usize,
+    pub created_at: i64,
+}
+
+impl Comment {
+    #[must_use]
+    pub const fn is_best(&self) -> bool {
+        self.like_count >= BEST_COMMENT_LIKES
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecentEntry {
     pub content_alias: String,
