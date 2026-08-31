@@ -5971,14 +5971,12 @@ mod tests {
 
     impl KoboApp for Tofu {
         fn on_start(&mut self, context: &mut Context) {
-            // An ideograph, and not a tick: neither face on the device carries
-            // one, whereas the tick this used to say has been drawn from the
-            // grid face ever since the interface face got somewhere to fall
-            // back to. A label that comes out fine is not a label worth
-            // failing a build over.
+            // A Unicode noncharacter is deliberately outside every supported
+            // font fallback, so its absence does not depend on which host or
+            // device fonts discovery finds.
             context.set_screen(
                 ScreenBuilder::new("tofu")
-                    .button("ok", "Chosen \u{4e2d}")
+                    .button("ok", "Chosen \u{10ffff}")
                     .build(),
             );
         }
