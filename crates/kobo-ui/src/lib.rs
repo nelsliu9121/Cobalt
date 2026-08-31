@@ -4738,7 +4738,9 @@ impl Layout {
             // control: what the reader touched was not the page.
             if matches!(
                 node.kind,
-                LayoutKind::Button(_, ControlState::Disabled, _) | LayoutKind::Scrim { .. }
+                LayoutKind::Button(_, ControlState::Disabled, _)
+                    | LayoutKind::Tile(_, ControlState::Disabled)
+                    | LayoutKind::Scrim { .. }
             ) {
                 return true;
             }
@@ -5552,6 +5554,11 @@ fn layout_node(
             let lead = metrics.space(Space::Small);
             let trail = metrics.space(Space::Tight);
             let line = FontSize::Caption.line_height();
+            let target_height = if action.is_some() {
+                max(line, metrics.touch_target_minimum())
+            } else {
+                line
+            };
             let gap = metrics.space(Space::Tight);
             // The value is measured first and the title clamped against what
             // is left, so a long name gives up its own hairline rather than
@@ -5581,13 +5588,13 @@ fn layout_node(
                     x,
                     y: y.saturating_add(lead),
                     width,
-                    height: line,
+                    height: target_height,
                 },
                 kind: LayoutKind::Section(*action),
                 text_lines,
             });
             y.saturating_add(lead)
-                .saturating_add(line)
+                .saturating_add(target_height)
                 .saturating_add(trail)
         }
         Node::Quote {
@@ -6959,6 +6966,19 @@ fn layout_node(
                     x.saturating_add(column * (cell_width.saturating_add(column_gap)));
                 let cell_y = y.saturating_add(row * (cell_height.saturating_add(row_gap)));
                 if cell_y.saturating_add(cell_height) > bottom {
+                    // Retain the first omitted cell as a non-drawing marker so
+                    // diagnostics report that this fixed grid was not paged.
+                    layout.nodes.push(LayoutNode {
+                        id: *id,
+                        rect: Rect {
+                            x: cell_x,
+                            y: cell_y,
+                            width: cell_width,
+                            height: cell_height,
+                        },
+                        kind: LayoutKind::Spacer,
+                        text_lines: Vec::new(),
+                    });
                     break;
                 }
                 placed_rows = row + 1;
@@ -10122,9 +10142,7 @@ fn validate_composition(
 /// A label belonging to a node that has somewhere better to put its state.
 fn stateful_label(node: &Node) -> Option<(NodeId, &str)> {
     match node {
-        Node::TileGrid { id, tiles, .. }
-        | Node::ImageStrip { id, tiles }
-        | Node::MediaGrid { id, tiles } => tiles
+        Node::TileGrid { id, tiles, .. } | Node::MediaGrid { id, tiles } => tiles
             .iter()
             .find(|tile| state_written_into(&tile.label))
             .map(|tile| (*id, tile.label.as_str())),
@@ -10422,8 +10440,6 @@ fn validate_node(
                 ));
             }
             for tile in tiles.iter().take(MAX_IMAGE_STRIP_ITEMS) {
-                check_text_coverage(id, &tile.label, Face::Text, issues);
-                check_text_coverage(id, &tile.subtitle, Face::Text, issues);
                 if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
                     check_picture(id, picture.handle, picture.source, pictures, issues);
                 }
@@ -20717,6 +20733,52 @@ mod feature_feed_tests {
     }
 
     #[test]
+    fn disabled_image_strip_tile_swallows_page_turn() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: vec![
+                    Tile::new(ActionId(1), "", Glyph::Book)
+                        .with_state(TileState::Unavailable),
+                ],
+            }],
+        )
+        .with_page_turns(ActionId(10), ActionId(11));
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let tile = layout
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == LayoutKind::Tile(ActionId(1), ControlState::Disabled)
+            })
+            .expect("disabled strip tile");
+        assert_eq!(layout.hit_test(tile.rect.x + 1, tile.rect.y + 1), None);
+    }
+
+    #[test]
+    fn image_strip_validation_ignores_hidden_tile_text() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: vec![
+                    Tile::new(ActionId(1), "\u{10ffff} (kept)", Glyph::Book)
+                        .with_subtitle("\u{10ffff}")
+                        .with_state(TileState::Held),
+                ],
+            }],
+        );
+        assert!(!screen.validate(&CLARA_BW_METRICS).iter().any(|issue| {
+            matches!(
+                issue.kind,
+                LayoutIssueKind::UnsupportedCharacter { .. }
+                    | LayoutIssueKind::StateInLabel
+            )
+        }));
+    }
+
+    #[test]
     fn media_grid_places_six_cards_as_three_rows_by_two_columns() {
         let screen = Screen::new(
             1,
@@ -20755,6 +20817,44 @@ mod feature_feed_tests {
                 Some(action)
             );
         }
+    }
+
+    #[test]
+    fn media_grid_reports_partial_fit() {
+        let chrome = Chrome::default();
+        let baseline =
+            Screen::new(0, Vec::new()).layout_with(&CLARA_BW_METRICS, &chrome);
+        let mut metrics = CLARA_BW_METRICS;
+        let overhead = metrics.height.saturating_sub(baseline.content.height);
+        metrics.height = overhead
+            .saturating_add(metrics.touch_target_default() * 2)
+            .saturating_add(metrics.space(Space::Tight));
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: (0..6)
+                    .map(|index| {
+                        Tile::new(ActionId(index + 1), format!("Title {index}"), Glyph::Book)
+                            .with_subtitle(format!("Creator {index}"))
+                    })
+                    .collect(),
+            }],
+        );
+        let diagnostics = screen.diagnostics(&metrics, &chrome);
+        let cards = diagnostics
+            .layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::MediaCard(_)))
+            .count();
+        assert!((1..6).contains(&cards), "expected a partial grid, got {cards}");
+        assert!(diagnostics.issues.iter().any(|issue| {
+            matches!(
+                issue.kind,
+                LayoutIssueKind::Clipped | LayoutIssueKind::ContentOverflow { .. }
+            )
+        }));
     }
 
     #[test]
@@ -20839,6 +20939,59 @@ mod feature_feed_tests {
             layout.hit_test(section.rect.x + 1, section.rect.y + 1),
             Some(action)
         );
+    }
+
+    #[test]
+    fn tappable_section_target_meets_clara_minimum_without_changing_plain_section() {
+        let plain = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "Plain".to_owned(),
+                value: None,
+                action: None,
+            }],
+        )
+        .layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let tappable_screen = Screen::new(
+            2,
+            vec![Node::Section {
+                id: NodeId(2),
+                title: "Tappable".to_owned(),
+                value: None,
+                action: Some(ActionId(42)),
+            }],
+        );
+        let diagnostics =
+            tappable_screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
+        let target = diagnostics
+            .layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(Some(ActionId(42))))
+            .expect("tappable section target");
+        assert_eq!(
+            plain
+                .nodes
+                .iter()
+                .find(|node| node.kind == LayoutKind::Section(None))
+                .expect("plain section")
+                .rect
+                .height,
+            FontSize::Caption.line_height()
+        );
+        assert!(
+            target.rect.height >= CLARA_BW_METRICS.touch_target_minimum()
+        );
+        assert_eq!(
+            diagnostics
+                .layout
+                .hit_test(target.rect.x + 1, target.rect.y + target.rect.height - 1),
+            Some(ActionId(42))
+        );
+        assert!(!diagnostics.issues.iter().any(|issue| {
+            matches!(issue.kind, LayoutIssueKind::TouchTargetTooSmall { .. })
+        }));
     }
 
     #[test]
