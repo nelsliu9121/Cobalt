@@ -3530,8 +3530,12 @@ impl Bomtoon {
                 && view.queued_aliases.is_empty()
                 && view.pending_aliases.is_empty()
         }) {
+            let discovery_origin = view.pages.len().saturating_sub(1);
+            let should_advance = view.page == discovery_origin;
             view.commit_page(start, count.min(candidate_count));
-            view.page = view.pages.len().saturating_sub(1);
+            if should_advance {
+                view.page = view.pages.len().saturating_sub(1);
+            }
         }
     }
 
@@ -3600,14 +3604,20 @@ impl Bomtoon {
     }
 
     fn reconcile_published_collection(&mut self, context: &mut Context) {
-        let Some((collection_id, origin_feed_page)) =
-            self.featured.collection.as_ref().map(|view| {
-                (view.collection_id.clone(), view.origin_feed_page)
-            })
-        else {
+        let active_collection = self
+            .featured
+            .collection
+            .as_ref()
+            .map(|view| (view.collection_id.clone(), view.origin_feed_page));
+        self.cancel_collection_details(context);
+        self.featured.detail_cache.clear();
+        let Some((collection_id, origin_feed_page)) = active_collection else {
             return;
         };
-        self.cancel_collection_details(context);
+        let last_page = featured_feed_pages(&self.featured, &CLARA_BW_METRICS)
+            .len()
+            .saturating_sub(1);
+        let origin_feed_page = origin_feed_page.min(last_page);
         let replacement_len = self
             .featured
             .snapshot()
@@ -3624,10 +3634,7 @@ impl Bomtoon {
         self.featured.collection = None;
         self.destination = MainDestination::Featured;
         self.view = View::Main;
-        let last_page = featured_feed_pages(&self.featured, &CLARA_BW_METRICS)
-            .len()
-            .saturating_sub(1);
-        self.featured.feed_page = origin_feed_page.min(last_page);
+        self.featured.feed_page = origin_feed_page;
     }
 
     fn resume_cancelled_collection_window(&mut self, context: &mut Context) {
@@ -4500,6 +4507,7 @@ impl Bomtoon {
             self.show(context);
             return;
         }
+        self.view = View::Main;
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
         self.page = 0;
@@ -17219,6 +17227,59 @@ mod tests {
     }
 
     #[test]
+    fn collection_async_boundary_settle_preserves_page_changed_during_discovery() {
+        let mut app = full_collection_app(AccountState::SignedOut, 12);
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        settle_open_collection_window(&mut runner, None);
+        runner.action(action_id(NEXT_PAGE));
+        settle_open_collection_window(&mut runner, None);
+        let settled_pages = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .pages
+            .len();
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .page,
+            settled_pages - 1
+        );
+
+        runner.action(action_id(NEXT_PAGE));
+        assert!(!collection_detail_tasks(&runner).is_empty());
+        runner.action(action_id(PREVIOUS_PAGE));
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .page,
+            settled_pages.saturating_sub(2)
+        );
+        settle_open_collection_window(&mut runner, None);
+        let view = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection");
+
+        assert!(view.pages.len() > settled_pages);
+        assert_eq!(view.page, settled_pages.saturating_sub(2));
+    }
+
+    #[test]
     fn collection_back_is_owned_signed_out_cancels_details_and_restores_exact_feed_page() {
         let mut app = full_collection_app(AccountState::SignedOut, 12);
         app.featured.feed_page = 4;
@@ -17264,6 +17325,31 @@ mod tests {
                 || runner.app().queued_foreground == Some(Pending::Content(0))
         );
         assert_eq!(runner.app().featured.collection, None);
+    }
+
+    #[test]
+    fn collection_pending_comic_request_leaves_collection_before_back_and_late_outcome() {
+        let mut app = full_collection_app(AccountState::Active, 6);
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        settle_open_collection_window(&mut runner, None);
+
+        let commands = runner.action(action_id(&comic_action("ranking", 0)));
+        let (content, work) = only_spawn(&commands);
+        assert_eq!(work, api::content("full-0"));
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().featured.collection, None);
+        assert_eq!(runner.app().pending, Some(Pending::Content(0)));
+
+        let commands = runner.action(ActionId::BACK);
+        assert!(cancelled_tasks(&commands).is_empty());
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().pending, Some(Pending::Content(0)));
+        assert_eq!(runner.app().task, Some(content));
+
+        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        assert_eq!(runner.app().view, View::Episodes);
     }
 
     #[test]
@@ -17405,6 +17491,100 @@ mod tests {
                 .pages
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn published_snapshot_clears_ready_and_failed_detail_cache_before_reopen() {
+        let mut app = ready_featured(local_day(30), "old");
+        app.featured.snapshot_generation = app.featured.generation;
+        app.featured.detail_cache.insert(
+            "new-ranking".to_owned(),
+            feature::DetailState::Ready(model::PublicDetail {
+                alias: "new-ranking".to_owned(),
+                title: "Stale ready".to_owned(),
+                synopsis: Some("Stale ready synopsis".to_owned()),
+            }),
+        );
+        app.featured
+            .detail_cache
+            .insert("new-free".to_owned(), feature::DetailState::Failed);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        observe_day_with_runner(&mut runner, local_day(31));
+
+        complete_feature_batch(&mut runner, "new", None);
+
+        assert!(runner.app().featured.detail_cache.is_empty());
+        runner.action(action_id(&collection_action("ranking")));
+        let mut requested = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(_, alias)| alias)
+            .collect::<BTreeSet<_>>();
+        requested.extend(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("ranking collection")
+                .queued_aliases
+                .iter()
+                .cloned(),
+        );
+        assert!(requested.contains("new-ranking"));
+        runner.action(ActionId::BACK);
+        runner.action(action_id(&collection_action("freetime")));
+        let mut requested = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(_, alias)| alias)
+            .collect::<BTreeSet<_>>();
+        requested.extend(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("freetime collection")
+                .queued_aliases
+                .iter()
+                .cloned(),
+        );
+        assert!(requested.contains("new-free"));
+    }
+
+    #[test]
+    fn published_snapshot_clamps_stable_collection_origin_before_back() {
+        let mut app = grouped_feature_app(None);
+        app.account = AccountState::SignedOut;
+        app.featured.loaded_day = Some(local_day(30));
+        app.featured.snapshot_generation = app.featured.generation;
+        let old_pages = featured_feed_pages(&app.featured, &CLARA_BW_METRICS).len();
+        assert!(old_pages > 1);
+        let origin = old_pages - 1;
+        app.featured.feed_page = origin;
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        observe_day_with_runner(&mut runner, local_day(31));
+        runner.app_mut().featured.feed_page = origin;
+        runner.action(action_id(&collection_action("freetime")));
+
+        complete_feature_batch(&mut runner, "replacement", None);
+        let new_pages = featured_feed_pages(&runner.app().featured, &CLARA_BW_METRICS).len();
+        assert!(new_pages < old_pages);
+        let expected_origin = origin.min(new_pages.saturating_sub(1));
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("stable collection remains open")
+                .origin_feed_page,
+            expected_origin
+        );
+
+        runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().featured.feed_page, expected_origin);
     }
 
     #[test]
