@@ -5017,9 +5017,34 @@ fn intrinsic_width(node: &Node, available: i32, metrics: &DisplayMetrics, prose:
         Node::Rows { rows, .. } => rows
             .iter()
             .map(|row| {
+                let text_width = row_title_width_beside(
+                    metrics,
+                    ProseArea {
+                        width: available,
+                        height: 0,
+                        gap: 0,
+                        face: Face::Text,
+                    },
+                    row.trailing.as_deref().unwrap_or(""),
+                    row.menu.is_some(),
+                    row_mark_column(metrics),
+                );
+                let description = limited_lines(
+                    &row.description,
+                    text_width,
+                    FontSize::Caption,
+                    row.line_limits.description,
+                )
+                .iter()
+                .map(|line| measure_text(line, FontSize::Caption).0)
+                .max()
+                .unwrap_or(0);
                 let mut text = max(
-                    measure_text(&row.title, FontSize::Body).0,
-                    measure_text(&row.summary, FontSize::Caption).0,
+                    max(
+                        measure_text(&row.title, FontSize::Body).0,
+                        measure_text(&row.summary, FontSize::Caption).0,
+                    ),
+                    description,
                 );
                 if let Some(trailing) = &row.trailing {
                     text = text
@@ -8800,11 +8825,15 @@ fn measure_row(
     let text_width = row_title_width_beside(metrics, area, trailing, menu, lead);
     let title_lines = limited_lines(title, text_width, FontSize::Body, limits.title);
     let summary_lines = limited_lines(summary, text_width, FontSize::Caption, limits.summary);
-    let description_lines =
-        limited_lines(description, text_width, FontSize::Body, limits.description);
+    let description_lines = limited_lines(
+        description,
+        text_width,
+        FontSize::Caption,
+        limits.description,
+    );
     let title_height = title_lines.len() as i32 * FontSize::Body.line_height();
     let summary_height = summary_lines.len() as i32 * FontSize::Caption.line_height();
-    let description_height = description_lines.len() as i32 * FontSize::Body.line_height();
+    let description_height = description_lines.len() as i32 * FontSize::Caption.line_height();
     let content_height = title_height
         .saturating_add(summary_height)
         .saturating_add(description_height);
@@ -8870,8 +8899,12 @@ pub fn paginate_rows_with_trailing(
 
 /// Breaks bounded rows with descriptions and trailing values into pages.
 ///
-/// Returns row indices so callers can build each page without cloning their
-/// source data.
+/// This paginator serves collection rows, whose leads are cover pictures. It
+/// therefore reserves the full picture column rather than the narrower mark
+/// column; the tuple deliberately carries no second, contradictory lead shape.
+///
+/// Returns row indices so callers can build each page without cloning source
+/// data.
 #[must_use]
 pub fn paginate_described_rows_with_trailing(
     rows: &[(&str, &str, &str, &str)],
@@ -8890,7 +8923,7 @@ pub fn paginate_described_rows_with_trailing(
                     description,
                     trailing,
                     false,
-                    row_mark_column(metrics),
+                    metrics.touch_target_default(),
                     limits,
                 )
             }),
@@ -8992,9 +9025,6 @@ fn paginate_row_heights(
     }
     if !page.is_empty() {
         pages.push(page);
-    }
-    if pages.is_empty() {
-        pages.push(Vec::new());
     }
     pages
 }
@@ -10600,8 +10630,7 @@ fn validate_node(
                 issues.push(limit_issue(id, "rows", rows.len(), MAX_ROWS));
             }
             for row in rows {
-                check_text_coverage(id, &row.title, Face::Text, issues);
-                check_text_coverage(id, &row.summary, Face::Text, issues);
+                check_row_text_coverage(id, row, issues);
             }
         }
         Node::TileGrid { tiles, .. } => {
@@ -10766,6 +10795,31 @@ fn check_text_coverage(id: NodeId, text: &str, face: Face, issues: &mut Vec<Layo
     }
 }
 
+fn check_row_text_coverage(id: NodeId, row: &Row, issues: &mut Vec<LayoutIssue>) {
+    check_row_text_coverage_with(id, row, issues, undrawable_in);
+}
+
+fn check_row_text_coverage_with(
+    id: NodeId,
+    row: &Row,
+    issues: &mut Vec<LayoutIssue>,
+    mut undrawable: impl FnMut(&str, Face) -> Option<char>,
+) {
+    for text in [&row.title, &row.summary, &row.description] {
+        if let Some(character) = undrawable(text, Face::Text) {
+            issues.push(LayoutIssue {
+                severity: DiagnosticSeverity::Error,
+                node: Some(id),
+                kind: LayoutIssueKind::UnsupportedCharacter {
+                    character,
+                    face: Face::Text,
+                },
+                rect: None,
+            });
+        }
+    }
+}
+
 fn validate_content_bounds(
     nodes: &[&Node],
     layout: &Layout,
@@ -10923,6 +10977,7 @@ fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
         | LayoutKind::FactLabel
         | LayoutKind::RowTrailing
         | LayoutKind::RowSummary
+        | LayoutKind::RowDescription
         | LayoutKind::TileLabel
         | LayoutKind::TileSubtitle
         | LayoutKind::TileBadge
@@ -10943,7 +10998,6 @@ fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
         | LayoutKind::BarAction(_)
         | LayoutKind::RowTitle
         | LayoutKind::RowTitleDone
-        | LayoutKind::RowDescription
         | LayoutKind::CellLabel
         | LayoutKind::ChoicePrompt
         | LayoutKind::ChoiceOption(_, _)
@@ -12220,7 +12274,7 @@ fn render_all_with_selected_font(
                 &node.text_lines,
                 node.rect.x,
                 node.rect.y,
-                FontSize::Body,
+                FontSize::Caption,
                 tone::MUTED,
                 clip,
             ),
@@ -15453,7 +15507,7 @@ mod row_tests {
             Glyph::Book,
         )
         .with_description(
-            "Synopsis repeated until it would occupy at least four lines on Clara",
+            "Synopsis repeated until it would occupy at least four lines on Clara ".repeat(8),
         )
         .with_line_limits(RowLineLimits::new(1, 1, 2));
         let screen = Screen::new(
@@ -15467,17 +15521,60 @@ mod row_tests {
         assert_eq!(lines_for(&layout, LayoutKind::RowTitle), 1);
         assert_eq!(lines_for(&layout, LayoutKind::RowSummary), 1);
         assert_eq!(lines_for(&layout, LayoutKind::RowDescription), 2);
+        let summary = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::RowSummary)
+            .expect("a summary");
+        let description = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::RowDescription)
+            .expect("a description");
+        assert_eq!(
+            description.rect.y,
+            summary.rect.y.saturating_add(summary.rect.height)
+        );
+        assert_eq!(
+            description.rect.height,
+            2 * FontSize::Caption.line_height()
+        );
     }
 
     #[test]
     fn described_row_paginator_matches_drawable_described_rows() {
+        let area = CLARA_BW_METRICS.prose_area(true, false);
+        let mark_width = row_title_width_beside(
+            &CLARA_BW_METRICS,
+            area,
+            "1K",
+            false,
+            row_mark_column(&CLARA_BW_METRICS),
+        );
+        let picture_width = row_title_width_beside(
+            &CLARA_BW_METRICS,
+            area,
+            "1K",
+            false,
+            CLARA_BW_METRICS.touch_target_default(),
+        );
+        let source = "Synopsis words repeated until the narrower picture row wraps ".repeat(20);
+        let synopsis = (1..=source.len())
+            .filter(|end| source.is_char_boundary(*end))
+            .map(|end| source[..end].trim_end())
+            .find(|candidate| {
+                wrap_text(candidate, mark_width, FontSize::Caption).len() == 1
+                    && wrap_text(candidate, picture_width, FontSize::Caption).len() == 2
+            })
+            .expect("a synopsis that wraps only beside a picture")
+            .to_owned();
         let rows = (0..12)
             .map(|index| {
                 (
                     format!("Title {index}"),
                     format!("Creator {index}"),
-                    "Two line synopsis with enough text to wrap on Clara".to_owned(),
-                    format!("{}K", index + 1),
+                    synopsis.clone(),
+                    "1K".to_owned(),
                 )
             })
             .collect::<Vec<_>>();
@@ -15489,7 +15586,7 @@ mod row_tests {
             &borrowed,
             RowLineLimits::new(1, 1, 2),
             &CLARA_BW_METRICS,
-            CLARA_BW_METRICS.prose_area(true, false),
+            area,
         );
         assert_eq!(
             pages.iter().flatten().copied().collect::<Vec<_>>(),
@@ -15509,7 +15606,15 @@ mod row_tests {
                                 ActionId(index as u32 + 1),
                                 title,
                                 creator,
-                                Glyph::Book,
+                                RowLead::Picture(
+                                    TilePicture::new(
+                                        PictureHandle(index as u32 + 100),
+                                        300,
+                                        300,
+                                    )
+                                    .with_fit(PictureFit::Cover),
+                                    Glyph::Book,
+                                ),
                             )
                             .with_description(synopsis)
                             .with_trailing(trailing)
@@ -15533,6 +15638,81 @@ mod row_tests {
                     .has_errors()
             );
         }
+    }
+
+    #[test]
+    fn empty_described_rows_and_existing_measured_paginators_have_no_pages() {
+        let area = CLARA_BW_METRICS.prose_area(true, false);
+        assert!(paginate_described_rows_with_trailing(
+            &[],
+            RowLineLimits::new(1, 1, 2),
+            &CLARA_BW_METRICS,
+            area,
+        )
+        .is_empty());
+        assert!(paginate_rows_with_trailing(&[], &CLARA_BW_METRICS, area).is_empty());
+        assert!(
+            paginate_ranked_rows_with_trailing(&[], &CLARA_BW_METRICS, area, 12).is_empty()
+        );
+        assert!(paginate_rows_with_menu(&[], &CLARA_BW_METRICS, area).is_empty());
+    }
+
+    #[test]
+    fn unsupported_described_row_text_is_reported() {
+        let row = Row::new(ActionId(1), "Title", "Creator", Glyph::Book)
+            .with_description("\u{10ffff}");
+        let mut issues = Vec::new();
+        check_row_text_coverage_with(
+            NodeId(41),
+            &row,
+            &mut issues,
+            |text, _face| text.contains('\u{10ffff}').then_some('\u{10ffff}'),
+        );
+        assert!(issues.iter().any(|issue| {
+            issue.node == Some(NodeId(41))
+                && matches!(
+                    issue.kind,
+                    LayoutIssueKind::UnsupportedCharacter {
+                        character: '\u{10ffff}',
+                        face: Face::Text,
+                    }
+                )
+        }));
+    }
+
+    #[test]
+    fn described_rows_contribute_caption_text_to_natural_width() {
+        let metrics = CLARA_BW_METRICS;
+        let area = metrics.prose_area(false, false);
+        let description =
+            "A description long enough to determine the natural width of this row by itself";
+        let row = Row::new(ActionId(1), "T", "", Glyph::Book)
+            .with_description(description)
+            .with_line_limits(RowLineLimits::new(0, 0, 1));
+        let text_width = row_title_width_beside(
+            &metrics,
+            area,
+            "",
+            false,
+            row_mark_column(&metrics),
+        );
+        let clamped = clamp_lines(description, text_width, FontSize::Caption, 1);
+        let expected = measure_text(&clamped, FontSize::Caption)
+            .0
+            .saturating_add(row_mark_column(&metrics))
+            .saturating_add(2 * metrics.space(Space::Small));
+        assert_eq!(
+            intrinsic_width(
+                &Node::Rows {
+                    id: NodeId(1),
+                    rows: vec![row],
+                },
+                area.width,
+                &metrics,
+                Face::Text,
+            ),
+            expected
+        );
     }
 
     #[test]
