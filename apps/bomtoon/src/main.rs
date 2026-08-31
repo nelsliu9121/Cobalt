@@ -1,7 +1,11 @@
 mod api;
 mod commerce;
+mod feature;
 mod model;
 mod parse;
+use feature::{FeatureSnapshot, FeatureSource, FeaturedState, SourceResult};
+#[cfg(test)]
+use feature::FEATURE_SOURCES;
 
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
@@ -12,7 +16,7 @@ use kobo_sdk::{
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
-    FeatureComic, Homepage, RecentEntry, WalletSummary,
+    FeatureComic, RecentEntry, WalletSummary,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
@@ -253,52 +257,14 @@ enum MarkerStoreOperation {
     Forget,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum FeaturedStatus {
-    #[default]
-    Unloaded,
-    Loading,
-    Ready,
-    Failed,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct FeaturedRefresh {
-    loaded_day: Option<LocalDay>,
-    desired_day: Option<LocalDay>,
-    active_day: Option<LocalDay>,
-    local_day_pending: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct StagedFeatured {
-    featured: Vec<FeatureComic>,
-    recommended: Vec<FeatureComic>,
-    pending_details: usize,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct FeaturedState {
-    status: FeaturedStatus,
-    generation: u64,
-    featured: Vec<FeatureComic>,
-    recommended: Vec<FeatureComic>,
-    pending_details: usize,
-    page: usize,
-    stale_warning: Option<String>,
-    refresh: FeaturedRefresh,
-    staged: Option<StagedFeatured>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ShelfTaskPurpose {
-    Homepage {
+enum FeatureTaskPurpose {
+    Source {
         generation: u64,
-        refresh_day: Option<LocalDay>,
+        source: FeatureSource,
     },
     BannerDetail {
         generation: u64,
-        slot: usize,
         alias: String,
     },
 }
@@ -332,18 +298,6 @@ struct CoverCache {
     visible_source: Option<CoverSource>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BannerDetailPlan {
-    slot: usize,
-    alias: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FeaturedPlan {
-    featured: Vec<FeatureComic>,
-    recommended: Vec<FeatureComic>,
-    details: Vec<BannerDetailPlan>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FeaturedPage {
@@ -351,95 +305,78 @@ struct FeaturedPage {
     recommended: std::ops::Range<usize>,
 }
 
-fn plan_featured(homepage: Homepage) -> FeaturedPlan {
-    let Homepage {
-        banners,
-        newest,
-        week_day,
-        only_bom,
-    } = homepage;
-    let mut aliases = BTreeSet::new();
-    let mut recommended = Vec::new();
-    for comic in newest.into_iter().chain(week_day).chain(only_bom) {
-        if aliases.insert(comic.alias.clone()) {
-            recommended.push(comic);
-        }
-    }
-
-    let mut featured = Vec::new();
-    let mut details = Vec::new();
-    for banner in banners.into_iter().take(3) {
-        if let Some(comic) = recommended.iter().find(|comic| comic.alias == banner.alias) {
-            featured.push(comic.clone());
-        } else {
-            let slot = featured.len();
-            details.push(BannerDetailPlan {
-                slot,
-                alias: banner.alias.clone(),
-            });
-            featured.push(FeatureComic {
-                title: banner.alias.clone(),
-                alias: banner.alias,
-                creators: String::new(),
-                view_count: None,
-                vertical_url: None,
-                square_url: None,
-            });
-        }
-    }
-    FeaturedPlan {
-        featured,
-        recommended,
-        details,
-    }
-}
 
 fn featured_page(featured: &FeaturedState, page: usize, first_page_rows: usize) -> FeaturedPage {
     let first_page_rows = first_page_rows.max(1);
+    let banner_count = featured
+        .snapshot()
+        .map_or(0, |snapshot| snapshot.banners.len().min(3));
+    let recommended_len = featured.snapshot().map_or(0, |snapshot| {
+        snapshot
+            .collections
+            .iter()
+            .map(|collection| collection.comics.len())
+            .sum()
+    });
     if page == 0 {
         return FeaturedPage {
-            featured: 0..featured.featured.len().min(3),
-            recommended: 0..featured.recommended.len().min(first_page_rows),
+            featured: 0..banner_count,
+            recommended: 0..recommended_len.min(first_page_rows),
         };
     }
     let continuation_rows = 6;
     let start = first_page_rows
         .saturating_add(page.saturating_sub(1).saturating_mul(continuation_rows))
-        .min(featured.recommended.len());
+        .min(recommended_len);
     FeaturedPage {
         featured: 0..0,
         recommended: start
             ..start
                 .saturating_add(continuation_rows)
-                .min(featured.recommended.len()),
+                .min(recommended_len),
     }
 }
 
 fn featured_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
     let first_page_rows = first_page_rows.max(1);
     let continuation_rows = 6;
-    if featured.recommended.len() <= first_page_rows {
+    let recommended_len = featured.snapshot().map_or(0, |snapshot| {
+        snapshot
+            .collections
+            .iter()
+            .map(|collection| collection.comics.len())
+            .sum()
+    });
+    if recommended_len <= first_page_rows {
         1
     } else {
-        1 + featured
-            .recommended
-            .len()
+        1 + recommended_len
             .saturating_sub(first_page_rows)
             .div_ceil(continuation_rows)
     }
 }
 
 fn featured_content_page(featured: &FeaturedState) -> Option<usize> {
-    if featured.stale_warning.is_some() {
-        featured.page.checked_sub(1)
+    if featured.warning().is_some() {
+        featured.feed_page.checked_sub(1)
     } else {
-        Some(featured.page)
+        Some(featured.feed_page)
     }
 }
 
 fn featured_display_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
     featured_page_count(featured, first_page_rows)
-        .saturating_add(usize::from(featured.stale_warning.is_some()))
+        .saturating_add(usize::from(featured.warning().is_some()))
+}
+
+fn recommended_comic(snapshot: &FeatureSnapshot, mut index: usize) -> Option<&FeatureComic> {
+    for collection in &snapshot.collections {
+        if index < collection.comics.len() {
+            return collection.comics.get(index);
+        }
+        index = index.saturating_sub(collection.comics.len());
+    }
+    None
 }
 fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
     match url.and_then(|url| covers.entries.get(url)) {
@@ -461,12 +398,15 @@ fn add_featured_feed(
     content_page: usize,
     first_page_rows: usize,
 ) -> ScreenBuilder {
+    let Some(snapshot) = featured.snapshot() else {
+        return screen;
+    };
     let page = featured_page(featured, content_page, first_page_rows);
     if !page.featured.is_empty() {
         screen = screen.picture_tiles(
             TileShape::Portrait,
             page.featured.map(|index| {
-                let comic = &featured.featured[index];
+                let comic = &snapshot.banners[index];
                 (
                     format!("comic-{index}"),
                     display_text(&comic.title, &comic.alias),
@@ -483,12 +423,12 @@ fn add_featured_feed(
             }),
         );
     }
-    let recommended_offset = featured.featured.len();
+    let recommended_offset = snapshot.banners.len();
     screen = screen
         .section("Recommended")
-        .rows(page.recommended.map(|index| {
-            let comic = &featured.recommended[index];
-            (
+        .rows(page.recommended.filter_map(|index| {
+            let comic = recommended_comic(snapshot, index)?;
+            Some((
                 format!("comic-{}", recommended_offset.saturating_add(index)),
                 display_text(&comic.title, &comic.alias),
                 "",
@@ -500,7 +440,7 @@ fn add_featured_feed(
                         .or(comic.square_url.as_ref())
                         .map(String::as_str),
                 ),
-            )
+            ))
         }));
     let pages = featured_page_count(featured, first_page_rows);
     screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
@@ -515,33 +455,34 @@ fn add_featured_content(
     covers: &CoverCache,
     first_page_rows: usize,
 ) -> ScreenBuilder {
-    if featured.page == 0 {
-        if let Some(warning) = &featured.stale_warning {
+    if featured.feed_page == 0 {
+        if let Some(warning) = featured.warning() {
             let pages = featured_display_page_count(featured, first_page_rows);
             return screen
-                .banner(BannerLevel::Attention, warning.clone())
+                .banner(BannerLevel::Attention, warning)
                 .primary_button(RETRY, "Try again")
                 .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
                 .page_position(1, u16::try_from(pages).unwrap_or(u16::MAX));
         }
     }
-    match featured.status {
-        FeaturedStatus::Unloaded => screen.text("Featured has not loaded yet."),
-        FeaturedStatus::Loading if featured.featured.is_empty() => {
-            screen.activity("Loading Featured", None)
-        }
-        FeaturedStatus::Loading | FeaturedStatus::Ready => {
-            let content_page = featured_content_page(featured).unwrap_or(0);
-            let pages = featured_display_page_count(featured, first_page_rows);
-            add_featured_feed(screen, featured, covers, content_page, first_page_rows)
-                .page_position(
-                    u16::try_from(featured.page.saturating_add(1)).unwrap_or(u16::MAX),
-                    u16::try_from(pages).unwrap_or(u16::MAX),
-                )
-        }
-        FeaturedStatus::Failed => screen
+    if featured.is_failed() {
+        return screen
             .banner(BannerLevel::Attention, "Featured could not be loaded.")
-            .primary_button(RETRY, "Try again"),
+            .primary_button(RETRY, "Try again");
+    }
+    if featured.snapshot().is_some() {
+        let content_page = featured_content_page(featured).unwrap_or(0);
+        let pages = featured_display_page_count(featured, first_page_rows);
+        return add_featured_feed(screen, featured, covers, content_page, first_page_rows)
+            .page_position(
+                u16::try_from(featured.feed_page.saturating_add(1)).unwrap_or(u16::MAX),
+                u16::try_from(pages).unwrap_or(u16::MAX),
+            );
+    }
+    if featured.is_loading() {
+        screen.activity("Loading Featured", None)
+    } else {
+        screen.text("Featured has not loaded yet.")
     }
 }
 
@@ -550,14 +491,11 @@ fn featured_page_zero_rows(featured: &FeaturedState) -> usize {
 }
 
 fn featured_page_zero_rows_with_covers(featured: &FeaturedState, covers: &CoverCache) -> usize {
-    let mut measuring = featured.clone();
-    measuring.page = 0;
-    measuring.stale_warning = None;
     for rows in (1..=6).rev() {
         let builder = ScreenBuilder::new("bomtoon-featured-measure")
             .top_bar("Featured")
             .top_bar_action(ACCOUNT, "Coins 18446744073709551615");
-        let screen = add_featured_feed(builder, &measuring, covers, 0, rows)
+        let screen = add_featured_feed(builder, featured, covers, 0, rows)
             .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
             .build();
         if !screen
@@ -1000,9 +938,8 @@ struct Bomtoon {
     wallet: WalletState,
     gifts: TitleGiftState,
     featured: FeaturedState,
-    shelf_tasks: BTreeMap<TaskId, ShelfTaskPurpose>,
-    superseded_shelf_tasks: BTreeSet<TaskId>,
-    queued_homepage: Option<(u64, Option<LocalDay>)>,
+    feature_tasks: BTreeMap<TaskId, FeatureTaskPurpose>,
+    superseded_feature_tasks: BTreeSet<TaskId>,
     covers: CoverCache,
     comics: Vec<Comic>,
     recent: Vec<RecentEntry>,
@@ -1065,31 +1002,31 @@ impl Bomtoon {
             }
         };
         match self.destination {
-            MainDestination::Featured
-                if matches!(
-                    self.featured.status,
-                    FeaturedStatus::Loading | FeaturedStatus::Ready
-                ) =>
-            {
+            MainDestination::Featured if self.featured.snapshot().is_some() => {
+                let snapshot = self.featured.snapshot().expect("checked Feature snapshot");
                 let first_page_rows = featured_page_zero_rows(&self.featured);
                 let Some(content_page) = featured_content_page(&self.featured) else {
                     return visible;
                 };
                 let page = featured_page(&self.featured, content_page, first_page_rows);
                 for index in page.featured {
+                    let comic = &snapshot.banners[index];
                     push(
-                        self.featured.featured[index]
+                        comic
                             .vertical_url
                             .as_ref()
-                            .or(self.featured.featured[index].square_url.as_ref()),
+                            .or(comic.square_url.as_ref()),
                     );
                 }
                 for index in page.recommended {
+                    let Some(comic) = recommended_comic(snapshot, index) else {
+                        continue;
+                    };
                     push(
-                        self.featured.recommended[index]
+                        comic
                             .vertical_url
                             .as_ref()
-                            .or(self.featured.recommended[index].square_url.as_ref()),
+                            .or(comic.square_url.as_ref()),
                     );
                 }
             }
@@ -1678,11 +1615,15 @@ impl Bomtoon {
 
     fn destination_len(&self) -> usize {
         match self.destination {
-            MainDestination::Featured => self
-                .featured
-                .featured
-                .len()
-                .saturating_add(self.featured.recommended.len()),
+            MainDestination::Featured => self.featured.snapshot().map_or(0, |snapshot| {
+                snapshot.banners.len().saturating_add(
+                    snapshot
+                        .collections
+                        .iter()
+                        .map(|collection| collection.comics.len())
+                        .sum::<usize>(),
+                )
+            }),
             MainDestination::Recent => self.recent.len(),
             MainDestination::Library => self.comics.len(),
         }
@@ -1707,7 +1648,7 @@ impl Bomtoon {
     fn select_destination(&mut self, context: &mut Context, target: MainDestination) {
         self.page = 0;
         if target == MainDestination::Featured {
-            self.featured.page = 0;
+            self.featured.feed_page = 0;
             self.request_local_day(context);
         }
         self.problem = None;
@@ -2349,7 +2290,7 @@ impl Bomtoon {
 
     fn open_account(&mut self, context: &mut Context) {
         self.page = 0;
-        self.featured.page = 0;
+        self.featured.feed_page = 0;
         self.problem = None;
         self.view = View::Account;
         self.refresh_asset_summary(context);
@@ -2375,15 +2316,16 @@ impl Bomtoon {
 
     fn public_cover_urls(&self) -> BTreeSet<String> {
         self.featured
-            .featured
-            .iter()
-            .chain(&self.featured.recommended)
-            .chain(
-                self.featured
-                    .staged
-                    .iter()
-                    .flat_map(|staged| staged.featured.iter().chain(&staged.recommended)),
-            )
+            .snapshot()
+            .into_iter()
+            .flat_map(|snapshot| {
+                snapshot.banners.iter().chain(
+                    snapshot
+                        .collections
+                        .iter()
+                        .flat_map(|collection| collection.comics.iter()),
+                )
+            })
             .filter_map(|comic| {
                 comic
                     .vertical_url
@@ -3134,7 +3076,7 @@ impl Bomtoon {
         self.account = account;
         self.connection = ConnectionState::Online;
         self.destination = MainDestination::Featured;
-        self.featured.page = 0;
+        self.featured.feed_page = 0;
         self.view = if account == AccountState::SignedOut {
             View::Main
         } else {
@@ -3153,15 +3095,16 @@ impl Bomtoon {
         }
         self.clear_protected_state(context);
         self.featured.generation = self.featured.generation.wrapping_add(1);
-        for task in std::mem::take(&mut self.shelf_tasks).into_keys() {
+        for task in std::mem::take(&mut self.feature_tasks).into_keys() {
             context.cancel(task);
         }
-        self.superseded_shelf_tasks.clear();
-        self.queued_homepage = None;
-        self.featured.refresh.local_day_pending = false;
-        self.featured.refresh.active_day = None;
-        self.featured.refresh.desired_day = None;
-        self.featured.staged = None;
+        self.superseded_feature_tasks.clear();
+        self.featured.snapshot = None;
+        self.featured.batch = None;
+        self.featured.feed_page = 0;
+        self.featured.loaded_day = None;
+        self.featured.local_day_pending = false;
+        self.featured.desired_day = None;
         self.covers.generation = self.covers.generation.wrapping_add(1);
         for task in std::mem::take(&mut self.covers.tasks).into_keys() {
             context.cancel(task);
@@ -3176,10 +3119,10 @@ impl Bomtoon {
     }
 
     fn request_local_day(&mut self, context: &mut Context) {
-        if self.featured.refresh.local_day_pending {
+        if self.featured.local_day_pending {
             return;
         }
-        self.featured.refresh.local_day_pending = true;
+        self.featured.local_day_pending = true;
         context.device().read_local_day();
     }
 
@@ -3187,348 +3130,154 @@ impl Bomtoon {
         let Some(day) = observed else {
             return;
         };
-        let refresh = &mut self.featured.refresh;
-        let Some(loaded_day) = refresh.loaded_day else {
-            refresh.loaded_day = Some(day);
-            return;
-        };
-        if let Some(active_day) = refresh.active_day {
-            if day != active_day && refresh.desired_day != Some(day) {
-                refresh.desired_day = Some(day);
-            }
-            return;
+        if self.featured.observe_day(day) {
+            self.resume_feature_capacity(context);
         }
-        if day == loaded_day || refresh.desired_day == Some(day) {
-            return;
-        }
-        refresh.desired_day = Some(day);
-        self.start_desired_refresh(context);
     }
 
-    fn start_desired_refresh(&mut self, context: &mut Context) {
-        if self.featured.refresh.active_day.is_some() {
-            return;
+    fn feature_source_work(source: FeatureSource) -> kobo_sdk::Task {
+        match source {
+            FeatureSource::Homepage => api::homepage(),
+            FeatureSource::Ranking => api::ranking(),
+            FeatureSource::MostFavorited => api::most_favorited(),
+            FeatureSource::Themes => api::themes(),
+            FeatureSource::Freetime => api::freetime(),
         }
-        let Some(day) = self.featured.refresh.desired_day.take() else {
-            return;
-        };
-        if self.featured.refresh.loaded_day == Some(day) {
-            return;
-        }
-        self.featured.refresh.active_day = Some(day);
-        self.start_homepage(context, Some(day));
     }
 
-    fn spawn_homepage_task(
+    fn spawn_feature_source(
         &mut self,
         context: &mut Context,
         generation: u64,
-        refresh_day: Option<LocalDay>,
-    ) {
-        if let Some(task) = context.spawn(api::homepage()) {
-            self.shelf_tasks.insert(
-                task,
-                ShelfTaskPurpose::Homepage {
-                    generation,
-                    refresh_day,
-                },
-            );
-        } else if refresh_day.is_some() {
-            self.fail_featured_refresh(context);
-        } else {
-            self.featured.status = FeaturedStatus::Failed;
-        }
-    }
-
-    fn resume_queued_homepage(&mut self, context: &mut Context) -> bool {
-        if !self.superseded_shelf_tasks.is_empty() || self.queued_foreground.is_some() {
+        source: FeatureSource,
+    ) -> bool {
+        if generation != self.featured.generation {
             return false;
         }
-        let Some((generation, refresh_day)) = self.queued_homepage.take() else {
+        let Some(task) = context.spawn(Self::feature_source_work(source)) else {
             return false;
         };
-        self.spawn_homepage_task(context, generation, refresh_day);
+        if !self.featured.mark_source_pending(generation, source) {
+            context.cancel(task);
+            return false;
+        }
+        self.feature_tasks.insert(
+            task,
+            FeatureTaskPurpose::Source { generation, source },
+        );
         true
     }
 
-    fn start_homepage(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
-        if refresh_day.is_some() && self.featured.status != FeaturedStatus::Ready {
-            self.featured.status = FeaturedStatus::Loading;
-            self.featured.stale_warning = None;
-        }
-        if let Some((_, queued_day)) = self.queued_homepage.as_mut() {
-            *queued_day = refresh_day;
-            if refresh_day.is_none() {
-                self.featured.status = FeaturedStatus::Loading;
-                self.featured.refresh.active_day = None;
-                self.featured.refresh.desired_day = None;
-                self.featured.staged = None;
+    fn resume_feature_capacity(&mut self, context: &mut Context) -> bool {
+        let mut spawned = false;
+        while let Some(source) = self.featured.queued_source() {
+            let generation = self.featured.generation;
+            if !self.spawn_feature_source(context, generation, source) {
+                return spawned;
             }
-            return;
+            spawned = true;
         }
-        for &task in self.shelf_tasks.keys() {
-            if self.superseded_shelf_tasks.insert(task) {
+
+        let generation = self.featured.generation;
+        for alias in self.featured.pending_banner_aliases() {
+            let active = self.feature_tasks.values().any(|purpose| {
+                matches!(
+                    purpose,
+                    FeatureTaskPurpose::BannerDetail {
+                        generation: task_generation,
+                        alias: task_alias,
+                    } if *task_generation == generation && task_alias == alias
+                )
+            });
+            if active {
+                continue;
+            }
+            let Some(task) = context.spawn(api::public_detail(alias)) else {
+                return spawned;
+            };
+            self.feature_tasks.insert(
+                task,
+                FeatureTaskPurpose::BannerDetail {
+                    generation,
+                    alias: alias.to_owned(),
+                },
+            );
+            spawned = true;
+        }
+        spawned
+    }
+
+    fn start_feature_batch(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
+        for &task in self.feature_tasks.keys() {
+            if self.superseded_feature_tasks.insert(task) {
                 context.cancel(task);
             }
         }
-        self.featured.generation = self.featured.generation.wrapping_add(1);
-        self.featured.staged = None;
-        if refresh_day.is_none() {
-            self.featured.status = FeaturedStatus::Loading;
-            self.featured.featured.clear();
-            self.featured.recommended.clear();
-            self.featured.pending_details = 0;
-            self.featured.page = 0;
-            self.featured.stale_warning = None;
-            self.featured.refresh.active_day = None;
-            self.featured.refresh.desired_day = None;
-        }
-        let generation = self.featured.generation;
-        if self.superseded_shelf_tasks.is_empty() {
-            self.spawn_homepage_task(context, generation, refresh_day);
-        } else {
-            self.queued_homepage = Some((generation, refresh_day));
-        }
+        self.featured.begin_full_batch(refresh_day);
+        self.resume_feature_capacity(context);
     }
 
-    fn complete_featured_refresh(&mut self, context: &mut Context) -> bool {
-        let Some(staged) = self.featured.staged.take() else {
+    fn retry_failed_feature_sources(&mut self, context: &mut Context) -> bool {
+        if self.featured.begin_failed_retry().is_empty() {
             return false;
-        };
-        let Some(day) = self.featured.refresh.active_day.take() else {
-            return false;
-        };
-        self.featured.featured = staged.featured;
-        self.featured.recommended = staged.recommended;
-        self.featured.pending_details = 0;
-        self.featured.page = 0;
-        self.featured.status = FeaturedStatus::Ready;
-        self.featured.stale_warning = None;
-        self.featured.refresh.loaded_day = Some(day);
-        if self.featured.refresh.desired_day == Some(day) {
-            self.featured.refresh.desired_day = None;
         }
-        self.start_desired_refresh(context);
+        self.resume_feature_capacity(context);
         true
     }
 
-    fn fail_featured_refresh(&mut self, context: &mut Context) -> bool {
-        self.featured.staged = None;
-        let Some(failed_day) = self.featured.refresh.active_day.take() else {
-            return false;
-        };
-        let preserves_ready_feed = self.featured.status == FeaturedStatus::Ready;
-        if self
-            .featured
-            .refresh
-            .desired_day
-            .is_some_and(|desired| desired != failed_day)
-        {
-            if !preserves_ready_feed {
-                self.featured.status = FeaturedStatus::Loading;
-                self.featured.stale_warning = None;
-            }
-            self.start_desired_refresh(context);
-            return true;
-        }
-        self.featured.refresh.desired_day = Some(failed_day);
-        if preserves_ready_feed {
-            if self.featured.stale_warning.is_none() {
-                self.featured.page = self.featured.page.saturating_add(1);
-            }
-            self.featured.stale_warning =
-                Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
-        } else {
-            self.featured.status = FeaturedStatus::Failed;
-            self.featured.pending_details = 0;
-            self.featured.stale_warning = None;
-        }
-        true
-    }
-
-    fn settle_banner_detail(
+    fn handle_feature_outcome(
         &mut self,
-        context: &mut Context,
-        generation: u64,
-        slot: usize,
-        alias: &str,
-        bytes: Option<&[u8]>,
-    ) -> bool {
-        if generation != self.featured.generation {
-            return false;
-        }
-        let detail = bytes.and_then(|bytes| parse::public_detail(bytes, alias).ok());
-        if self.featured.staged.is_some() {
-            let finished = {
-                let staged = self.featured.staged.as_mut().expect("checked staged feed");
-                if let Some(detail) = detail {
-                    if let Some(selected) = staged
-                        .featured
-                        .get_mut(slot)
-                        .filter(|selected| selected.alias == alias)
-                    {
-                        selected.alias = detail.alias;
-                        selected.title = detail.title;
-                    }
-                }
-                staged.pending_details = staged.pending_details.saturating_sub(1);
-                staged.pending_details == 0
-            };
-            if finished {
-                self.complete_featured_refresh(context);
-            }
-            return true;
-        }
-        if let Some(detail) = detail {
-            if let Some(selected) = self
-                .featured
-                .featured
-                .get_mut(slot)
-                .filter(|selected| selected.alias == alias)
-            {
-                selected.alias = detail.alias;
-                selected.title = detail.title;
-            }
-        }
-        self.featured.pending_details = self.featured.pending_details.saturating_sub(1);
-        if self.featured.pending_details == 0 {
-            self.featured.status = FeaturedStatus::Ready;
-        }
-        true
-    }
-
-    fn accept_homepage(&mut self, context: &mut Context, generation: u64, bytes: &[u8]) -> bool {
-        if generation != self.featured.generation {
-            return false;
-        }
-        let Ok(homepage) = parse::homepage(bytes) else {
-            self.featured.status = FeaturedStatus::Failed;
-            self.featured.pending_details = 0;
-            return true;
-        };
-        let plan = plan_featured(homepage);
-        self.featured.featured = plan.featured;
-        self.featured.recommended = plan.recommended;
-        self.featured.page = 0;
-        self.featured.pending_details = plan.details.len();
-        self.featured.status = if plan.details.is_empty() {
-            FeaturedStatus::Ready
-        } else {
-            FeaturedStatus::Loading
-        };
-        for detail in plan.details {
-            if let Some(task) = context.spawn(api::public_detail(&detail.alias)) {
-                self.shelf_tasks.insert(
-                    task,
-                    ShelfTaskPurpose::BannerDetail {
-                        generation,
-                        slot: detail.slot,
-                        alias: detail.alias,
-                    },
-                );
-            } else {
-                self.featured.pending_details = self.featured.pending_details.saturating_sub(1);
-            }
-        }
-        if self.featured.pending_details == 0 {
-            self.featured.status = FeaturedStatus::Ready;
-        }
-        true
-    }
-
-    fn accept_refresh_homepage(
-        &mut self,
-        context: &mut Context,
-        generation: u64,
-        refresh_day: LocalDay,
-        bytes: &[u8],
-    ) -> bool {
-        if generation != self.featured.generation
-            || self.featured.refresh.active_day != Some(refresh_day)
-        {
-            return false;
-        }
-        let Ok(homepage) = parse::homepage(bytes) else {
-            return self.fail_featured_refresh(context);
-        };
-        let plan = plan_featured(homepage);
-        self.featured.staged = Some(StagedFeatured {
-            featured: plan.featured,
-            recommended: plan.recommended,
-            pending_details: plan.details.len(),
-        });
-        for detail in plan.details {
-            if let Some(task) = context.spawn(api::public_detail(&detail.alias)) {
-                self.shelf_tasks.insert(
-                    task,
-                    ShelfTaskPurpose::BannerDetail {
-                        generation,
-                        slot: detail.slot,
-                        alias: detail.alias,
-                    },
-                );
-            } else if let Some(staged) = self.featured.staged.as_mut() {
-                staged.pending_details = staged.pending_details.saturating_sub(1);
-            }
-        }
-        if self
-            .featured
-            .staged
-            .as_ref()
-            .is_some_and(|staged| staged.pending_details == 0)
-        {
-            self.complete_featured_refresh(context);
-        }
-        true
-    }
-
-    fn handle_shelf_outcome(
-        &mut self,
-        context: &mut Context,
-        purpose: ShelfTaskPurpose,
+        purpose: FeatureTaskPurpose,
         outcome: TaskOutcome,
     ) -> bool {
         match purpose {
-            ShelfTaskPurpose::Homepage {
-                generation,
-                refresh_day,
-            } => {
+            FeatureTaskPurpose::Source { generation, source } => {
                 if generation != self.featured.generation {
                     return false;
                 }
-                match (refresh_day, outcome) {
-                    (Some(day), TaskOutcome::Completed(bytes)) => {
-                        self.accept_refresh_homepage(context, generation, day, &bytes)
+                let result = match (source, outcome) {
+                    (FeatureSource::Homepage, TaskOutcome::Completed(bytes)) => {
+                        parse::homepage(&bytes).map(SourceResult::homepage)
                     }
-                    (Some(day), TaskOutcome::Failed(_) | TaskOutcome::Cancelled)
-                        if self.featured.refresh.active_day == Some(day) =>
-                    {
-                        self.fail_featured_refresh(context)
+                    (FeatureSource::Themes, TaskOutcome::Completed(bytes)) => {
+                        parse::themes(&bytes).map(SourceResult::themes)
                     }
-                    (Some(_), TaskOutcome::Failed(_) | TaskOutcome::Cancelled) => false,
-                    (None, TaskOutcome::Completed(bytes)) => {
-                        self.accept_homepage(context, generation, &bytes)
-                    }
-                    (None, TaskOutcome::Failed(_) | TaskOutcome::Cancelled) => {
-                        self.featured.status = FeaturedStatus::Failed;
-                        self.featured.pending_details = 0;
-                        true
+                    (
+                        FeatureSource::Ranking
+                        | FeatureSource::MostFavorited
+                        | FeatureSource::Freetime,
+                        TaskOutcome::Completed(bytes),
+                    ) => parse::public_collection(&bytes)
+                        .map(|comics| SourceResult::collection(source, comics)),
+                    (_, TaskOutcome::Failed(_) | TaskOutcome::Cancelled) => {
+                        Err(parse::ParseError::InvalidValue("Feature source"))
                     }
                 }
+                .unwrap_or_else(|_| SourceResult::failure(source));
+                if !self.featured.settle_generation(generation, result) {
+                    return false;
+                }
+                self.featured.publish_ready_banner_details();
+                true
             }
-            ShelfTaskPurpose::BannerDetail {
-                generation,
-                slot,
-                alias,
-            } => {
+            FeatureTaskPurpose::BannerDetail { generation, alias } => {
                 if generation != self.featured.generation {
                     return false;
                 }
-                let bytes = match &outcome {
-                    TaskOutcome::Completed(bytes) => Some(bytes.as_slice()),
+                let detail = match outcome {
+                    TaskOutcome::Completed(bytes) => {
+                        parse::public_detail(&bytes, &alias).ok()
+                    }
                     TaskOutcome::Failed(_) | TaskOutcome::Cancelled => None,
                 };
-                self.settle_banner_detail(context, generation, slot, &alias, bytes)
+                if !self
+                    .featured
+                    .settle_banner_detail_generation(generation, &alias, detail)
+                {
+                    return false;
+                }
+                self.featured.publish_ready_banner_details();
+                true
             }
         }
     }
@@ -3538,7 +3287,7 @@ impl Bomtoon {
         self.view = View::Main;
         self.page = 0;
         self.request_local_day(context);
-        self.start_homepage(context, None);
+        self.start_feature_batch(context, None);
         self.refresh_asset_summary(context);
     }
 
@@ -3627,6 +3376,7 @@ impl Bomtoon {
         if self.scope_refresh_pending {
             return;
         }
+        self.resume_feature_capacity(context);
         self.resume_queued_foreground(context);
         if self.queued_foreground.is_none() {
             self.resume_deferred_wallet(context);
@@ -4381,16 +4131,17 @@ impl Bomtoon {
             return;
         }
         let selected = match self.destination {
-            MainDestination::Featured => self
-                .featured
-                .featured
-                .get(index)
-                .or_else(|| {
-                    index
-                        .checked_sub(self.featured.featured.len())
-                        .and_then(|index| self.featured.recommended.get(index))
-                })
-                .map(|comic| (comic.alias.clone(), comic.title.clone())),
+            MainDestination::Featured => self.featured.snapshot().and_then(|snapshot| {
+                snapshot
+                    .banners
+                    .get(index)
+                    .or_else(|| {
+                        index
+                            .checked_sub(snapshot.banners.len())
+                            .and_then(|index| recommended_comic(snapshot, index))
+                    })
+                    .map(|comic| (comic.alias.clone(), comic.title.clone()))
+            }),
             MainDestination::Library => self
                 .comics
                 .get(index)
@@ -5664,11 +5415,11 @@ impl KoboApp for Bomtoon {
         request: DeviceRequest,
         result: DeviceResult,
     ) {
-        if !self.featured.refresh.local_day_pending {
+        if !self.featured.local_day_pending {
             return;
         }
         if let (DeviceRequest::ReadLocalDay, DeviceResult::LocalDay(observed)) = (request, result) {
-            self.featured.refresh.local_day_pending = false;
+            self.featured.local_day_pending = false;
             self.observe_local_day(context, observed);
         }
     }
@@ -5802,7 +5553,7 @@ impl KoboApp for Bomtoon {
             }
             self.view = View::Main;
             self.page = 0;
-            self.featured.page = 0;
+            self.featured.feed_page = 0;
             if self.destination == MainDestination::Library && !self.library_load.loaded {
                 self.comics.clear();
                 self.total_library_titles = 0;
@@ -5834,25 +5585,14 @@ impl KoboApp for Bomtoon {
             && self.problem.is_none()
             && self.view == View::Main
             && self.destination == MainDestination::Featured
-            && self.featured.stale_warning.is_some()
-            && self.featured.refresh.active_day.is_none()
+            && self.featured.has_failed_sources()
+            && self
+                .featured
+                .batch
+                .as_ref()
+                .is_none_or(feature::FeatureBatch::settled)
         {
-            self.start_desired_refresh(context);
-            self.show(context);
-            return;
-        }
-        if action == action_id(RETRY)
-            && self.problem.is_none()
-            && self.view == View::Main
-            && self.destination == MainDestination::Featured
-            && self.featured.status == FeaturedStatus::Failed
-            && self.featured.refresh.active_day.is_none()
-        {
-            if self.featured.refresh.desired_day.is_some() {
-                self.start_desired_refresh(context);
-            } else {
-                self.start_homepage(context, None);
-            }
+            self.retry_failed_feature_sources(context);
             self.show(context);
             return;
         }
@@ -5906,15 +5646,15 @@ impl KoboApp for Bomtoon {
             && featured_content_ready
         {
             if action == action_id(PREVIOUS_PAGE) {
-                self.featured.page = self.featured.page.saturating_sub(1);
+                self.featured.feed_page = self.featured.feed_page.saturating_sub(1);
                 self.show(context);
                 return;
             }
             if action == action_id(NEXT_PAGE) {
                 let first_page_rows = featured_page_zero_rows(&self.featured);
                 let pages = featured_display_page_count(&self.featured, first_page_rows);
-                if self.featured.page.saturating_add(1) < pages {
-                    self.featured.page = self.featured.page.saturating_add(1);
+                if self.featured.feed_page.saturating_add(1) < pages {
+                    self.featured.feed_page = self.featured.feed_page.saturating_add(1);
                 }
                 self.show(context);
                 return;
@@ -6065,26 +5805,17 @@ impl KoboApp for Bomtoon {
             self.resume_capacity_work(context);
             return;
         }
-        if let Some(purpose) = self.shelf_tasks.remove(&task) {
-            if self.superseded_shelf_tasks.remove(&task) {
-                self.resume_queued_foreground(context);
-                let changed = self.resume_queued_homepage(context);
-                if changed
-                    && self.view == View::Main
-                    && self.destination == MainDestination::Featured
-                {
-                    self.show(context);
-                }
+        if let Some(purpose) = self.feature_tasks.remove(&task) {
+            if self.superseded_feature_tasks.remove(&task) {
                 self.resume_capacity_work(context);
                 return;
             }
             self.observe_connectivity(context, &outcome);
-            self.resume_queued_foreground(context);
-            let changed = self.handle_shelf_outcome(context, purpose, outcome);
+            let changed = self.handle_feature_outcome(purpose, outcome);
+            self.resume_capacity_work(context);
             if changed && self.view == View::Main && self.destination == MainDestination::Featured {
                 self.show(context);
             }
-            self.resume_capacity_work(context);
             return;
         }
         if let Some(purpose) = self.wallet.tasks.remove(&task) {
@@ -7541,29 +7272,25 @@ mod tests {
         let (mut runner, commands) = started();
         let homepage = fetch_task_with(&commands, "/comic/main").0;
         let scope = scope_task(&commands);
-        let library = fetch_task_with(&commands, "/library?").0;
-        let summary = fetch_task_with(&commands, "/asset/user").0;
         runner.task_outcome(
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
+        let mut resumed = Vec::new();
+        for source in FEATURE_SOURCES {
+            resumed.extend(settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Cancelled,
+            ));
+        }
+        let library = fetch_task_with(&resumed, "/library?").0;
+        let summary = fetch_task_with(&resumed, "/asset/user").0;
         runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         (runner, homepage)
     }
 
-    fn signed_out_ready_for_homepage() -> (AppRunner<Bomtoon>, TaskId) {
-        let (mut runner, commands) = started();
-        let homepage = fetch_task_with(&commands, "/comic/main").0;
-        let scope = scope_task(&commands);
-        let library = fetch_task_with(&commands, "/library?").0;
-        let summary = fetch_task_with(&commands, "/asset/user").0;
-        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
-        runner.task_outcome(library, TaskOutcome::Cancelled);
-        runner.task_outcome(summary, TaskOutcome::Cancelled);
-        assert_eq!(runner.app().account, AccountState::SignedOut);
-        (runner, homepage)
-    }
 
     fn spawns(commands: &[Command]) -> Vec<(TaskId, Task)> {
         commands
@@ -7603,7 +7330,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_uses_all_four_task_slots_for_scope_homepage_library_and_wallet() {
+    fn startup_uses_all_four_task_slots_for_scope_and_first_feature_sources() {
         let (runner, commands) = started();
         let spawned = spawns(&commands);
 
@@ -7614,14 +7341,14 @@ mod tests {
             commerce::CommerceState::LoadingSafetyState
         );
         assert_eq!(spawned.len(), 4);
-        assert!(spawned
-            .iter()
-            .any(|(_, work)| *work == api::account_scope()));
-        assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
-        assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
-        assert!(spawned
-            .iter()
-            .any(|(_, work)| *work == api::asset_summary()));
+        for work in [
+            api::account_scope(),
+            api::homepage(),
+            api::ranking(),
+            api::most_favorited(),
+        ] {
+            assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
+        }
         assert!(commands.iter().any(|command| matches!(
             command,
             Command::Store(StoreRequest::Load { key }) if key == commerce::MARKER_KEY
@@ -8221,7 +7948,7 @@ mod tests {
         spawns(commands)
             .into_iter()
             .find(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains(needle)))
-            .expect("matching fetch task")
+            .unwrap_or_else(|| panic!("matching fetch task {needle}: {commands:?}"))
     }
 
     fn only_spawn(commands: &[Command]) -> (TaskId, Task) {
@@ -8277,22 +8004,25 @@ mod tests {
     fn loaded_library_with_metrics(metrics: DisplayMetrics) -> (AppRunner<Bomtoon>, Vec<Command>) {
         let mut runner = AppRunner::with_metrics(Bomtoon::default(), metrics);
         let commands = runner.start();
-        let (homepage_task, _) = fetch_task_with(&commands, "/comic/main");
-        let (library_task, _) = fetch_task_with(&commands, "/library?");
         let scope = scope_task(&commands);
         runner.task_outcome(
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
-        runner.task_outcome(
-            homepage_task,
-            TaskOutcome::Completed(b"<html></html>".to_vec()),
-        );
+        let mut resumed = Vec::new();
+        for source in FEATURE_SOURCES {
+            resumed.extend(settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Cancelled,
+            ));
+        }
+        let (library, _) = fetch_task_with(&resumed, "/library?");
+        let (summary, _) = fetch_task_with(&resumed, "/asset/user");
+        runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         runner.action(action_id(LIBRARY));
-        let commands = runner.task_outcome(
-            library_task,
-            TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Library);
         (runner, commands)
@@ -8992,14 +8722,18 @@ mod tests {
         assert_eq!(runner.app().account, AccountState::Checking);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert!(commands.iter().any(is_homepage_fetch));
-        assert!(commands.iter().any(is_library_or_recent_fetch));
-        assert!(spawns(&commands)
-            .iter()
-            .any(|(_, work)| *work == api::account_scope()));
-        assert!(spawns(&commands)
-            .iter()
-            .any(|(_, work)| *work == api::asset_summary()));
+        let spawned = spawns(&commands);
+        for work in [
+            api::account_scope(),
+            api::homepage(),
+            api::ranking(),
+            api::most_favorited(),
+        ] {
+            assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
+        }
+        assert!(!spawned.iter().any(|(_, work)| {
+            *work == api::library(0) || *work == api::asset_summary()
+        }));
     }
 
     #[test]
@@ -9318,15 +9052,15 @@ mod tests {
 
         runner.app_mut().view = View::Main;
         runner.app_mut().destination = MainDestination::Featured;
-        runner.app_mut().featured.page = 2;
+        runner.app_mut().featured.feed_page = 2;
         runner.app_mut().page = 7;
         runner.action(action_id(ACCOUNT));
         assert_eq!(runner.app().view, View::Account);
-        assert_eq!(runner.app().featured.page, 0);
+        assert_eq!(runner.app().featured.feed_page, 0);
         runner.action(ActionId::BACK);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert_eq!(runner.app().featured.page, 0);
+        assert_eq!(runner.app().featured.feed_page, 0);
         assert_eq!(runner.app().page, 0);
     }
 
@@ -11066,18 +10800,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_loads_public_and_account_reads_independently() {
+    fn startup_loads_public_sources_and_account_scope_independently() {
         let (_, commands) = started();
         let spawned = spawns(&commands);
         assert_eq!(spawned.len(), 4);
-        assert!(spawned
-            .iter()
-            .any(|(_, work)| *work == api::account_scope()));
-        assert!(spawned.iter().any(|(_, work)| *work == api::homepage()));
-        assert!(spawned.iter().any(|(_, work)| *work == api::library(0)));
-        assert!(spawned
-            .iter()
-            .any(|(_, work)| *work == api::asset_summary()));
+        for work in [
+            api::account_scope(),
+            api::homepage(),
+            api::ranking(),
+            api::most_favorited(),
+        ] {
+            assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
+        }
     }
 
     #[test]
@@ -12039,28 +11773,30 @@ mod tests {
     }
 
     fn seed_sign_out_public_data(app: &mut Bomtoon, scenario: &SignOutScenario) {
-        app.featured = FeaturedState {
-            status: FeaturedStatus::Ready,
-            generation: 7,
-            featured: vec![
-                FeatureComic {
-                    title: "Public".to_owned(),
-                    alias: "public".to_owned(),
-                    creators: String::new(),
-                    view_count: None,
-                    vertical_url: Some(scenario.public_url.clone()),
-                    square_url: None,
-                },
-                FeatureComic {
-                    title: "Shared".to_owned(),
-                    alias: "shared".to_owned(),
-                    creators: String::new(),
-                    view_count: None,
-                    vertical_url: Some(scenario.shared_url.clone()),
-                    square_url: None,
-                },
-            ],
-            recommended: vec![
+        let banners = vec![
+            FeatureComic {
+                title: "Public".to_owned(),
+                alias: "public".to_owned(),
+                creators: String::new(),
+                view_count: None,
+                vertical_url: Some(scenario.public_url.clone()),
+                square_url: None,
+            },
+            FeatureComic {
+                title: "Shared".to_owned(),
+                alias: "shared".to_owned(),
+                creators: String::new(),
+                view_count: None,
+                vertical_url: Some(scenario.shared_url.clone()),
+                square_url: None,
+            },
+        ];
+        let collection = model::FeatureCollection {
+            id: "newest".to_owned(),
+            label: "人氣新作".to_owned(),
+            priority: 2,
+            order: 0,
+            comics: vec![
                 FeatureComic {
                     title: "Recommended".to_owned(),
                     alias: "recommended".to_owned(),
@@ -12078,15 +11814,26 @@ mod tests {
                     square_url: None,
                 },
             ],
-            page: 2,
-            refresh: FeaturedRefresh {
-                loaded_day: Some(local_day(30)),
-                desired_day: Some(local_day(31)),
-                active_day: Some(local_day(30)),
-                local_day_pending: true,
-            },
+        };
+        let mut featured = FeaturedState {
+            generation: 6,
+            snapshot: Some(FeatureSnapshot {
+                banners,
+                collections: vec![collection.clone()],
+                sources: BTreeMap::from([(FeatureSource::Homepage, vec![collection])]),
+                failed_sources: BTreeSet::new(),
+                warning: None,
+            }),
+            feed_page: 2,
+            loaded_day: Some(local_day(30)),
+            desired_day: Some(local_day(31)),
+            local_day_pending: true,
             ..FeaturedState::default()
         };
+        featured.begin_full_batch(Some(local_day(30)));
+        featured.mark_source_pending(featured.generation, FeatureSource::Homepage);
+        featured.desired_day = Some(local_day(31));
+        app.featured = featured;
     }
 
     fn seed_sign_out_protected_data(app: &mut Bomtoon, scenario: &SignOutScenario) {
@@ -12216,11 +11963,11 @@ mod tests {
         app.page = 4;
         seed_sign_out_public_data(app, scenario);
         seed_sign_out_protected_data(app, scenario);
-        app.shelf_tasks.insert(
+        app.feature_tasks.insert(
             scenario.public_homepage_task,
-            ShelfTaskPurpose::Homepage {
+            FeatureTaskPurpose::Source {
                 generation: app.featured.generation,
-                refresh_day: Some(local_day(30)),
+                source: FeatureSource::Homepage,
             },
         );
         seed_sign_out_cover_cache(app, scenario);
@@ -12230,18 +11977,17 @@ mod tests {
     fn assert_signed_out_public_state(
         app: &Bomtoon,
         scenario: &SignOutScenario,
-        featured: &[FeatureComic],
-        recommended: &[FeatureComic],
-        refresh: &FeaturedRefresh,
+        featured: &FeaturedState,
     ) {
         assert_eq!(app.account, AccountState::SignedOut);
         assert_eq!(app.view, View::Main);
         assert_eq!(app.destination, MainDestination::Featured);
         assert_eq!(app.page, 0);
-        assert_eq!(app.featured.page, 0);
-        assert_eq!(app.featured.featured.as_slice(), featured);
-        assert_eq!(app.featured.recommended.as_slice(), recommended);
-        assert_eq!(&app.featured.refresh, refresh);
+        assert_eq!(app.featured.feed_page, 0);
+        assert_eq!(app.featured.snapshot, featured.snapshot);
+        assert_eq!(app.featured.generation, featured.generation);
+        assert_eq!(app.featured.loaded_day, featured.loaded_day);
+        assert_eq!(app.featured.desired_day, featured.desired_day);
         assert_eq!(
             app.covers.entries.get(&scenario.shared_url),
             Some(&CoverState::Ready(scenario.shared_picture))
@@ -12254,7 +12000,9 @@ mod tests {
             app.covers.entries.get(&scenario.shared_loading_url),
             Some(&CoverState::Loading(scenario.shared_cover_task))
         );
-        assert!(app.shelf_tasks.contains_key(&scenario.public_homepage_task));
+        assert!(app
+            .feature_tasks
+            .contains_key(&scenario.public_homepage_task));
         assert!(app.covers.tasks.contains_key(&scenario.public_cover_task));
         assert_eq!(
             app.covers
@@ -12376,32 +12124,44 @@ mod tests {
     }
 
     fn full_exit_runner(scenario: &FullExitScenario) -> AppRunner<Bomtoon> {
+        let collection = model::FeatureCollection {
+            id: "newest".to_owned(),
+            label: "人氣新作".to_owned(),
+            priority: 2,
+            order: 0,
+            comics: vec![FeatureComic {
+                title: "Ready".to_owned(),
+                alias: "ready".to_owned(),
+                creators: String::new(),
+                view_count: None,
+                vertical_url: Some(scenario.ready_url.clone()),
+                square_url: None,
+            }],
+        };
+        let mut featured = FeaturedState {
+            generation: 3,
+            snapshot: Some(FeatureSnapshot {
+                banners: Vec::new(),
+                collections: vec![collection.clone()],
+                sources: BTreeMap::from([(FeatureSource::Homepage, vec![collection])]),
+                failed_sources: BTreeSet::new(),
+                warning: None,
+            }),
+            desired_day: Some(local_day(31)),
+            local_day_pending: true,
+            ..FeaturedState::default()
+        };
+        featured.begin_full_batch(Some(local_day(30)));
+        featured.mark_source_pending(featured.generation, FeatureSource::Homepage);
         AppRunner::new(Bomtoon {
             pending: Some(Pending::Content(0)),
             task: Some(scenario.pending_task),
-            featured: FeaturedState {
-                generation: 4,
-                featured: vec![FeatureComic {
-                    title: "Ready".to_owned(),
-                    alias: "ready".to_owned(),
-                    creators: String::new(),
-                    view_count: None,
-                    vertical_url: Some(scenario.ready_url.clone()),
-                    square_url: None,
-                }],
-                refresh: FeaturedRefresh {
-                    local_day_pending: true,
-                    active_day: Some(local_day(30)),
-                    desired_day: Some(local_day(31)),
-                    ..FeaturedRefresh::default()
-                },
-                ..FeaturedState::default()
-            },
-            shelf_tasks: BTreeMap::from([(
+            featured,
+            feature_tasks: BTreeMap::from([(
                 scenario.shelf_task,
-                ShelfTaskPurpose::Homepage {
+                FeatureTaskPurpose::Source {
                     generation: 4,
-                    refresh_day: None,
+                    source: FeatureSource::Homepage,
                 },
             )]),
             covers: full_exit_cover_cache(scenario),
@@ -12431,27 +12191,26 @@ mod tests {
         scenario: &FullExitScenario,
     ) {
         assert!(commands.contains(&Command::DropPicture(scenario.ready_picture.handle)));
-        assert!(runner.app().shelf_tasks.is_empty());
+        assert!(runner.app().feature_tasks.is_empty());
         assert!(runner.app().covers.tasks.is_empty());
         assert!(runner.app().covers.entries.is_empty());
         assert!(runner.app().wallet.tasks.is_empty());
         assert!(runner.app().reader_tasks.is_empty());
-        assert!(!runner.app().featured.refresh.local_day_pending);
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
+        assert!(!runner.app().featured.local_day_pending);
+        assert_eq!(runner.app().featured.batch, None);
+        assert_eq!(runner.app().featured.desired_day, None);
+        assert_eq!(runner.app().featured.snapshot, None);
     }
 
     #[test]
-    fn wallet_credential_failure_keeps_public_featured_and_ignores_homepage_outcome() {
+    fn scope_credential_failure_keeps_public_feature_loading_and_ignores_source_outcome() {
         let (mut runner, commands) = started();
-        let (homepage_task, _) = fetch_task_with(&commands, "/comic/main");
-        let (summary_task, _) = fetch_task_with(&commands, "/asset/user");
-        runner.task_outcome(summary_task, TaskOutcome::Failed(TaskError::NoCredential));
+        let homepage_task = fetch_task_with(&commands, "/comic/main").0;
+        let scope = scope_task(&commands);
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
         assert_eq!(runner.app().account, AccountState::SignedOut);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert_eq!(runner.app().task, None);
-        assert_eq!(runner.app().pending, None);
 
         runner.task_outcome(
             homepage_task,
@@ -12466,9 +12225,7 @@ mod tests {
     fn sign_out_retains_public_feed_pictures_and_tasks_while_clearing_protected_state() {
         let scenario = sign_out_scenario();
         let mut runner = sign_out_runner(&scenario);
-        let public_featured = runner.app().featured.featured.clone();
-        let public_recommended = runner.app().featured.recommended.clone();
-        let public_refresh = runner.app().featured.refresh.clone();
+        let public_featured = runner.app().featured.clone();
 
         let account_commands = runner.action(action_id(ACCOUNT));
         assert_eq!(runner.app().view, View::Account);
@@ -12496,13 +12253,7 @@ mod tests {
         );
 
         let commands = runner.task_outcome(logout_task, TaskOutcome::Completed(Vec::new()));
-        assert_signed_out_public_state(
-            runner.app(),
-            &scenario,
-            &public_featured,
-            &public_recommended,
-            &public_refresh,
-        );
+        assert_signed_out_public_state(runner.app(), &scenario, &public_featured);
         assert_signed_out_protected_state_cleared(runner.app(), &scenario);
         assert_sign_out_cleanup_commands(&commands, &scenario);
         assert_eq!(
@@ -12573,28 +12324,33 @@ mod tests {
     #[test]
     fn missing_credentials_leave_featured_available_and_sign_in_retries_cleanly() {
         let (mut runner, commands) = started();
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let task = scope_task(&commands);
-        let library = fetch_task_with(&commands, "/library?").0;
-        let summary = fetch_task_with(&commands, "/asset/user").0;
-        let _commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NoCredential));
+        let scope = scope_task(&commands);
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
 
         assert_eq!(runner.app().account, AccountState::SignedOut);
         assert_eq!(runner.app().view, View::Main);
         assert!(format!("{:?}", runner.app().screen()).contains("Sign in"));
-        runner.task_outcome(library, TaskOutcome::Cancelled);
-        runner.task_outcome(summary, TaskOutcome::Cancelled);
 
         let commands = runner.action(action_id(SIGN_IN));
         assert_login_instructions(&last_screen(&commands));
+        let old_feature_tasks = runner
+            .app()
+            .feature_tasks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
 
         let commands = runner.action(action_id(RETRY));
-        let scope = scope_task(&commands);
-        assert!(commands.contains(&Command::Cancel(homepage)));
+        assert!(old_feature_tasks
+            .iter()
+            .all(|task| commands.contains(&Command::Cancel(*task))));
         assert!(!commands.iter().any(is_homepage_fetch));
-        let commands = runner.task_outcome(homepage, TaskOutcome::Cancelled);
-        let (_, work) = fetch_task_with(&commands, "/comic/main");
-        assert_eq!(work, api::homepage());
+
+        let commands = runner.task_outcome(old_feature_tasks[0], TaskOutcome::Cancelled);
+        let scope = scope_task(&commands);
+        for task in old_feature_tasks.into_iter().skip(1) {
+            runner.task_outcome(task, TaskOutcome::Cancelled);
+        }
         runner.task_outcome(
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
@@ -12602,7 +12358,6 @@ mod tests {
         assert_eq!(runner.app().account, AccountState::Active);
         assert_eq!(runner.app().view, View::Main);
         assert_eq!(runner.app().destination, MainDestination::Featured);
-        assert!(!commands.iter().any(is_library_or_recent_fetch));
     }
 
     #[test]
@@ -13977,6 +13732,48 @@ mod tests {
             assert_all_account_data_cleared(runner.app());
         }
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     fn shelf(alias: &str, title: &str) -> model::FeatureComic {
         model::FeatureComic {
             alias: alias.to_owned(),
@@ -13990,77 +13787,156 @@ mod tests {
         }
     }
 
-    fn homepage_fixture() -> model::Homepage {
-        model::Homepage {
-            banners: ["shared", "banner_b", "banner_c", "banner_d"]
-                .into_iter()
-                .map(|alias| model::BannerComic {
-                    alias: alias.to_owned(),
-                })
-                .collect(),
-            newest: vec![shelf("shared", "Shared first"), shelf("new_b", "New B")],
-            week_day: vec![
-                shelf("new_b", "New B later"),
-                shelf("weekday_a", "Weekday A"),
-            ],
-            only_bom: vec![shelf("shared", "Shared later"), shelf("only_a", "Only A")],
-        }
-    }
-
-    fn aliases(comics: &[model::FeatureComic]) -> Vec<&str> {
-        comics.iter().map(|comic| comic.alias.as_str()).collect()
-    }
-
     fn feed_with_recommendations(count: usize) -> FeaturedState {
-        FeaturedState {
-            status: FeaturedStatus::Ready,
-            generation: 1,
-            featured: ["feature-a", "feature-b", "feature-c"]
-                .into_iter()
-                .map(|alias| shelf(alias, alias))
-                .collect(),
-            recommended: (0..count)
+        let banners = ["feature-a", "feature-b", "feature-c"]
+            .into_iter()
+            .map(|alias| shelf(alias, alias))
+            .collect::<Vec<_>>();
+        let collection = model::FeatureCollection {
+            id: "newest".to_owned(),
+            label: "人氣新作".to_owned(),
+            priority: 2,
+            order: 0,
+            comics: (0..count)
                 .map(|index| shelf(&format!("rec-{index}"), &format!("Recommended {index}")))
                 .collect(),
-            pending_details: 0,
-            page: 0,
-            stale_warning: None,
+        };
+        FeaturedState {
+            generation: 1,
+            snapshot: Some(FeatureSnapshot {
+                banners,
+                collections: vec![collection.clone()],
+                sources: BTreeMap::from([(FeatureSource::Homepage, vec![collection])]),
+                failed_sources: BTreeSet::new(),
+                warning: None,
+            }),
             ..FeaturedState::default()
         }
-    }
-
-    fn homepage_response(banners: &[&str], recommendations: &[(&str, &str)]) -> Vec<u8> {
-        let banners = banners
-            .iter()
-            .map(|alias| {
-                format!(
-                    "{{\"bannerDetailInfo\":[{{\"linkInfo\":{{\"target\":\"CONTENTS\",\"subTarget\":\"COMIC\",\"params\":\"{alias}\"}}}}]}}"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let recommendations = recommendations
-            .iter()
-            .map(|(alias, title)| {
-                format!(
-                    "{{\"alias\":\"{alias}\",\"title\":\"{title}\",\"creators\":\"Creator\",\"isAdult\":false,\"thumbnails\":[]}}"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "<script id=\"__NEXT_DATA__\">{{\"props\":{{\"pageProps\":{{\"main\":{{\"banners\":[{banners}],\"newest\":[{recommendations}],\"weekDay\":[],\"onlyBom\":[]}}}}}}}}</script>"
-        )
-        .into_bytes()
     }
 
     fn local_day(day: u8) -> LocalDay {
         LocalDay::new(2026, 8, day).expect("valid local day")
     }
 
-    fn ready_featured(day: Option<LocalDay>) -> Bomtoon {
-        let mut featured = feed_with_recommendations(1);
-        featured.refresh.loaded_day = day;
+    fn homepage_response(banners: &[&str], alias: &str) -> Vec<u8> {
+        let banners = banners
+            .iter()
+            .map(|alias| {
+                format!(
+                    r#"{{"bannerDetailInfo":[{{"linkInfo":{{"target":"CONTENTS","subTarget":"COMIC","params":"{alias}"}}}}]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"<script id="__NEXT_DATA__" type="application/json">{{"props":{{"pageProps":{{"main":{{"banners":[{banners}],"newest":[{{"alias":"{alias}","title":"Title {alias}","creators":"Creator","adult":false,"viewCount":1,"thumbnailVertical":"https://image.balcony.studio/tw/contents/{alias}.webp"}}],"weekDay":[],"onlyBom":[]}}}}}}}}</script>"#
+        )
+        .into_bytes()
+    }
+
+    fn collection_response(alias: &str) -> Vec<u8> {
+        format!(
+            r#"{{"result":"SUCCESS","data":[{{"alias":"{alias}","title":"Title {alias}","creators":"Creator","isAdult":false,"viewCount":1,"thumbnails":[{{"type":"VERTICAL_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/{alias}.webp"}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn themes_response(alias: &str) -> Vec<u8> {
+        format!(
+            r#"{{"result":"SUCCESS","data":[{{"id":1785,"title":"Theme","contentsInfo":[{{"alias":"{alias}","title":"Title {alias}","creators":"Creator","badgeAdult":false,"viewCount":1,"thumbnails":[{{"type":"VERTICAL_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/{alias}.webp"}}]}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn detail_response(alias: &str, title: &str) -> Vec<u8> {
+        format!(
+            r#"<meta property="og:title" content="{title} - 漫畫 - BOMTOON"><meta property="og:description" content="Synopsis for {alias}">"#
+        )
+        .into_bytes()
+    }
+
+    fn source_response(source: FeatureSource, prefix: &str) -> Vec<u8> {
+        let suffix = match source {
+            FeatureSource::Homepage => "homepage",
+            FeatureSource::Ranking => "ranking",
+            FeatureSource::MostFavorited => "favorite",
+            FeatureSource::Themes => "theme",
+            FeatureSource::Freetime => "free",
+        };
+        let alias = format!("{prefix}-{suffix}");
+        match source {
+            FeatureSource::Homepage => homepage_response(&[], &alias),
+            FeatureSource::Themes => themes_response(&alias),
+            FeatureSource::Ranking
+            | FeatureSource::MostFavorited
+            | FeatureSource::Freetime => collection_response(&alias),
+        }
+    }
+
+    fn feature_task(runner: &AppRunner<Bomtoon>, source: FeatureSource) -> TaskId {
+        runner
+            .app()
+            .feature_tasks
+            .iter()
+            .find_map(|(task, purpose)| {
+                matches!(
+                    purpose,
+                    FeatureTaskPurpose::Source {
+                        source: task_source,
+                        ..
+                    } if *task_source == source
+                )
+                .then_some(*task)
+            })
+            .unwrap_or_else(|| panic!("missing {source:?} task"))
+    }
+
+    fn settle_source(
+        runner: &mut AppRunner<Bomtoon>,
+        source: FeatureSource,
+        outcome: TaskOutcome,
+    ) -> Vec<Command> {
+        let task = feature_task(runner, source);
+        runner.task_outcome(task, outcome)
+    }
+
+    fn complete_feature_batch(
+        runner: &mut AppRunner<Bomtoon>,
+        prefix: &str,
+        failed: Option<FeatureSource>,
+    ) -> Vec<Command> {
+        let mut last = Vec::new();
+        for source in FEATURE_SOURCES {
+            let outcome = if failed == Some(source) {
+                TaskOutcome::Failed(TaskError::Offline)
+            } else {
+                TaskOutcome::Completed(source_response(source, prefix))
+            };
+            last = settle_source(runner, source, outcome);
+        }
+        last
+    }
+
+    fn ready_featured(day: LocalDay, prefix: &str) -> Bomtoon {
+        let collection = model::FeatureCollection {
+            id: "ranking".to_owned(),
+            label: "排行榜".to_owned(),
+            priority: 5,
+            order: 0,
+            comics: vec![shelf(&format!("{prefix}-ranking"), prefix)],
+        };
+        let featured = FeaturedState {
+            generation: 1,
+            snapshot: Some(FeatureSnapshot {
+                banners: vec![shelf(&format!("{prefix}-banner"), prefix)],
+                collections: vec![collection.clone()],
+                sources: BTreeMap::from([(FeatureSource::Ranking, vec![collection])]),
+                failed_sources: BTreeSet::new(),
+                warning: None,
+            }),
+            loaded_day: Some(day),
+            ..FeaturedState::default()
+        };
         Bomtoon {
             account: AccountState::SignedOut,
             view: View::Main,
@@ -14070,1024 +13946,275 @@ mod tests {
         }
     }
 
-    fn ready_featured_runner(day: Option<LocalDay>) -> AppRunner<Bomtoon> {
-        AppRunner::with_metrics(ready_featured(day), CLARA_BW_METRICS)
-    }
-
-    fn homepage_fetches(commands: &[Command]) -> usize {
-        commands
-            .iter()
-            .filter(|command| is_homepage_fetch(command))
-            .count()
-    }
-
-    fn observe_local_day(
+    fn observe_day_with_runner(
         runner: &mut AppRunner<Bomtoon>,
-        observed: Option<LocalDay>,
+        observed: LocalDay,
     ) -> Vec<Command> {
-        let requests = runner.resume();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|command| {
-                    matches!(command, Command::Device(DeviceRequest::ReadLocalDay))
-                })
-                .count(),
-            1
-        );
-        runner.device_result(DeviceResult::LocalDay(observed))
-    }
-
-    fn detail_response(alias: &str, title: &str) -> Vec<u8> {
-        format!(
-            r#"
-                <meta property="og:title" content="{title} - 漫畫 - BOMTOON">
-                <meta property="og:image" content="https://image.balcony.studio/tw/contents/{alias}.webp">
-            "#
-        )
-        .into_bytes()
-    }
-
-    #[test]
-    fn first_known_local_day_establishes_baseline_without_refresh() {
-        let mut runner = ready_featured_runner(None);
-
-        let commands = observe_local_day(&mut runner, Some(local_day(30)));
-
-        assert_eq!(homepage_fetches(&commands), 0);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-    }
-
-    #[test]
-    fn repeated_or_unknown_local_day_preserves_known_baseline() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-
-        let unknown = observe_local_day(&mut runner, None);
-        let repeated = observe_local_day(&mut runner, Some(local_day(30)));
-
-        assert_eq!(homepage_fetches(&unknown), 0);
-        assert_eq!(homepage_fetches(&repeated), 0);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-    }
-
-    #[test]
-    fn later_different_local_day_refreshes_exactly_once() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-
-        let first = observe_local_day(&mut runner, Some(local_day(31)));
-        let repeated = observe_local_day(&mut runner, Some(local_day(31)));
-
-        assert_eq!(homepage_fetches(&first), 1);
-        assert_eq!(homepage_fetches(&repeated), 0);
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(31))
-        );
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-    }
-
-    #[test]
-    fn local_day_device_results_require_an_exact_pending_pair() {
-        let mut app = ready_featured(Some(local_day(30)));
-        let mut context = Context::default();
-        app.request_local_day(&mut context);
-        let _ = context.take_commands();
-        let pending = app.featured.refresh.clone();
-
-        app.on_device_result(
-            &mut context,
-            DeviceRequest::ReadBattery,
-            DeviceResult::LocalDay(Some(local_day(31))),
-        );
-        assert_eq!(app.featured.refresh, pending);
-
-        app.on_device_result(
-            &mut context,
-            DeviceRequest::ReadLocalDay,
-            DeviceResult::Done,
-        );
-        assert_eq!(app.featured.refresh, pending);
-
-        app.on_device_result(
-            &mut context,
-            DeviceRequest::ReadLocalDay,
-            DeviceResult::LocalDay(Some(local_day(31))),
-        );
-        assert_eq!(app.featured.refresh.loaded_day, Some(local_day(30)));
-        assert_eq!(app.featured.refresh.active_day, Some(local_day(31)));
-        assert!(!app.featured.refresh.local_day_pending);
-
-        let after_exact = app.featured.refresh.clone();
-        app.on_device_result(
-            &mut context,
-            DeviceRequest::ReadLocalDay,
-            DeviceResult::LocalDay(Some(local_day(30))),
-        );
-        assert_eq!(app.featured.refresh, after_exact);
-    }
-
-    #[test]
-    fn overlapping_local_day_boundaries_emit_one_request() {
-        let mut runner = AppRunner::new(Bomtoon::default());
-
-        let started = runner.start();
         let resumed = runner.resume();
-        let foregrounded = runner.lifecycle(kobo_sdk::Lifecycle::Foreground);
-        let entered = runner.action(action_id(FEATURED));
-
-        assert_eq!(
-            [&started, &resumed, &foregrounded, &entered]
-                .into_iter()
-                .flat_map(|commands| commands.iter())
-                .filter(|command| {
-                    matches!(command, Command::Device(DeviceRequest::ReadLocalDay))
-                })
-                .count(),
-            1
-        );
-        assert!(runner.app().featured.refresh.local_day_pending);
-    }
-
-    #[test]
-    fn featured_entry_requests_local_day_after_prior_observation_settles() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-        runner.app_mut().destination = MainDestination::Recent;
-
-        let commands = runner.action(action_id(FEATURED));
-
-        assert!(commands
+        if let Some(scope) = spawns(&resumed)
+            .into_iter()
+            .find_map(|(task, work)| (work == api::account_scope()).then_some(task))
+        {
+            runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        }
+        assert!(resumed
             .iter()
             .any(|command| matches!(command, Command::Device(DeviceRequest::ReadLocalDay))));
-        assert!(runner.app().featured.refresh.local_day_pending);
+        runner.device_result(DeviceResult::LocalDay(Some(observed)))
     }
 
     #[test]
-    fn newer_desired_day_chains_after_active_refresh_settles() {
-        let mut runner = ready_featured_runner(Some(local_day(29)));
-        let first = observe_local_day(&mut runner, Some(local_day(30)));
-        let (first_homepage, _) = fetch_task_with(&first, "/comic/main");
+    fn feature_startup_fills_four_source_slots_then_starts_the_fifth_after_one_outcome() {
+        let (mut runner, commands) = started();
+        assert_eq!(runner.app().feature_tasks.len(), 3);
+        assert!(runner.app().feature_tasks.len() <= 4);
+        let scope = scope_task(&commands);
 
-        let newer = observe_local_day(&mut runner, Some(local_day(31)));
-        assert_eq!(homepage_fetches(&newer), 0);
-        assert_eq!(
-            runner.app().featured.refresh.desired_day,
-            Some(local_day(31))
-        );
-
-        let commands = runner.task_outcome(
-            first_homepage,
-            TaskOutcome::Completed(homepage_response(&[], &[("day-30", "Day 30")])),
-        );
-
-        assert_eq!(homepage_fetches(&commands), 1);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(31))
-        );
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-        assert_eq!(aliases(&runner.app().featured.recommended), ["day-30"]);
-    }
-
-    #[test]
-    fn active_day_refresh_retains_observed_loaded_baseline_as_next_target() {
-        let mut runner = ready_featured_runner(Some(local_day(29)));
-        let first = observe_local_day(&mut runner, Some(local_day(30)));
-        let (day_30, _) = fetch_task_with(&first, "/comic/main");
-
-        let observed_baseline = observe_local_day(&mut runner, Some(local_day(29)));
-        assert_eq!(homepage_fetches(&observed_baseline), 0);
-        assert_eq!(
-            runner.app().featured.refresh.desired_day,
-            Some(local_day(29))
-        );
-
-        let commands = runner.task_outcome(
-            day_30,
-            TaskOutcome::Completed(homepage_response(&[], &[("day-30", "Day 30")])),
-        );
-
-        assert_eq!(homepage_fetches(&commands), 1);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(29))
-        );
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-    }
-
-    #[test]
-    fn refresh_failure_chains_the_latest_desired_day() {
-        let mut runner = ready_featured_runner(Some(local_day(29)));
-        let first = observe_local_day(&mut runner, Some(local_day(30)));
-        let (first_homepage, _) = fetch_task_with(&first, "/comic/main");
-        let newer = observe_local_day(&mut runner, Some(local_day(31)));
-        assert_eq!(homepage_fetches(&newer), 0);
-
-        let commands = runner.task_outcome(first_homepage, TaskOutcome::Failed(TaskError::Offline));
-
-        assert_eq!(homepage_fetches(&commands), 1);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(29))
-        );
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(31))
-        );
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-        assert!(runner.app().featured.stale_warning.is_none());
-    }
-
-    fn settle_visible_cover_baseline(
-        runner: &mut AppRunner<Bomtoon>,
-        shared_url: &str,
-        obsolete_urls: &[&str; 2],
-    ) -> (BTreeMap<String, TaskId>, Option<TilePicture>) {
-        let cover_commands = runner.action(action_id(PREVIOUS_PAGE));
-        let cover_tasks = spawns(&cover_commands)
-            .into_iter()
-            .filter_map(|(task, work)| match work {
-                Task::Fetch { url, .. } => Some((url, task)),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        for url in runner.app().covers.visible_urls.clone() {
-            if !cover_tasks.contains_key(&url) {
-                runner
-                    .app_mut()
-                    .covers
-                    .entries
-                    .insert(url, CoverState::Failed);
-            }
-        }
-        for url in [
-            shared_url,
-            "https://image.balcony.studio/tw/contents/feature-b.webp",
-        ] {
-            runner.task_outcome(
-                *cover_tasks.get(url).expect("old cover task"),
-                TaskOutcome::Completed(TINY_WEBP.to_vec()),
-            );
-        }
-        runner.task_outcome(
-            *cover_tasks
-                .get(obsolete_urls[0])
-                .expect("settled obsolete cover task"),
-            TaskOutcome::Completed(TINY_WEBP.to_vec()),
-        );
-        let _obsolete_picture = ready_cover(&runner.app().covers, Some(obsolete_urls[0]))
-            .expect("settled obsolete cover picture");
-        assert_eq!(runner.tasks_in_flight(), 1);
-        let shared_picture = ready_cover(&runner.app().covers, Some(shared_url));
-        (cover_tasks, shared_picture)
-    }
-
-    #[test]
-    fn refresh_success_is_atomic_and_reprioritizes_visible_covers() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-        let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp";
-        let obsolete_urls = [
-            "https://image.balcony.studio/tw/contents/feature-c.webp",
-            "https://image.balcony.studio/tw/contents/rec-0.webp",
-        ];
-        let (cover_tasks, shared_picture) =
-            settle_visible_cover_baseline(&mut runner, shared_url, &obsolete_urls);
-        let old_featured = runner.app().featured.featured.clone();
-        let old_recommended = runner.app().featured.recommended.clone();
-
-        let commands = observe_local_day(&mut runner, Some(local_day(31)));
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let commands = runner.task_outcome(
-            homepage,
-            TaskOutcome::Completed(homepage_response(&["feature-a", "fresh-b"], &[])),
-        );
-        let (shared_detail, _) = fetch_task_with(&commands, "/detail/feature-a");
-        let (fresh_detail, _) = fetch_task_with(&commands, "/detail/fresh-b");
-
-        assert_eq!(runner.app().featured.featured, old_featured);
-        assert_eq!(runner.app().featured.recommended, old_recommended);
-        assert_eq!(runner.app().featured.page, 0);
-
-        runner.task_outcome(
-            shared_detail,
-            TaskOutcome::Completed(detail_response("feature-a", "Shared refreshed")),
-        );
-        assert_eq!(runner.app().featured.featured, old_featured);
-        assert_eq!(runner.app().featured.recommended, old_recommended);
-        runner.app_mut().featured.page = 7;
-        let commands = runner.task_outcome(
-            fresh_detail,
-            TaskOutcome::Completed(detail_response("fresh-b", "Fresh B")),
-        );
-
-        assert_eq!(
-            aliases(&runner.app().featured.featured),
-            ["feature-a", "fresh-b"]
-        );
-        assert!(runner.app().featured.recommended.is_empty());
-        assert_eq!(runner.app().featured.page, 0);
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Ready);
-        assert_eq!(runner.app().featured.stale_warning, None);
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(31))
-        );
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-        assert_eq!(
-            ready_cover(&runner.app().covers, Some(shared_url)),
-            shared_picture
-        );
-        let cancelled = commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Cancel(task) => Some(*task),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert!(cancelled.contains(
-            cover_tasks
-                .get(obsolete_urls[1])
-                .expect("in-flight obsolete cover task")
-        ));
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        assert_eq!(runner.app().feature_tasks.len(), 4);
         assert!(runner
             .app()
-            .covers
-            .visible_urls
-            .iter()
-            .any(|url| url.ends_with("/fresh-b.webp")));
+            .featured
+            .batch
+            .as_ref()
+            .expect("batch")
+            .queued
+            .contains(&FeatureSource::Freetime));
+
+        settle_source(
+            &mut runner,
+            FeatureSource::Homepage,
+            TaskOutcome::Completed(homepage_response(&[], "home")),
+        );
+        assert_eq!(runner.app().feature_tasks.len(), 4);
+        assert!(runner.app().feature_tasks.values().any(|purpose| matches!(
+            purpose,
+            FeatureTaskPurpose::Source {
+                source: FeatureSource::Freetime,
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn refresh_failure_preserves_feed_pictures_baseline_and_has_one_retry() {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-        runner.app_mut().featured = {
-            let mut featured = feed_with_recommendations(8);
-            featured.page = 1;
-            featured.refresh.loaded_day = Some(local_day(30));
-            featured
-        };
-        let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp".to_owned();
-        let picture = TilePicture::new(PictureHandle(77), 1, 1);
-        runner
-            .app_mut()
-            .covers
-            .entries
-            .insert(shared_url.clone(), CoverState::Ready(picture));
-        let old_featured = runner.app().featured.featured.clone();
-        let old_recommended = runner.app().featured.recommended.clone();
+    fn feature_initial_feed_remains_loading_until_sources_and_banner_details_settle() {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
 
-        let cached_urls = runner
+        settle_source(
+            &mut runner,
+            FeatureSource::Homepage,
+            TaskOutcome::Completed(homepage_response(&["unresolved"], "home")),
+        );
+        for source in [
+            FeatureSource::Ranking,
+            FeatureSource::MostFavorited,
+            FeatureSource::Themes,
+            FeatureSource::Freetime,
+        ] {
+            settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(source_response(source, "fresh")),
+            );
+        }
+        assert!(runner.app().featured.snapshot().is_none());
+        assert!(runner.app().featured.is_loading());
+        let detail = runner
             .app()
-            .featured
-            .featured
+            .feature_tasks
             .iter()
-            .chain(&runner.app().featured.recommended)
-            .filter_map(|comic| {
-                comic
-                    .vertical_url
-                    .as_ref()
-                    .or(comic.square_url.as_ref())
-                    .cloned()
+            .find_map(|(task, purpose)| {
+                matches!(
+                    purpose,
+                    FeatureTaskPurpose::BannerDetail { alias, .. } if alias == "unresolved"
+                )
+                .then_some(*task)
             })
-            .collect::<Vec<_>>();
-        for (index, url) in cached_urls.into_iter().enumerate() {
-            runner
-                .app_mut()
-                .covers
-                .entries
-                .entry(url)
-                .or_insert_with(|| {
-                    CoverState::Ready(TilePicture::new(
-                        PictureHandle(
-                            100_u32.saturating_add(u32::try_from(index).expect("cover index")),
-                        ),
-                        1,
-                        1,
-                    ))
-                });
-        }
-        let commands = observe_local_day(&mut runner, Some(local_day(31)));
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-        let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
-        let screen = last_screen(&commands);
+            .expect("banner detail");
 
-        assert_eq!(runner.app().featured.featured, old_featured);
-        assert_eq!(runner.app().featured.recommended, old_recommended);
-        assert_eq!(runner.app().featured.page, 2);
-        assert_eq!(
-            runner.app().covers.entries.get(&shared_url),
-            Some(&CoverState::Ready(picture))
+        runner.task_outcome(
+            detail,
+            TaskOutcome::Completed(detail_response("unresolved", "Recovered")),
         );
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(
-            runner.app().featured.refresh.desired_day,
-            Some(local_day(31))
-        );
-        assert!(runner.app().featured.stale_warning.is_some());
-        assert_eq!(retry_button_count(&screen), 0);
-        assert_fits(&screen);
-        assert!(!commands
-            .iter()
-            .any(|command| matches!(command, Command::DropPicture(PictureHandle(77)))));
-
-        runner.action(action_id(PREVIOUS_PAGE));
-        let warning_commands = runner.action(action_id(PREVIOUS_PAGE));
-        let warning_screen = last_screen(&warning_commands);
-        assert_eq!(runner.app().featured.page, 0);
-        assert_eq!(retry_button_count(&warning_screen), 1);
-        assert_fits(&warning_screen);
-
-        let retry = runner.action(action_id(RETRY));
-        assert_eq!(homepage_fetches(&retry), 1);
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(31))
-        );
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-        assert_eq!(runner.app().featured.featured, old_featured);
-        assert_eq!(runner.app().featured.recommended, old_recommended);
-    }
-
-    fn assert_non_ready_refresh_failure_is_terminal(status: FeaturedStatus) {
-        let mut runner = ready_featured_runner(Some(local_day(30)));
-        {
-            let featured = &mut runner.app_mut().featured;
-            featured.status = status;
-            featured.featured.clear();
-            featured.recommended.clear();
-        }
-        let commands = observe_local_day(&mut runner, Some(local_day(31)));
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-
-        let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
-        let screen = last_screen(&commands);
-
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Failed);
-        assert!(runner.app().featured.stale_warning.is_none());
-        assert_eq!(
-            runner.app().featured.refresh.loaded_day,
-            Some(local_day(30))
-        );
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(
-            runner.app().featured.refresh.desired_day,
-            Some(local_day(31))
-        );
-        assert_eq!(
-            screen
-                .nodes
-                .iter()
-                .filter(|node| {
-                    matches!(node, Node::Button { action, .. } if *action == action_id(RETRY))
-                })
-                .count(),
-            1
-        );
-
-        let retry = runner.action(action_id(RETRY));
-        let (homepage, _) = fetch_task_with(&retry, "/comic/main");
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
-        assert_eq!(
-            runner.app().featured.refresh.active_day,
-            Some(local_day(31))
-        );
-        assert!(matches!(
-            runner.app().shelf_tasks.get(&homepage),
-            Some(ShelfTaskPurpose::Homepage {
-                refresh_day: Some(day),
-                ..
-            }) if *day == local_day(31)
-        ));
+        assert!(runner.app().featured.snapshot().is_some());
+        assert!(!runner.app().featured.is_loading());
     }
 
     #[test]
-    fn refresh_failure_from_loading_without_a_ready_feed_is_terminal() {
-        assert_non_ready_refresh_failure_is_terminal(FeaturedStatus::Loading);
-    }
-
-    #[test]
-    fn refresh_failure_from_failed_without_a_ready_feed_is_terminal() {
-        assert_non_ready_refresh_failure_is_terminal(FeaturedStatus::Failed);
-    }
-
-    #[test]
-    fn featured_problem_retry_precedes_stale_refresh_retry() {
-        let mut app = ready_featured(Some(local_day(30)));
-        app.featured.stale_warning = Some("Showing an older Featured feed.".to_owned());
-        app.featured.refresh.desired_day = Some(local_day(31));
-        app.problem = Some("The protected request failed.".to_owned());
-        app.retry = Retry::Restart;
-        let mut runner = AppRunner::new(app);
-
-        let commands = runner.action(action_id(RETRY));
-        let (homepage, _) = fetch_task_with(&commands, "/comic/main");
-
-        assert!(runner.app().problem.is_none());
-        assert!(runner.app().featured.stale_warning.is_none());
-        assert_eq!(runner.app().featured.refresh.active_day, None);
-        assert_eq!(runner.app().featured.refresh.desired_day, None);
-        assert!(matches!(
-            runner.app().shelf_tasks.get(&homepage),
-            Some(ShelfTaskPurpose::Homepage {
-                refresh_day: None,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn recommended_deduplicates_within_lists_but_not_against_featured() {
-        let plan = plan_featured(homepage_fixture());
-
-        assert_eq!(aliases(&plan.featured), ["shared", "banner_b", "banner_c"]);
-        assert_eq!(
-            aliases(&plan.recommended),
-            ["shared", "new_b", "weekday_a", "only_a"]
-        );
-    }
-
-    #[test]
-    fn featured_uses_first_three_banners_and_reuses_first_list_metadata() {
-        let plan = plan_featured(homepage_fixture());
-
-        assert_eq!(plan.featured[0], shelf("shared", "Shared first"));
-        assert_eq!(
-            plan.details
-                .iter()
-                .map(|detail| (detail.slot, detail.alias.as_str()))
-                .collect::<Vec<_>>(),
-            [(1, "banner_b"), (2, "banner_c")]
-        );
-        assert_eq!(plan.featured[1].title, "banner_b");
-        assert_eq!(plan.featured[1].creators, "");
-        assert_eq!(plan.featured[1].view_count, None);
-        assert_eq!(plan.featured[1].vertical_url, None);
-        assert_eq!(plan.featured[1].square_url, None);
-    }
-
-    #[test]
-    fn featured_unresolved_selection_never_plans_more_than_three_details() {
-        let plan = plan_featured(model::Homepage {
-            banners: ["a", "b", "c", "d", "e"]
-                .into_iter()
-                .map(|alias| model::BannerComic {
-                    alias: alias.to_owned(),
-                })
-                .collect(),
-            newest: Vec::new(),
-            week_day: Vec::new(),
-            only_bom: Vec::new(),
-        });
-
-        assert_eq!(aliases(&plan.featured), ["a", "b", "c"]);
-        assert_eq!(plan.details.len(), 3);
-    }
-
-    #[test]
-    fn featured_page_one_has_tiles_then_measured_recommendations() {
-        let feed = feed_with_recommendations(20);
-        let page = featured_page(&feed, 0, 6);
-
-        assert_eq!(page.featured, 0..3);
-        assert_eq!(page.recommended, 0..6);
-    }
-
-    #[test]
-    fn featured_page_continuations_do_not_repeat_tiles() {
-        let feed = feed_with_recommendations(20);
-        let page = featured_page(&feed, 1, 6);
-
-        assert!(page.featured.is_empty());
-        assert_eq!(page.recommended, 6..12);
-        assert_eq!(featured_page_count(&feed, 6), 4);
-    }
-
-    #[test]
-    fn featured_homepage_spawns_only_bounded_public_detail_tasks_with_runner_cap() {
-        let (mut runner, homepage) = started_ready_for_homepage();
-        let response = homepage_response(
-            &["banner-a", "banner-b", "banner-c", "banner-d"],
-            &[("recommended", "Recommended")],
-        );
-
-        let commands = runner.task_outcome(homepage, TaskOutcome::Completed(response));
-
-        assert_eq!(runner.app().featured.pending_details, 3);
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
-        assert_eq!(aliases(&runner.app().featured.recommended), ["recommended"]);
-        assert_eq!(spawns(&commands).len(), 3);
-        assert!(spawns(&commands).iter().all(
-            |(_, work)| matches!(work, Task::Fetch { url, credential: None, .. } if url.contains("/detail/"))
-        ));
-        assert_eq!(runner.tasks_in_flight(), 3);
-    }
-
-    #[test]
-    fn banner_detail_success_enriches_exact_slot_and_waits_for_every_detail() {
-        let (mut runner, homepage) = signed_out_ready_for_homepage();
-        let commands = runner.task_outcome(
-            homepage,
-            TaskOutcome::Completed(homepage_response(&["first", "second"], &[])),
-        );
-        let (first, _) = fetch_task_with(&commands, "/detail/first");
-        let (second, _) = fetch_task_with(&commands, "/detail/second");
-        let detail = r#"
-            <meta property="og:title" content="First title - 漫畫 - BOMTOON">
-            <meta property="og:image" content="https://image.balcony.studio/tw/contents/first.webp">
-        "#;
-
-        runner.task_outcome(first, TaskOutcome::Completed(detail.as_bytes().to_vec()));
-
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
-        assert_eq!(runner.app().featured.pending_details, 1);
-        assert_eq!(runner.app().featured.featured[0].title, "First title");
-        assert_eq!(runner.app().featured.featured[0].creators, "");
-        assert_eq!(runner.app().featured.featured[0].vertical_url, None);
-        assert_eq!(runner.app().featured.featured[0].square_url, None);
-        assert_eq!(runner.app().featured.featured[1].title, "second");
-
-        runner.task_outcome(second, TaskOutcome::Failed(TaskError::TimedOut));
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Ready);
-        assert_eq!(runner.app().featured.pending_details, 0);
-    }
-
-    #[test]
-    fn banner_detail_failure_keeps_validated_alias_fallback_and_finishes_featured() {
-        let (mut runner, homepage) = signed_out_ready_for_homepage();
-        let commands = runner.task_outcome(
-            homepage,
-            TaskOutcome::Completed(homepage_response(&["fallback"], &[])),
-        );
-        let (detail, _) = fetch_task_with(&commands, "/detail/fallback");
-
-        let commands = runner.task_outcome(detail, TaskOutcome::Failed(TaskError::TimedOut));
-
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Ready);
-        assert_eq!(
-            runner.app().featured.featured,
-            [model::FeatureComic {
-                alias: "fallback".to_owned(),
-                title: "fallback".to_owned(),
-                creators: String::new(),
-                view_count: None,
-                vertical_url: None,
-                square_url: None,
-            }]
-        );
-        assert!(spawns(&commands).is_empty());
-        assert!(runner.app().problem.is_none());
-    }
-
-    #[test]
-    fn featured_stale_generation_and_unknown_outcomes_are_no_ops() {
-        let (mut runner, homepage) = signed_out_ready_for_homepage();
-        runner.app_mut().featured.generation = runner.app().featured.generation.wrapping_add(1);
-        let before = runner.app().featured.clone();
-
-        let commands = runner.task_outcome(
-            homepage,
-            TaskOutcome::Completed(homepage_response(&["stale"], &[])),
-        );
-        assert!(commands.is_empty());
-        assert_eq!(runner.app().featured, before);
-
-        let commands = runner.task_outcome(TaskId(9_999), TaskOutcome::Completed(Vec::new()));
-        assert!(commands.is_empty());
-        assert_eq!(runner.app().featured, before);
-    }
-
-    #[test]
-    fn featured_initial_failure_is_local_retryable_and_keeps_navigation() {
-        let (mut runner, homepage) = signed_out_ready_for_homepage();
-        let generation = runner.app().featured.generation;
-
-        let commands = runner.task_outcome(homepage, TaskOutcome::Failed(TaskError::Offline));
-        let screen = last_screen(&commands);
-
-        assert_eq!(runner.app().view, View::Main);
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Failed);
-        assert!(runner.app().problem.is_none());
-        assert!(screen.top_bar.is_some());
-        assert!(screen.nav_bar.is_some());
-        assert!(screen.nodes.iter().any(
-            |node| matches!(node, Node::Button { action, .. } if *action == action_id(RETRY))
-        ));
-        assert_fits(&screen);
-
-        let commands = runner.action(action_id(RETRY));
-        assert_eq!(runner.app().featured.status, FeaturedStatus::Loading);
-        assert_eq!(runner.app().featured.generation, generation.wrapping_add(1));
-        assert_eq!(
-            spawns(&commands),
-            [(
-                runner
-                    .app()
-                    .shelf_tasks
-                    .keys()
-                    .copied()
-                    .next()
-                    .expect("retry task"),
-                api::homepage()
-            )]
-        );
-    }
-
-    #[test]
-    fn featured_metadata_layout_measures_page_zero_and_uses_turns_without_buttons() {
-        let featured = feed_with_recommendations(20);
-        let measured = featured_page_zero_rows(&featured);
-        assert!(measured > 0);
-        assert!(measured <= 6);
-        let page_count = featured_page_count(&featured, measured);
-        let screen = Bomtoon {
-            account: AccountState::SignedOut,
-            view: View::Main,
-            destination: MainDestination::Featured,
-            featured,
-            ..Bomtoon::default()
-        }
-        .screen();
-
-        let tiles = screen
-            .nodes
-            .iter()
-            .find_map(|node| match node {
-                Node::TileGrid {
-                    tiles,
-                    shape: kobo_sdk::TileShape::Portrait,
-                    ..
-                } => Some(tiles),
-                _ => None,
-            })
-            .expect("portrait Featured tiles");
-        assert_eq!(tiles.len(), 3);
-        assert!(tiles.iter().all(|tile| tile.picture.is_none()));
-        let rows = screen
-            .nodes
-            .iter()
-            .find_map(|node| match node {
-                Node::Rows { rows, .. } => Some(rows),
-                _ => None,
-            })
-            .expect("Recommended rows");
-        assert_eq!(rows.len(), measured);
-        assert_eq!(
-            screen.page_turns.expect("Featured page turns").position,
-            Some((
-                1,
-                u16::try_from(page_count).expect("bounded test page count")
-            ))
-        );
-        assert!(screen.nodes.iter().all(|node| {
-            !matches!(
-                node,
-                Node::Button { action, .. }
-                    if *action == action_id(PREVIOUS_PAGE) || *action == action_id(NEXT_PAGE)
-            )
-        }));
-        assert_fits(&screen);
-    }
-
-    #[test]
-    fn featured_page_zero_uses_signed_in_maximum_coins_action_and_fits_clara() {
-        let featured = feed_with_recommendations(20);
-        let measured = featured_page_zero_rows(&featured);
-        let screen = Bomtoon {
-            account: AccountState::Active,
-            view: View::Main,
-            destination: MainDestination::Featured,
-            featured,
-            wallet: WalletState {
-                summary: Some(WalletSummary {
-                    coins: model::AssetAmounts {
-                        standard: usize::MAX,
-                        bonus: 0,
-                        free: 0,
-                    },
-                    tickets: model::AssetAmounts::default(),
-                }),
-                ..WalletState::default()
-            },
-            ..Bomtoon::default()
-        }
-        .screen();
-
-        let action = &screen.top_bar.as_ref().expect("Featured top bar").actions[0];
-        assert_eq!(action.action, action_id(ACCOUNT));
-        assert_eq!(action.label, format!("Coins {}", usize::MAX));
-        let rows = screen
-            .nodes
-            .iter()
-            .find_map(|node| match node {
-                Node::Rows { rows, .. } => Some(rows),
-                _ => None,
-            })
-            .expect("measured Featured rows");
-        assert_eq!(rows.len(), measured);
-        assert_fits(&screen);
-    }
-
-    #[test]
-    fn stale_featured_warning_and_feed_pages_keep_every_recommendation_once() {
-        let mut featured = feed_with_recommendations(20);
-        let first_page_rows = featured_page_zero_rows(&featured);
-        let feed_pages = featured_page_count(&featured, first_page_rows);
-        featured.stale_warning =
-            Some("Featured could not be refreshed. Showing the previous feed.".to_owned());
+    fn feature_source_batch_partial_failure_publishes_one_retry_action() {
         let mut runner = AppRunner::with_metrics(
-            Bomtoon {
-                account: AccountState::SignedOut,
-                view: View::Main,
-                destination: MainDestination::Featured,
-                featured,
-                ..Bomtoon::default()
-            },
+            ready_featured(local_day(30), "old"),
             CLARA_BW_METRICS,
         );
-
-        let warning = runner.app().screen();
-        assert!(format!("{warning:?}").contains("Showing the previous feed"));
-        assert!(!warning
-            .nodes
-            .iter()
-            .any(|node| matches!(node, Node::Rows { .. } | Node::TileGrid { .. })));
-        assert_fits(&warning);
-
-        let mut observed = Vec::new();
-        for content_page in 0..feed_pages {
-            let commands = runner.action(action_id(NEXT_PAGE));
-            assert_eq!(runner.app().featured.page, content_page + 1);
-            let screen = last_screen(&commands);
-            let rows = screen
-                .nodes
-                .iter()
-                .find_map(|node| match node {
-                    Node::Rows { rows, .. } => Some(rows),
-                    _ => None,
-                })
-                .expect("stale feed rows");
-            if content_page == 0 {
-                assert_eq!(rows.len(), first_page_rows);
-            } else {
-                assert!(!screen
-                    .nodes
-                    .iter()
-                    .any(|node| matches!(node, Node::TileGrid { .. })));
-                if content_page + 1 < feed_pages {
-                    assert_eq!(rows.len(), 6);
-                }
-            }
-            observed.extend(rows.iter().map(|row| row.title.clone()));
-            assert!(!format!("{screen:?}").contains("Showing the previous feed"));
-            assert_fits(&screen);
-        }
-
+        observe_day_with_runner(&mut runner, local_day(31));
+        let commands =
+            complete_feature_batch(&mut runner, "fresh", Some(FeatureSource::Ranking));
+        let snapshot = runner.app().featured.snapshot().expect("partial snapshot");
         assert_eq!(
-            observed,
-            (0..20)
-                .map(|index| format!("Recommended {index}"))
-                .collect::<Vec<_>>()
+            snapshot.failed_sources,
+            BTreeSet::from([FeatureSource::Ranking])
         );
-    }
-    #[test]
-    fn featured_page_turn_actions_change_only_the_public_feed_position() {
-        let mut runner = AppRunner::new(Bomtoon {
-            account: AccountState::SignedOut,
-            view: View::Main,
-            destination: MainDestination::Featured,
-            featured: feed_with_recommendations(20),
-            page: 7,
-            ..Bomtoon::default()
-        });
-
-        let commands = runner.action(action_id(NEXT_PAGE));
-
-        assert_eq!(runner.app().featured.page, 1);
-        assert_eq!(runner.app().page, 7);
-        assert_eq!(
-            last_screen(&commands)
-                .page_turns
-                .expect("Featured page turns")
-                .position
-                .expect("Featured page position")
-                .0,
-            2
-        );
-
-        runner.action(action_id(PREVIOUS_PAGE));
-        assert_eq!(runner.app().featured.page, 0);
-        assert_eq!(runner.app().page, 7);
+        assert_eq!(retry_button_count(&last_screen(&commands)), 1);
     }
 
     #[test]
-    fn featured_tiles_and_rows_use_the_existing_protected_content_route() {
-        for (index, alias) in [(0, "feature-a"), (3, "rec-0")] {
-            let mut runner = AppRunner::new(Bomtoon {
-                account: AccountState::Active,
-                view: View::Main,
-                destination: MainDestination::Featured,
-                featured: feed_with_recommendations(2),
-                ..Bomtoon::default()
-            });
-
-            let commands = runner.action(action_id(&format!("comic-{index}")));
-            let (_, work) = only_spawn(&commands);
-
-            assert_eq!(work, api::content(alias));
-            assert_eq!(runner.app().pending, Some(Pending::Content(index)));
-            assert_eq!(runner.app().selected_content_alias, alias);
-        }
-    }
-
-    #[test]
-    fn featured_restart_defers_and_coalesces_replacement_until_every_cancellation_settles() {
-        let (mut runner, old_homepage) = signed_out_ready_for_homepage();
-        let commands = runner.task_outcome(
-            old_homepage,
-            TaskOutcome::Completed(homepage_response(&["old-a", "old-b"], &[])),
+    fn failed_source_retry_emits_only_the_failed_public_endpoint() {
+        let mut runner = AppRunner::with_metrics(
+            ready_featured(local_day(30), "old"),
+            CLARA_BW_METRICS,
         );
-        let (old_a, _) = fetch_task_with(&commands, "/detail/old-a");
-        let (old_b, _) = fetch_task_with(&commands, "/detail/old-b");
-        runner.app_mut().featured.status = FeaturedStatus::Failed;
+        observe_day_with_runner(&mut runner, local_day(31));
+        complete_feature_batch(&mut runner, "fresh", Some(FeatureSource::Ranking));
 
         let commands = runner.action(action_id(RETRY));
-        let cancelled = commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Cancel(task) => Some(*task),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(cancelled, BTreeSet::from([old_a, old_b]));
-        assert!(!commands.iter().any(is_homepage_fetch));
-        assert_eq!(
-            runner.app().shelf_tasks.keys().copied().collect::<Vec<_>>(),
-            [old_a, old_b]
-        );
-        let generation = runner.app().featured.generation;
-
-        runner.app_mut().featured.status = FeaturedStatus::Failed;
-        let repeated = runner.action(action_id(RETRY));
-        assert!(!repeated
-            .iter()
-            .any(|command| matches!(command, Command::Cancel(_))));
-        assert!(!repeated.iter().any(is_homepage_fetch));
-        assert_eq!(runner.app().featured.generation, generation);
-
-        let commands = runner.task_outcome(old_a, TaskOutcome::Cancelled);
-        assert!(!commands.iter().any(is_homepage_fetch));
-        assert_eq!(
-            runner.app().shelf_tasks.keys().copied().collect::<Vec<_>>(),
-            [old_b]
-        );
-
-        let commands = runner.task_outcome(old_b, TaskOutcome::Completed(Vec::new()));
-        let (replacement_homepage, _) = fetch_task_with(&commands, "/comic/main");
-        assert_eq!(runner.app().shelf_tasks.len(), 1);
+        let spawned = spawns(&commands);
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].1, api::ranking());
         assert!(matches!(
-            runner.app().shelf_tasks.get(&replacement_homepage),
-            Some(ShelfTaskPurpose::Homepage {
-                generation: replacement_generation,
+            runner.app().feature_tasks.get(&spawned[0].0),
+            Some(FeatureTaskPurpose::Source {
+                source: FeatureSource::Ranking,
                 ..
-            }) if *replacement_generation == generation
+            })
         ));
+    }
+
+    #[test]
+    fn daily_refresh_keeps_old_aliases_until_the_last_new_source_result() {
+        let mut runner = AppRunner::with_metrics(
+            ready_featured(local_day(30), "old"),
+            CLARA_BW_METRICS,
+        );
+        let before = runner.app().featured.snapshot().expect("old").clone();
+        observe_day_with_runner(&mut runner, local_day(31));
+        for source in FEATURE_SOURCES.into_iter().take(4) {
+            settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(source_response(source, "fresh")),
+            );
+            assert_eq!(runner.app().featured.snapshot(), Some(&before));
+        }
+        settle_source(
+            &mut runner,
+            FeatureSource::Freetime,
+            TaskOutcome::Completed(source_response(FeatureSource::Freetime, "fresh")),
+        );
+        assert_ne!(runner.app().featured.snapshot(), Some(&before));
+    }
+
+    #[test]
+    fn daily_refresh_total_failure_keeps_old_feed_with_one_retry_action() {
+        let mut runner = AppRunner::with_metrics(
+            ready_featured(local_day(30), "old"),
+            CLARA_BW_METRICS,
+        );
+        let before = runner.app().featured.snapshot().expect("old").clone();
+        observe_day_with_runner(&mut runner, local_day(31));
+
+        let mut commands = Vec::new();
+        for source in FEATURE_SOURCES {
+            commands = settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Failed(TaskError::Offline),
+            );
+        }
+
+        assert_eq!(runner.app().featured.snapshot(), Some(&before));
+        assert!(runner
+            .app()
+            .featured
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.settled()));
+        assert_eq!(retry_button_count(&last_screen(&commands)), 1);
+    }
+
+    #[test]
+    fn newer_local_day_starts_after_the_older_atomic_refresh_settles() {
+        let mut runner = AppRunner::with_metrics(
+            ready_featured(local_day(29), "old"),
+            CLARA_BW_METRICS,
+        );
+        observe_day_with_runner(&mut runner, local_day(30));
+        observe_day_with_runner(&mut runner, local_day(31));
+        assert_eq!(runner.app().featured.desired_day, Some(local_day(31)));
+
+        let commands = complete_feature_batch(&mut runner, "day30", None);
+        assert_eq!(runner.app().featured.loaded_day, Some(local_day(30)));
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .batch
+                .as_ref()
+                .and_then(|batch| batch.refresh_day),
+            Some(local_day(31))
+        );
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::homepage()));
+    }
+
+    #[test]
+    fn feature_exit_cancellation_and_stale_outcomes_never_publish() {
+        let mut runner = AppRunner::with_metrics(
+            ready_featured(local_day(30), "old"),
+            CLARA_BW_METRICS,
+        );
+        observe_day_with_runner(&mut runner, local_day(31));
+        let stale = feature_task(&runner, FeatureSource::Homepage);
+        let cancelled = runner.exit();
+        assert!(cancelled.contains(&Command::Cancel(stale)));
+        assert!(runner.app().featured.snapshot().is_none());
 
         let commands = runner.task_outcome(
-            replacement_homepage,
-            TaskOutcome::Completed(homepage_response(&["a", "b", "c", "d"], &[])),
+            stale,
+            TaskOutcome::Completed(homepage_response(&[], "stale")),
         );
+        assert!(commands.is_empty());
+        assert!(runner.app().featured.snapshot().is_none());
+    }
 
-        assert_eq!(spawns(&commands).len(), 3);
-        assert!(["/detail/a", "/detail/b", "/detail/c"]
-            .into_iter()
-            .all(|path| spawns(&commands)
-                .iter()
-                .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.ends_with(path)))));
-        assert_eq!(runner.app().featured.pending_details, 3);
-        assert_eq!(runner.tasks_in_flight(), 3);
+    #[test]
+    fn signed_out_feature_sources_never_emit_credentials() {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+        let mut command_batches = vec![commands];
+        command_batches.push(
+            runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential)),
+        );
+        for source in FEATURE_SOURCES {
+            command_batches.push(settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(source_response(source, "public")),
+            ));
+        }
+        let feature_requests = command_batches
+            .iter()
+            .flat_map(|commands| spawns(commands))
+            .filter(|(_, work)| {
+                [
+                    api::homepage(),
+                    api::ranking(),
+                    api::most_favorited(),
+                    api::themes(),
+                    api::freetime(),
+                ]
+                .contains(work)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(feature_requests.len(), FEATURE_SOURCES.len());
+        for (_, task) in feature_requests {
+            let Task::Fetch { credential, .. } = task else {
+                panic!("Feature source was not a fetch");
+            };
+            assert_eq!(credential, None);
+        }
     }
 
     fn shelf_cover_url(index: usize) -> String {
@@ -15600,15 +14727,28 @@ mod tests {
                 account: AccountState::SignedOut,
                 view: View::Main,
                 destination: MainDestination::Recent,
-                featured: FeaturedState {
-                    status: FeaturedStatus::Ready,
-                    generation: 1,
-                    featured: vec![shared.clone()],
-                    recommended: vec![shared],
-                    pending_details: 0,
-                    page: 0,
-                    stale_warning: None,
-                    ..FeaturedState::default()
+                featured: {
+                    let collection = model::FeatureCollection {
+                        id: "newest".to_owned(),
+                        label: "人氣新作".to_owned(),
+                        priority: 2,
+                        order: 0,
+                        comics: vec![shared.clone()],
+                    };
+                    FeaturedState {
+                        generation: 1,
+                        snapshot: Some(FeatureSnapshot {
+                            banners: vec![shared],
+                            collections: vec![collection.clone()],
+                            sources: BTreeMap::from([(
+                                FeatureSource::Homepage,
+                                vec![collection],
+                            )]),
+                            failed_sources: BTreeSet::new(),
+                            warning: None,
+                        }),
+                        ..FeaturedState::default()
+                    }
                 },
                 ..Bomtoon::default()
             },
