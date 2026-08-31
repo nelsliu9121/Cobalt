@@ -3221,7 +3221,7 @@ impl Bomtoon {
             return;
         };
         if self.featured.observe_day(day) {
-            self.resume_feature_capacity(context);
+            self.resume_capacity_work(context);
         }
     }
 
@@ -3359,14 +3359,14 @@ impl Bomtoon {
             }
         }
         self.featured.begin_full_batch(refresh_day);
-        self.resume_feature_capacity(context);
+        self.resume_capacity_work(context);
     }
 
     fn retry_failed_feature_sources(&mut self, context: &mut Context) -> bool {
         if self.featured.begin_failed_retry().is_empty() {
             return false;
         }
-        self.resume_feature_capacity(context);
+        self.resume_capacity_work(context);
         true
     }
 
@@ -3458,7 +3458,7 @@ impl Bomtoon {
                 if let Some(collection) = self.featured.collection.as_mut() {
                     collection.pending_aliases.remove(&alias);
                 }
-                self.resume_feature_capacity(context);
+                self.resume_capacity_work(context);
                 self.settle_collection_window(context);
                 true
             }
@@ -3565,7 +3565,7 @@ impl Bomtoon {
         if let Some(view) = self.featured.collection.as_mut() {
             view.queue_detail_window(&aliases, &self.featured.detail_cache);
         }
-        self.resume_feature_capacity(context);
+        self.resume_capacity_work(context);
         self.settle_collection_window(context);
     }
 
@@ -3654,8 +3654,9 @@ impl Bomtoon {
         self.view = View::Main;
         self.page = 0;
         self.request_local_day(context);
-        self.start_feature_batch(context, None);
         self.refresh_asset_summary(context);
+        self.request_foreground(context, Pending::Library(0));
+        self.start_feature_batch(context, None);
     }
 
     fn restart(&mut self, context: &mut Context) {
@@ -3663,7 +3664,6 @@ impl Bomtoon {
         self.clear_protected_state(context);
         self.begin_commerce_safety(context);
         self.open_public_main(context);
-        self.request_foreground(context, Pending::Library(0));
     }
 
     fn foreground_work(&self, pending: Pending) -> kobo_sdk::Task {
@@ -3743,12 +3743,16 @@ impl Bomtoon {
         if self.scope_refresh_pending {
             return;
         }
-        self.resume_feature_capacity(context);
         self.resume_queued_foreground(context);
-        if self.queued_foreground.is_none() {
-            self.resume_deferred_wallet(context);
-            self.spawn_visible_covers(context);
+        if self.queued_foreground.is_some() {
+            return;
         }
+        self.resume_deferred_wallet(context);
+        if self.wallet.summary_refresh_queued || !self.wallet.detail_queue.is_empty() {
+            return;
+        }
+        self.resume_feature_capacity(context);
+        self.spawn_visible_covers(context);
     }
 
     fn spawn_reader(
@@ -7791,16 +7795,15 @@ mod tests {
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
-        let mut resumed = Vec::new();
         for source in FEATURE_SOURCES {
-            resumed.extend(settle_source(
+            settle_source(
                 &mut runner,
                 source,
-                TaskOutcome::Cancelled,
-            ));
+                TaskOutcome::Completed(empty_source_response(source)),
+            );
         }
-        let library = fetch_task_with(&resumed, "/library?").0;
-        let summary = fetch_task_with(&resumed, "/asset/user").0;
+        let library = fetch_task_with(&commands, "/library?").0;
+        let summary = fetch_task_with(&commands, "/asset/user").0;
         runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
         runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         (runner, homepage)
@@ -7845,7 +7848,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_uses_all_four_task_slots_for_scope_and_first_feature_sources() {
+    fn startup_preserves_scope_wallet_library_and_one_feature_source() {
         let (runner, commands) = started();
         let spawned = spawns(&commands);
 
@@ -7858,9 +7861,9 @@ mod tests {
         assert_eq!(spawned.len(), 4);
         for work in [
             api::account_scope(),
+            api::asset_summary(),
+            api::library(0),
             api::homepage(),
-            api::ranking(),
-            api::most_favorited(),
         ] {
             assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
         }
@@ -7983,6 +7986,13 @@ mod tests {
         );
         assert!(runner.app().commerce.marker_belongs_to_another_account());
         assert_no_post_or_marker_forget(&commands);
+        for source in FEATURE_SOURCES {
+            settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(empty_source_response(source)),
+            );
+        }
 
         seed_all_account_data(&mut runner);
         let app = runner.app_mut();
@@ -8092,12 +8102,20 @@ mod tests {
             format!("{:?}", last_screen(&commands)).contains("Join Wi-Fi"),
             "cold-start offline did not expose the standard network recovery surface"
         );
+        for cancelled in cancelled_tasks(&commands) {
+            runner.task_outcome(cancelled, TaskOutcome::Cancelled);
+        }
         let retry_commands = runner.action(action_id(RETRY));
+        let mut resumed = Vec::new();
+        for cancelled in cancelled_tasks(&retry_commands) {
+            resumed.extend(runner.task_outcome(cancelled, TaskOutcome::Cancelled));
+        }
         assert_eq!(runner.app().account, AccountState::Checking);
         assert_eq!(runner.app().connection, ConnectionState::Unknown);
         assert!(spawns(&retry_commands)
-            .iter()
-            .any(|(_, work)| *work == api::account_scope()));
+            .into_iter()
+            .chain(spawns(&resumed))
+            .any(|(_, work)| work == api::account_scope()));
         assert!(retry_commands.iter().any(|command| matches!(
             command,
             Command::Store(StoreRequest::Load { key }) if key == commerce::MARKER_KEY
@@ -8446,7 +8464,19 @@ mod tests {
         runner.task_outcome(scope_task, TaskOutcome::Completed(SCOPE.to_vec()));
         let library = runner.app().task.expect("startup library task");
         runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
-        let logout = begin_logout(&mut runner);
+        runner.app_mut().view = View::Account;
+        let queued = runner.action(action_id(SIGN_OUT));
+        assert!(spawns(&queued).is_empty());
+        assert_eq!(runner.app().queued_foreground, Some(Pending::Logout));
+        let homepage = feature_task(&runner, FeatureSource::Homepage);
+        let resumed = runner.task_outcome(
+            homepage,
+            TaskOutcome::Completed(empty_source_response(FeatureSource::Homepage)),
+        );
+        let logout = spawns(&resumed)
+            .into_iter()
+            .find_map(|(task, work)| (work == api::logout()).then_some(task))
+            .unwrap_or_else(|| panic!("logout did not win released capacity: {resumed:?}"));
 
         let commands = runner.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
 
@@ -8524,17 +8554,14 @@ mod tests {
             scope,
             TaskOutcome::Completed(b"00112233445566778899aabbccddeeff".to_vec()),
         );
-        let mut resumed = Vec::new();
         for source in FEATURE_SOURCES {
-            resumed.extend(settle_source(
+            settle_source(
                 &mut runner,
                 source,
-                TaskOutcome::Cancelled,
-            ));
+                TaskOutcome::Completed(empty_source_response(source)),
+            );
         }
-        let (library, _) = fetch_task_with(&resumed, "/library?");
-        let (summary, _) = fetch_task_with(&resumed, "/asset/user");
-        runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
+        let (library, _) = fetch_task_with(&commands, "/library?");
         runner.action(action_id(LIBRARY));
         let commands =
             runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
@@ -9240,15 +9267,12 @@ mod tests {
         let spawned = spawns(&commands);
         for work in [
             api::account_scope(),
+            api::asset_summary(),
+            api::library(0),
             api::homepage(),
-            api::ranking(),
-            api::most_favorited(),
         ] {
             assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
         }
-        assert!(!spawned.iter().any(|(_, work)| {
-            *work == api::library(0) || *work == api::asset_summary()
-        }));
     }
 
     #[test]
@@ -9477,7 +9501,12 @@ mod tests {
             ..Bomtoon::default()
         };
         let mut context = Context::default();
-        app.open_comic(&mut context, 0);
+        app.open_selected_comic(
+            &mut context,
+            "public-comic".to_owned(),
+            "Public Comic".to_owned(),
+            0,
+        );
         assert_eq!(app.view, View::Status);
         assert_eq!(app.destination, MainDestination::Featured);
         assert_eq!(app.page, 0);
@@ -9533,9 +9562,12 @@ mod tests {
         assert!(!spawns(&commands)
             .iter()
             .any(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/recent?"))));
-        assert!(!spawns(&commands).iter().any(
-            |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/"))
-        ));
+        assert!(!spawns(&commands).iter().any(|(_, work)| matches!(
+            work,
+            Task::Fetch { url, .. }
+                if url.contains("/api/balcony-api-v2/contents/")
+                    && !url.contains("/api/balcony-api-v2/contents/main/")
+        )));
     }
 
     #[test]
@@ -11321,9 +11353,9 @@ mod tests {
         assert_eq!(spawned.len(), 4);
         for work in [
             api::account_scope(),
+            api::asset_summary(),
+            api::library(0),
             api::homepage(),
-            api::ranking(),
-            api::most_favorited(),
         ] {
             assert!(spawned.iter().any(|(_, spawned)| *spawned == work));
         }
@@ -13053,7 +13085,11 @@ mod tests {
         assert_fits(&screen);
 
         let commands = runner.action(action_id(RETRY));
-        let (_, work) = fetch_task_with(&commands, "/comic/main");
+        let mut resumed = Vec::new();
+        for cancelled in cancelled_tasks(&commands) {
+            resumed.extend(runner.task_outcome(cancelled, TaskOutcome::Cancelled));
+        }
+        let (_, work) = fetch_task_with(&resumed, "/comic/main");
         assert_eq!(work, api::homepage());
         assert_eq!(runner.app().account, AccountState::Checking);
         assert_eq!(runner.app().view, View::Main);
@@ -14764,6 +14800,18 @@ mod tests {
         .into_bytes()
     }
 
+    fn empty_source_response(source: FeatureSource) -> Vec<u8> {
+        match source {
+            FeatureSource::Homepage => {
+                br#"<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"main":{"banners":[],"newest":[],"weekDay":[],"onlyBom":[]}}}}</script>"#.to_vec()
+            }
+            FeatureSource::Ranking
+            | FeatureSource::MostFavorited
+            | FeatureSource::Themes
+            | FeatureSource::Freetime => br#"{"result":"SUCCESS","data":[]}"#.to_vec(),
+        }
+    }
+
     fn source_response(source: FeatureSource, prefix: &str) -> Vec<u8> {
         let suffix = match source {
             FeatureSource::Homepage => "homepage",
@@ -14875,11 +14923,17 @@ mod tests {
     #[test]
     fn feature_startup_fills_four_source_slots_then_starts_the_fifth_after_one_outcome() {
         let (mut runner, commands) = started();
-        assert_eq!(runner.app().feature_tasks.len(), 3);
+        assert_eq!(runner.app().feature_tasks.len(), 1);
         assert!(runner.app().feature_tasks.len() <= 4);
         let scope = scope_task(&commands);
 
-        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        let commands =
+            runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        let protected = cancelled_tasks(&commands);
+        assert_eq!(protected.len(), 2);
+        for task in protected {
+            runner.task_outcome(task, TaskOutcome::Cancelled);
+        }
         assert_eq!(runner.app().feature_tasks.len(), 4);
         assert!(runner
             .app()
@@ -14903,6 +14957,70 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn scheduler_released_slot_prefers_queued_foreground_over_feature_source() {
+        let (mut runner, commands) = started();
+        let library = fetch_task_with(&commands, "/library?").0;
+        runner.app_mut().queued_foreground = Some(Pending::Recent(0));
+
+        let commands =
+            runner.task_outcome(library, TaskOutcome::Completed(LIBRARY_RESPONSE.to_vec()));
+
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::recent(0));
+        assert!(!spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::ranking()));
+    }
+
+    #[test]
+    fn scheduler_source_outcome_prefers_deferred_wallet_over_feature_refill() {
+        let (mut runner, commands) = started();
+        let summary = fetch_task_with(&commands, "/asset/user").0;
+        runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
+        runner.app_mut().wallet.summary_refresh_queued = true;
+        let homepage = feature_task(&runner, FeatureSource::Homepage);
+
+        let commands = runner.task_outcome(
+            homepage,
+            TaskOutcome::Completed(homepage_response(&[], "home")),
+        );
+
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(work, api::asset_summary());
+        assert!(!spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::most_favorited()));
+    }
+
+    #[test]
+    fn scheduler_retry_enters_shared_foreground_priority() {
+        let mut app = ready_featured(local_day(30), "old");
+        let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
+        snapshot.failed_sources.insert(FeatureSource::Ranking);
+        snapshot.warning = Some("Some Featured collections could not be loaded.".to_owned());
+        app.queued_foreground = Some(Pending::Recent(0));
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id(RETRY));
+
+        let spawned = spawns(&commands);
+        assert_eq!(spawned.first().map(|(_, work)| work), Some(&api::recent(0)));
+    }
+
+    #[test]
+    fn scheduler_daily_refresh_enters_shared_foreground_priority() {
+        let mut app = ready_featured(local_day(30), "old");
+        app.queued_foreground = Some(Pending::Recent(0));
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.resume();
+
+        let commands = runner.device_result(DeviceResult::LocalDay(Some(local_day(31))));
+
+        let spawned = spawns(&commands);
+        assert_eq!(spawned.first().map(|(_, work)| work), Some(&api::recent(0)));
     }
 
     #[test]
@@ -15774,13 +15892,16 @@ mod tests {
         runner.app_mut().featured = feed_with_recommendations(6);
 
         let commands = runner.action(action_id(FEATURED));
-        let covers = cover_fetches(&commands);
-        assert_eq!(covers.len(), 2);
+        assert!(cover_fetches(&commands).is_empty());
         assert_eq!(runner.tasks_in_flight(), 4);
 
-        let commands = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::TimedOut));
-        assert_eq!(cover_fetches(&commands).len(), 1);
-        assert_eq!(runner.tasks_in_flight(), 4);
+        let sources = runner.app().feature_tasks.keys().copied().take(2).collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        for source in sources {
+            let commands = runner.task_outcome(source, TaskOutcome::Cancelled);
+            assert_eq!(cover_fetches(&commands).len(), 1);
+            assert_eq!(runner.tasks_in_flight(), 4);
+        }
     }
     #[test]
     fn episode_commerce_summary_and_actions_fit_clara() {
@@ -16998,6 +17119,28 @@ mod tests {
                 work == &api::public_detail(alias)
             })));
         assert!(spawns(&commands).len() <= 4);
+    }
+
+    #[test]
+    fn scheduler_collection_details_enter_shared_wallet_priority() {
+        let mut app = full_collection_app(AccountState::Active, 14);
+        app.wallet.summary_refresh_queued = true;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id(&collection_action("ranking")));
+        let spawned = spawns(&commands);
+
+        assert_eq!(spawned.first().map(|(_, work)| work), Some(&api::asset_summary()));
+        assert_eq!(collection_detail_tasks(&runner).len(), 3);
+        let summary = spawned[0].0;
+
+        let commands =
+            runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
+
+        assert_eq!(collection_detail_tasks(&runner).len(), 4);
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/detail/"))));
     }
 
     #[test]
