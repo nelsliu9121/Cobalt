@@ -7,7 +7,7 @@
 //! exactly once.
 
 use kobo_protocol::{
-    Credential, SecretHeader, Task, TaskError, TaskId, TaskOutcome, MAX_TASK_BYTES,
+    Credential, CredentialUse, SecretHeader, Task, TaskError, TaskId, TaskOutcome, MAX_TASK_BYTES,
     MAX_TASK_BYTES_U32,
 };
 use std::collections::HashMap;
@@ -57,20 +57,14 @@ struct Running {
     handle: Option<thread::JoinHandle<()>>,
 }
 
-/// The exact HTTP method a credential is authorized for.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestMethod {
-    Get,
-    Post,
-}
-
 /// The host-provided network implementation a task's fetch runs through.
 ///
 /// It is a named type because the runtime, its builder and the worker all
 /// mention it, and spelling the whole signature in three places invites them
 /// to drift apart. The fourth argument is the resolved runtime credential,
-/// kept apart from the fifth argument containing the non-secret headers the
-/// application asked for.
+/// kept separate so the backend retains its provenance; the fifth is the
+/// application's non-secret headers, already checked against the ones the
+/// runtime owns. These are the same guarantees `Poster` makes for `Post`.
 pub type Fetcher = dyn Fn(&str, u32, u32, Option<(&str, &str)>, &[(&str, &str)]) -> Result<Vec<u8>, TaskError>
     + Send
     + Sync;
@@ -90,7 +84,7 @@ pub type Poster = dyn Fn(&str, &[u8], &str, Option<(&str, &str)>, &[(&str, &str)
 ///
 /// Secret files alone are not authority: without this second decision an
 /// application could name a real key and an attacker-controlled destination.
-pub type CredentialAuthorizer = dyn Fn(&Credential, RequestMethod, &str) -> bool + Send + Sync;
+pub type CredentialAuthorizer = dyn Fn(&Credential, &str, CredentialUse) -> bool + Send + Sync;
 
 /// Headers an application may not set, because the runtime decides them.
 ///
@@ -120,7 +114,6 @@ struct ResolvedHeader {
     name: String,
     value: String,
 }
-
 /// Turns a named credential into the header it will be sent as.
 ///
 /// The policy check deliberately precedes both resolution mechanisms. A
@@ -128,15 +121,15 @@ struct ResolvedHeader {
 /// probing until the exact method and destination have been authorized.
 fn resolved_credential(
     wanted: Option<&Credential>,
-    method: RequestMethod,
     url: &str,
+    usage: CredentialUse,
     credentials: Option<&CredentialAuthorizer>,
     secrets: Option<&Path>,
 ) -> Result<Option<ResolvedHeader>, TaskError> {
     let Some(wanted) = wanted else {
         return Ok(None);
     };
-    if credentials.is_none_or(|allows| !allows(wanted, method, url)) {
+    if credentials.is_none_or(|allows| !allows(wanted, url, usage)) {
         return Err(TaskError::Denied);
     }
     // Not `Denied`. The application asked for a key it is allowed to ask for,
@@ -163,8 +156,8 @@ fn resolved_credential(
 /// remains leased against refresh, revocation, and attended replacement.
 fn with_managed_credential<T>(
     wanted: Option<&Credential>,
-    method: RequestMethod,
     url: &str,
+    usage: CredentialUse,
     backends: &Backends<'_>,
     force_renewal: bool,
     operation: impl FnOnce(&crate::ResolvedCredential) -> T,
@@ -180,7 +173,7 @@ fn with_managed_credential<T>(
     }
     if backends
         .credentials
-        .is_none_or(|allows| !allows(wanted, method, url))
+        .is_none_or(|allows| !allows(wanted, url, usage))
     {
         return Err(TaskError::Denied);
     }
@@ -574,8 +567,8 @@ fn run_fetch(
     let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
     let managed_first = with_managed_credential(
         wanted,
-        RequestMethod::Get,
         url,
+        CredentialUse::Fetch,
         backends,
         false,
         |credential| {
@@ -596,8 +589,8 @@ fn run_fetch(
         Ok(None) => {
             let credential = match resolved_credential(
                 wanted,
-                RequestMethod::Get,
                 url,
+                CredentialUse::Fetch,
                 backends.credentials,
                 backends.secrets,
             ) {
@@ -622,8 +615,8 @@ fn run_fetch(
     let result = if matches!(&first, Err(TaskError::Unauthorized)) && used_managed {
         match with_managed_credential(
             wanted,
-            RequestMethod::Get,
             url,
+            CredentialUse::Fetch,
             backends,
             true,
             |credential| {
@@ -671,8 +664,8 @@ fn run_post(
     let ceiling = max_bytes.min(MAX_TASK_BYTES_U32);
     let managed_first = with_managed_credential(
         wanted,
-        RequestMethod::Post,
         url,
+        CredentialUse::Post,
         backends,
         false,
         |credential| {
@@ -694,8 +687,8 @@ fn run_post(
         Ok(None) => {
             let credential = match resolved_credential(
                 wanted,
-                RequestMethod::Post,
                 url,
+                CredentialUse::Post,
                 backends.credentials,
                 backends.secrets,
             ) {
@@ -721,8 +714,8 @@ fn run_post(
     let result = if matches!(&first, Err(TaskError::Unauthorized)) && used_managed {
         match with_managed_credential(
             wanted,
-            RequestMethod::Post,
             url,
+            CredentialUse::Post,
             backends,
             true,
             |credential| {
@@ -1348,9 +1341,9 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("resolved-root"))
             .with_capabilities([Capability::Network])
             .with_secrets(directory)
-            .with_credential_policy(Arc::new(|credential, method, url| {
+            .with_credential_policy(Arc::new(|credential, url, usage| {
                 credential.secret == "openai"
-                    && method == RequestMethod::Post
+                    && usage == CredentialUse::Post
                     && url == "https://example.invalid/"
             }))
             .with_post(Arc::new(|_, _, _, credential, _, _| {
@@ -1387,9 +1380,9 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("wrong-destination-root"))
             .with_capabilities([Capability::Network])
             .with_secrets(directory)
-            .with_credential_policy(Arc::new(|credential, method, url| {
+            .with_credential_policy(Arc::new(|credential, url, usage| {
                 credential.secret == "openai"
-                    && method == RequestMethod::Post
+                    && usage == CredentialUse::Post
                     && url == "https://api.openai.com/v1/chat/completions"
             }))
             .with_post(Arc::new(move |_, _, _, _, _, _| {
@@ -1414,6 +1407,59 @@ mod tests {
             TaskOutcome::Failed(TaskError::Denied)
         );
         assert!(!sent.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn credential_policy_distinguishes_fetch_from_post_to_the_same_url() {
+        let directory = secret_dir("read-only-method");
+        let mut runner = TaskRunner::simulated(temp_root("read-only-method-root"))
+            .with_capabilities([Capability::Network])
+            .with_secrets(directory)
+            .with_credential_policy(Arc::new(|credential, url, usage| {
+                credential.secret == "openai"
+                    && url == "https://example.invalid/items"
+                    && usage == CredentialUse::Fetch
+            }))
+            .with_fetch(Arc::new(|_, _, _, credential, headers| {
+                assert_eq!(credential, Some(("x-api-key", "not-a-real-key")));
+                assert!(headers.is_empty());
+                Ok(b"[]".to_vec())
+            }))
+            .with_post(Arc::new(|_, _, _, _, _, _| Ok(b"{}".to_vec())));
+        runner
+            .submit(
+                TaskId(1),
+                Task::Fetch {
+                    url: "https://example.invalid/items".into(),
+                    offset: 0,
+                    max_bytes: 1024,
+                    credential: Some(Credential::in_header("openai", "x-api-key")),
+                    headers: Vec::new(),
+                },
+            )
+            .expect("fetch submitted");
+        assert!(matches!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Completed(_)
+        ));
+
+        runner
+            .submit(
+                TaskId(2),
+                Task::Post {
+                    url: "https://example.invalid/items".into(),
+                    body: "[]".into(),
+                    content_type: "application/json".into(),
+                    credential: Some(Credential::bearer("openai")),
+                    headers: Vec::new(),
+                    max_bytes: 1024,
+                },
+            )
+            .expect("post submitted");
+        assert_eq!(
+            collect(&mut runner, 1)[0].outcome,
+            TaskOutcome::Failed(TaskError::Denied)
+        );
     }
 
     #[test]
@@ -1557,17 +1603,17 @@ mod tests {
     }
 
     #[test]
-    fn credential_policy_receives_get_or_post_method() {
+    fn credential_policy_receives_fetch_or_post_usage() {
         let methods = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&methods);
         let mut runner = TaskRunner::simulated(temp_root("credential-method"))
             .with_capabilities([Capability::Network])
             .with_secrets(secret_dir("credential-method"))
-            .with_credential_policy(Arc::new(move |_, method, url| {
+            .with_credential_policy(Arc::new(move |_, url, usage| {
                 observed
                     .lock()
-                    .expect("method observations")
-                    .push((method, url.to_owned()));
+                    .expect("usage observations")
+                    .push((usage, url.to_owned()));
                 true
             }))
             .with_fetch(Arc::new(|_, _, _, _, _| Ok(Vec::new())))
@@ -1607,14 +1653,14 @@ mod tests {
             TaskOutcome::Completed(Vec::new())
         );
         assert_eq!(
-            *methods.lock().expect("method observations"),
+            *methods.lock().expect("usage observations"),
             vec![
                 (
-                    RequestMethod::Get,
+                    CredentialUse::Fetch,
                     "https://example.test/catalog".to_owned()
                 ),
                 (
-                    RequestMethod::Post,
+                    CredentialUse::Post,
                     "https://example.test/action".to_owned()
                 ),
             ]
@@ -1629,7 +1675,7 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("separate-fetch-credential"))
             .with_capabilities([Capability::Network])
             .with_secrets(secret_dir("separate-fetch-credential"))
-            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Get))
+            .with_credential_policy(Arc::new(|_, _, usage| usage == CredentialUse::Fetch))
             .with_fetch(Arc::new(move |_, _, _, credential, headers| {
                 *observed.lock().expect("fetch observation") = Some((
                     credential.map(|(name, value)| (name.to_owned(), value.to_owned())),
@@ -1823,7 +1869,7 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("post-renew-once-root"))
             .with_capabilities([Capability::Network])
             .with_managed_credentials(managed)
-            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Post))
+            .with_credential_policy(Arc::new(|_, _, usage| usage == CredentialUse::Post))
             .with_post(Arc::new(
                 move |url, body, content_type, credential, headers, max_bytes| {
                     observed
@@ -1895,7 +1941,7 @@ mod tests {
         let mut runner = TaskRunner::simulated(temp_root("post-second-unauthorized-root"))
             .with_capabilities([Capability::Network])
             .with_managed_credentials(managed)
-            .with_credential_policy(Arc::new(|_, method, _| method == RequestMethod::Post))
+            .with_credential_policy(Arc::new(|_, _, usage| usage == CredentialUse::Post))
             .with_post(Arc::new(move |_, _, _, _, _, _| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 Err(TaskError::Unauthorized)

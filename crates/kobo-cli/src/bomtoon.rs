@@ -289,7 +289,7 @@ fn login(target: &LoginTarget) -> Result<(), String> {
         open_normal_chrome,
         wait_for_payload,
         |selected| {
-            kobo_net::bomtoon::validate_session_cookie(selected)
+            kobo_policy::bomtoon::validate_session_cookie(selected)
                 .map_err(|_| SESSION_VALIDATION_FAILED.to_owned())
         },
         |selected| install_target(target, selected),
@@ -542,7 +542,7 @@ fn select_cookie_family(cookies: &[BrowserCookie], family: &str) -> Result<Strin
         }
         selected
     };
-    if selected.len() > kobo_net::bomtoon::SESSION_COOKIE_MAX_BYTES {
+    if selected.len() > kobo_policy::bomtoon::SESSION_COOKIE_MAX_BYTES {
         return Err(());
     }
     Ok(selected)
@@ -1462,12 +1462,12 @@ mod tests {
         .is_err());
         assert!(select_session_cookie(&[cookie(SECURE_COOKIE, "line\nbreak")]).is_err());
         let prefix_bytes = SECURE_COOKIE.len() + 1;
-        let boundary = "x".repeat(kobo_net::bomtoon::SESSION_COOKIE_MAX_BYTES - prefix_bytes);
+        let boundary = "x".repeat(kobo_policy::bomtoon::SESSION_COOKIE_MAX_BYTES - prefix_bytes);
         assert_eq!(
             select_session_cookie(&[cookie(SECURE_COOKIE, &boundary)])
                 .expect("exact ceiling")
                 .len(),
-            kobo_net::bomtoon::SESSION_COOKIE_MAX_BYTES
+            kobo_policy::bomtoon::SESSION_COOKIE_MAX_BYTES
         );
         let oversized = format!("{boundary}x");
         assert!(select_session_cookie(&[cookie(SECURE_COOKIE, &oversized)]).is_err());

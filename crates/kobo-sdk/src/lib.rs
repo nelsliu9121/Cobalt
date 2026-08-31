@@ -7,11 +7,11 @@
 
 pub use kobo_protocol::{
     is_valid_key, AppInfo, AppLinkState, AudioPlaybackState, AudioSource, BatteryDetail,
-    BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason, DeviceError, DeviceRequest,
-    DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LocalDay, LogLevel, Message,
-    PictureFormat, PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError, ShellEvent,
-    ShellRequest, StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError, TaskId,
-    TaskOutcome, WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS,
+    BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason, DeviceError, DeviceIdentity,
+    DeviceRequest, DeviceResult, DictionaryEntry, Frame, Header, Lifecycle, LocalDay, LogLevel,
+    Message, PictureFormat, PicturePixels, RemoteInstallOutcome, SecretHeader, ShellError,
+    ShellEvent, ShellRequest, StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError,
+    TaskId, TaskOutcome, WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS,
     MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES,
     MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK,
     MAX_SHELL_CHUNK, MAX_STORE_KEYS, MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
@@ -53,11 +53,11 @@ pub mod prelude {
         action_id, ActionId, AppIcon, AppLinkState, AppMetadata, AppRunner, AppShelf, AppShell,
         AppStore, AudioMetadata, AudioPlaybackState, AudioPlayer, AudioSource, BluetoothDevice,
         BluetoothDeviceKind, Capability, Client, ClientEvent, Command, Context, ControlState,
-        DenyReason, Device, DeviceError, DeviceRequest, DeviceResult, DialogAction, Failure, Grant,
-        Grants, Heartbeat, KoboApp, Lifecycle, Navigator, Node, NodeId, PictureFormat,
-        PicturePixels, PicturePixelsRef, PowerPolicy, RemoteInstallOutcome, Screen, ScreenBuilder,
-        ShelfDownload, ShelfProgress, ShelfUpload, ShellError, ShellEvent, ShellRequest,
-        StandardState, StoreError, StoreRequest, StoreResult, WifiNetwork,
+        DenyReason, Device, DeviceError, DeviceIdentity, DeviceRequest, DeviceResult, DialogAction,
+        Failure, Grant, Grants, Heartbeat, KoboApp, Lifecycle, Navigator, Node, NodeId,
+        PictureFormat, PicturePixels, PicturePixelsRef, PowerPolicy, RemoteInstallOutcome, Screen,
+        ScreenBuilder, ShelfDownload, ShelfProgress, ShelfUpload, ShellError, ShellEvent,
+        ShellRequest, StandardState, StoreError, StoreRequest, StoreResult, WifiNetwork,
     };
 }
 
@@ -3046,6 +3046,29 @@ impl Context {
         kobo_ui::paginate_rows_with_trailing(rows, &self.metrics, self.area_for(nav_bar, position))
     }
 
+    /// The same, when one section header is drawn immediately above the rows.
+    ///
+    /// A section is content rather than chrome, so the panel area cannot
+    /// reserve it automatically. Measuring the rows against the whole content
+    /// area puts the final row underneath the bottom controls on a full page.
+    /// This subtracts both the header and the inter-node gap the layout engine
+    /// places after it.
+    #[must_use]
+    pub fn paginate_rows_with_trailing_after_section_at(
+        &self,
+        rows: &[(&str, &str, &str)],
+        nav_bar: bool,
+        position: Position,
+    ) -> Vec<Vec<usize>> {
+        let mut area = self.area_for(nav_bar, position);
+        area.height = area
+            .height
+            .saturating_sub(kobo_ui::section_height(&self.metrics))
+            .saturating_sub(area.gap)
+            .max(1);
+        kobo_ui::paginate_rows_with_trailing(rows, &self.metrics, area)
+    }
+
     /// The page a list gets, given where it says which page that is.
     fn area_for(&self, nav_bar: bool, position: Position) -> kobo_ui::ProseArea {
         match position {
@@ -4031,6 +4054,17 @@ impl Device<'_> {
     /// arrives rather than reserving space for what might.
     pub fn read_battery_detail(&mut self) {
         self.request(DeviceRequest::ReadBatteryDetail);
+    }
+
+    /// Asks what this runtime is and what it is running on.
+    ///
+    /// The answer arrives as [`DeviceResult::Identity`] and carries the
+    /// matched profile, model, firmware, kernel, panel size and runtime
+    /// version. Ask this when a reader opens a screen that shows them, such
+    /// as an about page whose photograph serves as evidence that a build ran
+    /// on real hardware.
+    pub fn read_identity(&mut self) {
+        self.request(DeviceRequest::ReadIdentity);
     }
 
     /// Asks where the magnet is now.

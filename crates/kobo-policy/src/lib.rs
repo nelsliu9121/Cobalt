@@ -8,8 +8,9 @@
 //! application asking for something unreasonable gets a reduced grant rather
 //! than the device it asked for.
 
+pub mod bomtoon;
+pub mod credentials;
 mod managed;
-
 pub mod services;
 pub mod shelf;
 pub mod store;
@@ -21,7 +22,7 @@ pub use managed::{
     ResolvedCredential, REFRESH_WINDOW_MS,
 };
 pub use services::{request_capability, Backends, DeviceServices, DeviceState};
-pub use tasks::{Finished, RejectReason, RequestMethod, TaskRunner, MAX_TASKS_IN_FLIGHT};
+pub use tasks::{Finished, RejectReason, TaskRunner, MAX_TASKS_IN_FLIGHT};
 
 use std::collections::BTreeSet;
 use std::fmt;

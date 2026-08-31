@@ -729,6 +729,7 @@ dependencies = [
  "kobo-image",
  "kobo-json",
  "kobo-net",
+ "kobo-policy",
  "kobo-sim",
 ]
 
@@ -875,7 +876,6 @@ dependencies = [
  "http",
  "httparse",
  "kobo-json",
- "kobo-policy",
  "kobo-protocol",
  "miniz_oxide 0.9.1",
  "rustls",
@@ -901,6 +901,8 @@ dependencies = [
  "fs4",
  "kobo-abi",
  "kobo-dict",
+ "kobo-json",
+ "kobo-net",
  "kobo-protocol",
 ]
 

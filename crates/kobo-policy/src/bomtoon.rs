@@ -1,12 +1,12 @@
+use crate::tasks::MAX_ACCOUNT_SUBJECT_BYTES;
+use crate::{ManagedCredentialRecipe, ManagedTokenPair};
 use kobo_json::{ObjectBuilder, Value};
-use kobo_policy::tasks::MAX_ACCOUNT_SUBJECT_BYTES;
-use kobo_policy::{ManagedCredentialRecipe, ManagedTokenPair};
 use kobo_protocol::TaskError;
 use std::sync::Arc;
 
 pub const ACCESS_CREDENTIAL: &str = "bomtoon-access-token";
 pub const SESSION_SECRET: &str = "bomtoon-session";
-pub const SESSION_COOKIE_MAX_BYTES: usize = kobo_policy::tasks::MAX_SECRET_BYTES;
+pub const SESSION_COOKIE_MAX_BYTES: usize = crate::tasks::MAX_SECRET_BYTES;
 pub const SESSION_URL: &str = "https://www.bomtoon.tw/api/auth/session";
 pub const IP_URL: &str = "https://www.bomtoon.tw/api/balcony/ip";
 pub const REFRESH_URL: &str = "https://www.bomtoon.tw/api/balcony/auth/refresh";
@@ -80,7 +80,7 @@ impl Transport for LiveTransport {
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError> {
-        crate::fetch_from(url, 0, max_bytes, credential, headers)
+        kobo_net::fetch_from(url, 0, max_bytes, credential, headers)
     }
 
     fn post_json(
@@ -91,7 +91,7 @@ impl Transport for LiveTransport {
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError> {
-        send_json_with_bearer(url, body, bearer, headers, max_bytes, crate::post)
+        send_json_with_bearer(url, body, bearer, headers, max_bytes, kobo_net::post)
     }
 
     fn put_json(
@@ -102,7 +102,7 @@ impl Transport for LiveTransport {
         headers: &[(&str, &str)],
         max_bytes: u32,
     ) -> Result<Vec<u8>, TaskError> {
-        send_json_with_bearer(url, body, bearer, headers, max_bytes, crate::put)
+        send_json_with_bearer(url, body, bearer, headers, max_bytes, kobo_net::put)
     }
 }
 
@@ -161,7 +161,7 @@ impl ManagedCredentialRecipe for Recipe {
     }
 
     fn binding_digest(&self, secret: &str) -> String {
-        crate::sha256::hex_digest(secret.as_bytes())
+        kobo_net::sha256::hex_digest(secret.as_bytes())
     }
 
     fn derive_scope_key(&self, binding_secret: &str) -> String {
@@ -169,14 +169,14 @@ impl ManagedCredentialRecipe for Recipe {
             Vec::with_capacity(MANAGED_SCOPE_KEY_DOMAIN.len() + binding_secret.len());
         material.extend_from_slice(MANAGED_SCOPE_KEY_DOMAIN);
         material.extend_from_slice(binding_secret.as_bytes());
-        crate::sha256::hex_digest(&material)
+        kobo_net::sha256::hex_digest(&material)
     }
 
     fn derive_account_scope(&self, scope_key: &str, account_subject: &str) -> String {
         let mut message = Vec::with_capacity(ACCOUNT_SCOPE_DOMAIN.len() + account_subject.len());
         message.extend_from_slice(ACCOUNT_SCOPE_DOMAIN);
         message.extend_from_slice(account_subject.as_bytes());
-        crate::sha256::hmac_hex(scope_key.as_bytes(), &message)[..32].to_owned()
+        kobo_net::sha256::hmac_hex(scope_key.as_bytes(), &message)[..32].to_owned()
     }
 
     fn bootstrap(&self, binding_secret: &str) -> Result<ManagedTokenPair, TaskError> {
@@ -332,7 +332,7 @@ fn parse_token(container: &Value, name: &str) -> Result<(String, u64), TaskError
     let text = unique_field(token, "token")?
         .as_str()
         .ok_or(TaskError::Unreachable)?;
-    if text.len() > kobo_policy::tasks::MAX_SECRET_BYTES {
+    if text.len() > crate::tasks::MAX_SECRET_BYTES {
         return Err(TaskError::TooLarge);
     }
     if text.is_empty() || text.bytes().any(|byte| byte.is_ascii_control()) {
@@ -404,7 +404,7 @@ fn pair_fingerprint(pair: &ManagedTokenPair) -> String {
     material.extend_from_slice(pair.access_token.as_bytes());
     material.push(0);
     material.extend_from_slice(pair.refresh_token.as_bytes());
-    crate::sha256::hex_digest(&material)
+    kobo_net::sha256::hex_digest(&material)
 }
 
 #[cfg(test)]
@@ -572,12 +572,13 @@ mod tests {
         let key = recipe.derive_scope_key("high-entropy-cookie-a");
         assert_eq!(
             key,
-            crate::sha256::hex_digest(b"cobalt-managed-scope-key-v1\0high-entropy-cookie-a")
+            kobo_net::sha256::hex_digest(b"cobalt-managed-scope-key-v1\0high-entropy-cookie-a")
         );
         let first = recipe.derive_account_scope(&key, "account-a");
         assert_eq!(
             first,
-            crate::sha256::hmac_hex(key.as_bytes(), b"bomtoon-account-scope-v1\0account-a")[..32]
+            kobo_net::sha256::hmac_hex(key.as_bytes(), b"bomtoon-account-scope-v1\0account-a")
+                [..32]
         );
         assert_eq!(first, recipe.derive_account_scope(&key, "account-a"));
         assert_ne!(first, recipe.derive_account_scope(&key, "account-b"));
@@ -682,7 +683,7 @@ mod tests {
             Err(TaskError::Unreachable)
         ));
 
-        let oversized_token = "X".repeat(kobo_policy::tasks::MAX_SECRET_BYTES + 1);
+        let oversized_token = "X".repeat(crate::tasks::MAX_SECRET_BYTES + 1);
         let oversized = format!(
             r#"{{"user":{{"id":"account-a","accessToken":{{"token":"{oversized_token}","createdAt":1,"expiredAt":2}},"refreshToken":{{"token":"R","createdAt":1,"expiredAt":2}}}}}}"#
         );
@@ -849,7 +850,7 @@ mod tests {
         assert_eq!(fingerprint.len(), 64);
         assert_eq!(
             fingerprint,
-            crate::sha256::hex_digest(b"ACCESS_A\0REFRESH_A")
+            kobo_net::sha256::hex_digest(b"ACCESS_A\0REFRESH_A")
         );
         assert!(!fingerprint.contains("ACCESS_A"));
         assert!(!fingerprint.contains("REFRESH_A"));
