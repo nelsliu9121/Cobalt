@@ -2,7 +2,7 @@
 
 ## Status
 
-Design approved. Implementation has not started.
+Implementation complete. Focused format, test, Clippy, workspace build, browser simulator, and one-shot runtime simulator gates pass. The browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
 
 ## Goal
 
@@ -123,7 +123,7 @@ The request contract is:
 
 ```text
 GET https://www.bomtoon.tw/detail/{validated alias}
-Credential: managed bearer `bomtoon-access-token`
+Credential: managed session `bomtoon-session` in the `Cookie` header
 Maximum response: 512 KiB
 Accept: HTML
 Accept-Language: existing zh-TW preference
@@ -212,20 +212,21 @@ All stale-result identity and generation checks continue to bind results to the 
 
 ## Files
 
-The implementation is limited to four existing files:
+The implementation is limited to five existing source files:
 
 1. `apps/bomtoon/src/api.rs`
 2. `apps/bomtoon/src/model.rs`
 3. `apps/bomtoon/src/parse.rs`
 4. `apps/bomtoon/src/main.rs`
+5. `crates/kobo-policy/src/credentials.rs`
 
-No new source module or SDK change is planned.
+No new source module, dependency, capability, origin, or SDK change is required. The network policy change permits the session cookie only for an exact `GET` to the BOMTOON detail route and continues to reject the access bearer on HTML detail requests.
 
 ## Verification
 
 ### API and parser contracts
 
-- Exact authenticated detail URL, managed credential, HTML acceptance, language header, and byte ceiling.
+- Exact authenticated detail URL, managed session cookie, HTML acceptance, language header, byte ceiling, and least-privilege credential policy.
 - Minimal sanitized HTML fixture matching the observed `__NEXT_DATA__` envelope.
 - Personalized response parses title, ordered creators, synopsis, episode identity, title, `openedAt`, `COMMON` thumbnail, and `purchaseStatus`.
 - Missing payload, inactive/inert script, `ssrPersonalized == false`, wrong alias, wrong types, invalid timestamp, oversized fields, duplicate ambiguous thumbnail, hostile image host/path, and unknown purchase status.
@@ -249,11 +250,13 @@ Run:
 
 ```sh
 cargo test -p kobo-bomtoon
+cargo test -p kobo-policy
 cargo fmt --all -- --check
 cargo clippy -p kobo-bomtoon --all-targets --all-features -- -D warnings
+cargo clippy -p kobo-policy --all-targets --all-features -- -D warnings
 ```
 
-Exercise the changed flow in both browser and runtime simulators:
+Exercise the changed flow in the browser simulator:
 
 - open a comic with a long synopsis;
 - open, page, and close the synopsis modal;
@@ -262,5 +265,7 @@ Exercise the changed flow in both browser and runtime simulators:
 - open an owned episode;
 - open purchase options for an unowned episode without spending;
 - confirm the selected comic and episode page remain stable after each return.
+
+Run `cargo run -p kobo-cli -- run --sim --app bomtoon` as the runtime build, IPC, daemon, device-result, and frame-render gate. This runtime simulator is deliberately one-shot: it has no post-start action channel and starts with a fresh credential root, so it cannot repeat the authenticated interactive browser flow.
 
 Simulator evidence must use `CLARA_BW_METRICS`. No automated or unattended smoke check may spend Coin or consume a Gift.

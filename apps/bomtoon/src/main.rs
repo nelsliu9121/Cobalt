@@ -6,9 +6,9 @@ mod parse;
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, ControlState, DeviceRequest, DeviceResult,
-    Failure, Glyph, KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen,
-    ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, TileShape,
-    CLARA_BW_METRICS,
+    DiagnosticSeverity, Failure, Glyph, KoboApp, LayoutIssueKind, LocalDay, PictureHandle,
+    ReadingChrome, RowLead, Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome,
+    TilePicture, TileShape, CLARA_BW_METRICS,
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
@@ -51,6 +51,24 @@ const APPENDIX_COMMENT_LIMIT: usize = 4;
 const APPENDIX_COMMENT_PREVIEW_BYTES: usize = 96;
 const COMMENT_LIST_PREVIEW_BYTES: usize = 320;
 const COMMENT_DETAIL_BYTES: usize = 320;
+const SYNOPSIS_MORE: &str = "synopsis-more";
+const SYNOPSIS_PREVIOUS: &str = "synopsis-previous";
+const SYNOPSIS_NEXT: &str = "synopsis-next";
+const SYNOPSIS_CLOSE: &str = "synopsis-close";
+const SYNOPSIS_PREVIEW_BYTES: usize = 240;
+const EPISODE_TITLE_PREVIEW_BYTES: usize = 160;
+const EPISODE_CREATORS_PREVIEW_BYTES: usize = 160;
+// Mirrors kobo_protocol::MAX_STRING_LEN; kobo-sdk does not expose that ceiling.
+const SYNOPSIS_MODAL_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SynopsisState {
+    pages: Vec<std::ops::Range<usize>>,
+    open_page: Option<usize>,
+    preview: String,
+    preview_truncated: bool,
+}
+
 const MAIN_DESTINATIONS: [(&str, &str); 3] = [
     (FEATURED, "Featured"),
     (RECENT, "Recent"),
@@ -169,6 +187,114 @@ fn comment_preview(text: &str, max_bytes: usize) -> (String, bool) {
         end -= 1;
     }
     (format!("{}...", text[..end].trim_end()), true)
+}
+
+fn normalized_header_preview(text: &str, max_bytes: usize, fallback: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = if normalized.is_empty() {
+        fallback
+    } else {
+        &normalized
+    };
+    comment_preview(visible, max_bytes).0
+}
+fn normalized_header_len(text: &str) -> usize {
+    text.split_whitespace()
+        .map(str::len)
+        .enumerate()
+        .map(|(index, len)| len + usize::from(index > 0))
+        .sum()
+}
+
+fn synopsis_modal_fits(text: &str) -> bool {
+    let screen = ScreenBuilder::new("bomtoon-synopsis-measure")
+        .top_bar("Episodes")
+        .modal("Synopsis", |modal| {
+            modal
+                .text(text)
+                .button(SYNOPSIS_PREVIOUS, "Previous")
+                .button(SYNOPSIS_NEXT, "Next")
+                .button(SYNOPSIS_CLOSE, "Close")
+        })
+        .build();
+    let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+    let all_overlay_nodes_fit = screen.overlay.as_ref().is_some_and(|overlay| {
+        overlay.nodes.iter().all(|node| {
+            diagnostics
+                .layout
+                .nodes
+                .iter()
+                .any(|laid_out| laid_out.id == node.id())
+        })
+    });
+    !diagnostics.has_errors() && all_overlay_nodes_fit
+}
+
+fn synopsis_page_break(text: &str, start: usize, end: usize) -> Option<usize> {
+    let candidate = &text[start..end];
+    if let Some(paragraph) = candidate.rfind("\n\n") {
+        let boundary = start.saturating_add(paragraph).saturating_add(2);
+        if boundary > start {
+            return Some(boundary);
+        }
+    }
+    candidate
+        .char_indices()
+        .rev()
+        .find_map(|(offset, character)| {
+            character.is_whitespace().then(|| {
+                start
+                    .saturating_add(offset)
+                    .saturating_add(character.len_utf8())
+            })
+        })
+}
+
+fn synopsis_pages(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut boundaries = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    if boundaries.last().copied() != Some(text.len()) {
+        boundaries.push(text.len());
+    }
+    let mut pages = Vec::new();
+    let mut start_index: usize = 0;
+    while start_index.saturating_add(1) < boundaries.len() {
+        let start = boundaries[start_index];
+        let maximum_end = start
+            .saturating_add(SYNOPSIS_MODAL_MAX_BYTES)
+            .min(text.len());
+        let last_candidate = boundaries
+            .partition_point(|boundary| *boundary <= maximum_end)
+            .saturating_sub(1);
+        let mut low = start_index.saturating_add(1);
+        let mut high = last_candidate.saturating_add(1);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if synopsis_modal_fits(&text[start..boundaries[middle]]) {
+                low = middle.saturating_add(1);
+            } else {
+                high = middle;
+            }
+        }
+        let fitting_index = low
+            .saturating_sub(1)
+            .max(start_index.saturating_add(1))
+            .min(boundaries.len().saturating_sub(1));
+        let fitting_end = boundaries[fitting_index];
+        let end = if fitting_end < text.len() {
+            synopsis_page_break(text, start, fitting_end).unwrap_or(fitting_end)
+        } else {
+            fitting_end
+        };
+        let end_index = boundaries
+            .binary_search(&end)
+            .expect("synopsis break is a UTF-8 boundary");
+        pages.push(start..end);
+        start_index = end_index;
+    }
+    pages
 }
 
 fn comment_detail_page(text: &str, page: usize) -> Option<(&str, usize)> {
@@ -448,6 +574,49 @@ fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
 fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
     ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
         RowLead::Picture(picture, Glyph::Book)
+    })
+}
+
+fn episode_status(episode: &Episode, now_ms: Option<i64>) -> String {
+    match episode.purchase {
+        model::PurchaseState::Owned => "Owned".to_owned(),
+        model::PurchaseState::Rented => now_ms
+            .and_then(|now| episode.remaining_rental_hours(now))
+            .map_or_else(
+                || "Rented".to_owned(),
+                |hours| {
+                    let unit = if hours == 1 { "hr" } else { "hrs" };
+                    format!("{hours} {unit}")
+                },
+            ),
+        model::PurchaseState::Free => "Free".to_owned(),
+        model::PurchaseState::Sample => "Sample".to_owned(),
+        model::PurchaseState::NotOwned => String::new(),
+        model::PurchaseState::Other(_) => display_text(episode.purchase.label(), "Other status"),
+    }
+}
+
+fn episode_screen_layout_fits(screen: &Screen) -> bool {
+    (0..2).all(|_| {
+        let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+        if diagnostics.issues.iter().any(|issue| {
+            issue.severity == DiagnosticSeverity::Error
+                && !matches!(issue.kind, LayoutIssueKind::UnsupportedCharacter { .. })
+        }) {
+            return false;
+        }
+        let content = diagnostics.layout.content;
+        screen.nodes.iter().all(|node| match node {
+            kobo_sdk::Node::Rows { rows, .. } => rows.iter().all(|row| {
+                diagnostics.layout.nodes.iter().any(|layout_node| {
+                    layout_node.kind.acts_on() == Some(row.action)
+                        && layout_node.rect.y >= content.y
+                        && layout_node.rect.y.saturating_add(layout_node.rect.height)
+                            <= content.y.saturating_add(content.height)
+                })
+            }),
+            _ => true,
+        })
     })
 }
 
@@ -969,6 +1138,7 @@ struct Bomtoon {
     marker_store: Option<MarkerStoreOperation>,
     commerce_generation: u64,
     commerce_task: Option<CommerceTask>,
+    queued_commerce_command: Option<commerce::CommerceCommand>,
     commerce_episode: Option<usize>,
     pending_purchase_rejection: Option<&'static str>,
     purchase_rejection_notice: Option<&'static str>,
@@ -995,12 +1165,19 @@ struct Bomtoon {
     selected_content_id: Option<usize>,
     selected_content_alias: String,
     selected_title: String,
+    selected_creators: String,
+    selected_synopsis: String,
+    synopsis: SynopsisState,
+    episode_title_preview: String,
+    episode_creators_preview: String,
+    episode_items_per_page: Option<usize>,
     reader_selection: Option<EpisodeSelection>,
     reader_after_content_refresh: Option<usize>,
     reader: Option<ReaderState>,
     reader_generation: u64,
     reader_tasks: BTreeMap<TaskId, ReaderTaskEntry>,
     foreground_reader_task: Option<TaskId>,
+    reader_manifest_pending: bool,
     comment_appendix: CommentAppendixState,
     comment_task: Option<CommentTask>,
     comments: Option<CommentPageState>,
@@ -1031,8 +1208,10 @@ impl Bomtoon {
     }
 
     fn visible_cover_urls(&self) -> Vec<String> {
-        if self.view != View::Main
-            || self.pending.is_some()
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
         {
@@ -1047,56 +1226,82 @@ impl Bomtoon {
                 }
             }
         };
-        match self.destination {
-            MainDestination::Featured
-                if matches!(
-                    self.featured.status,
-                    FeaturedStatus::Loading | FeaturedStatus::Ready
-                ) =>
-            {
-                let first_page_rows = featured_page_zero_rows(&self.featured);
-                let Some(content_page) = featured_content_page(&self.featured) else {
-                    return visible;
-                };
-                let page = featured_page(&self.featured, content_page, first_page_rows);
-                for index in page.featured {
-                    push(self.featured.featured[index].cover_url.as_ref());
+        match self.view {
+            View::Main => match self.destination {
+                MainDestination::Featured
+                    if matches!(
+                        self.featured.status,
+                        FeaturedStatus::Loading | FeaturedStatus::Ready
+                    ) =>
+                {
+                    let first_page_rows = featured_page_zero_rows(&self.featured);
+                    let Some(content_page) = featured_content_page(&self.featured) else {
+                        return visible;
+                    };
+                    let page = featured_page(&self.featured, content_page, first_page_rows);
+                    for index in page.featured {
+                        push(self.featured.featured[index].cover_url.as_ref());
+                    }
+                    for index in page.recommended {
+                        push(self.featured.recommended[index].cover_url.as_ref());
+                    }
                 }
-                for index in page.recommended {
-                    push(self.featured.recommended[index].cover_url.as_ref());
+                MainDestination::Recent if self.recent_load.loaded => {
+                    let (start, end) =
+                        page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
+                    for entry in &self.recent[start..end] {
+                        push(entry.cover_url.as_ref());
+                    }
+                }
+                MainDestination::Library if self.library_load.loaded => {
+                    let (start, end) =
+                        page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
+                    for comic in &self.comics[start..end] {
+                        push(comic.cover_url.as_ref());
+                    }
+                }
+                MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
+            },
+            View::Episodes => {
+                let rows = self.episode_rows_per_page();
+                let (start, end) = page_bounds(self.page, self.episodes.len(), rows);
+                for episode in &self.episodes[start..end] {
+                    push(episode.thumbnail_url.as_ref());
                 }
             }
-            MainDestination::Recent if self.recent_load.loaded => {
-                let (start, end) =
-                    page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
-                for entry in &self.recent[start..end] {
-                    push(entry.cover_url.as_ref());
-                }
-            }
-            MainDestination::Library if self.library_load.loaded => {
-                let (start, end) =
-                    page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
-                for comic in &self.comics[start..end] {
-                    push(comic.cover_url.as_ref());
-                }
-            }
-            MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
+            View::Status
+            | View::Account
+            | View::Reader
+            | View::CommentAppendix
+            | View::Comments
+            | View::Replies => {}
         }
         visible
     }
 
     fn visible_cover_source(&self) -> Option<CoverSource> {
-        if self.view != View::Main
-            || self.pending.is_some()
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
         {
             return None;
         }
-        Some(match self.destination {
-            MainDestination::Featured => CoverSource::Public,
-            MainDestination::Recent | MainDestination::Library => CoverSource::Protected,
-        })
+        match self.view {
+            View::Main => Some(match self.destination {
+                MainDestination::Featured => CoverSource::Public,
+                MainDestination::Recent | MainDestination::Library => CoverSource::Protected,
+            }),
+            View::Episodes => Some(CoverSource::Protected),
+            View::Status
+            | View::Account
+            | View::Reader
+            | View::CommentAppendix
+            | View::Comments
+            | View::Replies => None,
+        }
     }
 
     fn sync_visible_covers(&mut self, context: &mut Context) {
@@ -1109,6 +1314,9 @@ impl Bomtoon {
             self.covers.generation = self.covers.generation.wrapping_add(1);
             let generation = self.covers.generation;
             let visible_set = visible.iter().cloned().collect::<BTreeSet<_>>();
+            let episode_urls = self.episode_thumbnail_urls();
+            let public_urls = self.public_cover_urls();
+            self.evict_episode_thumbnails(context, &visible_set, &episode_urls, &public_urls);
             let obsolete = self
                 .covers
                 .tasks
@@ -1143,13 +1351,20 @@ impl Bomtoon {
     }
 
     fn spawn_visible_covers(&mut self, context: &mut Context) {
-        if self.pending.is_some() || self.queued_foreground.is_some() {
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
+        {
             return;
         }
         let Some(source) = self.covers.visible_source else {
             return;
         };
         for url in self.covers.visible_urls.clone() {
+            if !self.cover_url_owned(source, &url) {
+                continue;
+            }
             if self.covers.entries.contains_key(&url) {
                 continue;
             }
@@ -1305,6 +1520,12 @@ impl Bomtoon {
                     .activity(message, None)
                     .build();
             }
+        }
+        if self.reader_manifest_pending {
+            return ScreenBuilder::new("bomtoon-loading")
+                .top_bar(self.reader_title())
+                .activity("Loading comic pages", None)
+                .build();
         }
         if let Some(entry) = self
             .foreground_reader_task
@@ -1715,9 +1936,230 @@ impl Bomtoon {
         }
     }
 
-    fn episode_screen(&self) -> Screen {
-        let screen = ScreenBuilder::new("bomtoon-episodes").top_bar(self.selected_title.clone());
-        let mut screen = if self.gifts.error {
+    fn add_episode_header_preview(
+        &self,
+        screen: ScreenBuilder,
+        preview: String,
+        truncated: bool,
+    ) -> ScreenBuilder {
+        let screen = screen
+            .heading(self.episode_title_preview.clone())
+            .text(self.episode_creators_preview.clone())
+            .text(preview);
+        if truncated {
+            screen.button(SYNOPSIS_MORE, "More")
+        } else {
+            screen
+        }
+    }
+
+    fn episode_preview_fits(&self, preview: String, truncated: bool) -> bool {
+        let header = self.add_episode_header_preview(
+            ScreenBuilder::new("bomtoon-episode-preview-measure").top_bar("Episodes"),
+            preview,
+            truncated,
+        );
+        let pages = self.episodes.len().max(1);
+        (0..pages).all(|page| {
+            let screen = self.add_episode_body(header.clone(), 1, page, true).build();
+            !screen
+                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                .has_errors()
+        })
+    }
+
+    fn measure_episode_synopsis_preview(&self) -> (String, bool) {
+        let text = &self.selected_synopsis;
+        if text.len() <= SYNOPSIS_PREVIEW_BYTES {
+            let full = text.clone();
+            if self.episode_preview_fits(full.clone(), false) {
+                return (full, false);
+            }
+        }
+
+        let mut maximum_end = text.len().min(SYNOPSIS_PREVIEW_BYTES);
+        while !text.is_char_boundary(maximum_end) {
+            maximum_end -= 1;
+        }
+        let mut boundaries = text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .take_while(|offset| *offset <= maximum_end)
+            .collect::<Vec<_>>();
+        if maximum_end < text.len() && boundaries.last().copied() != Some(maximum_end) {
+            boundaries.push(maximum_end);
+        }
+        if boundaries.is_empty() {
+            return (String::new(), false);
+        }
+
+        let (smallest, smallest_truncated) = comment_preview(text, boundaries[0]);
+        let mut best = self
+            .episode_preview_fits(smallest, smallest_truncated)
+            .then_some(0);
+        let mut low = 1;
+        let mut high = boundaries.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let (candidate, truncated) = comment_preview(text, boundaries[middle]);
+            if self.episode_preview_fits(candidate, truncated) {
+                best = Some(middle);
+                low = middle.saturating_add(1);
+            } else {
+                high = middle;
+            }
+        }
+        comment_preview(text, boundaries[best.unwrap_or(0)])
+    }
+
+    fn add_episode_header(&self, screen: ScreenBuilder) -> ScreenBuilder {
+        self.add_episode_header_preview(
+            screen,
+            self.synopsis.preview.clone(),
+            self.synopsis.preview_truncated,
+        )
+    }
+
+    fn episode_capacity_fits(&self, header: &ScreenBuilder, rows_per_page: usize) -> bool {
+        let pages = self.episodes.len().div_ceil(rows_per_page).max(1);
+        (0..pages).all(|page| {
+            let actual = self.episode_screen_for(page, rows_per_page, false);
+            if !episode_screen_layout_fits(&actual) {
+                return false;
+            }
+            let reserved = self
+                .add_episode_body(header.clone(), rows_per_page, page, true)
+                .build();
+            episode_screen_layout_fits(&reserved)
+        })
+    }
+
+    fn measure_episode_page_capacity(&mut self) -> Option<usize> {
+        let header = self.add_episode_header(
+            ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
+        );
+        let mut stable_capacity = EPISODE_ITEMS_PER_PAGE;
+        for _ in 0..2 {
+            let measured_capacity = (1..=EPISODE_ITEMS_PER_PAGE).rev().find(|rows_per_page| {
+                self.episode_items_per_page = Some(*rows_per_page);
+                self.episode_capacity_fits(&header, *rows_per_page)
+            });
+            let Some(measured_capacity) = measured_capacity else {
+                self.episode_items_per_page = None;
+                return None;
+            };
+            stable_capacity = stable_capacity.min(measured_capacity);
+        }
+        let capacity = if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES
+            || self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
+        {
+            1
+        } else {
+            stable_capacity
+        };
+        self.episode_capacity_fits(&header, capacity)
+            .then_some(capacity)
+    }
+
+    fn prepare_episode_layout(&mut self) {
+        let title_fits_default =
+            normalized_header_len(&self.selected_title) <= EPISODE_TITLE_PREVIEW_BYTES;
+        let creators_fit_default =
+            normalized_header_len(&self.selected_creators) <= EPISODE_CREATORS_PREVIEW_BYTES;
+        for (title_bytes, creator_bytes) in [
+            (EPISODE_TITLE_PREVIEW_BYTES, EPISODE_CREATORS_PREVIEW_BYTES),
+            (96, 96),
+            (48, 48),
+            (24, 24),
+        ] {
+            self.episode_items_per_page = None;
+            let title_bytes = if title_fits_default {
+                EPISODE_TITLE_PREVIEW_BYTES
+            } else {
+                title_bytes
+            };
+            let creator_bytes = if creators_fit_default {
+                EPISODE_CREATORS_PREVIEW_BYTES
+            } else {
+                creator_bytes
+            };
+            self.episode_title_preview =
+                normalized_header_preview(&self.selected_title, title_bytes, "Comic");
+            self.episode_creators_preview =
+                normalized_header_preview(&self.selected_creators, creator_bytes, "Creators");
+            let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
+            self.synopsis.preview = preview;
+            self.synopsis.preview_truncated = preview_truncated;
+            if let Some(rows_per_page) = self.measure_episode_page_capacity() {
+                self.episode_items_per_page = Some(rows_per_page);
+                return;
+            }
+        }
+
+        self.episode_title_preview = normalized_header_preview(
+            &self.selected_title,
+            if title_fits_default {
+                EPISODE_TITLE_PREVIEW_BYTES
+            } else {
+                24
+            },
+            "Comic",
+        );
+        self.episode_creators_preview = normalized_header_preview(
+            &self.selected_creators,
+            if creators_fit_default {
+                EPISODE_CREATORS_PREVIEW_BYTES
+            } else {
+                24
+            },
+            "Creators unavailable",
+        );
+        self.synopsis.preview.clear();
+        self.synopsis.preview_truncated = !self.selected_synopsis.is_empty();
+        self.episode_items_per_page = None;
+        let rows_per_page = self
+            .measure_episode_page_capacity()
+            .expect("minimal episode header must fit one measured row");
+        self.episode_items_per_page = Some(rows_per_page);
+    }
+
+    fn episode_rows_per_page(&self) -> usize {
+        self.episode_items_per_page.unwrap_or(1)
+    }
+
+    fn visible_episode_anchor(&self) -> Option<usize> {
+        if self.view != View::Episodes {
+            return None;
+        }
+        let (start, end) =
+            page_bounds(self.page, self.episodes.len(), self.episode_rows_per_page());
+        (start < end).then(|| self.episodes[start].id)
+    }
+
+    fn restore_episode_page(&mut self, anchor: Option<usize>, fallback_page: usize) {
+        let rows_per_page = self.episode_rows_per_page();
+        let last_page = self
+            .episodes
+            .len()
+            .saturating_sub(1)
+            .checked_div(rows_per_page)
+            .unwrap_or(0);
+        self.page = anchor
+            .and_then(|id| self.episodes.iter().position(|episode| episode.id == id))
+            .map_or_else(
+                || fallback_page.min(last_page),
+                |index| index / rows_per_page,
+            );
+    }
+
+    fn add_episode_body(
+        &self,
+        screen: ScreenBuilder,
+        rows_per_page: usize,
+        page: usize,
+        reserve_transient_space: bool,
+    ) -> ScreenBuilder {
+        let mut screen = if reserve_transient_space || self.gifts.error {
             screen.button(
                 RETRY_GIFTS,
                 format!("{} · Retry Gift", self.episode_balance_label()),
@@ -1725,66 +2167,83 @@ impl Bomtoon {
         } else {
             screen.text(self.episode_balance_label())
         };
-        if let Some(result) = self.purchase_rejection_notice {
+        if reserve_transient_space {
+            screen = screen.text("Purchase rejected: FAIL");
+        } else if let Some(result) = self.purchase_rejection_notice {
             screen = screen.text(format!("Purchase rejected: {result}"));
         }
         let marker_belongs_to_another_account = self.commerce.marker_belongs_to_another_account();
-        if marker_belongs_to_another_account {
+        if reserve_transient_space || marker_belongs_to_another_account {
             screen = screen.text(
                 "A purchase is unresolved for another account. Restore the original account to refresh its status.",
             );
         }
-        let (start, end) = page_bounds(self.page, self.episodes.len(), EPISODE_ITEMS_PER_PAGE);
+        let (start, end) = page_bounds(page, self.episodes.len(), rows_per_page);
         let now_ms = unix_time_ms();
-        for (index, episode) in self.episodes[start..end].iter().enumerate() {
-            let index = start + index;
-            let title_fallback = format!("Episode {}", episode.alias);
-            let status = if episode.purchase == model::PurchaseState::Rented {
-                now_ms
-                    .and_then(|now| episode.remaining_rental_hours(now))
-                    .map_or_else(
-                        || "Read · Rented".to_owned(),
-                        |hours| {
-                            let unit = if hours == 1 { "hr" } else { "hrs" };
-                            format!("Read · {hours} {unit}")
-                        },
-                    )
-            } else {
-                match episode.purchase {
-                    model::PurchaseState::Owned
-                    | model::PurchaseState::Sample
-                    | model::PurchaseState::Free => "Read".to_owned(),
-                    model::PurchaseState::NotOwned if marker_belongs_to_another_account => {
-                        "Purchase locked".to_owned()
-                    }
-                    model::PurchaseState::NotOwned => "View options".to_owned(),
-                    model::PurchaseState::Rented => unreachable!(),
-                    model::PurchaseState::Other(_) => {
-                        display_text(episode.purchase.label(), "Other status")
-                    }
-                }
-            };
-            let label = format!(
-                "{} · {status}",
-                display_text(&episode.title, &title_fallback),
-            );
-            if episode.purchase.is_readable()
+        screen = screen.rows_with_trailing((start..end).map(|index| {
+            let episode = &self.episodes[index];
+            let title = display_text(&episode.title, &format!("Episode {}", episode.alias));
+            let action = if episode.purchase.is_readable()
                 || (episode.purchase == model::PurchaseState::NotOwned
                     && !marker_belongs_to_another_account)
             {
-                screen = screen.button(format!("episode-{index}"), label);
+                format!("episode-{index}")
             } else {
-                screen = screen.text(label);
+                format!("episode-disabled-{index}")
+            };
+            (
+                action,
+                title,
+                taipei_date(episode.opened_at).unwrap_or_else(|| "Unknown date".to_owned()),
+                cover_lead(&self.covers, episode.thumbnail_url.as_deref()),
+                episode_status(episode, now_ms),
+            )
+        }));
+        let episode_pages = self.episodes.len().div_ceil(rows_per_page).max(1);
+        screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+            u16::try_from(page.saturating_add(1)).unwrap_or(u16::MAX),
+            u16::try_from(episode_pages).unwrap_or(u16::MAX),
+        )
+    }
+
+    fn episode_screen_for(&self, page: usize, rows_per_page: usize, modal: bool) -> Screen {
+        let header =
+            self.add_episode_header(ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"));
+        let mut screen = self.add_episode_body(header, rows_per_page, page, false);
+        if modal {
+            if let Some((synopsis_page, range)) =
+                self.synopsis.open_page.and_then(|synopsis_page| {
+                    self.synopsis
+                        .pages
+                        .get(synopsis_page)
+                        .map(|range| (synopsis_page, range))
+                })
+            {
+                let synopsis = &self.selected_synopsis[range.clone()];
+                screen = screen.modal("Synopsis", |modal| {
+                    let mut modal = modal.text(synopsis);
+                    if synopsis_page > 0 {
+                        modal = modal.button(SYNOPSIS_PREVIOUS, "Previous");
+                    }
+                    if synopsis_page.saturating_add(1) < self.synopsis.pages.len() {
+                        modal = modal.button(SYNOPSIS_NEXT, "Next");
+                    }
+                    modal.button(SYNOPSIS_CLOSE, "Close")
+                });
             }
         }
-        let pages = self.episodes.len().div_ceil(EPISODE_ITEMS_PER_PAGE).max(1);
-        screen
-            .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-            .page_position(
-                u16::try_from(self.page.saturating_add(1)).unwrap_or(u16::MAX),
-                u16::try_from(pages).unwrap_or(u16::MAX),
-            )
-            .build()
+        screen.build()
+    }
+
+    fn episode_screen(&self) -> Screen {
+        let rows_per_page = self.episode_rows_per_page();
+        let last_page = self
+            .episodes
+            .len()
+            .saturating_sub(1)
+            .checked_div(rows_per_page)
+            .unwrap_or(0);
+        self.episode_screen_for(self.page.min(last_page), rows_per_page, true)
     }
 
     fn reader_screen(&self) -> Screen {
@@ -2024,6 +2483,7 @@ impl Bomtoon {
     }
 
     fn cancel_reader(&mut self, context: &mut Context) {
+        self.reader_manifest_pending = false;
         self.reader_generation = self.reader_generation.wrapping_add(1);
         for task in std::mem::take(&mut self.reader_tasks).into_keys() {
             context.cancel(task);
@@ -2346,6 +2806,110 @@ impl Bomtoon {
         self.page = self.page.min(last_page);
     }
 
+    fn owns_public_cover_url(&self, url: &str) -> bool {
+        self.featured
+            .featured
+            .iter()
+            .chain(&self.featured.recommended)
+            .chain(
+                self.featured
+                    .staged
+                    .iter()
+                    .flat_map(|staged| staged.featured.iter().chain(&staged.recommended)),
+            )
+            .any(|comic| comic.cover_url.as_deref() == Some(url))
+    }
+
+    fn cover_url_owned(&self, source: CoverSource, url: &str) -> bool {
+        match source {
+            CoverSource::Public => self.owns_public_cover_url(url),
+            CoverSource::Protected => {
+                self.account == AccountState::Active
+                    && self.covers.visible_source == Some(CoverSource::Protected)
+                    && self
+                        .covers
+                        .visible_urls
+                        .iter()
+                        .any(|visible| visible == url)
+            }
+        }
+    }
+
+    fn is_episode_thumbnail_url(&self, url: &str) -> bool {
+        self.episodes
+            .iter()
+            .any(|episode| episode.thumbnail_url.as_deref() == Some(url))
+    }
+
+    fn episode_thumbnail_urls(&self) -> BTreeSet<String> {
+        self.episodes
+            .iter()
+            .filter_map(|episode| episode.thumbnail_url.clone())
+            .collect()
+    }
+
+    fn evict_episode_thumbnails(
+        &mut self,
+        context: &mut Context,
+        retained: &BTreeSet<String>,
+        episode_urls: &BTreeSet<String>,
+        public_urls: &BTreeSet<String>,
+    ) {
+        let obsolete_tasks = self
+            .covers
+            .tasks
+            .iter()
+            .filter(|(_, task)| episode_urls.contains(&task.url) && !retained.contains(&task.url))
+            .map(|(task, cover)| (*task, cover.url.clone()))
+            .collect::<Vec<_>>();
+        for (task, url) in obsolete_tasks {
+            context.cancel(task);
+            self.covers.tasks.remove(&task);
+            if self.covers.entries.get(&url) == Some(&CoverState::Loading(task)) {
+                self.covers.entries.remove(&url);
+            }
+        }
+
+        let obsolete_entries = self
+            .covers
+            .entries
+            .keys()
+            .filter(|url| {
+                episode_urls.contains(*url)
+                    && !retained.contains(*url)
+                    && !public_urls.contains(*url)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for url in obsolete_entries {
+            if let Some(CoverState::Ready(picture)) = self.covers.entries.remove(&url) {
+                context.drop_picture(picture.handle);
+            }
+        }
+
+        self.covers
+            .visible_urls
+            .retain(|url| !episode_urls.contains(url) || retained.contains(url));
+    }
+    fn clear_episode_thumbnail_cache(&mut self, context: &mut Context) {
+        let episode_urls = self.episode_thumbnail_urls();
+        if episode_urls.is_empty() {
+            return;
+        }
+        let public_urls = self.public_cover_urls();
+        self.covers.generation = self.covers.generation.wrapping_add(1);
+        let generation = self.covers.generation;
+        self.evict_episode_thumbnails(context, &BTreeSet::new(), &episode_urls, &public_urls);
+        for task in self.covers.tasks.values_mut() {
+            task.generation = generation;
+            if public_urls.contains(&task.url) {
+                task.source = CoverSource::Public;
+            }
+        }
+        if self.covers.visible_urls.is_empty() {
+            self.covers.visible_source = None;
+        }
+    }
     fn public_cover_urls(&self) -> BTreeSet<String> {
         self.featured
             .featured
@@ -2459,7 +3023,7 @@ impl Bomtoon {
             gift_generation: None,
         });
 
-        if let Some(id) = context.spawn(api::content(&selection.title_alias)) {
+        if let Some(id) = context.spawn(api::detail(&selection.title_alias)) {
             self.commerce_task = Some(CommerceTask {
                 id,
                 purpose: CommerceTaskPurpose::ReconcileContent {
@@ -2570,7 +3134,7 @@ impl Bomtoon {
             TaskOutcome::Completed(bytes)
                 if self.current_commerce_scope() == Some(account_scope) =>
             {
-                match parse::content_detail(&bytes) {
+                match parse::content_detail(&bytes, &selection.title_alias) {
                     Ok(detail) if detail.id == selection.title_id => {
                         let evidence = Self::content_evidence(
                             reconciliation.marker.as_ref(),
@@ -2579,14 +3143,20 @@ impl Bomtoon {
                         if self.selected_content_id == Some(selection.title_id)
                             && self.selected_content_alias == selection.title_alias
                         {
+                            let episode_anchor = self.visible_episode_anchor();
+                            let episode_page = self.page;
+                            self.synopsis = SynopsisState {
+                                pages: synopsis_pages(&detail.synopsis),
+                                open_page: None,
+                                ..SynopsisState::default()
+                            };
+                            self.selected_title = detail.title;
+                            self.selected_creators = detail.creators.join(" | ");
+                            self.selected_synopsis = detail.synopsis;
+                            self.clear_episode_thumbnail_cache(context);
                             self.episodes = detail.episodes;
-                            let last_page = self
-                                .episodes
-                                .len()
-                                .saturating_sub(1)
-                                .checked_div(EPISODE_ITEMS_PER_PAGE)
-                                .unwrap_or(0);
-                            self.page = self.page.min(last_page);
+                            self.prepare_episode_layout();
+                            self.restore_episode_page(episode_anchor, episode_page);
                         }
                         Evidence::Value(evidence)
                     }
@@ -2730,6 +3300,76 @@ impl Bomtoon {
             }
         }
     }
+    fn try_spawn_commerce_command(
+        &mut self,
+        context: &mut Context,
+        command: commerce::CommerceCommand,
+    ) -> Option<commerce::CommerceCommand> {
+        match command {
+            commerce::CommerceCommand::FetchQuote {
+                selection,
+                purchase,
+            } => {
+                let Some(account_scope) = self.current_commerce_scope() else {
+                    let effects = self.commerce.quote_failed();
+                    self.apply_commerce_effects(context, effects);
+                    return None;
+                };
+                let work = api::quote(&selection.title_alias, &selection.episode_alias, purchase);
+                let Some(id) = context.spawn(work) else {
+                    return Some(commerce::CommerceCommand::FetchQuote {
+                        selection,
+                        purchase,
+                    });
+                };
+                self.commerce_generation = self.commerce_generation.wrapping_add(1);
+                self.commerce_task = Some(CommerceTask {
+                    id,
+                    purpose: CommerceTaskPurpose::Quote {
+                        generation: self.commerce_generation,
+                        account_scope,
+                        selection,
+                        purchase,
+                    },
+                });
+                None
+            }
+            commerce::CommerceCommand::Post(marker) => {
+                let work =
+                    api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
+                let Some(id) = context.spawn(work) else {
+                    return Some(commerce::CommerceCommand::Post(marker));
+                };
+                self.commerce_generation = self.commerce_generation.wrapping_add(1);
+                self.commerce_task = Some(CommerceTask {
+                    id,
+                    purpose: CommerceTaskPurpose::Post {
+                        generation: self.commerce_generation,
+                        account_scope: marker.account_scope,
+                        marker,
+                    },
+                });
+                None
+            }
+            commerce::CommerceCommand::SaveMarker(_)
+            | commerce::CommerceCommand::ForgetMarker
+            | commerce::CommerceCommand::RefreshContent(_) => {
+                unreachable!("only network commerce commands can be deferred")
+            }
+        }
+    }
+
+    fn resume_queued_commerce(&mut self, context: &mut Context) {
+        if self.commerce_task.is_some() {
+            return;
+        }
+        let Some(command) = self.queued_commerce_command.take() else {
+            return;
+        };
+        if let Some(command) = self.try_spawn_commerce_command(context, command) {
+            self.queued_commerce_command = Some(command);
+        }
+    }
 
     fn apply_commerce_effects(
         &mut self,
@@ -2737,6 +3377,7 @@ impl Bomtoon {
         effects: commerce::CommerceEffects,
     ) {
         if self.commerce.state() == commerce::CommerceState::Idle {
+            self.queued_commerce_command = None;
             self.retained_quote = None;
             self.commerce_episode = None;
         }
@@ -2753,56 +3394,33 @@ impl Bomtoon {
                     self.marker_store = Some(MarkerStoreOperation::Forget);
                     context.store().forget(commerce::MARKER_KEY);
                 }
-                Some(commerce::CommerceCommand::FetchQuote {
-                    selection,
-                    purchase,
-                }) => {
-                    let Some(account_scope) = self.current_commerce_scope() else {
-                        let effects = self.commerce.quote_failed();
-                        self.apply_commerce_effects(context, effects);
-                        return;
-                    };
-                    self.commerce_generation = self.commerce_generation.wrapping_add(1);
-                    let generation = self.commerce_generation;
-                    let work =
-                        api::quote(&selection.title_alias, &selection.episode_alias, purchase);
-                    if let Some(id) = context.spawn(work) {
-                        self.commerce_task = Some(CommerceTask {
-                            id,
-                            purpose: CommerceTaskPurpose::Quote {
-                                generation,
-                                account_scope,
-                                selection,
-                                purchase,
-                            },
-                        });
+                Some(
+                    command @ (commerce::CommerceCommand::FetchQuote { .. }
+                    | commerce::CommerceCommand::Post(_)),
+                ) => {
+                    if self.covers.tasks.is_empty() {
+                        if let Some(command) = self.try_spawn_commerce_command(context, command) {
+                            let effects = match command {
+                                commerce::CommerceCommand::FetchQuote { .. } => {
+                                    self.commerce.quote_failed()
+                                }
+                                commerce::CommerceCommand::Post(_) => self
+                                    .commerce
+                                    .mutation_finished(commerce::PostOutcome::Ambiguous),
+                                commerce::CommerceCommand::SaveMarker(_)
+                                | commerce::CommerceCommand::ForgetMarker
+                                | commerce::CommerceCommand::RefreshContent(_) => {
+                                    unreachable!("only network commands reach the task scheduler")
+                                }
+                            };
+                            self.apply_commerce_effects(context, effects);
+                            return;
+                        }
                     } else {
-                        let effects = self.commerce.quote_failed();
-                        self.apply_commerce_effects(context, effects);
-                        return;
-                    }
-                }
-                Some(commerce::CommerceCommand::Post(marker)) => {
-                    self.commerce_generation = self.commerce_generation.wrapping_add(1);
-                    let generation = self.commerce_generation;
-                    let account_scope = marker.account_scope;
-                    let work =
-                        api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
-                    if let Some(id) = context.spawn(work) {
-                        self.commerce_task = Some(CommerceTask {
-                            id,
-                            purpose: CommerceTaskPurpose::Post {
-                                generation,
-                                account_scope,
-                                marker,
-                            },
-                        });
-                    } else {
-                        let effects = self
-                            .commerce
-                            .mutation_finished(commerce::PostOutcome::Ambiguous);
-                        self.apply_commerce_effects(context, effects);
-                        return;
+                        self.preempt_cover_tasks(context);
+                        if let Some(command) = self.try_spawn_commerce_command(context, command) {
+                            self.queued_commerce_command = Some(command);
+                        }
                     }
                 }
                 Some(commerce::CommerceCommand::RefreshContent(selection)) => {
@@ -2961,6 +3579,7 @@ impl Bomtoon {
             context.cancel(task.id);
         }
         self.commerce_generation = self.commerce_generation.wrapping_add(1);
+        self.queued_commerce_command = None;
         self.reconciliation = None;
         self.scope_refresh_pending = false;
         self.account_scope = None;
@@ -3070,6 +3689,7 @@ impl Bomtoon {
         self.cancel_reader(context);
         self.cancel_wallet(context);
         self.clear_title_gifts(context);
+        self.clear_episode_thumbnail_cache(context);
         self.retain_public_cover_cache(context);
         self.wallet.summary = None;
         self.wallet.summary_error = false;
@@ -3086,6 +3706,12 @@ impl Bomtoon {
         self.selected_content_id = None;
         self.selected_content_alias.clear();
         self.selected_title.clear();
+        self.selected_creators.clear();
+        self.selected_synopsis.clear();
+        self.synopsis = SynopsisState::default();
+        self.episode_title_preview.clear();
+        self.episode_creators_preview.clear();
+        self.episode_items_per_page = None;
         self.reader_selection = None;
         self.problem = None;
         self.retry = Retry::Restart;
@@ -3519,7 +4145,7 @@ impl Bomtoon {
         match pending {
             Pending::Library(page) => api::library(page),
             Pending::Recent(page) => api::recent(page),
-            Pending::Content(_) => api::content(&self.selected_content_alias),
+            Pending::Content(_) => api::detail(&self.selected_content_alias),
             Pending::Logout => api::logout(),
         }
     }
@@ -3594,6 +4220,18 @@ impl Bomtoon {
         }
         self.resume_queued_foreground(context);
         if self.queued_foreground.is_none() {
+            if self.reader_manifest_pending {
+                self.start_manifest(context);
+            }
+            if self.reader_manifest_pending {
+                return;
+            }
+            if self.queued_commerce_command.is_some() {
+                self.resume_queued_commerce(context);
+            }
+            if self.queued_commerce_command.is_some() {
+                return;
+            }
             self.resume_deferred_wallet(context);
             self.spawn_visible_covers(context);
         }
@@ -3628,6 +4266,7 @@ impl Bomtoon {
     }
 
     fn start_manifest(&mut self, context: &mut Context) {
+        self.reader_manifest_pending = false;
         let Some((content_alias, episode_alias)) =
             self.reader_selection.as_ref().map(|selection| {
                 (
@@ -3659,7 +4298,7 @@ impl Bomtoon {
             )
             .is_none()
         {
-            self.fail_reader(Retry::Manifest, "Another reader request is still active.");
+            self.reader_manifest_pending = true;
         }
     }
 
@@ -4261,6 +4900,7 @@ impl Bomtoon {
     }
 
     fn accept(&mut self, context: &mut Context, pending: Pending, bytes: &[u8]) -> bool {
+        let selected_content_alias = self.selected_content_alias.clone();
         match pending {
             Pending::Logout => {
                 if bytes.is_empty() {
@@ -4301,37 +4941,53 @@ impl Bomtoon {
                     .fail(expected, "BOMTOON returned a different recent page."),
                 Err(error) => self.recent_load.fail(expected, error.to_string()),
             },
-            Pending::Content(_index) => match parse::content_detail(bytes) {
-                Ok(detail) => {
-                    let reader_after_refresh = self.reader_after_content_refresh.take();
-                    let episode_page = self.page;
-                    self.selected_content_id = Some(detail.id);
-                    if let Some(title) = detail.title {
-                        self.selected_title = title;
+            Pending::Content(_index) => {
+                match parse::content_detail(bytes, &selected_content_alias) {
+                    Ok(detail) => {
+                        let reader_after_refresh = self.reader_after_content_refresh.take();
+                        let episode_page = self.page;
+                        let episode_anchor = self.visible_episode_anchor();
+                        let refreshed_episode_id = reader_after_refresh
+                            .and_then(|index| self.episodes.get(index))
+                            .map(|episode| episode.id);
+                        self.selected_content_id = Some(detail.id);
+                        self.synopsis = SynopsisState {
+                            pages: synopsis_pages(&detail.synopsis),
+                            open_page: None,
+                            ..SynopsisState::default()
+                        };
+                        self.selected_title = detail.title;
+                        self.selected_creators = detail.creators.join(" | ");
+                        self.selected_synopsis = detail.synopsis;
+                        self.clear_episode_thumbnail_cache(context);
+                        self.episodes = detail.episodes;
+                        self.prepare_episode_layout();
+                        self.restore_episode_page(
+                            episode_anchor,
+                            if reader_after_refresh.is_some() {
+                                episode_page
+                            } else {
+                                0
+                            },
+                        );
+                        self.view = View::Episodes;
+                        let refreshed_index = refreshed_episode_id.and_then(|id| {
+                            self.episodes.iter().position(|episode| episode.id == id)
+                        });
+                        let refreshed_rental = refreshed_index.is_some_and(|index| {
+                            self.episodes.get(index).is_some_and(|episode| {
+                                episode.purchase == model::PurchaseState::Rented
+                            })
+                        });
+                        if let Some(index) = refreshed_index.filter(|_| refreshed_rental) {
+                            self.start_reader_episode(context, index);
+                        } else {
+                            self.refresh_title_gifts(context, GiftTaskPurpose::Display);
+                        }
                     }
-                    self.episodes = detail.episodes;
-                    self.page = reader_after_refresh.map_or(0, |_| {
-                        episode_page.min(
-                            self.episodes
-                                .len()
-                                .div_ceil(EPISODE_ITEMS_PER_PAGE)
-                                .saturating_sub(1),
-                        )
-                    });
-                    self.view = View::Episodes;
-                    let refreshed_rental = reader_after_refresh.is_some_and(|index| {
-                        self.episodes
-                            .get(index)
-                            .is_some_and(|episode| episode.purchase == model::PurchaseState::Rented)
-                    });
-                    if let Some(index) = reader_after_refresh.filter(|_| refreshed_rental) {
-                        self.start_reader_episode(context, index);
-                    } else {
-                        self.refresh_title_gifts(context, GiftTaskPurpose::Display);
-                    }
+                    Err(error) => self.problem = Some(error.to_string()),
                 }
-                Err(error) => self.problem = Some(error.to_string()),
-            },
+            }
         }
         false
     }
@@ -4368,6 +5024,7 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
+        self.clear_episode_thumbnail_cache(context);
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
         self.page = 0;
@@ -4375,6 +5032,12 @@ impl Bomtoon {
         self.selected_content_id = None;
         self.selected_content_alias.clone_from(&alias);
         self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
+        self.selected_creators.clear();
+        self.selected_synopsis.clear();
+        self.synopsis = SynopsisState::default();
+        self.episode_title_preview.clear();
+        self.episode_creators_preview.clear();
+        self.episode_items_per_page = None;
         self.problem = None;
         self.retry = Retry::Restart;
         self.request_foreground(context, Pending::Content(index));
@@ -4393,6 +5056,8 @@ impl Bomtoon {
         }) else {
             return;
         };
+        self.clear_episode_thumbnail_cache(context);
+        self.synopsis.open_page = None;
         self.cancel_title_gift_task(context);
         self.clear_comment_state(context);
         self.reader_selection = Some(EpisodeSelection {
@@ -4427,6 +5092,7 @@ impl Bomtoon {
         {
             return;
         }
+        self.synopsis.open_page = None;
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
         if episode.purchase == model::PurchaseState::NotOwned {
@@ -5518,9 +6184,14 @@ impl Bomtoon {
         cover: CoverTask,
         outcome: TaskOutcome,
     ) -> bool {
+        let loading = self.covers.entries.get(&cover.url) == Some(&CoverState::Loading(task));
         if cover.generation != self.covers.generation
-            || self.covers.entries.get(&cover.url) != Some(&CoverState::Loading(task))
+            || !loading
+            || !self.cover_url_owned(cover.source, &cover.url)
         {
+            if loading {
+                self.covers.entries.remove(&cover.url);
+            }
             return false;
         }
         let state = match outcome {
@@ -5595,6 +6266,8 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_suspend(&mut self, context: &mut Context) {
+        self.synopsis.open_page = None;
+        self.clear_episode_thumbnail_cache(context);
         self.clear_commerce_access(context);
         if self.view.is_reader_flow()
             || self.reader_selection.is_some()
@@ -5647,6 +6320,27 @@ impl KoboApp for Bomtoon {
         reason = "one ordered action dispatcher keeps Back, retry, and view ownership explicit"
     )]
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
+        if let Some(page) = self.synopsis.open_page {
+            if action == action_id(SYNOPSIS_PREVIOUS) {
+                self.synopsis.open_page = Some(page.saturating_sub(1));
+            } else if action == action_id(SYNOPSIS_NEXT)
+                && page.saturating_add(1) < self.synopsis.pages.len()
+            {
+                self.synopsis.open_page = Some(page.saturating_add(1));
+            } else if action == action_id(SYNOPSIS_CLOSE) || action == ActionId::BACK {
+                self.synopsis.open_page = None;
+            }
+            self.show(context);
+            return;
+        }
+        if self.view == View::Episodes
+            && action == action_id(SYNOPSIS_MORE)
+            && !self.synopsis.pages.is_empty()
+        {
+            self.synopsis.open_page = Some(0);
+            self.show(context);
+            return;
+        }
         if self.view == View::Episodes && action == action_id(RETRY_GIFTS) {
             self.refresh_title_gifts(context, GiftTaskPurpose::Display);
             self.show(context);
@@ -5902,6 +6596,7 @@ impl KoboApp for Bomtoon {
         }
         if self.view == View::Account {
             if action == action_id(SIGN_OUT) {
+                self.synopsis.open_page = None;
                 self.request_foreground(context, Pending::Logout);
             } else if action == action_id(RETRY_BALANCES)
                 && (self.wallet.summary_error
@@ -5934,10 +6629,10 @@ impl KoboApp for Bomtoon {
         } else if action == action_id(PREVIOUS_PAGE) {
             self.page = self.page.saturating_sub(1);
         } else if action == action_id(NEXT_PAGE) {
-            let items_per_page = if self.view == View::Main {
-                LIBRARY_ITEMS_PER_PAGE
+            let items_per_page = if self.view == View::Episodes {
+                self.episode_rows_per_page()
             } else {
-                EPISODE_ITEMS_PER_PAGE
+                LIBRARY_ITEMS_PER_PAGE
             };
             let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
             if self.view == View::Episodes {
@@ -6021,7 +6716,10 @@ impl KoboApp for Bomtoon {
             return;
         }
         if let Some(cover) = self.covers.tasks.remove(&task) {
-            self.observe_connectivity(context, &outcome);
+            if cover.source != CoverSource::Protected || !self.is_episode_thumbnail_url(&cover.url)
+            {
+                self.observe_connectivity(context, &outcome);
+            }
             self.resume_queued_foreground(context);
             let changed = self.handle_cover_outcome(context, task, cover, outcome);
             if changed {
@@ -6805,8 +7503,9 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use kobo_sdk::{
-        AppRunner, Chrome, Command, DisplayMetrics, Lifecycle, Node, PictureHandle, ReadingChrome,
-        SecretHeader, StoreError, StoreRequest, StoreResult, Task, TilePicture, CLARA_BW_METRICS,
+        AppRunner, Chrome, Command, DisplayMetrics, Lifecycle, Node, Overlay, PictureHandle,
+        ReadingChrome, SecretHeader, StoreError, StoreRequest, StoreResult, Task, TilePicture,
+        CLARA_BW_METRICS,
     };
 
     const LIBRARY_RESPONSE: &[u8] = br#"{
@@ -6893,23 +7592,55 @@ mod tests {
         }
     }"#;
     const REMOTE_LIBRARY_PAGE_SIZE: usize = 30;
-    const CONTENT_RESPONSE: &[u8] = br#"{
-        "result":"SUCCESS",
-        "data":{"id":41,"title":"Localized Title","episodes":[
-            {"id":101,"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
-            {"id":102,"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
-            {"id":103,"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
-            {"id":104,"alias":"rented","title":"Rented Episode","isSample":false,"purchaseStatus":"RENT"},
-            {"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2}
-        ]}
-    }"#;
-    const COIN_ONLY_CONTENT_RESPONSE: &[u8] = br#"{
-        "result":"SUCCESS",
-        "data":{"id":42,"episodes":[
-            {"id":201,"alias":"owned","title":"Owned Episode","isSample":false,"purchaseStatus":"POSSESSION"},
-            {"id":202,"alias":"coin","title":"Coin Episode","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2}
-        ]}
-    }"#;
+
+    fn detail_response(id: usize, alias: &str, title: &str, episodes: &str) -> Vec<u8> {
+        format!(
+            concat!(
+                "<script id=\"__NEXT_DATA__\">",
+                "{{\"props\":{{\"pageProps\":{{",
+                "\"ssrPersonalized\":true,",
+                "\"ssrDetail\":{{\"id\":{id},\"alias\":\"{alias}\",",
+                "\"title\":\"{title}\",",
+                "\"creators\":[{{\"name\":\"Writer\"}}],",
+                "\"synopsis\":\"Synopsis\",",
+                "\"episodes\":[{episodes}]}}",
+                "}}}}}}",
+                "</script>"
+            ),
+            id = id,
+            alias = alias,
+            title = title,
+            episodes = episodes,
+        )
+        .into_bytes()
+    }
+
+    fn content_response() -> Vec<u8> {
+        detail_response(
+            41,
+            "hunter_q",
+            "Localized Title",
+            concat!(
+                "{\"id\":101,\"alias\":\"ep-1\",\"title\":\"Episode One\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\"},",
+                "{\"id\":102,\"alias\":\"ep-2\",\"title\":\"Episode Two\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":null,\"paid\":false},",
+                "{\"id\":103,\"alias\":\"sample\",\"title\":\"Sample\",\"openedAt\":1709136000000,\"isSample\":true,\"purchaseStatus\":null},",
+                "{\"id\":104,\"alias\":\"rented\",\"title\":\"Rented Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\"},",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2}"
+            ),
+        )
+    }
+
+    fn coin_only_content_response() -> Vec<u8> {
+        detail_response(
+            42,
+            "hunter_q",
+            "Coin Only",
+            concat!(
+                "{\"id\":201,\"alias\":\"owned\",\"title\":\"Owned Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\"},",
+                "{\"id\":202,\"alias\":\"coin\",\"title\":\"Coin Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2}"
+            ),
+        )
+    }
     const TINY_WEBP: &[u8] = &[
         82, 73, 70, 70, 36, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 24, 0, 0, 0, 48, 1, 0, 157, 1,
         42, 1, 0, 1, 0, 1, 64, 38, 37, 164, 0, 3, 112, 0, 254, 251, 148, 0, 0,
@@ -7718,12 +8449,15 @@ mod tests {
             id: 105,
             alias: "paid".to_owned(),
             title: "Paid Episode".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase: model::PurchaseState::NotOwned,
             rent_expires_at: None,
             rent_coin: Some(1),
             purchase_coin: Some(2),
             gift_eligible: true,
         });
+        app.prepare_episode_layout();
 
         let screen = runner.app().screen();
         let drawn = format!("{screen:?}");
@@ -7733,15 +8467,20 @@ mod tests {
             ),
             "{drawn}"
         );
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { action, .. } if *action == action_id("episode-0")
-        )));
-        assert!(!screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { action, .. } if *action == action_id("episode-1")
-        )));
-        assert!(drawn.contains("Paid Episode · Purchase locked"), "{drawn}");
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("episode rows");
+        assert!(rows.iter().any(|row| row.action == action_id("episode-0")));
+        assert!(rows.iter().any(|row| {
+            row.title == "Paid Episode"
+                && row.action == action_id("episode-disabled-1")
+                && row.trailing.is_none()
+        }));
 
         let commands = runner.action(action_id("episode-1"));
         assert!(spawns(&commands).is_empty(), "{commands:?}");
@@ -8337,10 +9076,7 @@ mod tests {
         let (mut runner, _) = loaded_library_with_metrics(metrics);
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
         (runner, manifest_task, commands)
@@ -8770,6 +9506,8 @@ mod tests {
             id: 101,
             alias: "ep-1".to_owned(),
             title: "Episode One".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase: model::PurchaseState::Owned,
             rent_expires_at: None,
             rent_coin: None,
@@ -8777,7 +9515,15 @@ mod tests {
             gift_eligible: false,
         });
         app.selected_title = "Hunter Q".to_owned();
+        app.selected_creators = "Writer | Artist".to_owned();
+        app.selected_synopsis = "Stored synopsis".to_owned();
+        app.synopsis = SynopsisState {
+            pages: synopsis_pages(&app.selected_synopsis),
+            open_page: None,
+            ..SynopsisState::default()
+        };
         app.selected_content_id = Some(41);
+        app.prepare_episode_layout();
         app.page = 3;
         app.next_library_page = Some(4);
         app.next_recent_page = Some(5);
@@ -8793,6 +9539,10 @@ mod tests {
         assert!(app.episodes.is_empty());
         assert_eq!(app.selected_content_id, None);
         assert!(app.selected_title.is_empty());
+        assert!(app.selected_creators.is_empty());
+        assert!(app.selected_synopsis.is_empty());
+        assert_eq!(app.synopsis, SynopsisState::default());
+        assert_eq!(app.episode_items_per_page, None);
         assert_eq!(app.page, 0);
         assert_eq!(app.next_library_page, None);
         assert_eq!(app.next_recent_page, None);
@@ -8808,6 +9558,10 @@ mod tests {
         assert_eq!(app.episodes.len(), 1);
         assert_eq!(app.selected_content_id, Some(41));
         assert_eq!(app.selected_title, "Hunter Q");
+        assert_eq!(app.selected_creators, "Writer | Artist");
+        assert_eq!(app.selected_synopsis, "Stored synopsis");
+        assert!(!app.synopsis.pages.is_empty());
+        assert_eq!(app.synopsis.open_page, None);
         assert_eq!(app.page, 3);
         assert_eq!(app.next_library_page, Some(4));
         assert_eq!(app.next_recent_page, Some(5));
@@ -9160,7 +9914,7 @@ mod tests {
         assert_eq!(runner.app().task, Some(task));
         assert!(spawns(&commands).is_empty());
 
-        runner.task_outcome(task, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        runner.task_outcome(task, TaskOutcome::Completed(content_response()));
         assert_eq!(runner.app().view, View::Episodes);
         assert_eq!(runner.app().destination, MainDestination::Library);
         assert_eq!(runner.app().pending, None);
@@ -9294,25 +10048,850 @@ mod tests {
         assert_eq!(runner.app().featured.page, 0);
         assert_eq!(runner.app().page, 0);
     }
+    const EXPECTED_SYNOPSIS_MORE: &str = "synopsis-more";
+    const EXPECTED_SYNOPSIS_PREVIOUS: &str = "synopsis-previous";
+    const EXPECTED_SYNOPSIS_NEXT: &str = "synopsis-next";
+    const EXPECTED_SYNOPSIS_CLOSE: &str = "synopsis-close";
+
+    fn long_synopsis() -> String {
+        use std::fmt::Write as _;
+
+        let mut synopsis = String::new();
+        for number in 0..80 {
+            writeln!(
+                synopsis,
+                "Part {number}: 사냥꾼 Q follows the signal through the old city while every clue changes what the team believes."
+            )
+            .expect("writing to String");
+            synopsis.push('\n');
+        }
+        synopsis
+    }
+
+    fn episode_metadata_app(synopsis: String) -> Bomtoon {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let pages = synopsis_pages(&synopsis);
+        let mut app = Bomtoon {
+            account: AccountState::Active,
+            connection: ConnectionState::Online,
+            account_scope: Some(test_scope(SCOPE)),
+            view: View::Episodes,
+            selected_content_id: Some(41),
+            selected_content_alias: "hunter_q".to_owned(),
+            selected_title: "Hunter Q".to_owned(),
+            selected_creators: "Writer | Artist".to_owned(),
+            selected_synopsis: synopsis,
+            synopsis: SynopsisState {
+                pages,
+                open_page: None,
+                ..SynopsisState::default()
+            },
+            wallet: WalletState {
+                summary: Some(WalletSummary {
+                    coins: model::AssetAmounts {
+                        standard: 10,
+                        bonus: 0,
+                        free: 0,
+                    },
+                    tickets: model::AssetAmounts::default(),
+                }),
+                ..WalletState::default()
+            },
+            gifts: TitleGiftState {
+                title_id: Some(41),
+                available: Some(2),
+                ..TitleGiftState::default()
+            },
+            episodes: vec![Episode {
+                id: 105,
+                alias: "ep-1".to_owned(),
+                title: "Episode One".to_owned(),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            }],
+            ..Bomtoon::default()
+        };
+        app.prepare_episode_layout();
+        app
+    }
+    fn episode_metadata_runner(synopsis: String) -> AppRunner<Bomtoon> {
+        let mut runner = AppRunner::with_metrics(episode_metadata_app(synopsis), CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        runner
+    }
+
+    fn screen_button_actions(screen: &Screen) -> Vec<ActionId> {
+        screen
+            .nodes
+            .iter()
+            .chain(
+                screen
+                    .overlay
+                    .iter()
+                    .flat_map(|overlay| overlay.nodes.iter()),
+            )
+            .filter_map(|node| match node {
+                Node::Button { action, .. } => Some(*action),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn overlay_text(overlay: &Overlay) -> String {
+        overlay
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn episode_header_shows_metadata_balance_and_more_without_duplicate_title() {
+        let app = episode_metadata_app(long_synopsis());
+        let screen = app.episode_screen();
+
+        assert_eq!(screen.top_bar.as_ref().expect("top bar").title, "Episodes");
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Hunter Q"));
+        assert_eq!(drawn.matches("Hunter Q").count(), 1);
+        assert!(drawn.contains("Writer | Artist"));
+        assert!(drawn.contains("Coins 10"));
+        assert!(drawn.contains("Gifts 2"));
+        assert!(screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn short_synopsis_shows_the_full_preview_without_more() {
+        let synopsis = "A complete short synopsis.";
+        let app = episode_metadata_app(synopsis.to_owned());
+        let screen = app.episode_screen();
+        let drawn = format!("{screen:?}");
+
+        assert!(drawn.contains(synopsis));
+        assert!(!screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+        assert_fits(&screen);
+    }
+    #[test]
+    fn whitespace_collapsed_synopsis_pages_remain_protocol_encodable() {
+        let synopsis = format!("Lead{}Tail", " ".repeat(17_000));
+        let mut runner = episode_metadata_runner(synopsis.clone());
+        assert!(runner.app().synopsis.pages.iter().all(|range| {
+            range.len() <= SYNOPSIS_MODAL_MAX_BYTES
+                && synopsis.is_char_boundary(range.start)
+                && synopsis.is_char_boundary(range.end)
+        }));
+        runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+
+        let mut observed = String::new();
+        loop {
+            let screen = runner.app().screen();
+            let overlay = screen.overlay.as_ref().expect("synopsis modal");
+            observed.push_str(&overlay_text(overlay));
+            assert_fits(&screen);
+            if !screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_NEXT)) {
+                break;
+            }
+            runner.action(action_id(EXPECTED_SYNOPSIS_NEXT));
+        }
+
+        assert_eq!(observed, synopsis);
+    }
+
+    #[test]
+    fn newline_heavy_preview_keeps_a_full_episode_page_visible() {
+        let synopsis = "Line\n".repeat(48);
+        assert_eq!(synopsis.len(), SYNOPSIS_PREVIEW_BYTES);
+        let mut app = episode_metadata_app(synopsis.clone());
+        app.episodes = (0..EPISODE_ITEMS_PER_PAGE)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        let mut observed = BTreeSet::new();
+        loop {
+            let screen = runner.app().episode_screen();
+            let actions = screen_button_actions(&screen);
+            assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+            let rows = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .expect("episode rows");
+            for index in 0..EPISODE_ITEMS_PER_PAGE {
+                if rows
+                    .iter()
+                    .any(|row| row.action == action_id(&format!("episode-{index}")))
+                {
+                    observed.insert(index);
+                }
+            }
+            assert!(!rows.is_empty());
+            assert_fits(&screen);
+            let (current, total) = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            if current == total {
+                break;
+            }
+            runner.action(action_id(NEXT_PAGE));
+        }
+        assert_eq!(
+            observed,
+            (0..EPISODE_ITEMS_PER_PAGE).collect::<BTreeSet<_>>()
+        );
+
+        runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+        let mut modal_text = String::new();
+        loop {
+            let screen = runner.app().screen();
+            let overlay = screen
+                .overlay
+                .as_ref()
+                .expect("render-truncated synopsis modal");
+            modal_text.push_str(&overlay_text(overlay));
+            assert_fits(&screen);
+            if !screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_NEXT)) {
+                break;
+            }
+            runner.action(action_id(EXPECTED_SYNOPSIS_NEXT));
+        }
+        assert_eq!(modal_text, synopsis);
+    }
+    #[test]
+    fn episode_capacity_fits_later_button_pages_without_skips_or_duplicates() {
+        let synopsis = "Line\n".repeat(48);
+        let mut app = episode_metadata_app(synopsis);
+        app.episodes = (0..12)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: if index < EPISODE_ITEMS_PER_PAGE {
+                    model::PurchaseState::Other("Locked".to_owned())
+                } else {
+                    model::PurchaseState::Owned
+                },
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        let mut observed = BTreeSet::new();
+
+        loop {
+            let screen = runner.app().episode_screen();
+            let rows = screen.nodes.iter().find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            });
+            for row in rows.into_iter().flatten() {
+                let index = runner
+                    .app()
+                    .episodes
+                    .iter()
+                    .position(|episode| episode.title == row.title)
+                    .expect("row identifies an episode");
+                assert!(observed.insert(index), "episode {index} was duplicated");
+            }
+            assert_fits(&screen);
+            let (current, total) = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            if current == total {
+                break;
+            }
+            runner.action(action_id(NEXT_PAGE));
+        }
+
+        assert_eq!(observed, (0..12).collect());
+    }
+    #[test]
+    fn transient_episode_controls_preserve_later_page_boundaries() {
+        const OWNER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
+        const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+
+        fn snapshot(app: &Bomtoon) -> (usize, (u16, u16), BTreeSet<usize>) {
+            let capacity = app.episode_rows_per_page();
+            let screen = app.episode_screen();
+            assert_fits(&screen);
+            let position = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            let indexes = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .into_iter()
+                .flatten()
+                .map(|row| {
+                    app.episodes
+                        .iter()
+                        .position(|episode| episode.title == row.title)
+                        .expect("row identifies an episode")
+                })
+                .collect();
+            (capacity, position, indexes)
+        }
+
+        let mut app = episode_metadata_app("Short synopsis.".to_owned());
+        app.selected_creators = "Writer\nArtist\nColorist".to_owned();
+        app.episodes = (0..18)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: Some(1),
+                purchase_coin: Some(2),
+                gift_eligible: true,
+            })
+            .collect();
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().prepare_episode_layout();
+        runner.app_mut().page = 1;
+        let baseline = snapshot(runner.app());
+        assert!(baseline.0 > 1, "{baseline:?}");
+        assert!(!baseline.2.is_empty());
+
+        runner.app_mut().gifts.error = true;
+        assert_eq!(snapshot(runner.app()), baseline);
+
+        runner.app_mut().purchase_rejection_notice = Some("FAIL");
+        assert_eq!(snapshot(runner.app()), baseline);
+
+        let marker = marker_for(test_scope(OWNER));
+        let _ = runner.app_mut().commerce.marker_loaded(Some(&marker));
+        let _ = runner.app_mut().commerce.safety_changed(
+            commerce::Authentication::Authenticated(test_scope(READER)),
+            commerce::Connectivity::Online,
+        );
+        assert!(runner.app().commerce.marker_belongs_to_another_account());
+        assert_eq!(snapshot(runner.app()), baseline);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn episode_rows_show_thumbnail_date_and_truthful_access_status() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms().expect("host clock");
+        let thumbnail_url = "https://image.balcony.studio/tw/ep_thumbnail/owned.webp".to_owned();
+        let picture = TilePicture::new(PictureHandle(73), 60, 60);
+        let episode = |id: usize,
+                       title: &str,
+                       purchase: model::PurchaseState,
+                       rent_expires_at: Option<i64>,
+                       thumbnail_url: Option<String>| Episode {
+            id,
+            alias: format!("ep-{id}"),
+            title: title.to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url,
+            purchase,
+            rent_expires_at,
+            rent_coin: Some(1),
+            purchase_coin: Some(2),
+            gift_eligible: false,
+        };
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.episodes = vec![
+            episode(
+                0,
+                "Owned episode",
+                model::PurchaseState::Owned,
+                None,
+                Some(thumbnail_url.clone()),
+            ),
+            episode(
+                1,
+                "Rented episode",
+                model::PurchaseState::Rented,
+                Some(now_ms + 2 * HOUR_MS),
+                None,
+            ),
+            episode(2, "Free episode", model::PurchaseState::Free, None, None),
+            episode(
+                3,
+                "Sample episode",
+                model::PurchaseState::Sample,
+                None,
+                None,
+            ),
+            episode(
+                4,
+                "Unowned episode",
+                model::PurchaseState::NotOwned,
+                None,
+                None,
+            ),
+            episode(
+                5,
+                "Unknown episode",
+                model::PurchaseState::Other("FUTURE".to_owned()),
+                None,
+                None,
+            ),
+        ];
+        app.covers
+            .entries
+            .insert(thumbnail_url, CoverState::Ready(picture));
+        app.episode_items_per_page = Some(app.episodes.len());
+        let account_scope = app.account_scope.expect("account scope");
+        let _ = app.commerce.marker_loaded(None);
+        let _ = app.commerce.safety_changed(
+            commerce::Authentication::Authenticated(account_scope),
+            commerce::Connectivity::Online,
+        );
+
+        let screen = app.episode_screen();
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("episode rows");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0].title, "Owned episode");
+        assert_eq!(rows[0].summary, "2024-02-29");
+        assert_eq!(rows[0].trailing.as_deref(), Some("Owned"));
+        assert!(matches!(
+            rows[0].lead,
+            RowLead::Picture(lead, Glyph::Book) if lead == picture
+        ));
+        assert_eq!(rows[1].trailing.as_deref(), Some("2 hrs"));
+        assert_eq!(rows[2].trailing.as_deref(), Some("Free"));
+        assert_eq!(rows[3].trailing.as_deref(), Some("Sample"));
+        assert_eq!(rows[4].trailing, None);
+        assert_eq!(rows[5].trailing.as_deref(), Some("FUTURE"));
+        assert_eq!(rows[4].action, action_id("episode-4"));
+        assert_eq!(rows[5].action, action_id("episode-disabled-5"));
+
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id("episode-disabled-5"));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
+
+        let commands = runner.action(action_id("episode-4"));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Quoting
+        );
+    }
+
+    #[test]
+    fn rich_episode_capacity_fits_every_page_without_skips_or_state_drift() {
+        let mut app = episode_metadata_app("節".repeat(80));
+        app.selected_title = "界".repeat(85);
+        app.selected_creators = "作".repeat(170);
+        app.wallet.summary = Some(WalletSummary {
+            coins: model::AssetAmounts {
+                standard: usize::MAX,
+                bonus: 0,
+                free: 0,
+            },
+            tickets: model::AssetAmounts::default(),
+        });
+        app.episodes = (0..18)
+            .map(|index| Episode {
+                id: 500 + index,
+                alias: format!("ep-{index}"),
+                title: format!("{index}{}", "集".repeat(169)),
+                opened_at: i64::MAX,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Other("未".repeat(42)),
+                rent_expires_at: None,
+                rent_coin: Some(usize::MAX),
+                purchase_coin: Some(usize::MAX),
+                gift_eligible: true,
+            })
+            .collect();
+        app.prepare_episode_layout();
+        let capacity = app.episode_rows_per_page();
+        assert!((1..=EPISODE_ITEMS_PER_PAGE).contains(&capacity));
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let mut observed = BTreeSet::new();
+
+        loop {
+            let screen = runner.app().episode_screen();
+            assert_fits(&screen);
+            let rows = screen
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .expect("episode rows");
+            assert!(!rows.is_empty());
+            for row in rows {
+                let index = (0..runner.app().episodes.len())
+                    .find(|index| row.action == action_id(&format!("episode-disabled-{index}")))
+                    .expect("row action identifies an episode");
+                assert!(observed.insert(index), "episode {index} was duplicated");
+            }
+            let (current, total) = screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position)
+                .expect("episode position");
+            if current == total {
+                let final_page = runner.app().page;
+                runner.action(action_id(NEXT_PAGE));
+                assert_eq!(runner.app().page, final_page);
+                break;
+            }
+            runner.action(action_id(NEXT_PAGE));
+            assert_eq!(runner.app().episode_rows_per_page(), capacity);
+        }
+        assert_eq!(observed, (0..runner.app().episodes.len()).collect());
+
+        runner.app_mut().gifts.error = true;
+        runner.app_mut().purchase_rejection_notice = Some("FAIL");
+        assert_eq!(runner.app().episode_rows_per_page(), capacity);
+        assert_fits(&runner.app().episode_screen());
+    }
+
+    #[test]
+    fn newline_heavy_maximum_episode_header_caches_only_a_fitted_capacity() {
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.selected_title = "T\n".repeat(128);
+        app.selected_creators = "C\n".repeat(128);
+        assert_eq!(app.selected_title.len(), 256);
+        assert_eq!(app.selected_creators.len(), 256);
+        app.episodes = vec![Episode {
+            id: 900,
+            alias: "newline-heavy".to_owned(),
+            title: "Visible episode".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
+            purchase: model::PurchaseState::Owned,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
+        }];
+
+        app.prepare_episode_layout();
+        assert_eq!(app.selected_title, "T\n".repeat(128));
+        assert_eq!(app.selected_creators, "C\n".repeat(128));
+        assert!(!app.episode_title_preview.contains('\n'));
+        assert!(!app.episode_creators_preview.contains('\n'));
+
+        assert!(app.episode_items_per_page.is_some());
+        let screen = app.episode_screen();
+        assert!(
+            episode_screen_layout_fits(&screen),
+            "cached capacity did not pass its one-row probe: {screen:?}"
+        );
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.len() == 1 && rows[0].action == action_id("episode-0")
+        )));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn unicode_episode_header_preserves_korean_and_cjk_copy_while_fitting() {
+        let title = "사냥꾼 Q와 漫畫".to_owned();
+        let creators = "글 김작가 | 그림 林老師".to_owned();
+        let mut app = episode_metadata_app("짧은 줄거리.".to_owned());
+        app.selected_title.clone_from(&title);
+        app.selected_creators.clone_from(&creators);
+
+        app.prepare_episode_layout();
+
+        assert_eq!(app.selected_title, title);
+        assert_eq!(app.selected_creators, creators);
+        let screen = app.episode_screen();
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Heading { text, .. } if text == &title
+        )));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Text { text, .. } if text == &creators
+        )));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.len() == 1 && rows[0].action == action_id("episode-0")
+        )));
+        assert!(episode_screen_layout_fits(&screen));
+    }
+
+    #[test]
+    fn refreshed_episode_data_preserves_the_visible_episode_anchor() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms().expect("host clock");
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.episodes = (0..12)
+            .map(|index| Episode {
+                id: 700 + index,
+                alias: format!("anchor-{index}"),
+                title: format!("Anchor {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        app.prepare_episode_layout();
+        let capacity = app.episode_rows_per_page();
+        assert!(app.episodes.len() > capacity);
+        app.page = 1;
+        let anchor_index = capacity;
+        let anchor_alias = app.episodes[anchor_index].alias.clone();
+        app.episodes[anchor_index].purchase = model::PurchaseState::Rented;
+        app.episodes[anchor_index].rent_expires_at = Some(now_ms - HOUR_MS);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id(&format!("episode-{anchor_index}")));
+        let (refresh_task, _) = only_spawn(&commands);
+        let reordered = (0..12)
+            .filter(|index| *index != anchor_index)
+            .chain(std::iter::once(anchor_index))
+            .map(|index| {
+                format!(
+                    "{{\"id\":{},\"alias\":\"anchor-{index}\",\"title\":\"Anchor {index}\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\"}}",
+                    700 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        runner.task_outcome(
+            refresh_task,
+            TaskOutcome::Completed(detail_response(41, "hunter_q", "Hunter Q", &reordered)),
+        );
+
+        assert_eq!(runner.app().view, View::Episodes);
+        let refreshed_index = runner
+            .app()
+            .episodes
+            .iter()
+            .position(|episode| episode.alias == anchor_alias)
+            .expect("refreshed anchor");
+        let refreshed_capacity = runner.app().episode_rows_per_page();
+        assert_eq!(runner.app().page, refreshed_index / refreshed_capacity);
+        let (start, end) = page_bounds(
+            runner.app().page,
+            runner.app().episodes.len(),
+            refreshed_capacity,
+        );
+        assert!((start..end).contains(&refreshed_index));
+    }
+
+    #[test]
+    fn accepting_content_precomputes_synopsis_pages() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (content_task, _) = only_spawn(&commands);
+
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
+        assert_eq!(
+            runner.app().synopsis.pages,
+            synopsis_pages(&runner.app().selected_synopsis)
+        );
+        assert_eq!(runner.app().synopsis.open_page, None);
+        assert!(!runner.app().synopsis.pages.is_empty());
+        assert!(runner.app().episode_items_per_page.is_some());
+        assert!(!runner.app().synopsis.preview.is_empty());
+    }
+
+    #[test]
+    fn changing_comic_clears_synopsis_pagination() {
+        let mut app = episode_metadata_app(long_synopsis());
+        app.view = View::Main;
+        app.destination = MainDestination::Library;
+        app.synopsis.open_page = None;
+        app.comics = vec![Comic {
+            alias: "another_comic".to_owned(),
+            title: "Another Comic".to_owned(),
+            creators: String::new(),
+            cover_url: None,
+            owned_episodes: 0,
+            total_episodes: 1,
+        }];
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        runner.action(action_id("comic-0"));
+
+        assert_eq!(runner.app().synopsis, SynopsisState::default());
+        assert_eq!(runner.app().episode_items_per_page, None);
+    }
+
+    #[test]
+    fn suspending_closes_the_synopsis_modal() {
+        let mut runner = episode_metadata_runner(long_synopsis());
+        runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+        assert!(runner.app().screen().overlay.is_some());
+
+        runner.suspend();
+
+        assert_eq!(runner.app().synopsis.open_page, None);
+        assert!(runner.app().screen().overlay.is_none());
+    }
+
+    #[test]
+    fn synopsis_modal_pages_preserve_all_text_and_close_to_same_episode_page() {
+        let synopsis = long_synopsis();
+        let mut runner = episode_metadata_runner(synopsis.clone());
+        runner.app_mut().page = 2;
+
+        let open = runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+        assert!(last_screen(&open).overlay.is_some());
+
+        let mut observed = String::new();
+        let mut page = 0;
+        loop {
+            let screen = runner.app().screen();
+            let overlay = screen.overlay.as_ref().expect("synopsis modal");
+            observed.push_str(&overlay_text(overlay));
+            let actions = screen_button_actions(&screen);
+            if page == 0 {
+                assert!(!actions.contains(&action_id(EXPECTED_SYNOPSIS_PREVIOUS)));
+            } else {
+                assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_PREVIOUS)));
+            }
+            assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_CLOSE)));
+            assert_fits(&screen);
+            if !actions.contains(&action_id(EXPECTED_SYNOPSIS_NEXT)) {
+                break;
+            }
+            if page == 1 {
+                assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_NEXT)));
+            }
+            runner.action(action_id(EXPECTED_SYNOPSIS_NEXT));
+            page += 1;
+        }
+
+        assert!(page >= 2, "fixture must exercise a middle modal page");
+        assert_eq!(observed, synopsis);
+        runner.action(action_id(EXPECTED_SYNOPSIS_CLOSE));
+        assert_eq!(runner.app().page, 2);
+        assert!(runner.app().screen().overlay.is_none());
+    }
+
+    #[test]
+    fn back_closes_synopsis_before_leaving_episodes() {
+        let mut runner = episode_metadata_runner(long_synopsis());
+        runner.app_mut().page = 2;
+        runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+
+        runner.action(ActionId::BACK);
+
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(runner.app().page, 2);
+        assert!(runner.app().screen().overlay.is_none());
+    }
+
+    #[test]
+    fn open_synopsis_blocks_underlying_episode_actions() {
+        const SCOPE: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+        let scope = test_scope(SCOPE);
+        let mut runner = episode_metadata_runner(long_synopsis());
+        runner.app_mut().page = 2;
+        runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
+
+        let commands = runner.action(action_id(PREVIOUS_PAGE));
+        assert_eq!(runner.app().page, 2);
+        assert!(spawns(&commands).is_empty());
+
+        let commands = runner.action(action_id("episode-0"));
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(spawns(&commands).is_empty());
+
+        runner.app_mut().gifts.error = true;
+        let commands = runner.action(action_id(RETRY_GIFTS));
+        assert!(runner.app().gifts.error);
+        assert!(runner.app().gifts.task.is_none());
+        assert!(spawns(&commands).is_empty());
+
+        runner.app_mut().commerce = choosing_commerce(scope);
+        for action in [USE_GIFT, RENT, BUY, CANCEL_COMMERCE] {
+            let commands = runner.action(action_id(action));
+            assert_eq!(
+                runner.app().commerce.state(),
+                commerce::CommerceState::Choosing
+            );
+            assert!(spawns(&commands).is_empty());
+        }
+    }
 
     #[test]
     fn readable_and_not_owned_episode_rows_are_actions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
-        let screen = last_screen(&commands);
-        let actions = screen
-            .nodes
-            .iter()
-            .filter_map(|node| match node {
-                Node::Button { action, .. } => Some(*action),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
+        let capacity = runner.app().episode_rows_per_page();
+        let pages = runner.app().episodes.len().div_ceil(capacity);
+        let mut actions = Vec::new();
+        for page in 0..pages {
+            let screen = runner.app().episode_screen_for(page, capacity, false);
+            actions.extend(
+                screen
+                    .nodes
+                    .iter()
+                    .find_map(|node| match node {
+                        Node::Rows { rows, .. } => Some(rows),
+                        _ => None,
+                    })
+                    .into_iter()
+                    .flatten()
+                    .map(|row| row.action),
+            );
+        }
         assert!(actions.contains(&action_id("episode-0")));
         assert!(actions.contains(&action_id("episode-1")));
         assert!(actions.contains(&action_id("episode-2")));
@@ -9334,18 +10913,18 @@ mod tests {
         });
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets 4"));
         assert!(!drawn.contains("Ticket ·"));
-        assert!(drawn.contains("Read · Rented"));
-        assert!(screen.nodes.iter().any(
-            |node| matches!(node, Node::Button { action, .. } if *action == action_id("episode-3"))
-        ));
+        assert!(drawn.contains("Rented"));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-3"))
+        )));
         assert_fits(&screen);
     }
 
@@ -9356,7 +10935,7 @@ mod tests {
         let (content_task, _) = only_spawn(&commands);
         let commands = runner.task_outcome(
             content_task,
-            TaskOutcome::Completed(COIN_ONLY_CONTENT_RESPONSE.to_vec()),
+            TaskOutcome::Completed(coin_only_content_response()),
         );
         let drawn = format!("{:?}", last_screen(&commands));
         assert!(!drawn.contains("Tickets"));
@@ -9374,12 +10953,10 @@ mod tests {
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. }
-                if url.contains("/api/balcony-api-v2/contents/hunter_q?")
+                if url.contains("/detail/hunter_q")
         ));
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (_, gift_work) = only_spawn(&commands);
         assert_eq!(gift_work, api::title_gifts(41));
         assert!(spawns(&commands).iter().all(
@@ -9389,7 +10966,7 @@ mod tests {
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets"));
         assert!(!drawn.contains("Ticket ·"));
-        assert!(drawn.contains("Read · Rented"));
+        assert!(drawn.contains("Rented"));
         assert_fits(&screen);
     }
 
@@ -9401,13 +10978,15 @@ mod tests {
             id,
             alias: alias.to_owned(),
             title: alias.to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase: model::PurchaseState::Rented,
             rent_expires_at,
             rent_coin: None,
             purchase_coin: None,
             gift_eligible: false,
         };
-        let app = Bomtoon {
+        let mut app = Bomtoon {
             view: View::Episodes,
             selected_title: "Rental labels".to_owned(),
             episodes: vec![
@@ -9418,21 +10997,26 @@ mod tests {
             ],
             ..Bomtoon::default()
         };
+        app.prepare_episode_layout();
 
         let screen = app.episode_screen();
-        let drawn = format!("{screen:?}");
-        assert!(drawn.contains("Read · 48 hrs"));
-        assert!(drawn.contains("Read · 1 hr"));
-        assert!(drawn.contains("Read · 0 hrs"));
-        assert!(drawn.contains("Read · Rented"));
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("rental rows");
         assert_eq!(
-            screen
-                .nodes
-                .iter()
-                .filter(|node| matches!(node, Node::Button { .. }))
-                .count(),
-            4
+            rows.iter()
+                .map(|row| row.trailing.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("48 hrs"), Some("1 hr"), Some("0 hrs"), Some("Rented")]
         );
+        assert!(rows
+            .iter()
+            .all(|row| row.action != action_id("episode-disabled-0")));
         assert_fits(&screen);
     }
 
@@ -9456,10 +11040,8 @@ mod tests {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let episode_screen = last_screen(&commands);
         assert!(format!("{episode_screen:?}").contains("Episode One"));
 
@@ -11113,10 +12695,7 @@ mod tests {
 
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
         assert_eq!(runner.tasks_in_flight(), 4);
@@ -12063,6 +13642,8 @@ mod tests {
             id: 101,
             alias: "ep-1".to_owned(),
             title: "Episode One".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase: model::PurchaseState::Owned,
             rent_expires_at: None,
             rent_coin: None,
@@ -12073,6 +13654,8 @@ mod tests {
         app.recent_load.loaded = true;
         app.selected_content_alias = "protected".to_owned();
         app.selected_title = "Protected".to_owned();
+        app.selected_creators = "Protected Creator".to_owned();
+        app.selected_synopsis = "Protected synopsis".to_owned();
         app.wallet = WalletState {
             summary: Some(test_wallet_summary()),
             summary_task: Some(scenario.wallet_task),
@@ -12225,6 +13808,8 @@ mod tests {
         assert!(app.episodes.is_empty());
         assert!(app.selected_content_alias.is_empty());
         assert!(app.selected_title.is_empty());
+        assert!(app.selected_creators.is_empty());
+        assert!(app.selected_synopsis.is_empty());
         assert!(app.reader_selection.is_none());
         assert!(app.reader.is_none());
         assert!(app.reader_tasks.is_empty());
@@ -12752,12 +14337,12 @@ mod tests {
         else {
             panic!("opening a comic did not request content");
         };
-        assert!(url.contains("/api/balcony-api-v2/contents/hunter_q?"));
+        assert!(url.contains("/detail/hunter_q"));
         assert!(matches!(
             credential,
             Some(value)
-                if value.secret == "bomtoon-access-token"
-                    && value.header == SecretHeader::Bearer
+                if value.secret == "bomtoon-session"
+                    && value.header == SecretHeader::Named("Cookie".to_owned())
         ));
 
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Unauthorized));
@@ -12803,17 +14388,17 @@ mod tests {
     }
 
     #[test]
-    fn comic_selection_uses_json_content_and_back_returns_to_the_library() {
+    fn comic_selection_uses_personalized_detail_and_back_returns_to_the_library() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (task, work) = only_spawn(&commands);
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. }
-                if url.contains("/api/balcony-api-v2/contents/hunter_q?")
+                if url.contains("/detail/hunter_q")
         ));
 
-        let commands = runner.task_outcome(task, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(task, TaskOutcome::Completed(content_response()));
         let screen = last_screen(&commands);
         assert_eq!(runner.app().view, View::Episodes);
         assert!(screen.owns_back);
@@ -12832,9 +14417,11 @@ mod tests {
         let commands = runner.action(action_id("comic-0"));
         let (task, _) = only_spawn(&commands);
 
-        runner.task_outcome(task, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        runner.task_outcome(task, TaskOutcome::Completed(content_response()));
 
         assert_eq!(runner.app().selected_title, "Localized Title");
+        assert_eq!(runner.app().selected_creators, "Writer");
+        assert_eq!(runner.app().selected_synopsis, "Synopsis");
     }
 
     #[test]
@@ -12871,6 +14458,8 @@ mod tests {
                 id: index,
                 alias: format!("ep-{index}"),
                 title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
                 purchase: model::PurchaseState::Owned,
                 rent_expires_at: None,
                 rent_coin: None,
@@ -12884,6 +14473,7 @@ mod tests {
             episodes,
             ..Bomtoon::default()
         });
+        runner.app_mut().prepare_episode_layout();
 
         let commands = runner.action(action_id(NEXT_PAGE));
         assert_eq!(runner.app().page, 1);
@@ -14045,7 +15635,7 @@ mod tests {
         runner.device_result(DeviceResult::LocalDay(observed))
     }
 
-    fn detail_response(alias: &str, title: &str) -> Vec<u8> {
+    fn public_detail_response(alias: &str, title: &str) -> Vec<u8> {
         format!(
             r#"
                 <meta property="og:title" content="{title} - 漫畫 - BOMTOON">
@@ -14334,14 +15924,14 @@ mod tests {
 
         runner.task_outcome(
             shared_detail,
-            TaskOutcome::Completed(detail_response("feature-a", "Shared refreshed")),
+            TaskOutcome::Completed(public_detail_response("feature-a", "Shared refreshed")),
         );
         assert_eq!(runner.app().featured.featured, old_featured);
         assert_eq!(runner.app().featured.recommended, old_recommended);
         runner.app_mut().featured.page = 7;
         let commands = runner.task_outcome(
             fresh_detail,
-            TaskOutcome::Completed(detail_response("fresh-b", "Fresh B")),
+            TaskOutcome::Completed(public_detail_response("fresh-b", "Fresh B")),
         );
 
         assert_eq!(
@@ -14940,7 +16530,7 @@ mod tests {
     }
 
     #[test]
-    fn featured_tiles_and_rows_use_the_existing_protected_content_route() {
+    fn featured_tiles_and_rows_use_the_authenticated_detail_route() {
         for (index, alias) in [(0, "feature-a"), (3, "rec-0")] {
             let mut runner = AppRunner::new(Bomtoon {
                 account: AccountState::Active,
@@ -14953,7 +16543,7 @@ mod tests {
             let commands = runner.action(action_id(&format!("comic-{index}")));
             let (_, work) = only_spawn(&commands);
 
-            assert_eq!(work, api::content(alias));
+            assert_eq!(work, api::detail(alias));
             assert_eq!(runner.app().pending, Some(Pending::Content(index)));
             assert_eq!(runner.app().selected_content_alias, alias);
         }
@@ -15197,6 +16787,643 @@ mod tests {
             .collect()
     }
 
+    fn episode_thumbnail_url(index: usize) -> String {
+        format!("https://image.balcony.studio/tw/ep_thumbnail/episode-{index}.webp")
+    }
+
+    fn thumbnail_episode(index: usize, thumbnail_url: String) -> Episode {
+        Episode {
+            id: 1_000 + index,
+            alias: format!("thumbnail-{index}"),
+            title: format!("Thumbnail episode {index}"),
+            opened_at: 1_709_136_000_000 + i64::try_from(index).expect("small index") * 1_000,
+            thumbnail_url: Some(thumbnail_url),
+            purchase: model::PurchaseState::Owned,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
+        }
+    }
+
+    fn episode_thumbnail_app(count: usize) -> Bomtoon {
+        let mut app = episode_metadata_app("Synopsis".to_owned());
+        app.episodes = (0..count)
+            .map(|index| thumbnail_episode(index, episode_thumbnail_url(index)))
+            .collect();
+        app.episode_items_per_page = None;
+        app.prepare_episode_layout();
+        app
+    }
+
+    fn episode_thumbnail_runner(count: usize) -> AppRunner<Bomtoon> {
+        AppRunner::with_metrics(episode_thumbnail_app(count), CLARA_BW_METRICS)
+    }
+
+    fn first_episode_lead(screen: &Screen) -> RowLead {
+        screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => rows.first().map(|row| row.lead),
+                _ => None,
+            })
+            .expect("episode row")
+    }
+
+    fn put_picture_handles(commands: &[Command]) -> BTreeSet<PictureHandle> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::PutPicture { handle, .. } => Some(*handle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn episode_thumbnails_request_only_the_visible_page() {
+        let mut runner = episode_thumbnail_runner(12);
+        let rows = runner.app().episode_rows_per_page();
+        assert!(runner.app().episodes.len() > rows);
+        let first_page = (0..rows)
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
+        let second_page = (rows..rows.saturating_mul(2).min(12))
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
+
+        let commands = runner.action(action_id("refresh-layout"));
+        let fetches = cover_fetches(&commands);
+        let requested = fetches
+            .iter()
+            .map(|(_, url)| url.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(!requested.is_empty());
+        assert!(requested.is_subset(&first_page));
+        assert!(requested.is_disjoint(&second_page));
+        assert!(fetches.len() <= 4);
+        assert_eq!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Icon(Glyph::Book)
+        );
+
+        let (ready_task, ready_url) = fetches[0].clone();
+        let commands = runner.task_outcome(ready_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert_eq!(put_picture_handles(&commands).len(), 1);
+        assert!(matches!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Picture(_, Glyph::Book)
+        ));
+        let ready_picture =
+            ready_cover(&runner.app().covers, Some(&ready_url)).expect("visible thumbnail picture");
+        let stale = runner
+            .app()
+            .covers
+            .tasks
+            .iter()
+            .filter(|(_, cover)| first_page.contains(&cover.url))
+            .map(|(task, cover)| (*task, cover.url.clone()))
+            .collect::<Vec<_>>();
+        assert!(stale.len() >= 2, "two stale outcomes must be exercised");
+
+        let commands = runner.action(action_id(NEXT_PAGE));
+        let cancelled = cancelled_tasks(&commands);
+        assert_eq!(runner.app().page, 1);
+        assert!(stale.iter().all(|(task, _)| cancelled.contains(task)));
+        assert!(commands.contains(&Command::DropPicture(ready_picture.handle)));
+        assert!(cover_fetches(&commands)
+            .iter()
+            .all(|(_, url)| second_page.contains(url)));
+
+        for (index, (task, url)) in stale.into_iter().take(2).enumerate() {
+            let outcome = if index == 0 {
+                TaskOutcome::Completed(TINY_WEBP.to_vec())
+            } else {
+                TaskOutcome::Failed(TaskError::TimedOut)
+            };
+            let commands = runner.task_outcome(task, outcome);
+            assert!(put_picture_handles(&commands).is_empty());
+            assert!(runner.app().problem.is_none());
+            assert!(!runner.app().covers.entries.contains_key(&url));
+            assert!(cover_fetches(&commands)
+                .iter()
+                .all(|(_, url)| second_page.contains(url)));
+        }
+        assert!(!runner.app().covers.entries.contains_key(&ready_url));
+    }
+
+    #[test]
+    fn repeated_episode_thumbnail_url_remains_owned_across_pages() {
+        let mut app = episode_thumbnail_app(12);
+        let rows = app.episode_rows_per_page();
+        let shared = episode_thumbnail_url(0);
+        app.episodes[rows].thumbnail_url = Some(shared.clone());
+        app.episode_items_per_page = None;
+        app.prepare_episode_layout();
+        let rows = app.episode_rows_per_page();
+        app.episodes[rows].thumbnail_url = Some(shared.clone());
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id("refresh-layout"));
+        let shared_task = cover_fetches(&commands)
+            .into_iter()
+            .find_map(|(task, url)| (url == shared).then_some(task))
+            .expect("shared visible thumbnail task");
+        let commands = runner.action(action_id(NEXT_PAGE));
+        assert!(!cancelled_tasks(&commands).contains(&shared_task));
+
+        let commands = runner.task_outcome(shared_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert_eq!(put_picture_handles(&commands).len(), 1);
+        assert!(matches!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Picture(_, Glyph::Book)
+        ));
+    }
+
+    #[test]
+    fn episode_thumbnail_failure_keeps_glyph_and_commerce_online_without_page_error() {
+        let mut app = episode_thumbnail_app(1);
+        app.episodes[0].purchase = model::PurchaseState::NotOwned;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id("refresh-layout"));
+        let thumbnail = cover_fetches(&commands)[0].0;
+
+        let commands = runner.task_outcome(thumbnail, TaskOutcome::Failed(TaskError::Offline));
+
+        assert!(put_picture_handles(&commands).is_empty());
+        assert!(runner.app().problem.is_none());
+        assert_eq!(runner.app().connection, ConnectionState::Online);
+        assert_eq!(
+            first_episode_lead(&runner.app().screen()),
+            RowLead::Icon(Glyph::Book)
+        );
+        assert!(cover_fetches(&runner.action(action_id("refresh-layout"))).is_empty());
+    }
+
+    fn cached_episode_thumbnail_runner(
+    ) -> (AppRunner<Bomtoon>, String, TilePicture, String, TilePicture) {
+        let shared = episode_thumbnail_url(0);
+        let episode_only = episode_thumbnail_url(1);
+        let shared_picture = TilePicture::new(PictureHandle(301), 1, 1);
+        let episode_picture = TilePicture::new(PictureHandle(302), 1, 1);
+        let mut app = episode_thumbnail_app(2);
+        app.episodes[0].thumbnail_url = Some(shared.clone());
+        app.episodes[1].thumbnail_url = Some(episode_only.clone());
+        app.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: vec![ShelfComic {
+                title: "Shared shelf comic".to_owned(),
+                alias: "shared-shelf".to_owned(),
+                cover_url: Some(shared.clone()),
+            }],
+            ..FeaturedState::default()
+        };
+        app.covers.entries = BTreeMap::from([
+            (shared.clone(), CoverState::Ready(shared_picture)),
+            (episode_only.clone(), CoverState::Ready(episode_picture)),
+        ]);
+        app.covers.visible_urls = vec![shared.clone(), episode_only.clone()];
+        app.covers.visible_source = Some(CoverSource::Protected);
+        (
+            AppRunner::with_metrics(app, CLARA_BW_METRICS),
+            shared,
+            shared_picture,
+            episode_only,
+            episode_picture,
+        )
+    }
+
+    #[test]
+    fn leaving_episode_view_drops_episode_only_pictures_but_preserves_public_shelf_covers() {
+        let (mut reader, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(reader.app().view, View::Reader);
+        assert_eq!(
+            reader.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!reader.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let (mut main, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        let commands = main.action(ActionId::BACK);
+        assert_eq!(main.app().view, View::Main);
+        assert_eq!(
+            main.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!main.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let (mut replacement, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        replacement.app_mut().view = View::Main;
+        let commands = replacement.action(action_id("comic-0"));
+        assert_eq!(replacement.app().pending, Some(Pending::Content(0)));
+        assert_eq!(
+            replacement.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!replacement.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let mut eviction = episode_thumbnail_app(12);
+        let shared = episode_thumbnail_url(0);
+        let shared_picture = TilePicture::new(PictureHandle(303), 1, 1);
+        eviction.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: vec![ShelfComic {
+                title: "Shared shelf comic".to_owned(),
+                alias: "shared-shelf".to_owned(),
+                cover_url: Some(shared.clone()),
+            }],
+            ..FeaturedState::default()
+        };
+        eviction.covers.entries =
+            BTreeMap::from([(shared.clone(), CoverState::Ready(shared_picture))]);
+        eviction.covers.visible_urls = eviction.visible_cover_urls();
+        eviction.covers.visible_source = Some(CoverSource::Protected);
+        let mut eviction = AppRunner::with_metrics(eviction, CLARA_BW_METRICS);
+        let commands = eviction.action(action_id(NEXT_PAGE));
+        assert_eq!(
+            eviction.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+    }
+
+    fn seed_episode_thumbnail_cache(
+        app: &mut Bomtoon,
+        loading_task: TaskId,
+        ready_picture: TilePicture,
+    ) -> (String, String) {
+        let loading_url = episode_thumbnail_url(0);
+        let ready_url = episode_thumbnail_url(1);
+        app.covers.generation = 17;
+        app.covers.visible_urls = vec![loading_url.clone(), ready_url.clone()];
+        app.covers.visible_source = Some(CoverSource::Protected);
+        app.covers.entries = BTreeMap::from([
+            (loading_url.clone(), CoverState::Loading(loading_task)),
+            (ready_url.clone(), CoverState::Ready(ready_picture)),
+        ]);
+        app.covers.tasks = BTreeMap::from([(
+            loading_task,
+            CoverTask {
+                generation: 17,
+                url: loading_url.clone(),
+                source: CoverSource::Protected,
+            },
+        )]);
+        (loading_url, ready_url)
+    }
+
+    fn assert_episode_thumbnail_cache_cleared(app: &Bomtoon, loading_url: &str, ready_url: &str) {
+        assert!(!app.covers.entries.contains_key(loading_url));
+        assert!(!app.covers.entries.contains_key(ready_url));
+        assert!(app.covers.tasks.is_empty());
+        assert!(!app.covers.visible_urls.contains(&loading_url.to_owned()));
+        assert!(!app.covers.visible_urls.contains(&ready_url.to_owned()));
+    }
+
+    #[test]
+    fn protected_episode_thumbnails_clear_on_suspend_credential_loss_sign_out_and_exit() {
+        let loading = TaskId(801);
+        let picture = TilePicture::new(PictureHandle(401), 1, 1);
+        let mut suspend = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(suspend.app_mut(), loading, picture);
+        let commands = suspend.suspend();
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(suspend.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(802);
+        let picture = TilePicture::new(PictureHandle(402), 1, 1);
+        let mut credential = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(credential.app_mut(), loading, picture);
+        let scope = TaskId(803);
+        credential.app_mut().scope_task = Some(scope);
+        let commands = credential.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(credential.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(804);
+        let picture = TilePicture::new(PictureHandle(404), 1, 1);
+        let mut sign_out = episode_thumbnail_runner(2);
+        sign_out.app_mut().view = View::Account;
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(sign_out.app_mut(), loading, picture);
+        let commands = sign_out.action(action_id(SIGN_OUT));
+        let (logout, work) = only_spawn(&commands);
+        assert_eq!(work, api::logout());
+        let commands = sign_out.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(sign_out.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(805);
+        let picture = TilePicture::new(PictureHandle(405), 1, 1);
+        let mut exit = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(exit.app_mut(), loading, picture);
+        let commands = exit.exit();
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(exit.app(), &loading_url, &ready_url);
+    }
+
+    #[test]
+    fn reader_and_content_foreground_work_preempt_episode_thumbnails() {
+        let mut reader = episode_thumbnail_runner(12);
+        let commands = reader.action(action_id("refresh-layout"));
+        let reader_covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert!(!reader_covers.is_empty());
+        assert_eq!(reader_covers.len(), 4);
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), reader_covers);
+        assert!(cover_fetches(&commands).is_empty());
+        let mut manifest = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072));
+        for task in reader_covers.iter().copied() {
+            if manifest.is_some() {
+                break;
+            }
+            let commands = reader.task_outcome(task, TaskOutcome::Cancelled);
+            assert!(cover_fetches(&commands).is_empty());
+            manifest = spawns(&commands)
+                .into_iter()
+                .find(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072));
+        }
+        assert!(manifest.is_some(), "reader manifest did not resume first");
+
+        let mut content = episode_thumbnail_runner(12);
+        content.app_mut().episodes[0].purchase = model::PurchaseState::Rented;
+        content.app_mut().episodes[0].rent_expires_at = Some(1);
+        let commands = content.action(action_id("refresh-layout"));
+        let content_covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(content_covers.len(), 4);
+
+        let commands = content.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), content_covers);
+        assert!(cover_fetches(&commands).is_empty());
+        let mut detail = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == api::detail("hunter_q"));
+        for task in content_covers.iter().copied() {
+            if detail.is_none() {
+                let commands = content.task_outcome(task, TaskOutcome::Cancelled);
+                assert!(cover_fetches(&commands).is_empty());
+                detail = spawns(&commands)
+                    .into_iter()
+                    .find(|(_, work)| *work == api::detail("hunter_q"));
+            } else {
+                let commands = content.task_outcome(task, TaskOutcome::Cancelled);
+                assert!(cover_fetches(&commands).is_empty());
+            }
+        }
+        let (detail, _) = detail.expect("content refresh did not resume first");
+        let refreshed_thumbnail = episode_thumbnail_url(50);
+        let refreshed_episode = format!(
+            concat!(
+                "{{\"id\":105,\"alias\":\"thumbnail-0\",\"title\":\"Thumbnail episode 0\",",
+                "\"openedAt\":1709136000000,\"isSample\":false,",
+                "\"purchaseStatus\":\"POSSESSION\",",
+                "\"thumbnails\":[{{\"type\":\"COMMON\",\"imagePath\":\"{}\"}}]}}"
+            ),
+            refreshed_thumbnail
+        );
+        let commands = content.task_outcome(
+            detail,
+            TaskOutcome::Completed(detail_response(
+                41,
+                "hunter_q",
+                "Hunter Q",
+                &refreshed_episode,
+            )),
+        );
+        assert!(cover_fetches(&commands)
+            .iter()
+            .any(|(_, url)| url == &refreshed_thumbnail));
+    }
+
+    #[test]
+    fn commerce_foreground_preempts_episode_thumbnails_and_resumes_after_cancellation() {
+        let mut app = episode_thumbnail_app(12);
+        app.episodes[0].purchase = model::PurchaseState::NotOwned;
+        app.episodes[0].purchase_coin = Some(7);
+        let account_scope = app.account_scope.expect("account scope");
+        let _ = app.commerce.marker_loaded(None);
+        let _ = app.commerce.safety_changed(
+            commerce::Authentication::Authenticated(account_scope),
+            commerce::Connectivity::Online,
+        );
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id("refresh-layout"));
+        let covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covers.len(), 4);
+
+        let commands = runner.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), covers);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Quoting
+        );
+        assert!(cover_fetches(&commands).is_empty());
+        let quote_work = api::quote("hunter_q", "thumbnail-0", model::PurchaseType::Possession);
+        let mut quote = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == quote_work);
+        for task in covers {
+            let commands = runner.task_outcome(task, TaskOutcome::Cancelled);
+            assert!(cover_fetches(&commands).is_empty());
+            if quote.is_none() {
+                quote = spawns(&commands)
+                    .into_iter()
+                    .find(|(_, work)| *work == quote_work);
+            }
+        }
+        assert!(quote.is_some(), "quote did not resume before thumbnails");
+    }
+
+    fn add_public_episode_covers(app: &mut Bomtoon, urls: &[String]) {
+        app.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: urls
+                .iter()
+                .enumerate()
+                .map(|(index, url)| ShelfComic {
+                    title: format!("Public shared {index}"),
+                    alias: format!("public-shared-{index}"),
+                    cover_url: Some(url.clone()),
+                })
+                .collect(),
+            ..FeaturedState::default()
+        };
+    }
+
+    #[test]
+    fn shared_public_loading_episode_tasks_yield_to_reader_and_next_page() {
+        let mut reader_app = episode_thumbnail_app(12);
+        let public_urls = (0..4).map(episode_thumbnail_url).collect::<Vec<_>>();
+        add_public_episode_covers(&mut reader_app, &public_urls);
+        let mut reader = AppRunner::with_metrics(reader_app, CLARA_BW_METRICS);
+        let commands = reader.action(action_id("refresh-layout"));
+        let reader_thumbnails = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(reader_thumbnails.len(), 4);
+
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), reader_thumbnails);
+        assert!(cover_fetches(&commands).is_empty());
+        let commands = reader.task_outcome(
+            *reader_thumbnails.iter().next().expect("thumbnail task"),
+            TaskOutcome::Cancelled,
+        );
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072)));
+        assert!(cover_fetches(&commands).is_empty());
+
+        let mut page_app = episode_thumbnail_app(12);
+        let rows = page_app.episode_rows_per_page();
+        let public_urls = (0..4).map(episode_thumbnail_url).collect::<Vec<_>>();
+        add_public_episode_covers(&mut page_app, &public_urls);
+        let second_page_urls = (rows..rows.saturating_mul(2).min(page_app.episodes.len()))
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
+        let mut page = AppRunner::with_metrics(page_app, CLARA_BW_METRICS);
+        let commands = page.action(action_id("refresh-layout"));
+        let first_page_tasks = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_page_tasks.len(), 4);
+
+        let commands = page.action(action_id(NEXT_PAGE));
+        assert_eq!(cancelled_tasks(&commands), first_page_tasks);
+        assert!(cover_fetches(&commands).is_empty());
+        let first_cancelled = *first_page_tasks.iter().next().expect("thumbnail task");
+        let commands = page.task_outcome(first_cancelled, TaskOutcome::Cancelled);
+        let resumed = cover_fetches(&commands);
+        assert_eq!(resumed.len(), 1);
+        assert!(second_page_urls.contains(&resumed[0].1));
+        assert!(!public_urls.contains(&resumed[0].1));
+        assert_eq!(
+            page.app()
+                .covers
+                .tasks
+                .get(&resumed[0].0)
+                .map(|task| task.source),
+            Some(CoverSource::Protected)
+        );
+        let mut second_page_tasks = BTreeSet::from([resumed[0].0]);
+        for task in first_page_tasks
+            .iter()
+            .copied()
+            .filter(|task| *task != first_cancelled)
+        {
+            let commands = page.task_outcome(task, TaskOutcome::Cancelled);
+            let resumed = cover_fetches(&commands);
+            assert_eq!(resumed.len(), 1);
+            assert!(second_page_urls.contains(&resumed[0].1));
+            assert!(!public_urls.contains(&resumed[0].1));
+            assert_eq!(
+                page.app()
+                    .covers
+                    .tasks
+                    .get(&resumed[0].0)
+                    .map(|cover| cover.source),
+                Some(CoverSource::Protected)
+            );
+            second_page_tasks.insert(resumed[0].0);
+        }
+        assert_eq!(second_page_tasks.len(), 4);
+
+        let commands = page.action(ActionId::BACK);
+        assert_eq!(cancelled_tasks(&commands), second_page_tasks);
+        assert!(cover_fetches(&commands).is_empty());
+        let commands = page.task_outcome(
+            *second_page_tasks.iter().next().expect("second-page task"),
+            TaskOutcome::Cancelled,
+        );
+        let shelf = cover_fetches(&commands);
+        assert_eq!(shelf.len(), 1);
+        assert!(public_urls.contains(&shelf[0].1));
+        assert_eq!(
+            page.app()
+                .covers
+                .tasks
+                .get(&shelf[0].0)
+                .map(|cover| cover.source),
+            Some(CoverSource::Public)
+        );
+    }
+
+    #[test]
+    fn rejected_shared_public_outcome_removes_loading_entry_and_retries_when_visible() {
+        let shared = episode_thumbnail_url(0);
+        let stale = TaskId(901);
+        let mut app = episode_thumbnail_app(1);
+        app.view = View::Main;
+        add_public_episode_covers(&mut app, std::slice::from_ref(&shared));
+        app.covers = CoverCache {
+            generation: 23,
+            entries: BTreeMap::from([(shared.clone(), CoverState::Loading(stale))]),
+            tasks: BTreeMap::from([(
+                stale,
+                CoverTask {
+                    generation: 23,
+                    url: shared.clone(),
+                    source: CoverSource::Public,
+                },
+            )]),
+            visible_urls: vec![shared.clone()],
+            visible_source: Some(CoverSource::Public),
+        };
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().featured.featured.clear();
+
+        let commands = runner.task_outcome(stale, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert!(put_picture_handles(&commands).is_empty());
+        assert!(cover_fetches(&commands).is_empty());
+        assert!(!runner.app().covers.entries.contains_key(&shared));
+
+        runner.app_mut().view = View::Episodes;
+        let commands = runner.action(action_id("refresh-layout"));
+        let retry = cover_fetches(&commands);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, shared);
+        assert_eq!(
+            runner
+                .app()
+                .covers
+                .tasks
+                .get(&retry[0].0)
+                .map(|task| task.source),
+            Some(CoverSource::Protected)
+        );
+    }
+
     #[test]
     fn four_active_covers_preempt_for_recent_and_resume_once_after_cancel_settles() {
         let mut runner = library_cover_runner(6);
@@ -15247,17 +17474,25 @@ mod tests {
 
         let resumed = runner.task_outcome(covers[0], TaskOutcome::Cancelled);
         let (content, work) = only_spawn(&resumed);
-        assert_eq!(work, api::content("recent-0"));
+        assert_eq!(work, api::detail("recent-0"));
 
         for cover in covers.into_iter().skip(1) {
             let commands = runner.task_outcome(cover, TaskOutcome::Cancelled);
             assert!(spawns(&commands)
                 .iter()
-                .all(|(_, work)| *work != api::content("recent-0")));
+                .all(|(_, work)| *work != api::detail("recent-0")));
             assert_eq!(runner.app().task, Some(content));
         }
 
-        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        runner.task_outcome(
+            content,
+            TaskOutcome::Completed(detail_response(
+                41,
+                "recent-0",
+                "Recent Zero",
+                "{\"id\":101,\"alias\":\"ep-1\",\"title\":\"Episode One\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\"}",
+            )),
+        );
         assert_eq!(runner.app().view, View::Episodes);
         assert!(runner.app().problem.is_none());
     }
@@ -15623,13 +17858,15 @@ mod tests {
             id,
             alias: format!("episode-{id}"),
             title: format!("Episode {id}"),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase,
             rent_expires_at: None,
             rent_coin: Some(usize::MAX),
             purchase_coin: Some(usize::MAX),
             gift_eligible: true,
         };
-        let app = Bomtoon {
+        let mut app = Bomtoon {
             view: View::Episodes,
             selected_title: "Maximum commerce".to_owned(),
             selected_content_id: Some(41),
@@ -15658,6 +17895,7 @@ mod tests {
             ],
             ..Bomtoon::default()
         };
+        app.prepare_episode_layout();
 
         let screen = app.episode_screen();
         let drawn = format!("{screen:?}");
@@ -15666,11 +17904,20 @@ mod tests {
             "missing independent balances: {drawn}"
         );
         assert!(!drawn.contains("Tickets"));
-        assert!(drawn.contains("Read"));
-        assert!(drawn.contains("View options"));
-        assert!(screen.nodes.iter().any(
-            |node| matches!(node, Node::Button { label, .. } if label.contains("View options"))
-        ));
+        let rows = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("commerce episode rows");
+        assert!(rows
+            .iter()
+            .any(|row| row.trailing.as_deref() == Some("Owned")));
+        assert!(rows
+            .iter()
+            .any(|row| { row.action == action_id("episode-3") && row.trailing.is_none() }));
         assert_fits(&screen);
     }
 
@@ -15692,6 +17939,8 @@ mod tests {
                 id: 105,
                 alias: "paid".to_owned(),
                 title: "Paid Episode".to_owned(),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
                 purchase: model::PurchaseState::NotOwned,
                 rent_expires_at: None,
                 rent_coin: Some(1),
@@ -15731,10 +17980,8 @@ mod tests {
 
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (gift_task, gift_work) = only_spawn(&commands);
         assert_eq!(gift_work, api::title_gifts(41));
         let loading = format!("{:?}", last_screen(&commands));
@@ -15757,8 +18004,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
 
         let commands = runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
@@ -15768,7 +18014,11 @@ mod tests {
             Node::Button { action, label, .. }
                 if *action == action_id(RETRY_GIFTS) && label.contains("Retry Gift")
         )));
-        assert!(format!("{screen:?}").contains("Paid Episode · View options"));
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-0"))
+        )));
         assert_fits(&screen);
 
         let commands = runner.action(action_id(RETRY_GIFTS));
@@ -15790,10 +18040,8 @@ mod tests {
         });
 
         let (content_task, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (gift_task, _) = only_spawn(&commands);
         runner.task_outcome(gift_task, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
 
@@ -15848,8 +18096,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -15891,8 +18138,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -15920,8 +18166,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -15941,23 +18186,29 @@ mod tests {
     #[test]
     fn accepted_coin_rent_reconciles_exact_content_and_wallet_before_forget() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1,"useGoldCoin":1,"useBonusCoin":0,"useFreeCoin":0}}"#;
-        const RENTED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"RENT","rentExpiredAt":1819728000000,"paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
-
         const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        let rented_content = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1819728000000,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
+
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let title = runner.app().selected_title.clone();
         let page = runner.app().page;
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
 
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(RENTED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(rented_content()));
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
@@ -15991,16 +18242,23 @@ mod tests {
     #[test]
     fn accepted_gift_rent_requires_entitlement_and_exact_gift_decrement() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT_GIFT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":0}}"#;
-        const RENTED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"RENT","rentExpiredAt":1819728000000,"paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const ZERO_GIFTS: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":1}],"receivableGifts":[]}}"#;
+        let rented_content = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1819728000000,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
         let (mut runner, post) = runner_waiting_for_gift_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 2, "{commands:?}");
 
-        runner.task_outcome(content, TaskOutcome::Completed(RENTED_CONTENT.to_vec()));
+        runner.task_outcome(content, TaskOutcome::Completed(rented_content()));
         let commands = runner.task_outcome(gift, TaskOutcome::Completed(ZERO_GIFTS.to_vec()));
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -16085,7 +18343,7 @@ mod tests {
             ),
         );
 
-        fetch_task_with(&commands, "/contents/hunter_q?");
+        fetch_task_with(&commands, "/detail/hunter_q");
         assert_eq!(
             runner.app().commerce.state(),
             commerce::CommerceState::Reconciling
@@ -16117,7 +18375,7 @@ mod tests {
         ] {
             let (mut runner, scope) = startup_with_marker(Some(marker_for(test_scope(SCOPE))));
             let commands = runner.task_outcome(scope, TaskOutcome::Completed(SCOPE.to_vec()));
-            let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+            let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
             seed_all_account_data(&mut runner);
             runner.app_mut().pending_purchase_rejection = Some("FAIL");
             runner.app_mut().purchase_rejection_notice = Some("FAIL");
@@ -16144,7 +18402,7 @@ mod tests {
         const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
 
         runner.task_outcome(content, TaskOutcome::Failed(TaskError::TimedOut));
@@ -16186,7 +18444,7 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
@@ -16195,7 +18453,7 @@ mod tests {
             .all(|(_, work)| !matches!(work, Task::Post { .. })));
 
         runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
-        runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -16221,22 +18479,29 @@ mod tests {
     }
     #[test]
     fn zero_hour_rental_refreshes_content_before_starting_reader() {
-        const EXPIRED_RENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":104,"alias":"rented","title":"Rented Episode","isSample":false,"purchaseStatus":"RENT","rentExpiredAt":1,"paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const NO_GIFTS: &[u8] =
             br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
+        let expired_rent = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":104,\"alias\":\"rented\",\"title\":\"Rented Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands = runner.task_outcome(content, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(expired_rent()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
 
         let commands = runner.action(action_id("episode-0"));
         let (refresh, work) = only_spawn(&commands);
-        assert_eq!(work, api::content("hunter_q"));
+        assert_eq!(work, api::detail("hunter_q"));
         assert_eq!(runner.app().view, View::Episodes);
 
-        let commands = runner.task_outcome(refresh, TaskOutcome::Completed(EXPIRED_RENT.to_vec()));
+        let commands = runner.task_outcome(refresh, TaskOutcome::Completed(expired_rent()));
         assert!(spawns(&commands).iter().any(
             |(_, work)| matches!(work, Task::Fetch { url, .. } if url.contains("/contents/images/"))
         ));
@@ -16291,11 +18556,18 @@ mod tests {
     #[test]
     fn back_is_consumed_during_reconciliation_and_marker_clearing() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1}}"#;
-        const RENTED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"RENT","rentExpiredAt":1819728000000,"paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        let rented_content = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1819728000000,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let commands = runner.action(ActionId::BACK);
         assert_eq!(
@@ -16305,7 +18577,7 @@ mod tests {
         assert_eq!(runner.app().view, View::Episodes);
         assert_no_post_or_marker_forget(&commands);
 
-        runner.task_outcome(content, TaskOutcome::Completed(RENTED_CONTENT.to_vec()));
+        runner.task_outcome(content, TaskOutcome::Completed(rented_content()));
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(NINE_COINS.to_vec()));
         assert_eq!(
             runner.app().commerce.state(),
@@ -16328,16 +18600,31 @@ mod tests {
 
         assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
         assert!(runner.app().retained_quote.is_none());
-        let drawn = format!("{:?}", last_screen(&commands));
-        assert!(drawn.contains("Paid Episode · View options"), "{drawn}");
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.iter().any(|row| row.action == action_id("episode-0"))
+        )));
         assert!(!drawn.contains("Use Gift"), "{drawn}");
     }
 
     #[test]
     fn stale_episode_action_during_quote_keeps_original_episode_bound() {
-        const TWO_UNOWNED: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"first","title":"First Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true},{"id":106,"alias":"second","title":"Second Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const NO_GIFTS: &[u8] =
             br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
+        let two_unowned = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                concat!(
+                    "{\"id\":105,\"alias\":\"first\",\"title\":\"First Paid\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true},",
+                    "{\"id\":106,\"alias\":\"second\",\"title\":\"Second Paid\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}"
+                ),
+            )
+        };
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.store_result(StoreResult::Loaded {
@@ -16345,7 +18632,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands = runner.task_outcome(content, TaskOutcome::Completed(TWO_UNOWNED.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(two_unowned()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
 
@@ -16382,10 +18669,20 @@ mod tests {
 
     #[test]
     fn quote_heading_names_the_selected_unowned_episode() {
-        const TWO_UNOWNED: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"first","title":"First Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true},{"id":106,"alias":"second","title":"Second Paid","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const NO_GIFTS: &[u8] =
             br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
         const SECOND_QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":106,"contentsAlias":"hunter_q","episodeAlias":"second","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let two_unowned = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                concat!(
+                    "{\"id\":105,\"alias\":\"first\",\"title\":\"First Paid\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true},",
+                    "{\"id\":106,\"alias\":\"second\",\"title\":\"Second Paid\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}"
+                ),
+            )
+        };
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.store_result(StoreResult::Loaded {
@@ -16393,7 +18690,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands = runner.task_outcome(content, TaskOutcome::Completed(TWO_UNOWNED.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(two_unowned()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(NO_GIFTS.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-1")));
@@ -16410,8 +18707,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(TWO_GIFTS.to_vec()));
         assert_eq!(runner.app().gifts.available, Some(2));
@@ -16477,8 +18773,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
         runner.task_outcome(quote, TaskOutcome::Completed(QUOTE.to_vec()));
@@ -16498,15 +18793,22 @@ mod tests {
     #[test]
     fn accepted_coin_possession_reconciles_and_back_reloads_library() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"POSSESSION","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":2,"useGoldCoin":2,"useBonusCoin":0,"useFreeCoin":0}}"#;
-        const OWNED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"POSSESSION","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        let owned_content = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
-        let commands = runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(owned_content()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert!(commands
@@ -16527,13 +18829,20 @@ mod tests {
 
     #[test]
     fn ambiguous_purchase_with_entitlement_and_exact_delta_clears_without_repost() {
-        const OWNED_CONTENT: &[u8] = br#"{"result":"SUCCESS","data":{"id":41,"episodes":[{"id":105,"alias":"paid","title":"Paid Episode","isSample":false,"purchaseStatus":"POSSESSION","paid":true,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"isRentGift":true}]}}"#;
         const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        let owned_content = || {
+            detail_response(
+                41,
+                "hunter_q",
+                "Localized Title",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
+            )
+        };
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
@@ -16542,7 +18851,7 @@ mod tests {
             .all(|(_, work)| !matches!(work, Task::Post { .. })));
         let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
-        let commands = runner.task_outcome(content, TaskOutcome::Completed(OWNED_CONTENT.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(owned_content()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert!(commands
@@ -16561,15 +18870,14 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(MISMATCHED.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/contents/hunter_q?");
+        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert_eq!(
@@ -16621,8 +18929,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         fetch_task_with(&commands, "/gift/contents/detail?");
         runner.app_mut().view = View::Main;
         runner.action(action_id(ACCOUNT));

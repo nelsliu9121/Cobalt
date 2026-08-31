@@ -83,6 +83,14 @@ pub fn allowed(app: &str, credential: &Credential, url: &str, usage: CredentialU
 /// Reader. The app cannot send it to group libraries, key-management routes,
 /// file downloads, arbitrary queries, or a lookalike origin.
 fn bomtoon_credential_allowed(credential: &Credential, url: &str, usage: CredentialUse) -> bool {
+    if credential.secret == "bomtoon-session" {
+        return usage == CredentialUse::Fetch
+            && matches!(
+                &credential.header,
+                SecretHeader::Named(header) if header.eq_ignore_ascii_case("cookie")
+            )
+            && bomtoon_detail_url(url);
+    }
     if !matches!(
         (&*credential.secret, &credential.header),
         ("bomtoon-access-token", SecretHeader::Bearer)
@@ -119,6 +127,14 @@ fn bomtoon_alias(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn bomtoon_detail_url(url: &str) -> bool {
+    const PREFIX: &str = "https://www.bomtoon.tw/detail/";
+    const MAX_ALIAS_BYTES: usize = 96;
+
+    url.strip_prefix(PREFIX)
+        .is_some_and(|alias| alias.len() <= MAX_ALIAS_BYTES && bomtoon_alias(alias))
 }
 
 fn bomtoon_commerce_alias(value: &str) -> bool {
@@ -344,24 +360,52 @@ mod tests {
     }
 
     #[test]
-    fn bomtoon_session_is_denied_to_every_application_task() {
+    fn bomtoon_session_cookie_is_limited_to_exact_detail_get() {
         use kobo_protocol::Credential;
 
-        for session in [
-            Credential::in_header("bomtoon-session", "Cookie"),
-            Credential::bearer("bomtoon-session"),
+        let session = Credential::in_header("bomtoon-session", "Cookie");
+        let exact = "https://www.bomtoon.tw/detail/hunter_q";
+        assert!(credential_allowed(
+            "bomtoon",
+            &session,
+            RequestMethod::Get,
+            exact
+        ));
+        for (method, url) in [
+            (RequestMethod::Post, exact),
+            (RequestMethod::Get, "https://www.bomtoon.tw/detail/"),
+            (RequestMethod::Get, "https://www.bomtoon.tw/detail/hunter/q"),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/detail/hunter_q?preview=true",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw/detail/hunter_q#episodes",
+            ),
+            (
+                RequestMethod::Get,
+                "https://www.bomtoon.tw:443/detail/hunter_q",
+            ),
+            (RequestMethod::Get, "http://www.bomtoon.tw/detail/hunter_q"),
+            (
+                RequestMethod::Get,
+                "https://attacker.example/detail/hunter_q",
+            ),
         ] {
-            for method in [RequestMethod::Get, RequestMethod::Post] {
-                for url in [
-                    "https://www.bomtoon.tw/api/auth/session",
-                    "https://www.bomtoon.tw/detail/hunter_q",
-                    "https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=1&size=30&isIncludeAdult=true&contentsThumbnailType=SQUARE",
-                ] {
-                    assert!(!credential_allowed(
-                        "bomtoon", &session, method, url
-                    ));
-                }
-            }
+            assert!(!credential_allowed("bomtoon", &session, method, url));
+        }
+        for credential in [
+            Credential::bearer("bomtoon-session"),
+            Credential::in_header("bomtoon-session", "Authorization"),
+            Credential::in_header("another-secret", "Cookie"),
+        ] {
+            assert!(!credential_allowed(
+                "bomtoon",
+                &credential,
+                RequestMethod::Get,
+                exact
+            ));
         }
     }
 
