@@ -2,6 +2,7 @@
 pub struct Comic {
     pub alias: String,
     pub title: String,
+    pub creators: String,
     pub cover_url: Option<String>,
     pub owned_episodes: usize,
     pub total_episodes: usize,
@@ -93,6 +94,7 @@ impl Comment {
 pub struct RecentEntry {
     pub content_alias: String,
     pub content_title: String,
+    pub creators: String,
     pub cover_url: Option<String>,
     pub episode_alias: String,
     pub episode_title: String,

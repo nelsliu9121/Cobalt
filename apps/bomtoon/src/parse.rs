@@ -17,6 +17,7 @@ const MAX_HOMEPAGE_BANNERS: usize = 64;
 const MAX_HOMEPAGE_LIST: usize = 64;
 const MAX_ALIAS_BYTES: usize = 96;
 const MAX_TITLE_BYTES: usize = 256;
+const MAX_CREATORS_BYTES: usize = 512;
 const MAX_COVER_URL_BYTES: usize = 2048;
 const MAX_COMMERCE_BODY_BYTES: usize = 64 * 1024;
 const MAX_GIFT_ENTRIES: usize = 64;
@@ -222,7 +223,9 @@ pub fn library(bytes: &[u8]) -> Result<LibraryPage, ParseError> {
             Ok(Comic {
                 alias: string(item, "alias", "comic.alias")?.to_owned(),
                 title: string(item, "title", "comic.title")?.to_owned(),
-                cover_url: public_thumbnail(item, &["MAIN_NON_ADULT"], PUBLIC_SQUARE_IMAGE_PATHS),
+                creators: bounded_string(item, "creators", "comic.creators", MAX_CREATORS_BYTES)?
+                    .to_owned(),
+                cover_url: public_thumbnail(item, &["SQUARE"], PUBLIC_SQUARE_IMAGE_PATHS),
                 owned_episodes: unsigned(item, "collectionCount", "comic.collectionCount")?,
                 total_episodes: unsigned(item, "episodeCount", "comic.episodeCount")?,
             })
@@ -256,7 +259,9 @@ pub fn recent(bytes: &[u8]) -> Result<RecentPage, ParseError> {
             Ok(RecentEntry {
                 content_alias: string(item, "alias", "recent.alias")?.to_owned(),
                 content_title: string(item, "title", "recent.title")?.to_owned(),
-                cover_url: public_thumbnail(item, &["MAIN_NON_ADULT"], PUBLIC_SQUARE_IMAGE_PATHS),
+                creators: bounded_string(item, "creators", "recent.creators", MAX_CREATORS_BYTES)?
+                    .to_owned(),
+                cover_url: public_thumbnail(item, &["SQUARE"], PUBLIC_SQUARE_IMAGE_PATHS),
                 episode_alias: string(episode, "alias", "recent.episode.alias")?.to_owned(),
                 episode_title: string(episode, "title", "recent.episode.title")?.to_owned(),
             })
@@ -1468,7 +1473,7 @@ mod tests {
     use super::{
         asset_summary, comments, content_detail, expiration_history, gift_balance, homepage,
         images, library, public_detail, purchase_receipt, purchase_rejection_result, quote, recent,
-        replies, ParseError,
+        replies, ParseError, MAX_CREATORS_BYTES,
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
@@ -2285,17 +2290,18 @@ mod tests {
     #[test]
     fn library_response_becomes_typed_comics_with_safe_public_covers() {
         let body = br#"{"result":"SUCCESS","data":{"content":[
-          {"alias":"365","title":"Dinner","collectionCount":25,"episodeCount":25,"thumbnails":[
+          {"alias":"365","title":"Dinner","creators":"Writer | Artist","collectionCount":25,"episodeCount":25,"thumbnails":[
             {"type":"MAIN","imagePath":"https://image.balcony.studio/tw/co_thumbnail/365/adult.webp"},
-            {"type":"MAIN_NON_ADULT","imagePath":"https://image.balcony.studio/tw/co_thumbnail/365/public.webp"}
+            {"type":"SQUARE","imagePath":"https://image.balcony.studio/tw/co_thumbnail/365/public.webp"}
           ]},
-          {"alias":"plain","title":"No cover","collectionCount":1,"episodeCount":2},
-          {"alias":"hostile","title":"Hostile cover","collectionCount":3,"episodeCount":4,"thumbnails":[
+          {"alias":"plain","title":"No cover","creators":"Plain Creator","collectionCount":1,"episodeCount":2},
+          {"alias":"hostile","title":"Hostile cover","creators":"Hostile Creator","collectionCount":3,"episodeCount":4,"thumbnails":[
             {"type":"MAIN_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/hostile/public.webp"}
           ]}
         ],"number":0,"totalPages":1,"totalElements":117}}"#;
         let page = library(body).expect("valid library response");
         assert_eq!(page.comics[0].alias, "365");
+        assert_eq!(page.comics[0].creators, "Writer | Artist");
 
         assert_eq!(page.comics[0].owned_episodes, 25);
         assert_eq!(
@@ -2453,17 +2459,18 @@ mod tests {
     #[test]
     fn recent_response_keeps_aliases_and_safe_public_covers() {
         let body = br#"{"result":"SUCCESS","data":{"content":[
-          {"alias":"hunter_q","title":"Hunter","thumbnails":[
+          {"alias":"hunter_q","title":"Hunter","creators":"Author A, Author B","thumbnails":[
             {"type":"MAIN","imagePath":"https://image.balcony.studio/tw/co_thumbnail/hunter_q/adult.webp"},
-            {"type":"MAIN_NON_ADULT","imagePath":"https://image.balcony.studio/tw/co_thumbnail/hunter_q/public.webp"}
+            {"type":"SQUARE","imagePath":"https://image.balcony.studio/tw/co_thumbnail/hunter_q/public.webp"}
           ],"episode":{"alias":"60","title":"Episode 60"}},
-          {"alias":"plain","title":"Plain","episode":{"alias":"1","title":"Episode 1"}},
-          {"alias":"hostile","title":"Hostile","thumbnails":[
+          {"alias":"plain","title":"Plain","creators":"Plain Creator","episode":{"alias":"1","title":"Episode 1"}},
+          {"alias":"hostile","title":"Hostile","creators":"Hostile Creator","thumbnails":[
             {"type":"MAIN_NON_ADULT","imagePath":"https://image.balcony.studio/tw/contents/hostile/public.webp"}
           ],"episode":{"alias":"2","title":"Episode 2"}}
         ],"number":0,"totalPages":1,"totalElements":3}}"#;
         let page = recent(body).expect("valid recent response");
         assert_eq!(page.entries[0].content_alias, "hunter_q");
+        assert_eq!(page.entries[0].creators, "Author A, Author B");
         assert_eq!(page.entries[0].episode_alias, "60");
         assert_eq!(
             page.entries[0].cover_url.as_deref(),
@@ -2474,6 +2481,32 @@ mod tests {
         assert_eq!(page.entries[2].content_title, "Hostile");
         assert_eq!(page.entries[2].cover_url, None);
         assert_eq!(page.total_items, 3);
+    }
+
+    #[test]
+    fn shelf_creator_text_is_bounded() {
+        let creators = "x".repeat(MAX_CREATORS_BYTES + 1);
+        let library_body = format!(
+            r#"{{"result":"SUCCESS","data":{{"content":[{{
+                "alias":"comic","title":"Comic","creators":"{creators}",
+                "collectionCount":1,"episodeCount":1
+            }}],"number":0,"totalPages":1,"totalElements":1}}}}"#
+        );
+        let recent_body = format!(
+            r#"{{"result":"SUCCESS","data":{{"content":[{{
+                "alias":"comic","title":"Comic","creators":"{creators}",
+                "episode":{{"alias":"1","title":"Episode 1"}}
+            }}],"number":0,"totalPages":1,"totalElements":1}}}}"#
+        );
+
+        assert!(matches!(
+            library(library_body.as_bytes()),
+            Err(ParseError::InvalidValue("comic.creators"))
+        ));
+        assert!(matches!(
+            recent(recent_body.as_bytes()),
+            Err(ParseError::InvalidValue("recent.creators"))
+        ));
     }
 
     fn homepage_document(main: &str) -> String {

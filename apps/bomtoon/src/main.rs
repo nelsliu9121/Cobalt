@@ -1435,15 +1435,15 @@ impl Bomtoon {
                 } else {
                     let (start, end) =
                         page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
-                    screen = screen.rows((start..end).map(|index| {
+                    screen = screen.rows_with_trailing((start..end).map(|index| {
                         let recent = &self.recent[index];
-                        let title_fallback = format!("Title {}", recent.content_alias);
                         let episode_fallback = format!("Episode {}", recent.episode_alias);
                         (
                             format!("comic-{index}"),
-                            display_text(&recent.content_title, &title_fallback),
-                            display_text(&recent.episode_title, &episode_fallback),
+                            recent.content_title.clone(),
+                            recent.creators.clone(),
                             cover_lead(&self.covers, recent.cover_url.as_deref()),
+                            display_text(&recent.episode_title, &episode_fallback),
                         )
                     }));
                     let pages = self
@@ -1467,14 +1467,14 @@ impl Bomtoon {
                 } else {
                     let (start, end) =
                         page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
-                    screen = screen.rows((start..end).map(|index| {
+                    screen = screen.rows_with_trailing((start..end).map(|index| {
                         let comic = &self.comics[index];
-                        let fallback = format!("Title {}", comic.alias);
                         (
                             format!("comic-{index}"),
-                            display_text(&comic.title, &fallback),
-                            format!("{} / {}", comic.owned_episodes, comic.total_episodes),
+                            comic.title.clone(),
+                            comic.creators.clone(),
                             cover_lead(&self.covers, comic.cover_url.as_deref()),
+                            format!("{} / {}", comic.owned_episodes, comic.total_episodes),
                         )
                     }));
                     let pages = self
@@ -6815,6 +6815,7 @@ mod tests {
             "content":[{
                 "alias":"hunter_q",
                 "title":"Hunter Q",
+                "creators":"Hunter Writer | Hunter Artist",
                 "collectionCount":1,
                 "episodeCount":2
             }],
@@ -6829,6 +6830,7 @@ mod tests {
             "content":[{
                 "alias":"hunter_q",
                 "title":"Hunter Q",
+                "creators":"Hunter Writer | Hunter Artist",
                 "episode":{"alias":"60","title":"Episode 60"}
             }],
             "number":0,
@@ -6881,6 +6883,7 @@ mod tests {
             "content":[{
                 "alias":"remote-first",
                 "title":"Remote First",
+                "creators":"Remote Creator",
                 "collectionCount":1,
                 "episodeCount":1
             }],
@@ -7833,6 +7836,7 @@ mod tests {
         runner.app_mut().comics.push(Comic {
             alias: "kept".to_owned(),
             title: "Kept".to_owned(),
+            creators: String::new(),
             cover_url: None,
             owned_episodes: 1,
             total_episodes: 1,
@@ -8757,6 +8761,7 @@ mod tests {
         app.recent.push(RecentEntry {
             content_alias: "hunter_q".to_owned(),
             content_title: "Hunter Q".to_owned(),
+            creators: String::new(),
             cover_url: None,
             episode_alias: "ep-1".to_owned(),
             episode_title: "Episode One".to_owned(),
@@ -12041,6 +12046,7 @@ mod tests {
         app.comics = vec![Comic {
             alias: "protected".to_owned(),
             title: "Protected".to_owned(),
+            creators: String::new(),
             cover_url: Some(scenario.protected_url.clone()),
             owned_episodes: 1,
             total_episodes: 2,
@@ -12048,6 +12054,7 @@ mod tests {
         app.recent = vec![RecentEntry {
             content_alias: "shared".to_owned(),
             content_title: "Shared protected placement".to_owned(),
+            creators: String::new(),
             cover_url: Some(scenario.shared_loading_url.clone()),
             episode_alias: "ep-1".to_owned(),
             episode_title: "Episode One".to_owned(),
@@ -12585,6 +12592,7 @@ mod tests {
             runner.app_mut().comics.push(Comic {
                 alias: format!("comic-{index}"),
                 title: format!("Comic {index}"),
+                creators: String::new(),
                 cover_url: None,
                 owned_episodes: index,
                 total_episodes: REMOTE_LIBRARY_PAGE_SIZE + 1,
@@ -15028,6 +15036,7 @@ mod tests {
         RecentEntry {
             content_alias: format!("recent-{index}"),
             content_title: format!("Recent {index}"),
+            creators: format!("Creators {index}"),
             cover_url,
             episode_alias: format!("episode-{index}"),
             episode_title: format!("Episode title {index}"),
@@ -15038,6 +15047,7 @@ mod tests {
         Comic {
             alias: format!("library-{index}"),
             title: format!("Library {index}"),
+            creators: format!("Creators {index}"),
             cover_url,
             owned_episodes: index + 1,
             total_episodes: index + 7,
@@ -15076,6 +15086,84 @@ mod tests {
             },
             CLARA_BW_METRICS,
         )
+    }
+
+    #[test]
+    fn recent_row_shows_cover_title_creators_and_episode() {
+        let url = shelf_cover_url(0);
+        let picture = TilePicture::new(PictureHandle(7), 60, 60);
+        let mut recent = recent_shelf_entry(0, Some(url.clone()));
+        recent.content_title = "近似嚮導".to_owned();
+        let app = Bomtoon {
+            account: AccountState::Active,
+            view: View::Main,
+            destination: MainDestination::Recent,
+            recent: vec![recent],
+            recent_load: loaded_shelf(),
+            total_recent_titles: 1,
+            covers: CoverCache {
+                entries: BTreeMap::from([(url, CoverState::Ready(picture))]),
+                ..CoverCache::default()
+            },
+            ..Bomtoon::default()
+        };
+
+        let screen = app.main_screen();
+        let row = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => rows.first(),
+                _ => None,
+            })
+            .expect("recent row");
+        assert_eq!(row.title, "近似嚮導");
+        assert_eq!(row.summary, "Creators 0");
+        assert_eq!(row.trailing.as_deref(), Some("Episode title 0"));
+        assert!(matches!(
+            row.lead,
+            RowLead::Picture(lead, Glyph::Book) if lead == picture
+        ));
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn library_row_shows_cover_title_creators_and_owned_total_count() {
+        let url = shelf_cover_url(0);
+        let picture = TilePicture::new(PictureHandle(8), 60, 60);
+        let mut comic = library_shelf_comic(0, Some(url.clone()));
+        comic.title = "戀愛漫畫".to_owned();
+        let app = Bomtoon {
+            account: AccountState::Active,
+            view: View::Main,
+            destination: MainDestination::Library,
+            comics: vec![comic],
+            library_load: loaded_shelf(),
+            total_library_titles: 1,
+            covers: CoverCache {
+                entries: BTreeMap::from([(url, CoverState::Ready(picture))]),
+                ..CoverCache::default()
+            },
+            ..Bomtoon::default()
+        };
+
+        let screen = app.main_screen();
+        let row = screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => rows.first(),
+                _ => None,
+            })
+            .expect("library row");
+        assert_eq!(row.title, "戀愛漫畫");
+        assert_eq!(row.summary, "Creators 0");
+        assert_eq!(row.trailing.as_deref(), Some("1 / 7"));
+        assert!(matches!(
+            row.lead,
+            RowLead::Picture(lead, Glyph::Book) if lead == picture
+        ));
+        assert_fits(&screen);
     }
 
     fn four_cover_task_ids(commands: &[Command]) -> Vec<TaskId> {
@@ -15236,7 +15324,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_shelf_recent_uses_six_episode_summary_rows_and_ready_picture() {
+    fn compact_shelf_recent_uses_creator_rows_with_episode_trailing_and_ready_picture() {
         let mut runner = recent_cover_runner(6);
         let commands = runner.action(action_id(RECENT));
         let first_screen = last_screen(&commands);
@@ -15251,7 +15339,8 @@ mod tests {
         assert_eq!(first_rows.len(), 6);
         assert!(first_rows.iter().enumerate().all(|(index, row)| {
             row.title == format!("Recent {index}")
-                && row.summary == format!("Episode title {index}")
+                && row.summary == format!("Creators {index}")
+                && row.trailing.as_deref() == Some(format!("Episode title {index}").as_str())
                 && row.lead == kobo_sdk::RowLead::Icon(Glyph::Book)
         }));
         assert!(first_screen.nav_bar.is_some());
@@ -15272,7 +15361,8 @@ mod tests {
             })
             .expect("Recent compact rows");
         assert_eq!(ready_rows[0].title, "Recent 0");
-        assert_eq!(ready_rows[0].summary, "Episode title 0");
+        assert_eq!(ready_rows[0].summary, "Creators 0");
+        assert_eq!(ready_rows[0].trailing.as_deref(), Some("Episode title 0"));
         assert!(matches!(
             ready_rows[0].lead,
             kobo_sdk::RowLead::Picture(TilePicture { source: (1, 1), .. }, Glyph::Book)
@@ -15285,7 +15375,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_shelf_library_uses_six_owned_total_rows_and_fixed_nav() {
+    fn compact_shelf_library_uses_creator_rows_with_owned_total_trailing_and_fixed_nav() {
         let mut runner = AppRunner::with_metrics(
             Bomtoon {
                 account: AccountState::Active,
@@ -15313,7 +15403,9 @@ mod tests {
         assert_eq!(rows.len(), 6);
         assert!(rows.iter().enumerate().all(|(index, row)| {
             row.title == format!("Library {index}")
-                && row.summary == format!("{} / {}", index + 1, index + 7)
+                && row.summary == format!("Creators {index}")
+                && row.trailing.as_deref()
+                    == Some(format!("{} / {}", index + 1, index + 7).as_str())
                 && row.lead == kobo_sdk::RowLead::Icon(Glyph::Book)
         }));
         assert!(screen.nav_bar.is_some());
