@@ -168,8 +168,19 @@ impl FeaturedState {
     }
 
     pub fn begin_failed_retry(&mut self) -> Vec<FeatureSource> {
-        let (failed_sources, collections, banners, resolved_banners) =
-            if let Some(snapshot) = &self.snapshot {
+        let (failed_sources, collections, banners, resolved_banners, refresh_day) =
+            if let Some(batch) = &self.batch {
+                if !batch.settled() {
+                    return Vec::new();
+                }
+                (
+                    failed_sources(batch),
+                    batch.collections.clone(),
+                    batch.banners.clone(),
+                    batch.resolved_banners.clone(),
+                    batch.refresh_day,
+                )
+            } else if let Some(snapshot) = &self.snapshot {
                 (
                     snapshot.failed_sources.clone(),
                     snapshot.sources.clone(),
@@ -185,13 +196,7 @@ impl FeaturedState {
                         .iter()
                         .map(|comic| (comic.alias.clone(), comic.clone()))
                         .collect(),
-                )
-            } else if let Some(batch) = &self.batch {
-                (
-                    failed_sources(batch),
-                    batch.collections.clone(),
-                    batch.banners.clone(),
-                    batch.resolved_banners.clone(),
+                    self.loaded_day,
                 )
             } else {
                 return Vec::new();
@@ -220,7 +225,7 @@ impl FeaturedState {
         let retry_sources = queued.iter().copied().collect();
         self.batch = Some(FeatureBatch {
             generation: self.generation,
-            refresh_day: self.loaded_day,
+            refresh_day,
             retry_only: true,
             statuses,
             queued,
@@ -829,6 +834,57 @@ mod tests {
         assert!(state.snapshot().is_none());
         assert!(state.is_failed());
         assert_eq!(state.begin_failed_retry(), FEATURE_SOURCES.to_vec());
+    }
+
+    #[test]
+    fn retry_prefers_a_retained_all_failed_refresh_over_an_old_full_snapshot() {
+        let mut state = FeaturedState::default();
+        state.begin_full_batch(None);
+        settle_all_sources(&mut state, successful_results("old"));
+
+        state.begin_full_batch(None);
+        for source in FEATURE_SOURCES {
+            state.settle(SourceResult::failure(source));
+        }
+        state.publish_ready_banner_details();
+
+        assert_eq!(state.begin_failed_retry(), FEATURE_SOURCES.to_vec());
+    }
+
+    #[test]
+    fn retry_uses_new_failures_instead_of_an_older_partial_snapshot() {
+        let mut state = state_with_partial_snapshot();
+        assert_eq!(
+            state.snapshot().expect("partial").failed_sources,
+            BTreeSet::from([FeatureSource::Ranking])
+        );
+
+        state.begin_full_batch(None);
+        for source in FEATURE_SOURCES {
+            state.settle(SourceResult::failure(source));
+        }
+        state.publish_ready_banner_details();
+
+        assert_eq!(state.begin_failed_retry(), FEATURE_SOURCES.to_vec());
+    }
+
+    #[test]
+    fn successful_retry_of_an_initial_failed_batch_commits_its_observed_day() {
+        let day = LocalDay::new(2026, 9, 1).expect("day");
+        let mut state = FeaturedState::default();
+        state.begin_full_batch(None);
+        assert!(!state.observe_day(day));
+        for source in FEATURE_SOURCES {
+            state.settle(SourceResult::failure(source));
+        }
+        state.publish_ready_banner_details();
+
+        assert_eq!(state.begin_failed_retry(), FEATURE_SOURCES.to_vec());
+        settle_all_sources(&mut state, successful_results("retry"));
+
+        assert_eq!(state.loaded_day, Some(day));
+        assert!(!state.observe_day(day));
+        assert!(state.batch.is_none());
     }
 
     #[test]

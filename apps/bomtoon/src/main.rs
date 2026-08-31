@@ -455,6 +455,11 @@ fn add_featured_content(
     covers: &CoverCache,
     first_page_rows: usize,
 ) -> ScreenBuilder {
+    if featured.is_failed() {
+        return screen
+            .banner(BannerLevel::Attention, "Featured could not be loaded.")
+            .primary_button(RETRY, "Try again");
+    }
     if featured.feed_page == 0 {
         if let Some(warning) = featured.warning() {
             let pages = featured_display_page_count(featured, first_page_rows);
@@ -464,11 +469,6 @@ fn add_featured_content(
                 .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
                 .page_position(1, u16::try_from(pages).unwrap_or(u16::MAX));
         }
-    }
-    if featured.is_failed() {
-        return screen
-            .banner(BannerLevel::Attention, "Featured could not be loaded.")
-            .primary_button(RETRY, "Try again");
     }
     if featured.snapshot().is_some() {
         let content_page = featured_content_page(featured).unwrap_or(0);
@@ -14043,6 +14043,29 @@ mod tests {
     }
 
     #[test]
+    fn feature_initial_total_failure_has_one_dedicated_retry_page() {
+        let (mut runner, commands) = started();
+        let scope = scope_task(&commands);
+        runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+
+        let mut commands = Vec::new();
+        for source in FEATURE_SOURCES {
+            commands = settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Failed(TaskError::Offline),
+            );
+        }
+
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Featured could not be loaded."));
+        assert!(!drawn.contains("Some Featured collections could not be loaded."));
+        assert_eq!(retry_button_count(&screen), 1);
+        assert!(screen.page_turns.is_none());
+    }
+
+    #[test]
     fn feature_source_batch_partial_failure_publishes_one_retry_action() {
         let mut runner = AppRunner::with_metrics(
             ready_featured(local_day(30), "old"),
@@ -14131,6 +14154,17 @@ mod tests {
             .as_ref()
             .is_some_and(|batch| batch.settled()));
         assert_eq!(retry_button_count(&last_screen(&commands)), 1);
+        let screen = last_screen(&commands);
+        let drawn = format!("{screen:?}");
+        assert!(drawn.contains("Some Featured collections could not be loaded."));
+        assert!(!drawn.contains("Featured could not be loaded."));
+        assert_eq!(
+            screen
+                .page_turns
+                .as_ref()
+                .and_then(|turns| turns.position),
+            Some((1, 2))
+        );
     }
 
     #[test]
