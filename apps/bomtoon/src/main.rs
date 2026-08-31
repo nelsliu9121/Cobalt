@@ -4,7 +4,8 @@ mod feature;
 mod model;
 mod parse;
 use feature::{
-    feed_blocks, FeedBlock, FeedPage, FeatureSnapshot, FeatureSource, FeaturedState, SourceResult,
+    compact_count, feed_blocks, CollectionView, DetailState, FeedBlock, FeedPage, FeatureSnapshot,
+    FeatureSource, FeaturedState, SourceResult,
 };
 #[cfg(test)]
 use feature::FEATURE_SOURCES;
@@ -12,8 +13,9 @@ use feature::FEATURE_SOURCES;
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, ControlState, DeviceRequest, DeviceResult,
-    DisplayMetrics, Failure, Glyph, KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen,
-    ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, CLARA_BW_METRICS,
+    DisplayMetrics, Failure, Glyph, KoboApp, LocalDay, PictureFit, PictureHandle, ReadingChrome,
+    RowLead, RowLineLimits, Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome,
+    TilePicture, CLARA_BW_METRICS,
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
@@ -69,6 +71,7 @@ enum View {
     #[default]
     Status,
     Main,
+    FeatureCollection,
     Account,
     Episodes,
     Reader,
@@ -270,6 +273,12 @@ enum FeatureTaskPurpose {
         generation: u64,
         alias: String,
     },
+    CollectionDetail {
+        generation: u64,
+        collection_generation: u64,
+        collection_id: String,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,6 +328,19 @@ fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
     ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
         RowLead::Picture(picture, Glyph::Book)
     })
+}
+
+fn collection_cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
+    ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
+        RowLead::Picture(picture.with_fit(PictureFit::Cover), Glyph::Book)
+    })
+}
+
+fn synopsis_for(cache: &BTreeMap<String, DetailState>, alias: &str) -> String {
+    match cache.get(alias) {
+        Some(DetailState::Ready(detail)) => detail.synopsis.clone().unwrap_or_default(),
+        Some(DetailState::Loading(_) | DetailState::Failed) | None => String::new(),
+    }
 }
 
 fn add_feed_blocks(
@@ -966,21 +988,22 @@ struct Bomtoon {
 impl Bomtoon {
     fn show(&mut self, context: &mut Context) {
         self.sync_visible_covers(context);
-        let owns_back = self.account == AccountState::Active
-            && match self.view {
-                View::Account | View::Episodes => {
-                    self.pending.is_none()
-                        && self.queued_foreground.is_none()
-                        && self.problem.is_none()
-                }
-                View::Reader | View::CommentAppendix | View::Comments | View::Replies => true,
-                View::Status | View::Main => false,
-            };
+        let owns_back = self.view == View::FeatureCollection
+            || (self.account == AccountState::Active
+                && match self.view {
+                    View::Account | View::Episodes => {
+                        self.pending.is_none()
+                            && self.queued_foreground.is_none()
+                            && self.problem.is_none()
+                    }
+                    View::Reader | View::CommentAppendix | View::Comments | View::Replies => true,
+                    View::Status | View::Main | View::FeatureCollection => false,
+                });
         context.set_screen(self.screen().with_own_back(owns_back));
     }
 
     fn visible_cover_urls(&self) -> Vec<String> {
-        if self.view != View::Main
+        if !matches!(self.view, View::Main | View::FeatureCollection)
             || self.pending.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
@@ -996,6 +1019,23 @@ impl Bomtoon {
                 }
             }
         };
+        if self.view == View::FeatureCollection {
+            if let Some((view, collection)) =
+                self.featured.collection.as_ref().and_then(|view| {
+                    self.featured
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.collection(&view.collection_id))
+                        .map(|collection| (view, collection))
+                })
+            {
+                if let Some(range) = view.pages.get(view.page) {
+                    for comic in &collection.comics[range.clone()] {
+                        push(comic.square_url.as_ref().or(comic.vertical_url.as_ref()));
+                    }
+                }
+            }
+            return visible;
+        }
         match self.destination {
             MainDestination::Featured if self.featured.snapshot().is_some() => {
                 let snapshot = self.featured.snapshot().expect("checked Feature snapshot");
@@ -1041,11 +1081,16 @@ impl Bomtoon {
     }
 
     fn visible_cover_source(&self) -> Option<CoverSource> {
-        if self.view != View::Main
-            || self.pending.is_some()
+        if self.pending.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
         {
+            return None;
+        }
+        if self.view == View::FeatureCollection {
+            return Some(CoverSource::Public);
+        }
+        if self.view != View::Main {
             return None;
         }
         Some(match self.destination {
@@ -1313,6 +1358,7 @@ impl Bomtoon {
                 .primary_button(RETRY, "Connect")
                 .build(),
             View::Main => self.main_screen(),
+            View::FeatureCollection => self.collection_screen(),
             View::Account => self.account_screen(),
             View::Episodes => self.episode_screen(),
             View::Reader => self.reader_screen(),
@@ -1442,6 +1488,57 @@ impl Bomtoon {
 
         screen
             .nav_bar(self.destination.index(), MAIN_DESTINATIONS)
+            .build()
+    }
+
+    fn collection_screen(&self) -> Screen {
+        let Some((view, collection)) = self.featured.collection.as_ref().and_then(|view| {
+            self.featured
+                .snapshot()
+                .and_then(|snapshot| snapshot.collection(&view.collection_id))
+                .map(|collection| (view, collection))
+        }) else {
+            return ScreenBuilder::new("bomtoon-feature-collection")
+                .top_bar("Featured")
+                .text("This collection is no longer available.")
+                .build();
+        };
+
+        let mut screen =
+            ScreenBuilder::new("bomtoon-feature-collection").top_bar(collection.label.clone());
+        if let Some(range) = view.pages.get(view.page) {
+            screen = screen.described_rows_with_trailing(
+                RowLineLimits::new(1, 1, 2),
+                range.clone().map(|index| {
+                    let comic = &collection.comics[index];
+                    (
+                        comic_action(&collection.id, index),
+                        display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
+                        display_text(&comic.creators, ""),
+                        synopsis_for(&self.featured.detail_cache, &comic.alias),
+                        collection_cover_lead(
+                            &self.covers,
+                            comic.square_url.as_deref().or(comic.vertical_url.as_deref()),
+                        ),
+                        compact_count(comic.view_count),
+                    )
+                }),
+            );
+        } else {
+            screen = screen.activity("Loading collection details", None);
+        }
+
+        let complete = view
+            .pages
+            .last()
+            .is_some_and(|range| range.end >= collection.comics.len());
+        let total = complete.then_some(view.pages.len()).unwrap_or(0);
+        screen
+            .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
+            .page_position(
+                u16::try_from(view.page.saturating_add(1)).unwrap_or(u16::MAX),
+                u16::try_from(total).unwrap_or(u16::MAX),
+            )
             .build()
     }
 
@@ -3050,6 +3147,10 @@ impl Bomtoon {
     }
 
     fn transition_after_credential_loss(&mut self, context: &mut Context, account: AccountState) {
+        if self.featured.collection.is_some() {
+            self.cancel_collection_details(context);
+            self.featured.collection = None;
+        }
         self.clear_protected_state(context);
         self.account = account;
         self.connection = ConnectionState::Online;
@@ -3068,6 +3169,15 @@ impl Bomtoon {
     }
 
     fn clear_all_state(&mut self, context: &mut Context) {
+        if self.featured.collection.is_some()
+            || self
+                .feature_tasks
+                .values()
+                .any(|purpose| matches!(purpose, FeatureTaskPurpose::CollectionDetail { .. }))
+        {
+            self.cancel_collection_details(context);
+            self.featured.collection = None;
+        }
         if self.view.is_reader_flow() {
             self.view = View::Episodes;
         }
@@ -3077,7 +3187,9 @@ impl Bomtoon {
             context.cancel(task);
         }
         self.superseded_feature_tasks.clear();
+        self.featured.snapshot_generation = self.featured.snapshot_generation.wrapping_add(1);
         self.featured.snapshot = None;
+        self.featured.detail_cache.clear();
         self.featured.batch = None;
         self.featured.feed_page = 0;
         self.featured.loaded_day = None;
@@ -3182,11 +3294,66 @@ impl Bomtoon {
             );
             spawned = true;
         }
+
+        loop {
+            let next = self.featured.collection.as_ref().and_then(|collection| {
+                collection.queued_aliases.front().map(|alias| {
+                    (
+                        self.featured.snapshot_generation,
+                        collection.generation,
+                        collection.collection_id.clone(),
+                        alias.clone(),
+                    )
+                })
+            });
+            let Some((generation, collection_generation, collection_id, alias)) = next else {
+                break;
+            };
+            if self.featured.detail_cache.contains_key(&alias) {
+                if let Some(collection) = self.featured.collection.as_mut() {
+                    collection.queued_aliases.pop_front();
+                }
+                continue;
+            }
+            let Some(task) = context.spawn(api::public_detail(&alias)) else {
+                return spawned;
+            };
+            let Some(collection) = self.featured.collection.as_mut().filter(|collection| {
+                collection.generation == collection_generation
+                    && collection.collection_id == collection_id
+                    && collection.queued_aliases.front() == Some(&alias)
+            }) else {
+                context.cancel(task);
+                return spawned;
+            };
+            collection.queued_aliases.pop_front();
+            collection.pending_aliases.insert(alias.clone());
+            self.featured
+                .detail_cache
+                .insert(alias.clone(), DetailState::Loading(task));
+            self.feature_tasks.insert(
+                task,
+                FeatureTaskPurpose::CollectionDetail {
+                    generation,
+                    collection_generation,
+                    collection_id,
+                    alias,
+                },
+            );
+            spawned = true;
+        }
         spawned
     }
 
     fn start_feature_batch(&mut self, context: &mut Context, refresh_day: Option<LocalDay>) {
-        for &task in self.feature_tasks.keys() {
+        let superseded = self
+            .feature_tasks
+            .iter()
+            .filter_map(|(task, purpose)| {
+                (!matches!(purpose, FeatureTaskPurpose::CollectionDetail { .. })).then_some(*task)
+            })
+            .collect::<Vec<_>>();
+        for task in superseded {
             if self.superseded_feature_tasks.insert(task) {
                 context.cancel(task);
             }
@@ -3205,6 +3372,7 @@ impl Bomtoon {
 
     fn handle_feature_outcome(
         &mut self,
+        context: &mut Context,
         purpose: FeatureTaskPurpose,
         outcome: TaskOutcome,
     ) -> bool {
@@ -3235,7 +3403,11 @@ impl Bomtoon {
                 if !self.featured.settle_generation(generation, result) {
                     return false;
                 }
+                let published = self.featured.snapshot_generation;
                 self.featured.publish_ready_banner_details();
+                if self.featured.snapshot_generation != published {
+                    self.reconcile_published_collection(context);
+                }
                 true
             }
             FeatureTaskPurpose::BannerDetail { generation, alias } => {
@@ -3254,9 +3426,219 @@ impl Bomtoon {
                 {
                     return false;
                 }
+                let published = self.featured.snapshot_generation;
                 self.featured.publish_ready_banner_details();
+                if self.featured.snapshot_generation != published {
+                    self.reconcile_published_collection(context);
+                }
                 true
             }
+            FeatureTaskPurpose::CollectionDetail {
+                generation,
+                collection_generation,
+                collection_id,
+                alias,
+            } => {
+                if generation != self.featured.snapshot_generation
+                    || !self.featured.collection.as_ref().is_some_and(|collection| {
+                        collection.generation == collection_generation
+                            && collection.collection_id == collection_id
+                            && collection.pending_aliases.contains(&alias)
+                    })
+                {
+                    return false;
+                }
+                let detail = match outcome {
+                    TaskOutcome::Completed(bytes) => parse::public_detail(&bytes, &alias)
+                        .map(DetailState::Ready)
+                        .unwrap_or(DetailState::Failed),
+                    TaskOutcome::Failed(_) | TaskOutcome::Cancelled => DetailState::Failed,
+                };
+                self.featured.detail_cache.insert(alias.clone(), detail);
+                if let Some(collection) = self.featured.collection.as_mut() {
+                    collection.pending_aliases.remove(&alias);
+                }
+                self.resume_feature_capacity(context);
+                self.settle_collection_window(context);
+                true
+            }
+        }
+    }
+
+    fn settle_collection_window(&mut self, context: &Context) {
+        let Some((collection_id, start, end)) =
+            self.featured.collection.as_ref().and_then(|view| {
+                (view.queued_aliases.is_empty()
+                    && view.pending_aliases.is_empty()
+                    && view.window_end > view.window_start
+                    && view.next_start() == view.window_start)
+                    .then(|| {
+                        (
+                            view.collection_id.clone(),
+                            view.window_start,
+                            view.window_end,
+                        )
+                    })
+            })
+        else {
+            return;
+        };
+        let Some(collection) = self
+            .featured
+            .snapshot()
+            .and_then(|snapshot| snapshot.collection(&collection_id))
+        else {
+            return;
+        };
+        let candidates = &collection.comics[start..end.min(collection.comics.len())];
+        if candidates.is_empty() {
+            return;
+        }
+        let candidate_count = candidates.len();
+        let owned = candidates
+            .iter()
+            .map(|comic| {
+                (
+                    display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
+                    display_text(&comic.creators, ""),
+                    synopsis_for(&self.featured.detail_cache, &comic.alias),
+                    compact_count(comic.view_count),
+                )
+            })
+            .collect::<Vec<_>>();
+        let measured = owned
+            .iter()
+            .map(|(title, creators, synopsis, trailing)| {
+                (
+                    title.as_str(),
+                    creators.as_str(),
+                    synopsis.as_str(),
+                    trailing.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pages = context.paginate_described_rows_with_trailing(
+            &measured,
+            RowLineLimits::new(1, 1, 2),
+            false,
+        );
+        let count = pages.first().map_or(1, |page| page.len().max(1));
+        if let Some(view) = self.featured.collection.as_mut().filter(|view| {
+            view.collection_id == collection_id
+                && view.window_start == start
+                && view.window_end == end
+                && view.queued_aliases.is_empty()
+                && view.pending_aliases.is_empty()
+        }) {
+            view.commit_page(start, count.min(candidate_count));
+            view.page = view.pages.len().saturating_sub(1);
+        }
+    }
+
+    fn queue_collection_window(&mut self, context: &mut Context) {
+        let Some(collection_id) = self
+            .featured
+            .collection
+            .as_ref()
+            .map(|view| view.collection_id.clone())
+        else {
+            return;
+        };
+        let Some(aliases) = self
+            .featured
+            .snapshot()
+            .and_then(|snapshot| snapshot.collection(&collection_id))
+            .map(|collection| {
+                collection
+                    .comics
+                    .iter()
+                    .map(|comic| comic.alias.clone())
+                    .collect::<Vec<_>>()
+            })
+        else {
+            return;
+        };
+        if let Some(view) = self.featured.collection.as_mut() {
+            view.queue_detail_window(&aliases, &self.featured.detail_cache);
+        }
+        self.resume_feature_capacity(context);
+        self.settle_collection_window(context);
+    }
+
+    fn cancel_collection_details(&mut self, context: &mut Context) {
+        self.featured.detail_generation = self.featured.detail_generation.wrapping_add(1);
+        let tasks = self
+            .feature_tasks
+            .iter()
+            .filter_map(|(task, purpose)| {
+                matches!(purpose, FeatureTaskPurpose::CollectionDetail { .. }).then_some(*task)
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            if let Some(FeatureTaskPurpose::CollectionDetail { alias, .. }) =
+                self.feature_tasks.remove(&task)
+            {
+                context.cancel(task);
+                if self.featured.detail_cache.get(&alias) == Some(&DetailState::Loading(task)) {
+                    self.featured.detail_cache.remove(&alias);
+                }
+            }
+        }
+        if let Some(view) = self.featured.collection.as_mut() {
+            for alias in &view.pending_aliases {
+                if matches!(
+                    self.featured.detail_cache.get(alias),
+                    Some(DetailState::Loading(_))
+                ) {
+                    self.featured.detail_cache.remove(alias);
+                }
+            }
+            view.generation = self.featured.detail_generation;
+            view.pending_aliases.clear();
+            view.queued_aliases.clear();
+        }
+    }
+
+    fn reconcile_published_collection(&mut self, context: &mut Context) {
+        let Some((collection_id, origin_feed_page)) =
+            self.featured.collection.as_ref().map(|view| {
+                (view.collection_id.clone(), view.origin_feed_page)
+            })
+        else {
+            return;
+        };
+        self.cancel_collection_details(context);
+        let replacement_len = self
+            .featured
+            .snapshot()
+            .and_then(|snapshot| snapshot.collection(&collection_id))
+            .map(|collection| collection.comics.len());
+        if let Some(len) = replacement_len {
+            let mut view = CollectionView::new(&collection_id, origin_feed_page, len);
+            view.generation = self.featured.detail_generation;
+            self.featured.collection = Some(view);
+            self.queue_collection_window(context);
+            return;
+        }
+
+        self.featured.collection = None;
+        self.destination = MainDestination::Featured;
+        self.view = View::Main;
+        let last_page = featured_feed_pages(&self.featured, &CLARA_BW_METRICS)
+            .len()
+            .saturating_sub(1);
+        self.featured.feed_page = origin_feed_page.min(last_page);
+    }
+
+    fn resume_cancelled_collection_window(&mut self, context: &mut Context) {
+        let should_resume = self.featured.collection.as_ref().is_some_and(|view| {
+            view.queued_aliases.is_empty()
+                && view.pending_aliases.is_empty()
+                && view.window_start == view.next_start()
+                && view.window_end > view.window_start
+        });
+        if should_resume {
+            self.queue_collection_window(context);
         }
     }
 
@@ -4106,6 +4488,10 @@ impl Bomtoon {
         title: String,
         pending_index: usize,
     ) {
+        if self.featured.collection.is_some() {
+            self.cancel_collection_details(context);
+            self.featured.collection = None;
+        }
         if self.account != AccountState::Active {
             self.destination = MainDestination::Featured;
             self.view = View::Status;
@@ -4146,16 +4532,21 @@ impl Bomtoon {
     }
 
     fn open_collection(&mut self, context: &mut Context, id: &str) {
-        if self
+        let Some(len) = self
             .featured
             .snapshot()
             .and_then(|snapshot| snapshot.collection(id))
-            .is_none()
-        {
+            .map(|collection| collection.comics.len())
+        else {
             return;
-        }
-        self.featured.collection_id = Some(id.to_owned());
-        self.featured.origin_feed_page = self.featured.feed_page;
+        };
+        self.featured.detail_generation = self.featured.detail_generation.wrapping_add(1);
+        let mut view = CollectionView::new(id, self.featured.feed_page, len);
+        view.generation = self.featured.detail_generation;
+        self.featured.collection = Some(view);
+        self.destination = MainDestination::Featured;
+        self.view = View::FeatureCollection;
+        self.queue_collection_window(context);
         self.show(context);
     }
 
@@ -5370,9 +5761,16 @@ impl KoboApp for Bomtoon {
     fn on_resume(&mut self, context: &mut Context) {
         self.request_local_day(context);
         self.request_commerce_scope(context);
+        self.resume_cancelled_collection_window(context);
+        if self.view == View::FeatureCollection {
+            self.show(context);
+        }
     }
 
     fn on_suspend(&mut self, context: &mut Context) {
+        if self.featured.collection.is_some() {
+            self.cancel_collection_details(context);
+        }
         self.clear_commerce_access(context);
         if self.view.is_reader_flow()
             || self.reader_selection.is_some()
@@ -5394,11 +5792,15 @@ impl KoboApp for Bomtoon {
 
     fn on_background(&mut self, context: &mut Context) {
         self.clear_commerce_access(context);
+        if self.featured.collection.is_some() {
+            self.cancel_collection_details(context);
+        }
     }
 
     fn on_foreground(&mut self, context: &mut Context) {
         self.request_local_day(context);
         self.request_commerce_scope(context);
+        self.resume_cancelled_collection_window(context);
     }
 
     fn on_device_result(
@@ -5425,6 +5827,19 @@ impl KoboApp for Bomtoon {
         reason = "one ordered action dispatcher keeps Back, retry, and view ownership explicit"
     )]
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
+        if self.view == View::FeatureCollection && action == ActionId::BACK {
+            self.cancel_collection_details(context);
+            let origin = self
+                .featured
+                .collection
+                .take()
+                .map_or(0, |view| view.origin_feed_page);
+            self.featured.feed_page = origin;
+            self.view = View::Main;
+            self.destination = MainDestination::Featured;
+            self.show(context);
+            return;
+        }
         if self.view == View::Episodes && action == action_id(RETRY_GIFTS) {
             self.refresh_title_gifts(context, GiftTaskPurpose::Display);
             self.show(context);
@@ -5523,7 +5938,11 @@ impl KoboApp for Bomtoon {
                     self.show(context);
                     return;
                 }
-                View::Status | View::Main | View::Account | View::Episodes => {}
+                View::Status
+                | View::Main
+                | View::FeatureCollection
+                | View::Account
+                | View::Episodes => {}
             }
         }
         if matches!(
@@ -5531,6 +5950,61 @@ impl KoboApp for Bomtoon {
             View::CommentAppendix | View::Comments | View::Replies
         ) {
             self.handle_comment_action(context, action);
+            return;
+        }
+        if self.view == View::FeatureCollection {
+            if action == action_id(PREVIOUS_PAGE) {
+                if let Some(view) = self.featured.collection.as_mut() {
+                    view.page = view.page.saturating_sub(1);
+                }
+                self.show(context);
+                return;
+            }
+            if action == action_id(NEXT_PAGE) {
+                let has_stored_next = self
+                    .featured
+                    .collection
+                    .as_ref()
+                    .is_some_and(|view| view.page.saturating_add(1) < view.pages.len());
+                if has_stored_next {
+                    if let Some(view) = self.featured.collection.as_mut() {
+                        view.page = view.page.saturating_add(1);
+                    }
+                } else {
+                    let can_discover = self.featured.collection.as_ref().is_some_and(|view| {
+                        view.queued_aliases.is_empty()
+                            && view.pending_aliases.is_empty()
+                            && self
+                                .featured
+                                .snapshot()
+                                .and_then(|snapshot| snapshot.collection(&view.collection_id))
+                                .is_some_and(|collection| view.next_start() < collection.comics.len())
+                    });
+                    if can_discover {
+                        self.queue_collection_window(context);
+                    }
+                }
+                self.show(context);
+                return;
+            }
+            let selected = self.featured.collection.as_ref().and_then(|view| {
+                let range = view.pages.get(view.page)?;
+                let collection = self
+                    .featured
+                    .snapshot()
+                    .and_then(|snapshot| snapshot.collection(&view.collection_id))?;
+                range.clone().find_map(|index| {
+                    let comic = &collection.comics[index];
+                    (action == action_id(&comic_action(&collection.id, index))).then(|| {
+                        (comic.alias.clone(), comic.title.clone(), index)
+                    })
+                })
+            });
+            if let Some((alias, title, index)) = selected {
+                self.open_selected_comic(context, alias, title, index);
+                return;
+            }
+            self.show(context);
             return;
         }
         let ready = self.account == AccountState::Active
@@ -5840,9 +6314,13 @@ impl KoboApp for Bomtoon {
                 return;
             }
             self.observe_connectivity(context, &outcome);
-            let changed = self.handle_feature_outcome(purpose, outcome);
+            let changed = self.handle_feature_outcome(context, purpose, outcome);
             self.resume_capacity_work(context);
-            if changed && self.view == View::Main && self.destination == MainDestination::Featured {
+            if changed
+                && (self.view == View::FeatureCollection
+                    || (self.view == View::Main
+                        && self.destination == MainDestination::Featured))
+            {
                 self.show(context);
             }
             return;
@@ -14059,12 +14537,17 @@ mod tests {
         let origin = runner.app().featured.feed_page;
 
         let commands = runner.action(action_id(&collection_action("theme-10")));
-        assert!(spawns(&commands).is_empty());
-        assert_eq!(
-            runner.app().featured.collection_id.as_deref(),
-            Some("theme-10")
-        );
-        assert_eq!(runner.app().featured.origin_feed_page, origin);
+        assert!(!spawns(&commands).is_empty());
+        let collection = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("open collection");
+        assert_eq!(collection.collection_id, "theme-10");
+        assert_eq!(collection.origin_feed_page, origin);
+        settle_open_collection_window(&mut runner, None);
+        runner.action(ActionId::BACK);
 
         let commands = runner.action(action_id(&comic_action("theme-10", 4)));
         assert!(spawns(&commands)
@@ -16314,5 +16797,709 @@ mod tests {
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::Store(StoreRequest::Save { .. }))));
+    }
+
+    fn full_collection_comic(index: usize) -> model::FeatureComic {
+        model::FeatureComic {
+            alias: format!("full-{index}"),
+            title: format!(
+                "A deliberately long collection title {index} that must stay on one rendered line"
+            ),
+            creators: format!(
+                "A deliberately long creator credit {index} that must stay on one rendered line"
+            ),
+            view_count: match index {
+                0 => Some(1_200),
+                1 => Some(0),
+                _ => Some(u64::try_from(index + 1).expect("small fixture")),
+            },
+            vertical_url: Some(format!(
+                "https://image.balcony.studio/tw/contents/full-{index}-vertical.webp"
+            )),
+            square_url: Some(format!(
+                "https://image.balcony.studio/tw/contents/full-{index}-square.webp"
+            )),
+        }
+    }
+
+    fn full_collection_app(account: AccountState, count: usize) -> Bomtoon {
+        let comics = (0..count).map(full_collection_comic).collect::<Vec<_>>();
+        let shared = comics.first().cloned().into_iter().collect::<Vec<_>>();
+        let collections = vec![
+            model::FeatureCollection {
+                id: "ranking".to_owned(),
+                label: "排行榜".to_owned(),
+                priority: 5,
+                order: 0,
+                comics: comics.clone(),
+            },
+            model::FeatureCollection {
+                id: "theme-shared".to_owned(),
+                label: "Shared alias".to_owned(),
+                priority: 9,
+                order: 0,
+                comics: shared,
+            },
+        ];
+        Bomtoon {
+            account,
+            view: View::Main,
+            destination: MainDestination::Featured,
+            featured: FeaturedState {
+                generation: 7,
+                snapshot_generation: 7,
+                snapshot: Some(FeatureSnapshot {
+                    banners: Vec::new(),
+                    collections,
+                    sources: BTreeMap::new(),
+                    failed_sources: BTreeSet::new(),
+                    warning: None,
+                }),
+                ..FeaturedState::default()
+            },
+            ..Bomtoon::default()
+        }
+    }
+
+    fn cache_all_feature_covers(app: &mut Bomtoon) {
+        let urls = app
+            .featured
+            .snapshot()
+            .into_iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .banners
+                    .iter()
+                    .chain(
+                        snapshot
+                            .collections
+                            .iter()
+                            .flat_map(|collection| collection.comics.iter()),
+                    )
+                    .flat_map(|comic| {
+                        [comic.square_url.clone(), comic.vertical_url.clone()]
+                            .into_iter()
+                            .flatten()
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        for (index, url) in urls.into_iter().enumerate() {
+            app.covers.entries.insert(
+                url,
+                CoverState::Ready(TilePicture::new(
+                    PictureHandle(1_000 + index as u32),
+                    300,
+                    300,
+                )),
+            );
+        }
+    }
+
+    fn collection_detail_tasks(runner: &AppRunner<Bomtoon>) -> Vec<(TaskId, String)> {
+        runner
+            .app()
+            .feature_tasks
+            .iter()
+            .filter_map(|(task, purpose)| match purpose {
+                FeatureTaskPurpose::CollectionDetail { alias, .. } => {
+                    Some((*task, alias.clone()))
+                }
+                FeatureTaskPurpose::Source { .. } | FeatureTaskPurpose::BannerDetail { .. } => None,
+            })
+            .collect()
+    }
+
+    fn long_detail_response(alias: &str) -> Vec<u8> {
+        let synopsis = format!(
+            "Synopsis for {alias}. {}",
+            "Long bounded synopsis text ".repeat(30)
+        );
+        format!(
+            r#"<meta property="og:title" content="Detail {alias} - 漫畫 - BOMTOON"><meta property="og:description" content="{synopsis}">"#
+        )
+        .into_bytes()
+    }
+
+    fn settle_open_collection_window(
+        runner: &mut AppRunner<Bomtoon>,
+        failed_alias: Option<&str>,
+    ) -> Vec<Command> {
+        let mut last = Vec::new();
+        loop {
+            let unsettled = runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .is_some_and(|view| {
+                    !view.queued_aliases.is_empty() || !view.pending_aliases.is_empty()
+                });
+            if !unsettled {
+                break;
+            }
+            let (task, alias) = collection_detail_tasks(runner)
+                .into_iter()
+                .next()
+                .expect("unsettled collection has an active detail task");
+            let outcome = if failed_alias == Some(alias.as_str()) {
+                TaskOutcome::Failed(TaskError::Offline)
+            } else {
+                TaskOutcome::Completed(long_detail_response(&alias))
+            };
+            last = runner.task_outcome(task, outcome);
+        }
+        last
+    }
+
+    fn collection_rows(screen: &Screen) -> &[kobo_sdk::Row] {
+        screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows.as_slice()),
+                _ => None,
+            })
+            .expect("collection rows")
+    }
+
+    #[test]
+    fn collection_detail_requests_begin_only_after_heading_tap_and_fill_bounded_capacity() {
+        let mut runner =
+            AppRunner::with_metrics(full_collection_app(AccountState::SignedOut, 14), CLARA_BW_METRICS);
+        assert!(collection_detail_tasks(&runner).is_empty());
+
+        let commands = runner.action(action_id(&collection_action("ranking")));
+        let active = collection_detail_tasks(&runner);
+
+        assert_eq!(runner.app().view, View::FeatureCollection);
+        assert_eq!(active.len(), 4);
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .queued_aliases
+                .len(),
+            2
+        );
+        assert!(active
+            .iter()
+            .all(|(_, alias)| spawns(&commands).iter().any(|(_, work)| {
+                work == &api::public_detail(alias)
+            })));
+        assert!(spawns(&commands).len() <= 4);
+    }
+
+    #[test]
+    fn collection_detail_window_requests_only_uncached_aliases_and_shares_alias_cache() {
+        let mut app = full_collection_app(AccountState::SignedOut, 8);
+        app.featured.detail_cache.insert(
+            "full-0".to_owned(),
+            feature::DetailState::Ready(model::PublicDetail {
+                alias: "full-0".to_owned(),
+                title: "Cached".to_owned(),
+                synopsis: Some("Cached synopsis".to_owned()),
+            }),
+        );
+        app.featured
+            .detail_cache
+            .insert("full-1".to_owned(), feature::DetailState::Failed);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        runner.action(action_id(&collection_action("ranking")));
+        assert_eq!(
+            collection_detail_tasks(&runner)
+                .iter()
+                .map(|(_, alias)| alias.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["full-2", "full-3", "full-4", "full-5"])
+        );
+        settle_open_collection_window(&mut runner, None);
+        runner.action(ActionId::BACK);
+        let commands = runner.action(action_id(&collection_action("theme-shared")));
+
+        assert!(spawns(&commands)
+            .iter()
+            .all(|(_, work)| work != &api::public_detail("full-0")));
+        assert!(collection_detail_tasks(&runner).is_empty());
+    }
+
+    #[test]
+    fn collection_boundary_waits_for_every_queued_and_pending_detail() {
+        let mut runner =
+            AppRunner::with_metrics(full_collection_app(AccountState::SignedOut, 6), CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+
+        for settled in 0..6 {
+            let (task, alias) = collection_detail_tasks(&runner)[0].clone();
+            runner.task_outcome(task, TaskOutcome::Completed(long_detail_response(&alias)));
+            let pages = &runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .pages;
+            assert_eq!(pages.is_empty(), settled < 5);
+        }
+        let range = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .pages[0]
+            .clone();
+        assert!(range.start == 0 && range.end > 0 && range.end < 6);
+    }
+
+    #[test]
+    fn adaptive_collection_screen_renders_exact_bounded_rows_counts_actions_and_square_crops() {
+        let mut app = full_collection_app(AccountState::SignedOut, 6);
+        for index in 0..6 {
+            let url = format!(
+                "https://image.balcony.studio/tw/contents/full-{index}-square.webp"
+            );
+            app.covers.entries.insert(
+                url,
+                CoverState::Ready(TilePicture::new(PictureHandle(70 + index as u32), 300, 180)),
+            );
+        }
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        let commands = settle_open_collection_window(&mut runner, Some("full-1"));
+        let screen = last_screen(&commands);
+        let rows = collection_rows(&screen);
+
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].title, full_collection_comic(0).title);
+        assert_eq!(rows[0].summary, full_collection_comic(0).creators);
+        assert!(rows[0].description.starts_with("Synopsis for full-0"));
+        assert_eq!(rows[0].trailing.as_deref(), Some("1.2K"));
+        assert_eq!(rows[0].action, action_id(&comic_action("ranking", 0)));
+        assert_eq!(rows[0].line_limits, kobo_sdk::RowLineLimits::new(1, 1, 2));
+        assert!(matches!(
+            rows[0].lead,
+            RowLead::Picture(
+                TilePicture {
+                    fit: kobo_sdk::PictureFit::Cover,
+                    ..
+                },
+                Glyph::Book
+            )
+        ));
+        if let Some(failed) = rows.iter().find(|row| {
+            row.action == action_id(&comic_action("ranking", 1))
+        }) {
+            assert!(failed.description.is_empty());
+            assert_eq!(failed.trailing, None);
+            assert_eq!(failed.state, kobo_sdk::RowState::Open);
+        }
+        let visible_range = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .pages[0]
+            .clone();
+        assert_eq!(
+            runner.app().covers.visible_urls,
+            visible_range
+                .map(|index| {
+                    format!(
+                        "https://image.balcony.studio/tw/contents/full-{index}-square.webp"
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(screen.nav_bar.is_none());
+        assert!(screen.owns_back);
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn collection_failed_synopses_remain_actionable_and_zero_or_missing_counts_have_no_trailing() {
+        let mut app = full_collection_app(AccountState::SignedOut, 3);
+        let comics = &mut app
+            .featured
+            .snapshot
+            .as_mut()
+            .expect("snapshot")
+            .collections[0]
+            .comics;
+        for (index, comic) in comics.iter_mut().enumerate() {
+            comic.title = format!("Title {index}");
+            comic.creators = "Creator".to_owned();
+            comic.view_count = match index {
+                0 => None,
+                1 => Some(0),
+                _ => Some(999),
+            };
+            app.featured
+                .detail_cache
+                .insert(comic.alias.clone(), feature::DetailState::Failed);
+        }
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id(&collection_action("ranking")));
+        let screen = last_screen(&commands);
+        let rows = collection_rows(&screen);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].trailing, None);
+        assert_eq!(rows[1].trailing, None);
+        assert_eq!(rows[2].trailing.as_deref(), Some("999"));
+        assert!(rows.iter().all(|row| {
+            row.description.is_empty() && row.state == kobo_sdk::RowState::Open
+        }));
+        assert!(collection_detail_tasks(&runner).is_empty());
+        assert_fits(&screen);
+    }
+
+    #[test]
+    fn collection_next_reuses_cached_overflow_before_requesting_only_new_aliases() {
+        let mut app = full_collection_app(AccountState::SignedOut, 12);
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        settle_open_collection_window(&mut runner, None);
+        let first_range = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .pages[0]
+            .clone();
+        let first_end = first_range.end;
+        assert!(first_end < 6);
+
+        runner.action(action_id(NEXT_PAGE));
+        let mut aliases = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(_, alias)| alias)
+            .collect::<BTreeSet<_>>();
+        aliases.extend(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .queued_aliases
+                .iter()
+                .cloned(),
+        );
+        let expected = (6..first_end.saturating_add(6).min(12))
+            .map(|index| format!("full-{index}"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(aliases, expected);
+        settle_open_collection_window(&mut runner, None);
+        assert!(runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .pages
+            .len()
+            > 1);
+        runner.action(action_id(PREVIOUS_PAGE));
+        let view = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection");
+        assert_eq!(view.page, 0);
+        assert_eq!(view.pages[0], first_range);
+    }
+
+    #[test]
+    fn collection_back_is_owned_signed_out_cancels_details_and_restores_exact_feed_page() {
+        let mut app = full_collection_app(AccountState::SignedOut, 12);
+        app.featured.feed_page = 4;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let open = runner.action(action_id(&collection_action("ranking")));
+        let details = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        let screen = last_screen(&open);
+        assert!(screen.owns_back);
+        assert!(screen.nav_bar.is_none());
+
+        let commands = runner.action(ActionId::BACK);
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert_eq!(runner.app().featured.feed_page, 4);
+        assert_eq!(runner.app().featured.collection, None);
+        assert_eq!(cancelled_tasks(&commands), details);
+    }
+
+    #[test]
+    fn collection_row_leave_cancels_unresolved_next_window_before_opening_comic() {
+        let mut app = full_collection_app(AccountState::Active, 12);
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        settle_open_collection_window(&mut runner, None);
+        runner.action(action_id(NEXT_PAGE));
+        let details = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+
+        let commands = runner.action(action_id(&comic_action("ranking", 0)));
+
+        assert!(details.is_subset(&cancelled_tasks(&commands)));
+        assert!(
+            spawns(&commands)
+                .iter()
+                .any(|(_, work)| work == &api::content("full-0"))
+                || runner.app().queued_foreground == Some(Pending::Content(0))
+        );
+        assert_eq!(runner.app().featured.collection, None);
+    }
+
+    #[test]
+    fn collection_suspend_and_exit_cancel_detail_work_and_reject_late_outcomes() {
+        for exit in [false, true] {
+            let mut runner = AppRunner::with_metrics(
+                full_collection_app(AccountState::SignedOut, 8),
+                CLARA_BW_METRICS,
+            );
+            runner.action(action_id(&collection_action("ranking")));
+            let (late, alias) = collection_detail_tasks(&runner)[0].clone();
+            let active = collection_detail_tasks(&runner)
+                .into_iter()
+                .map(|(task, _)| task)
+                .collect::<BTreeSet<_>>();
+
+            let commands = if exit {
+                runner.exit()
+            } else {
+                runner.suspend()
+            };
+            assert!(active.is_subset(&cancelled_tasks(&commands)));
+            let generation = runner.app().featured.detail_generation;
+            runner.task_outcome(late, TaskOutcome::Completed(long_detail_response(&alias)));
+            assert_eq!(runner.app().featured.detail_generation, generation);
+            assert!(!matches!(
+                runner.app().featured.detail_cache.get(&alias),
+                Some(feature::DetailState::Ready(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn collection_sign_out_transition_cancels_loading_details_and_retains_settled_public_cache() {
+        let mut runner = AppRunner::with_metrics(
+            full_collection_app(AccountState::Active, 8),
+            CLARA_BW_METRICS,
+        );
+        runner.action(action_id(&collection_action("ranking")));
+        runner.resume();
+        let mut scope = None;
+        for _ in 0..6 {
+            let (task, alias) = collection_detail_tasks(&runner)[0].clone();
+            let commands =
+                runner.task_outcome(task, TaskOutcome::Completed(long_detail_response(&alias)));
+            scope = spawns(&commands)
+                .into_iter()
+                .find_map(|(task, work)| (work == api::account_scope()).then_some(task));
+            if scope.is_some() {
+                break;
+            }
+        }
+        let scope = scope.expect("scope request resumes after a detail slot opens");
+        let active = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        let settled = runner
+            .app()
+            .featured
+            .detail_cache
+            .values()
+            .filter(|state| matches!(state, feature::DetailState::Ready(_)))
+            .count();
+        assert!(!active.is_empty());
+        assert!(settled > 0);
+
+        let commands = runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+
+        assert!(active.is_subset(&cancelled_tasks(&commands)));
+        assert_eq!(runner.app().account, AccountState::SignedOut);
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().featured.collection, None);
+        assert_eq!(
+            runner
+                .app()
+                .featured
+                .detail_cache
+                .values()
+                .filter(|state| matches!(state, feature::DetailState::Ready(_)))
+                .count(),
+            settled
+        );
+        assert!(runner
+            .app()
+            .featured
+            .detail_cache
+            .values()
+            .all(|state| !matches!(state, feature::DetailState::Loading(_))));
+    }
+
+    #[test]
+    fn collection_detail_outcomes_require_snapshot_collection_generation_and_id() {
+        for mismatch in ["snapshot", "collection-generation", "collection-id"] {
+            let mut runner = AppRunner::with_metrics(
+                full_collection_app(AccountState::SignedOut, 6),
+                CLARA_BW_METRICS,
+            );
+            runner.action(action_id(&collection_action("ranking")));
+            let (task, alias) = collection_detail_tasks(&runner)[0].clone();
+            match mismatch {
+                "snapshot" => {
+                    let generation = runner.app().featured.snapshot_generation;
+                    runner.app_mut().featured.snapshot_generation = generation.wrapping_add(1);
+                }
+                "collection-generation" => {
+                    let collection = runner
+                        .app_mut()
+                        .featured
+                        .collection
+                        .as_mut()
+                        .expect("collection");
+                    collection.generation = collection.generation.wrapping_add(1);
+                }
+                "collection-id" => {
+                    runner
+                        .app_mut()
+                        .featured
+                        .collection
+                        .as_mut()
+                        .expect("collection")
+                        .collection_id = "another".to_owned();
+                }
+                _ => unreachable!(),
+            }
+
+            runner.task_outcome(task, TaskOutcome::Completed(long_detail_response(&alias)));
+
+            assert!(!matches!(
+                runner.app().featured.detail_cache.get(&alias),
+                Some(feature::DetailState::Ready(_))
+            ));
+            assert!(runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .pages
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn published_snapshot_resets_stable_open_collection_and_cancels_old_details() {
+        let mut app = ready_featured(local_day(30), "old");
+        app.featured.snapshot_generation = app.featured.generation;
+        app.featured
+            .snapshot
+            .as_mut()
+            .expect("snapshot")
+            .collections
+            .iter_mut()
+            .find(|collection| collection.id == "ranking")
+            .expect("ranking")
+            .comics = (0..8).map(full_collection_comic).collect();
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        observe_day_with_runner(&mut runner, local_day(31));
+        runner.action(action_id(&collection_action("ranking")));
+        let old_collection_generation = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("collection")
+            .generation;
+        for source in FEATURE_SOURCES.into_iter().take(4) {
+            settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(source_response(source, "new")),
+            );
+        }
+        let old_details = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert!(!old_details.is_empty());
+
+        let commands = settle_source(
+            &mut runner,
+            FeatureSource::Freetime,
+            TaskOutcome::Completed(source_response(FeatureSource::Freetime, "new")),
+        );
+        let collection = runner
+            .app()
+            .featured
+            .collection
+            .as_ref()
+            .expect("stable collection remains open");
+
+        assert_eq!(runner.app().view, View::FeatureCollection);
+        assert_eq!(collection.collection_id, "ranking");
+        assert_ne!(collection.generation, old_collection_generation);
+        assert!(collection.pages.is_empty());
+        assert_eq!(collection.window_start, 0);
+        assert_eq!(collection.window_end, 1);
+        assert!(old_details.is_subset(&cancelled_tasks(&commands)));
+        let mut aliases = collection_detail_tasks(&runner)
+            .into_iter()
+            .map(|(_, alias)| alias)
+            .collect::<BTreeSet<_>>();
+        aliases.extend(collection.queued_aliases.iter().cloned());
+        assert!(aliases.contains("new-ranking"));
+    }
+
+    #[test]
+    fn published_snapshot_closes_missing_open_collection_to_clamped_origin_feed_page() {
+        let mut app = grouped_feature_app(None);
+        app.account = AccountState::SignedOut;
+        app.featured.loaded_day = Some(local_day(30));
+        app.featured.snapshot_generation = app.featured.generation;
+        let old_pages = featured_feed_pages(&app.featured, &CLARA_BW_METRICS).len();
+        app.featured.feed_page = old_pages.saturating_sub(1);
+        let origin = app.featured.feed_page;
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        observe_day_with_runner(&mut runner, local_day(31));
+        runner.app_mut().featured.feed_page = origin;
+        runner.action(action_id(&collection_action("theme-20")));
+        for source in FEATURE_SOURCES {
+            settle_source(
+                &mut runner,
+                source,
+                TaskOutcome::Completed(source_response(source, "replacement")),
+            );
+        }
+        let new_pages = featured_feed_pages(&runner.app().featured, &CLARA_BW_METRICS).len();
+
+        assert_eq!(runner.app().view, View::Main);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert_eq!(runner.app().featured.collection, None);
+        assert_eq!(
+            runner.app().featured.feed_page,
+            origin.min(new_pages.saturating_sub(1))
+        );
     }
 }

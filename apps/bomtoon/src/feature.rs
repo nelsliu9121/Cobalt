@@ -1,7 +1,7 @@
 use crate::model::{
     BannerComic, FeatureCollection, FeatureComic, Homepage, PublicDetail, ThemeCollection,
 };
-use kobo_sdk::{drawable_text_in, Face, LocalDay};
+use kobo_sdk::{drawable_text_in, Face, LocalDay, TaskId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 const PARTIAL_FAILURE_WARNING: &str = "Some Featured collections could not be loaded.";
 
@@ -150,15 +150,121 @@ impl FeatureBatch {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DetailState {
+    Loading(TaskId),
+    Ready(PublicDetail),
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionView {
+    pub generation: u64,
+    pub collection_id: String,
+    pub origin_feed_page: usize,
+    pub page: usize,
+    pub pages: Vec<std::ops::Range<usize>>,
+    pub window_start: usize,
+    pub window_end: usize,
+    pub pending_aliases: BTreeSet<String>,
+    pub queued_aliases: VecDeque<String>,
+}
+
+impl CollectionView {
+    const DETAIL_WINDOW: usize = 6;
+
+    #[must_use]
+    pub fn new(collection_id: &str, origin_feed_page: usize, len: usize) -> Self {
+        Self {
+            generation: 0,
+            collection_id: collection_id.to_owned(),
+            origin_feed_page,
+            page: 0,
+            pages: Vec::new(),
+            window_start: 0,
+            window_end: len.min(Self::DETAIL_WINDOW),
+            pending_aliases: BTreeSet::new(),
+            queued_aliases: VecDeque::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn next_start(&self) -> usize {
+        self.pages.last().map_or(0, |page| page.end)
+    }
+
+    #[must_use]
+    pub fn next_detail_window(
+        &self,
+        aliases: &[String],
+        _detail_cache: &BTreeMap<String, DetailState>,
+    ) -> Vec<String> {
+        let start = self.next_start().min(aliases.len());
+        aliases[start..start.saturating_add(Self::DETAIL_WINDOW).min(aliases.len())].to_vec()
+    }
+
+    pub fn queue_detail_window(
+        &mut self,
+        aliases: &[String],
+        detail_cache: &BTreeMap<String, DetailState>,
+    ) {
+        self.window_start = self.next_start().min(aliases.len());
+        self.window_end = self
+            .window_start
+            .saturating_add(Self::DETAIL_WINDOW)
+            .min(aliases.len());
+        self.pending_aliases.clear();
+        self.queued_aliases.clear();
+        let mut queued = BTreeSet::new();
+        for alias in &aliases[self.window_start..self.window_end] {
+            if !detail_cache.contains_key(alias) && queued.insert(alias.clone()) {
+                self.queued_aliases.push_back(alias.clone());
+            }
+        }
+    }
+
+    pub fn commit_page(&mut self, start: usize, count: usize) {
+        let end = start.saturating_add(count);
+        if count == 0 || self.pages.last().is_some_and(|page| page.end != start) {
+            return;
+        }
+        self.pages.push(start..end);
+    }
+}
+
+#[must_use]
+pub fn compact_count(value: Option<u64>) -> String {
+    let Some(value) = value.filter(|value| *value > 0) else {
+        return String::new();
+    };
+    if value < 1_000 {
+        return value.to_string();
+    }
+    let (tenths, suffix) = if value < 1_000_000 {
+        (value / 100, "K")
+    } else {
+        (value / 100_000, "M")
+    };
+    let whole = tenths / 10;
+    let fraction = tenths % 10;
+    if fraction == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{fraction}{suffix}")
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FeaturedState {
     pub generation: u64,
+    pub snapshot_generation: u64,
     pub snapshot: Option<FeatureSnapshot>,
     pub batch: Option<FeatureBatch>,
     pub feed_page: usize,
     pub loaded_day: Option<LocalDay>,
-    pub collection_id: Option<String>,
-    pub origin_feed_page: usize,
+    pub detail_generation: u64,
+    pub detail_cache: BTreeMap<String, DetailState>,
+    pub collection: Option<CollectionView>,
     pub desired_day: Option<LocalDay>,
     pub local_day_pending: bool,
 }
@@ -493,6 +599,7 @@ impl FeaturedState {
             self.loaded_day = Some(day);
         }
         self.feed_page = 0;
+        self.snapshot_generation = batch.generation;
         self.snapshot = Some(FeatureSnapshot {
             banners,
             collections,
@@ -1230,5 +1337,93 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn aliases(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("comic-{index}"))
+            .collect()
+    }
+
+    fn detail(alias: &str) -> PublicDetail {
+        PublicDetail {
+            alias: alias.to_owned(),
+            title: format!("Title {alias}"),
+            synopsis: Some(format!("Synopsis {alias}")),
+        }
+    }
+
+    #[test]
+    fn collection_requests_only_the_next_six_uncached_aliases() {
+        let view = CollectionView::new("ranking", 3, 14);
+        let aliases = aliases(14);
+
+        assert_eq!(
+            view.next_detail_window(&aliases, &BTreeMap::new()),
+            aliases[0..6]
+        );
+    }
+
+    #[test]
+    fn collection_detail_window_omits_ready_failed_loading_and_duplicate_aliases() {
+        let aliases = [
+            "cached-ready",
+            "cached-failed",
+            "cached-loading",
+            "fresh",
+            "fresh",
+            "last",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let cache = BTreeMap::from([
+            (
+                "cached-ready".to_owned(),
+                DetailState::Ready(detail("cached-ready")),
+            ),
+            ("cached-failed".to_owned(), DetailState::Failed),
+            (
+                "cached-loading".to_owned(),
+                DetailState::Loading(TaskId(9)),
+            ),
+        ]);
+        let mut view = CollectionView::new("ranking", 3, aliases.len());
+        view.queue_detail_window(&aliases, &cache);
+
+        assert_eq!(
+            view.queued_aliases,
+            VecDeque::from(["fresh".to_owned(), "last".to_owned()])
+        );
+    }
+
+    #[test]
+    fn adaptive_collection_page_stores_largest_prefix_and_reuses_overflow_details() {
+        let mut view = CollectionView::new("ranking", 3, 12);
+        view.commit_page(0, 4);
+        let aliases = aliases(12);
+        let cache = (0..6)
+            .map(|index| {
+                let alias = format!("comic-{index}");
+                (alias.clone(), DetailState::Ready(detail(&alias)))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(view.pages, vec![0..4]);
+        assert_eq!(view.next_start(), 4);
+        assert_eq!(
+            view.next_detail_window(&aliases, &cache),
+            aliases[4..10]
+        );
+    }
+
+    #[test]
+    fn compact_collection_counts_follow_production_units() {
+        assert_eq!(compact_count(None), "");
+        assert_eq!(compact_count(Some(0)), "");
+        assert_eq!(compact_count(Some(999)), "999");
+        assert_eq!(compact_count(Some(1_000)), "1K");
+        assert_eq!(compact_count(Some(1_200)), "1.2K");
+        assert_eq!(compact_count(Some(12_000)), "12K");
+        assert_eq!(compact_count(Some(1_000_000)), "1M");
     }
 }
