@@ -2,7 +2,7 @@
 
 //! Localhost-only browser simulator for typed Kobo screens.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -26,6 +26,7 @@ use kobo_ui::{
 };
 
 const MAX_HTTP_HEADER: usize = 8 * 1024;
+const RETAINED_PAINTS: usize = 8;
 const PROFILE: &DeviceProfile = &CLARA_BW_391;
 /// The simulator asserts an orientation rather than observing one, because it
 /// has no device. That is legitimate here and nowhere near a real framebuffer:
@@ -276,6 +277,36 @@ impl PanelPreview {
             u32::try_from(self.width).map_err(|_| "simulated width is too large")?,
             u32::try_from(self.height).map_err(|_| "simulated height is too large")?,
             self.frame(ideal),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+#[derive(Debug)]
+struct PaintFrame {
+    number: u64,
+    width: usize,
+    height: usize,
+    ideal: PicturePixels,
+    visible: PicturePixels,
+}
+
+impl PaintFrame {
+    fn from_panel(number: u64, panel: &PanelPreview) -> Self {
+        Self {
+            number,
+            width: panel.width,
+            height: panel.height,
+            ideal: owned_pixels(panel.frame(true)),
+            visible: owned_pixels(panel.frame(false)),
+        }
+    }
+
+    fn png(&self, ideal: bool) -> Result<Vec<u8>, String> {
+        let pixels = if ideal { &self.ideal } else { &self.visible };
+        kobo_image::encode_png(
+            u32::try_from(self.width).map_err(|_| "simulated width is too large")?,
+            u32::try_from(self.height).map_err(|_| "simulated height is too large")?,
+            pixels.as_ref(),
         )
         .map_err(|error| error.to_string())
     }
@@ -991,6 +1022,7 @@ struct AppState {
     /// gives it something to wait on. Not the screen's own id, which is the
     /// application's name and never changes.
     paints: u64,
+    frames: VecDeque<PaintFrame>,
     logs: Vec<String>,
     /// The same bounded cache the device runtime uses, so a preview that shows
     /// a cover and a panel that does not would be a real difference rather than
@@ -1018,6 +1050,7 @@ impl AppState {
         Self {
             screen: Screen::new(0, Vec::new()),
             paints: 0,
+            frames: VecDeque::new(),
             logs: Vec::new(),
             pictures: kobo_ui::PictureCache::default(),
             pressure_pictures: kobo_ui::PictureCache::new(256 * 1024),
@@ -1219,6 +1252,36 @@ impl AppState {
             &mut self.pictures
         }
     }
+
+    fn capture_paint(&mut self) {
+        render_app_panel(self);
+        if self
+            .frames
+            .back()
+            .is_some_and(|frame| frame.number == self.paints)
+        {
+            self.frames.pop_back();
+        }
+        self.frames
+            .push_back(PaintFrame::from_panel(self.paints, &self.panel));
+        while self.frames.len() > RETAINED_PAINTS {
+            self.frames.pop_front();
+        }
+    }
+}
+
+fn requested_paint(path: &str) -> Option<(bool, u64)> {
+    let (ideal, number) = path
+        .strip_prefix("/frame/")
+        .map(|number| (false, number))
+        .or_else(|| {
+            path.strip_prefix("/ideal-frame/")
+                .map(|number| (true, number))
+        })?;
+    (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| number.parse().ok())
+        .flatten()
+        .map(|number| (ideal, number))
 }
 
 fn render_app_panel(state: &mut AppState) {
@@ -1287,12 +1350,17 @@ impl AppSession {
         Ok(())
     }
 
-    fn render_png(&self, ideal: bool) -> Result<Vec<u8>, String> {
+    fn render_png(&self, ideal: bool, paint: Option<u64>) -> Result<Vec<u8>, String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        render_app_panel(&mut state);
+        if let Some(frame) =
+            paint.and_then(|number| state.frames.iter().find(|frame| frame.number == number))
+        {
+            return frame.png(ideal);
+        }
+        state.capture_paint();
         state.panel.png(ideal)
     }
 
@@ -1309,6 +1377,7 @@ impl AppSession {
             state.pressure_pictures = kobo_ui::PictureCache::new(256 * 1024);
         }
         state.logs.push(format!("scenario: {}", scenario.name()));
+        state.capture_paint();
         Ok(())
     }
 
@@ -1334,6 +1403,14 @@ impl AppSession {
     #[allow(clippy::too_many_lines, reason = "one explicit route table")]
     fn handle_http(&self, mut stream: TcpStream) -> io::Result<()> {
         let request = read_request(&mut stream)?;
+        if request.method == "GET" {
+            if let Some((ideal, paint)) = requested_paint(&request.path) {
+                let png = self
+                    .render_png(ideal, Some(paint))
+                    .map_err(io::Error::other)?;
+                return write_response(&mut stream, 200, "image/png", &png);
+            }
+        }
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/") => write_response(
                 &mut stream,
@@ -1342,11 +1419,11 @@ impl AppSession {
                 SHELL.as_bytes(),
             ),
             ("GET", "/frame") => {
-                let png = self.render_png(false).map_err(io::Error::other)?;
+                let png = self.render_png(false, None).map_err(io::Error::other)?;
                 write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/ideal-frame") => {
-                let png = self.render_png(true).map_err(io::Error::other)?;
+                let png = self.render_png(true, None).map_err(io::Error::other)?;
                 write_response(&mut stream, 200, "image/png", &png)
             }
             ("GET", "/simulation") => {
@@ -1957,6 +2034,7 @@ fn read_app_messages(
                     .map_err(|_| io::Error::other("app state lock poisoned"))?;
                 state.screen = screen;
                 state.paints = state.paints.saturating_add(1);
+                state.capture_paint();
             }
             // The simulator hosts exactly one application, so a launch is
             // reported rather than performed. Pretending it worked would hide
@@ -2681,13 +2759,59 @@ figcaption { margin-top:12px; color:var(--muted); font-size:.875rem; }
 const canvas=document.getElementById("display"), ctx=canvas.getContext("2d",{alpha:false});
 const status=document.getElementById("status"),list=document.getElementById("diagnostics"),overlay=document.getElementById("overlay");
 const ideal=document.getElementById("ideal"),refreshRegion=document.getElementById("refresh-region"),scenario=document.getElementById("scenario");
-let point={x:536,y:177},issues=[],profile={width:1072,height:1448},transition=null,lastFlash=0;
+let point={x:536,y:177},issues=[],profile={width:1072,height:1448},transition=null,lastFlash=0,lastPaints=-1,frameInFlight=null;
 function checked(response){if(!response.ok)throw Error("Simulator request failed ("+response.status+")");return response;}
+function nextPaint(paints){return lastPaints<0||lastPaints>=paints?paints:lastPaints+1;}
 function showDiagnostics(){list.replaceChildren();if(!issues.length){const item=document.createElement("li");item.textContent="No layout issues.";list.append(item);return;}for(const issue of issues){const item=document.createElement("li");item.className=issue.severity;item.textContent=issue.message;list.append(item);}}
 function outline(rect,color,width){if(!rect)return;ctx.save();ctx.lineWidth=width;ctx.strokeStyle=color;ctx.strokeRect(rect.x+width/2,rect.y+width/2,Math.max(0,rect.width-width),Math.max(0,rect.height-width));ctx.restore();}
 function drawOverlays(){if(refreshRegion.checked&&transition)outline(transition.region,"#006fbb",6);if(!overlay.checked)return;for(const issue of issues){outline(issue.rect,issue.severity==="error"?"#d00000":"#b56a00",5);}}
 function showSimulation(sim){profile=sim.profile;transition=sim.transition;scenario.value=sim.scenario;document.getElementById("profile-badge").textContent=profile.id;document.getElementById("geometry").textContent=profile.width+" × "+profile.height;document.getElementById("density").textContent=profile.pixelsPerInch+" PPI";document.getElementById("rotation").textContent=profile.rotation;document.getElementById("lifecycle").textContent=sim.lifecycle;const touch=sim.touch;document.getElementById("display-touch").textContent=touch?touch.display.x+", "+touch.display.y:"—";document.getElementById("raw-touch").textContent=touch?touch.raw.x+", "+touch.raw.y:"—";document.getElementById("waveform").textContent=transition?transition.waveform:"—";document.getElementById("update-kind").textContent=transition?(transition.full?"full / cleaning":"partial"):"unchanged";document.getElementById("region").textContent=transition?transition.region.width+"×"+transition.region.height+" @ "+transition.region.x+","+transition.region.y:"—";document.getElementById("refresh-count").textContent=sim.refreshCount;document.getElementById("partial-count").textContent=sim.partialsSinceClean+" / 8";}
-async function frame(){const path=ideal.checked?"/ideal-frame":"/frame";const response=checked(await fetch(path,{cache:"no-store"}));const bitmap=await createImageBitmap(await response.blob());const [diagnostics,simulation]=await Promise.all([fetch("/diagnostics",{cache:"no-store"}).then(checked).then(r=>r.json()),fetch("/simulation",{cache:"no-store"}).then(checked).then(r=>r.json())]);issues=diagnostics.issues;showSimulation(simulation);if(bitmap.width!==profile.width||bitmap.height!==profile.height){bitmap.close();throw Error("Invalid "+profile.id+" frame");}if(canvas.width!==profile.width||canvas.height!==profile.height){canvas.width=profile.width;canvas.height=profile.height;}ctx.drawImage(bitmap,0,0);bitmap.close();showDiagnostics();drawOverlays();if(!ideal.checked&&transition&&transition.full&&transition.refresh!==lastFlash){lastFlash=transition.refresh;canvas.classList.remove("clean-flash");void canvas.offsetWidth;canvas.classList.add("clean-flash");}status.textContent=issues.length?"Frame loaded with "+issues.length+" diagnostic"+(issues.length===1?"":"s")+".":"Frame loaded; layout clean.";}
+async function renderFrame(observedPaints){
+  if(observedPaints===undefined){
+    const layout=checked(await fetch("/layout",{cache:"no-store"}));
+    observedPaints=nextPaint((await layout.json()).paints);
+  }
+  const path=(ideal.checked?"/ideal-frame/":"/frame/")+observedPaints;
+  const response=checked(await fetch(path,{cache:"no-store"}));
+  const bitmap=await createImageBitmap(await response.blob());
+  const [diagnostics,simulation]=await Promise.all([
+    fetch("/diagnostics",{cache:"no-store"}).then(checked).then(r=>r.json()),
+    fetch("/simulation",{cache:"no-store"}).then(checked).then(r=>r.json())
+  ]);
+  issues=diagnostics.issues;
+  showSimulation(simulation);
+  if(bitmap.width!==profile.width||bitmap.height!==profile.height){
+    bitmap.close();
+    throw Error("Invalid "+profile.id+" frame");
+  }
+  if(canvas.width!==profile.width||canvas.height!==profile.height){
+    canvas.width=profile.width;
+    canvas.height=profile.height;
+  }
+  ctx.drawImage(bitmap,0,0);
+  bitmap.close();
+  showDiagnostics();
+  drawOverlays();
+  if(!ideal.checked&&transition&&transition.full&&transition.refresh!==lastFlash){
+    lastFlash=transition.refresh;
+    canvas.classList.remove("clean-flash");
+    void canvas.offsetWidth;
+    canvas.classList.add("clean-flash");
+  }
+  lastPaints=observedPaints;
+  status.textContent=issues.length?"Frame loaded with "+issues.length+" diagnostic"+(issues.length===1?"":"s")+".":"Frame loaded; layout clean.";
+}
+async function frame(observedPaints){
+  if(frameInFlight)return frameInFlight;
+  frameInFlight=renderFrame(observedPaints);
+  try{return await frameInFlight;}finally{frameInFlight=null;}
+}
+async function refreshFrame(){
+  if(document.visibilityState!=="visible")return;
+  const response=checked(await fetch("/layout",{cache:"no-store"}));
+  const paints=(await response.json()).paints;
+  if(paints!==lastPaints)await frame(nextPaint(paints));
+}
 function touchLocation(event){const rect=canvas.getBoundingClientRect();return{x:Math.floor((event.clientX-rect.left)*profile.width/rect.width),y:Math.floor((event.clientY-rect.top)*profile.height/rect.height)};}
 async function touch(next){point=next;checked(await fetch("/touch",{method:"POST",headers:{"Content-Type":"text/plain"},body:"x="+point.x+"&y="+point.y}));await frame();status.textContent="Touch delivered through the Clara BW transform.";}
 async function post(path,body){checked(await fetch(path,{method:"POST",headers:{"Content-Type":"text/plain"},body}));await frame();}
@@ -2697,6 +2821,7 @@ document.getElementById("refresh").addEventListener("click",()=>frame().catch(er
 for(const control of [overlay,ideal,refreshRegion])control.addEventListener("change",()=>frame().catch(error=>status.textContent=error.message));
 scenario.addEventListener("change",()=>post("/scenario",scenario.value).catch(error=>status.textContent=error.message));
 for(const button of document.querySelectorAll("[data-lifecycle]"))button.addEventListener("click",()=>post("/lifecycle",button.dataset.lifecycle).catch(error=>status.textContent=error.message));
+setInterval(()=>refreshFrame().catch(error=>status.textContent=error.message),100);
 frame().catch(error=>status.textContent=error.message);
 </script>
 </body></html>"##;
@@ -3677,6 +3802,102 @@ mod tests {
             app.join().expect("app thread").expect("app IO"),
             ActionId(9)
         );
+        drop(session);
+        drop(server);
+        assert!(!socket_path.exists());
+        fs::remove_dir(root).expect("remove private directory");
+    }
+
+    #[test]
+    fn app_server_returns_the_frame_for_the_requested_paint() {
+        let root = private_temp_dir();
+        let socket_path = root.join("app.sock");
+        let server = AppServer::bind("127.0.0.1:0", &socket_path).expect("bind app server");
+        let address = server.local_addr().expect("HTTP address");
+        let first = Screen::new(
+            1,
+            vec![Node::Text {
+                id: NodeId(1),
+                text: "First paint".into(),
+                links: Vec::new(),
+            }],
+        );
+        let second = Screen::new(
+            2,
+            vec![Node::Text {
+                id: NodeId(1),
+                text: "Second paint".into(),
+                links: Vec::new(),
+            }],
+        );
+        let mut expected_state = AppState {
+            screen: first.clone(),
+            ..AppState::default()
+        };
+        render_app_panel(&mut expected_state);
+        let expected = expected_state.panel.png(false).expect("encode first paint");
+        let app_socket_path = socket_path.clone();
+        let app = thread::spawn(move || -> io::Result<()> {
+            let mut stream = UnixStream::connect(&app_socket_path)?;
+            write_protocol_frame(
+                &mut stream,
+                &Frame {
+                    request_id: 7,
+                    message: Message::Hello {
+                        name: "paint history".into(),
+                    },
+                },
+            )?;
+            let _welcome = read_protocol_frame(&mut stream)?;
+            for (request_id, screen) in [(8, first), (9, second)] {
+                write_protocol_frame(
+                    &mut stream,
+                    &Frame {
+                        request_id,
+                        message: Message::SetScreen(screen),
+                    },
+                )?;
+            }
+            Ok(())
+        });
+        let session = server.accept_app().expect("accept app");
+        app.join().expect("app thread").expect("app IO");
+        for _ in 0..100 {
+            let paints = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .paints;
+            if paints == 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .paints,
+            2
+        );
+
+        let browser = thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut stream = TcpStream::connect(address)?;
+            stream.write_all(b"GET /frame/1 HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            let body = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| response.split_off(index + 4))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP body"))?;
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+            Ok(body)
+        });
+        server.serve_one(&session).expect("serve frame");
+        let actual = browser.join().expect("browser thread").expect("browser IO");
+        assert_eq!(actual, expected);
         drop(session);
         drop(server);
         assert!(!socket_path.exists());

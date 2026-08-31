@@ -1310,17 +1310,24 @@ impl Bomtoon {
             .foreground_reader_task
             .and_then(|task| self.reader_tasks.get(&task))
         {
-            let message = match entry.purpose {
-                ReaderTaskPurpose::ForegroundSource { .. } => "Loading comic image",
-                ReaderTaskPurpose::Manifest
-                | ReaderTaskPurpose::ManifestRefresh
-                | ReaderTaskPurpose::PrefetchSource { .. }
-                | ReaderTaskPurpose::Maintenance => "Loading comic pages",
-            };
-            return ScreenBuilder::new("bomtoon-loading")
-                .top_bar(self.reader_title())
-                .activity(message, None)
-                .build();
+            let retains_page = matches!(entry.purpose, ReaderTaskPurpose::ForegroundSource { .. })
+                && self
+                    .reader
+                    .as_ref()
+                    .is_some_and(|reader| reader.picture.is_some());
+            if !retains_page {
+                let message = match entry.purpose {
+                    ReaderTaskPurpose::ForegroundSource { .. } => "Loading comic image",
+                    ReaderTaskPurpose::Manifest
+                    | ReaderTaskPurpose::ManifestRefresh
+                    | ReaderTaskPurpose::PrefetchSource { .. }
+                    | ReaderTaskPurpose::Maintenance => "Loading comic pages",
+                };
+                return ScreenBuilder::new("bomtoon-loading")
+                    .top_bar(self.reader_title())
+                    .activity(message, None)
+                    .build();
+            }
         }
         if self.account == AccountState::Checking && self.connection == ConnectionState::Offline {
             return ScreenBuilder::new("bomtoon-offline")
@@ -1781,6 +1788,26 @@ impl Bomtoon {
     }
 
     fn reader_screen(&self) -> Screen {
+        let reader = self
+            .reader
+            .as_ref()
+            .expect("reader view without reader state");
+        let loading = self.foreground_reader_task.is_some_and(|task| {
+            self.reader_tasks.get(&task).is_some_and(|entry| {
+                matches!(entry.purpose, ReaderTaskPurpose::ForegroundSource { .. })
+            })
+        });
+        let chrome = if loading {
+            ReadingChrome::OverlayBusy
+        } else if reader.chrome_visible {
+            ReadingChrome::Overlay
+        } else {
+            ReadingChrome::Hidden
+        };
+        self.reader_screen_with_chrome(chrome)
+    }
+
+    fn reader_screen_with_chrome(&self, chrome: ReadingChrome) -> Screen {
         let selection = self
             .reader_selection
             .as_ref()
@@ -1792,14 +1819,7 @@ impl Bomtoon {
         let picture = reader.picture.expect("reader view without uploaded slice");
         ScreenBuilder::new("bomtoon-reader")
             .top_bar(selection.title.clone())
-            .reading_surface(
-                picture,
-                if reader.chrome_visible {
-                    ReadingChrome::Overlay
-                } else {
-                    ReadingChrome::Hidden
-                },
-            )
+            .reading_surface(picture, chrome)
             .page_turns(READER_PREVIOUS, READER_NEXT)
             .reading_menu(READER_CHROME)
             .page_position(
@@ -4286,6 +4306,9 @@ impl Bomtoon {
                     let reader_after_refresh = self.reader_after_content_refresh.take();
                     let episode_page = self.page;
                     self.selected_content_id = Some(detail.id);
+                    if let Some(title) = detail.title {
+                        self.selected_title = title;
+                    }
                     self.episodes = detail.episodes;
                     self.page = reader_after_refresh.map_or(0, |_| {
                         episode_page.min(
@@ -4610,6 +4633,7 @@ impl Bomtoon {
 
     fn request_reader_page(&mut self, context: &mut Context, page: usize) {
         if let Some(picture) = self.take_ready_page(page) {
+            context.set_screen(self.reader_screen_with_chrome(ReadingChrome::OverlayBusy));
             if let Err(error) = self.install_page(context, page, picture) {
                 self.fail_reader(Retry::Page(page), error);
                 self.show(context);
@@ -6868,7 +6892,7 @@ mod tests {
     const REMOTE_LIBRARY_PAGE_SIZE: usize = 30;
     const CONTENT_RESPONSE: &[u8] = br#"{
         "result":"SUCCESS",
-        "data":{"id":41,"episodes":[
+        "data":{"id":41,"title":"Localized Title","episodes":[
             {"id":101,"alias":"ep-1","title":"Episode One","isSample":false,"purchaseStatus":"POSSESSION"},
             {"id":102,"alias":"ep-2","title":"Episode Two","isSample":false,"purchaseStatus":null,"paid":false},
             {"id":103,"alias":"sample","title":"Sample","isSample":true,"purchaseStatus":null},
@@ -9954,25 +9978,33 @@ mod tests {
     }
 
     #[test]
-    fn successful_page_turn_hides_chrome_and_replaces_handle_in_order() {
+    fn successful_page_turn_shows_busy_footer_before_replacing_handle() {
         let mut runner = seeded_reader(2, 0, true);
         let commands = runner.action(action_id(READER_NEXT));
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(reader.page, 1);
         assert!(!reader.chrome_visible);
+        let screens = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| match command {
+                Command::SetScreen(screen) => Some((index, screen)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(screens.len(), 2, "busy screen followed by the new page");
+        let busy = screens[0].1.reading_surface.expect("busy reading surface");
+        assert_eq!(busy.picture.handle, PictureHandle(7));
+        assert_eq!(busy.chrome, ReadingChrome::OverlayBusy);
         let put = commands
             .iter()
             .position(|command| matches!(command, Command::PutPicture { .. }))
             .expect("PutPicture");
-        let set = commands
-            .iter()
-            .position(|command| matches!(command, Command::SetScreen(_)))
-            .expect("SetScreen");
         let drop = commands
             .iter()
             .position(|command| matches!(command, Command::DropPicture(_)))
             .expect("DropPicture");
-        assert!(put < set && set < drop);
+        assert!(screens[0].0 < put && put < screens[1].0 && screens[1].0 < drop);
     }
 
     fn assert_prepared_turn_commands(
@@ -10002,9 +10034,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(put_indices.len(), 1);
-        assert_eq!(set_indices.len(), 1);
+        assert_eq!(set_indices.len(), 2);
         assert_eq!(drop_indices.len(), 1);
-        assert!(put_indices[0] < set_indices[0] && set_indices[0] < drop_indices[0]);
+        assert!(
+            set_indices[0] < put_indices[0]
+                && put_indices[0] < set_indices[1]
+                && set_indices[1] < drop_indices[0]
+        );
         match (&commands[put_indices[0]], format) {
             (
                 Command::PutPicture {
@@ -10022,13 +10058,21 @@ mod tests {
             ) => {}
             (command, _) => panic!("wrong typed page upload: {command:?}"),
         }
-        let Command::SetScreen(screen) = &commands[set_indices[0]] else {
+        let Command::SetScreen(busy_screen) = &commands[set_indices[0]] else {
             unreachable!();
         };
-        assert!(
-            screen.reading_surface.is_some(),
-            "prepared turn showed loading"
-        );
+        let busy = busy_screen
+            .reading_surface
+            .expect("prepared turn busy reading surface");
+        assert_eq!(busy.picture.handle, old_handle);
+        assert_eq!(busy.chrome, ReadingChrome::OverlayBusy);
+        let Command::SetScreen(page_screen) = &commands[set_indices[1]] else {
+            unreachable!();
+        };
+        let page = page_screen
+            .reading_surface
+            .expect("prepared turn page reading surface");
+        assert_eq!(page.chrome, ReadingChrome::Hidden);
         assert!(matches!(
             commands[drop_indices[0]],
             Command::DropPicture(handle) if handle == old_handle
@@ -10327,7 +10371,14 @@ mod tests {
         first_pixels: &PicturePixels,
     ) -> Vec<u8> {
         let previous_commands = runner.action(action_id(READER_PREVIOUS));
-        assert!(last_screen(&previous_commands).reading_surface.is_none());
+        let previous_surface = last_screen(&previous_commands)
+            .reading_surface
+            .expect("current page remains while the previous page loads");
+        assert_eq!(previous_surface.chrome, ReadingChrome::OverlayBusy);
+        assert_eq!(
+            Some(previous_surface.picture),
+            runner.app().reader.as_ref().expect("reader").picture
+        );
         let failed_source = runner
             .app()
             .foreground_reader_task
@@ -10487,7 +10538,11 @@ mod tests {
                 Command::PutPicture { .. } | Command::DropPicture(_)
             )));
             let screen = last_screen(&commands);
-            assert!(screen.reading_surface.is_none());
+            let surface = screen
+                .reading_surface
+                .expect("the displayed page remains visible while its replacement loads");
+            assert_eq!(surface.picture.handle, PictureHandle(7));
+            assert_eq!(surface.chrome, ReadingChrome::OverlayBusy);
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
             assert_eq!(reader.page, 0);
@@ -10705,7 +10760,14 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![maintenance_task]
             );
-            assert!(last_screen(&commands).reading_surface.is_none());
+            let previous_surface = last_screen(&commands)
+                .reading_surface
+                .expect("current page remains while the previous page loads");
+            assert_eq!(previous_surface.chrome, ReadingChrome::OverlayBusy);
+            assert_eq!(
+                Some(previous_surface.picture),
+                runner.app().reader.as_ref().expect("reader").picture
+            );
             assert_eq!(
                 runner
                     .app()
@@ -12754,6 +12816,17 @@ mod tests {
         assert_eq!(runner.app().view, View::Main);
         assert!(!screen.owns_back);
         assert_fits(&screen);
+    }
+
+    #[test]
+    fn content_detail_replaces_the_provisional_shelf_title() {
+        let (mut runner, _) = loaded_library();
+        let commands = runner.action(action_id("comic-0"));
+        let (task, _) = only_spawn(&commands);
+
+        runner.task_outcome(task, TaskOutcome::Completed(CONTENT_RESPONSE.to_vec()));
+
+        assert_eq!(runner.app().selected_title, "Localized Title");
     }
 
     #[test]

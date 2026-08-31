@@ -1257,6 +1257,9 @@ impl NavBar {
 pub enum ReadingChrome {
     Hidden,
     Overlay,
+    /// Keep the reading picture visible while replacing the footer position
+    /// with a static loading status.
+    OverlayBusy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1848,7 +1851,10 @@ impl Screen {
             text_lines: Vec::new(),
         });
 
-        if surface.chrome == ReadingChrome::Overlay {
+        if matches!(
+            surface.chrome,
+            ReadingChrome::Overlay | ReadingChrome::OverlayBusy
+        ) {
             if let Some(top_bar) = &self.top_bar {
                 layout_top_bar(top_bar, chrome, metrics, 0, &mut layout);
             }
@@ -1869,7 +1875,17 @@ impl Screen {
                     kind: LayoutKind::ReadingFooter,
                     text_lines: Vec::new(),
                 });
-                layout_page_position(turns, page, of, band, metrics, &mut layout);
+                if surface.chrome == ReadingChrome::OverlayBusy {
+                    layout.nodes.push(LayoutNode {
+                        id: NodeId(0),
+                        rect: band,
+                        kind: LayoutKind::PagePosition,
+                        text_lines: vec!["Loading page...".to_owned()],
+                    });
+                    layout.page_turns = PagingState::SuppressedByOverlay;
+                } else {
+                    layout_page_position(turns, page, of, band, metrics, &mut layout);
+                }
             }
         }
 
@@ -14307,6 +14323,47 @@ mod page_turn_tests {
         assert_eq!(
             overlay.hit_test(CLARA_BW_METRICS.width / 2, CLARA_BW_METRICS.height / 2),
             Some(ActionId(12))
+        );
+    }
+
+    #[test]
+    fn busy_reading_chrome_keeps_the_picture_and_suppresses_page_turns() {
+        let picture = TilePicture::new(
+            PictureHandle(41),
+            CLARA_BW_METRICS.width as u32,
+            CLARA_BW_METRICS.height as u32,
+        );
+        let mut screen = Screen::new(7, Vec::new())
+            .with_top_bar(TopBar::new(NodeId(1), "Episode One"))
+            .with_page_turns(ActionId(10), ActionId(11));
+        screen.page_turns = screen
+            .page_turns
+            .map(|turns| turns.with_menu(ActionId(12)).with_position(4, 12));
+        let layout = screen
+            .with_reading_surface(Some(ReadingSurface::new(
+                NodeId(2),
+                picture,
+                ReadingChrome::OverlayBusy,
+            )))
+            .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
+
+        assert!(layout
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::Picture(PictureHandle(41))));
+        let status = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::PagePosition)
+            .expect("busy footer status");
+        assert_eq!(status.text_lines, ["Loading page..."]);
+        assert!(!layout.nodes.iter().any(|node| matches!(
+            node.kind,
+            LayoutKind::PagePrevious(_) | LayoutKind::PageNext(_)
+        )));
+        assert_eq!(
+            layout.hit_page_turn(CLARA_BW_METRICS.width / 2, CLARA_BW_METRICS.height / 2),
+            None
         );
     }
 

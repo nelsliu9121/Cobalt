@@ -128,6 +128,19 @@ pub const READING_FONT_CANDIDATES: &[&str] = &[
     "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/Vollkorn-Regular.ttf",
 ];
 
+/// CJK faces supplied by Kobo firmware or common simulator hosts.
+///
+/// Latin text stays in Atkinson. These are consulted only for glyphs the
+/// interface, reading and grid fallback faces cannot draw.
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/ub_arudjingxihei.ttf",
+    "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/KBJ-UDKakugoPr6N-M.ttf",
+    "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/KBJ-TsukuMinPr6N-RB.ttf",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+];
+
 /// The environment variable that overrides the prose face alone.
 pub const READING_FONT_OVERRIDE: &str = "KOBO_READING_FONT";
 
@@ -215,6 +228,16 @@ impl Typeface {
             }
         }
         Self::from_bytes(TEXT_FONT, "AtkinsonHyperlegible-Regular.ttf", metrics)
+    }
+
+    /// Loads a CJK fallback when the device or simulator host provides one.
+    fn discover_cjk(metrics: DisplayMetrics) -> Option<Self> {
+        CJK_FONT_CANDIDATES.iter().find_map(|candidate| {
+            let path = Path::new(candidate);
+            path.exists()
+                .then(|| Self::load(path, metrics).ok())
+                .flatten()
+        })
     }
 
     /// Loads the bold cut of the interface face.
@@ -381,7 +404,11 @@ impl Typeface {
     /// letter: an unaccented `i` is a different name and a question mark is an
     /// apology. Another face that has the letter is the only answer that draws
     /// what the author wrote, and one is compiled in already.
-    fn pick<'a>(&'a self, character: char, fallback: Option<&'a Self>) -> Option<(&'a Self, char)> {
+    fn pick<'a>(
+        &'a self,
+        character: char,
+        fallbacks: [Option<&'a Self>; 2],
+    ) -> Option<(&'a Self, char)> {
         if self.has(character) {
             return Some((self, character));
         }
@@ -391,8 +418,10 @@ impl Typeface {
         if let Some(glyph) = substitute(character).filter(|glyph| self.has(*glyph)) {
             return Some((self, glyph));
         }
-        if let Some(other) = fallback.filter(|other| other.has(character)) {
-            return Some((other, character));
+        for other in fallbacks.into_iter().flatten() {
+            if other.has(character) {
+                return Some((other, character));
+            }
         }
         Some((self, character))
     }
@@ -421,7 +450,7 @@ impl Typeface {
         size: FontSize,
         face: Face,
         cell: Option<i32>,
-        fallback: Option<&Self>,
+        fallbacks: [Option<&Self>; 2],
     ) -> (i32, i32) {
         if let Some(cell) = cell {
             // A grid is measured by counting, not by adding. The exact sum of
@@ -436,7 +465,7 @@ impl Typeface {
         let mut width = 0f32;
         let mut previous: Option<(&Self, char)> = None;
         for character in text.chars() {
-            let Some((face, glyph)) = self.pick(character, fallback) else {
+            let Some((face, glyph)) = self.pick(character, fallbacks) else {
                 continue;
             };
             // Kerning is a pair drawn by one designer. Across a face boundary
@@ -480,7 +509,7 @@ impl Typeface {
         size: FontSize,
         face: Face,
         cell: Option<i32>,
-        fallback: Option<&Self>,
+        fallbacks: [Option<&Self>; 2],
         plot: &mut dyn FnMut(i32, i32, u8),
     ) {
         let pixels = self.pixels(size, face);
@@ -491,7 +520,7 @@ impl Typeface {
         let mut pen = x as f32;
         let mut previous: Option<(&Self, char)> = None;
         for character in text.chars() {
-            let Some((face, character)) = self.pick(character, fallback) else {
+            let Some((face, character)) = self.pick(character, fallbacks) else {
                 // An invisible character owns a column in a grid and nothing
                 // at all in a proportional run. Advancing here in both cases
                 // would open a hole in the middle of a word.
@@ -566,6 +595,7 @@ pub struct SystemFonts {
     text: Typeface,
     display: Typeface,
     mono: Typeface,
+    cjk: Option<Typeface>,
     reading: Typeface,
 }
 
@@ -594,7 +624,8 @@ impl BookFont {
 
 impl Typesetter for BookFont {
     fn measure(&self, text: &str, size: FontSize, _face: Face) -> (i32, i32) {
-        self.face.measure_run(text, size, Face::Reading, None, None)
+        self.face
+            .measure_run(text, size, Face::Reading, None, [None, None])
     }
 
     fn em(&self, size: FontSize, _face: Face) -> i32 {
@@ -619,7 +650,7 @@ impl Typesetter for BookFont {
         plot: &mut dyn FnMut(i32, i32, u8),
     ) {
         self.face
-            .draw_run(text, x, y, size, Face::Reading, None, None, plot);
+            .draw_run(text, x, y, size, Face::Reading, None, [None, None], plot);
     }
 
     fn has_glyph(&self, character: char, _face: Face) -> bool {
@@ -674,6 +705,7 @@ impl SystemFonts {
             display: Typeface::discover_display(metrics)
                 .or_else(|_| Typeface::discover(metrics))?,
             mono: Typeface::from_bytes(MONO_FONT, "DejaVuSansMono.ttf", metrics)?,
+            cjk: Typeface::discover_cjk(metrics),
             reading,
         })
     }
@@ -730,10 +762,10 @@ impl SystemFonts {
     ///
     /// Nothing stands behind the grid face itself. It is the end of the chain,
     /// and there is nothing here that covers more than it does.
-    const fn fallback(&self, face: Face) -> Option<&Typeface> {
+    fn fallbacks(&self, face: Face) -> [Option<&Typeface>; 2] {
         match face {
-            Face::Text | Face::Reading => Some(&self.mono),
-            Face::Mono => None,
+            Face::Text | Face::Reading => [Some(&self.mono), self.cjk.as_ref()],
+            Face::Mono => [None, None],
         }
     }
 }
@@ -745,7 +777,7 @@ impl Typesetter for SystemFonts {
             size,
             face,
             self.cell(size, face),
-            self.fallback(face),
+            self.fallbacks(face),
         )
     }
 
@@ -784,7 +816,7 @@ impl Typesetter for SystemFonts {
             size,
             face,
             self.cell(size, face),
-            self.fallback(face),
+            self.fallbacks(face),
             plot,
         );
     }
@@ -797,7 +829,7 @@ impl Typesetter for SystemFonts {
         // readable.
         let typeface = self.face(face);
         typeface
-            .pick(character, self.fallback(face))
+            .pick(character, self.fallbacks(face))
             .is_none_or(|(drawn, glyph)| drawn.has(glyph))
     }
 
@@ -826,7 +858,7 @@ impl Typesetter for SystemFonts {
             .fixed_advance(size, Face::Mono)
             .unwrap_or_else(|| {
                 self.mono
-                    .measure_run("0", size, Face::Mono, None, None)
+                    .measure_run("0", size, Face::Mono, None, [None, None])
                     .0
                     .max(1)
             })
@@ -1143,7 +1175,7 @@ mod tests {
         let at = |scale| {
             kobo_ui::with_text_scale(scale, || {
                 (
-                    face.measure_run("Readable", FontSize::Body, Face::Text, None, None)
+                    face.measure_run("Readable", FontSize::Body, Face::Text, None, [None, None])
                         .0,
                     face.height(FontSize::Body, Face::Text),
                 )
@@ -1174,6 +1206,20 @@ mod tests {
 
         let combined = "e\u{301}x";
         assert_eq!(fonts.grapheme_boundaries(combined)[0], "e\u{301}".len());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_fonts_draw_traditional_chinese_with_the_host_fallback() {
+        let fonts = SystemFonts::discover(CLARA).expect("fonts");
+
+        for character in "獵人只想安靜生活".chars() {
+            assert!(
+                fonts.has_glyph(character, Face::Text),
+                "U+{:04X} would draw an empty box",
+                character as u32
+            );
+        }
     }
 
     #[test]
@@ -1286,13 +1332,14 @@ mod tests {
             "this test is pointless unless the face really lacks the character"
         );
 
-        let (plain, _) = face.measure_run("one-to-one", FontSize::Body, Face::Text, None, None);
+        let (plain, _) =
+            face.measure_run("one-to-one", FontSize::Body, Face::Text, None, [None, None]);
         let (fancy, _) = face.measure_run(
             "one\u{2011}to\u{2011}one",
             FontSize::Body,
             Face::Text,
             None,
-            None,
+            [None, None],
         );
         assert_eq!(plain, fancy, "the substitute must measure as what it draws");
         assert_eq!(
@@ -1320,7 +1367,7 @@ mod tests {
                 "{missing:?} would not exercise the fallback"
             );
             let (drawn, glyph) = face
-                .pick(missing, Some(&other))
+                .pick(missing, [Some(&other), None])
                 .expect("a letter is not invisible");
             assert!(
                 std::ptr::eq(drawn, std::ptr::from_ref(&other)) && glyph == missing,
@@ -1335,7 +1382,7 @@ mod tests {
                 FontSize::Body,
                 Face::Text,
                 None,
-                Some(&other),
+                [Some(&other), None],
                 &mut |x, y, coverage| {
                     if coverage > 0 {
                         borrowed.push((x, y));
@@ -1391,8 +1438,8 @@ mod tests {
             );
             let text = format!("wo{invisible}rd");
             assert_eq!(
-                face.measure_run(&text, FontSize::Body, Face::Text, None, None),
-                face.measure_run("word", FontSize::Body, Face::Text, None, None),
+                face.measure_run(&text, FontSize::Body, Face::Text, None, [None, None]),
+                face.measure_run("word", FontSize::Body, Face::Text, None, [None, None]),
                 "{invisible:?} widened the line it should have left alone"
             );
             assert_eq!(ink(&face, &text), ink(&face, "word"));
@@ -1412,7 +1459,7 @@ mod tests {
             .expect("a fixed advance");
         let text = "a\u{200b}b";
         assert_eq!(
-            mono.measure_run(text, FontSize::Body, Face::Text, Some(cell), None)
+            mono.measure_run(text, FontSize::Body, Face::Text, Some(cell), [None, None])
                 .0,
             cell * 3
         );
@@ -1424,7 +1471,7 @@ mod tests {
             FontSize::Body,
             Face::Text,
             Some(cell),
-            None,
+            [None, None],
             &mut |x, _, coverage| {
                 if coverage > 0 {
                     columns.push(x);
@@ -1497,7 +1544,7 @@ mod tests {
             FontSize::Body,
             Face::Text,
             None,
-            None,
+            [None, None],
             &mut |x, y, coverage| {
                 if coverage > 0 {
                     marks.push((x, y));
@@ -1512,8 +1559,8 @@ mod tests {
         let Some(face) = face() else {
             return;
         };
-        let lower = face.measure_run("aaaa", FontSize::Body, Face::Text, None, None);
-        let upper = face.measure_run("AAAA", FontSize::Body, Face::Text, None, None);
+        let lower = face.measure_run("aaaa", FontSize::Body, Face::Text, None, [None, None]);
+        let upper = face.measure_run("AAAA", FontSize::Body, Face::Text, None, [None, None]);
         // The built-in bitmap folded case away entirely, so these were equal.
         assert_ne!(lower, upper, "case is still being folded away");
     }
@@ -1523,8 +1570,8 @@ mod tests {
         let Some(face) = face() else {
             return;
         };
-        let narrow = face.measure_run("iiii", FontSize::Body, Face::Text, None, None);
-        let wide = face.measure_run("mmmm", FontSize::Body, Face::Text, None, None);
+        let narrow = face.measure_run("iiii", FontSize::Body, Face::Text, None, [None, None]);
+        let wide = face.measure_run("mmmm", FontSize::Body, Face::Text, None, [None, None]);
         assert!(narrow.0 < wide.0, "text is still monospaced");
     }
 
@@ -1534,10 +1581,10 @@ mod tests {
             return;
         };
         let once = face
-            .measure_run("kobo", FontSize::Body, Face::Text, None, None)
+            .measure_run("kobo", FontSize::Body, Face::Text, None, [None, None])
             .0;
         let twice = face
-            .measure_run("kobokobo", FontSize::Body, Face::Text, None, None)
+            .measure_run("kobokobo", FontSize::Body, Face::Text, None, [None, None])
             .0;
         let drift = (twice - once * 2).abs();
         assert!(
@@ -1552,7 +1599,8 @@ mod tests {
             return;
         };
         let text = "Reading";
-        let (width, height) = face.measure_run(text, FontSize::Body, Face::Text, None, None);
+        let (width, height) =
+            face.measure_run(text, FontSize::Body, Face::Text, None, [None, None]);
         let mut out_of_bounds = 0;
         face.draw_run(
             text,
@@ -1561,7 +1609,7 @@ mod tests {
             FontSize::Body,
             Face::Text,
             None,
-            None,
+            [None, None],
             &mut |x, y, _| {
                 if x < 0 || y < 0 || x > width || y > height {
                     out_of_bounds += 1;
@@ -1584,7 +1632,7 @@ mod tests {
             FontSize::Body,
             Face::Text,
             None,
-            None,
+            [None, None],
             &mut |_, _, coverage| {
                 if coverage > 0 {
                     covered += 1;
@@ -1607,7 +1655,7 @@ mod tests {
             FontSize::Title,
             Face::Text,
             None,
-            None,
+            [None, None],
             &mut |_, _, coverage| {
                 if coverage > 0 && coverage < 255 {
                     partial += 1;
@@ -1622,8 +1670,10 @@ mod tests {
         let Some(face) = face() else {
             return;
         };
-        let caption = face.measure_run("Chapter", FontSize::Caption, Face::Text, None, None);
-        let heading = face.measure_run("Chapter", FontSize::Heading, Face::Text, None, None);
+        let caption =
+            face.measure_run("Chapter", FontSize::Caption, Face::Text, None, [None, None]);
+        let heading =
+            face.measure_run("Chapter", FontSize::Heading, Face::Text, None, [None, None]);
         assert!(caption.0 < heading.0);
         assert!(caption.1 < heading.1);
     }
@@ -1686,7 +1736,8 @@ mod tests {
             .fixed_advance(FontSize::Body, Face::Mono)
             .expect("fixed pitch");
         for probe in ["i", "m", "W", ".", "0", "|"] {
-            let (width, _) = mono.measure_run(probe, FontSize::Body, Face::Text, Some(cell), None);
+            let (width, _) =
+                mono.measure_run(probe, FontSize::Body, Face::Text, Some(cell), [None, None]);
             assert_eq!(width, cell, "{probe} is not one cell wide");
         }
     }
@@ -1704,7 +1755,7 @@ mod tests {
             FontSize::Body,
             Face::Text,
             Some(cell),
-            None,
+            [None, None],
         );
         assert_eq!(width, cell * 16);
     }
@@ -1748,7 +1799,7 @@ mod tests {
             .map(|character| face.font.metrics(character, pixels).advance_width)
             .sum();
         let measured = face
-            .measure_run(&line, FontSize::Body, Face::Text, None, None)
+            .measure_run(&line, FontSize::Body, Face::Text, None, [None, None])
             .0;
         assert!(
             (measured as f32 - exact).abs() <= 1.0,
@@ -1994,7 +2045,8 @@ mod tests {
         let regular = Typeface::from_bytes(TEXT_FONT, "regular", CLARA).expect("regular");
         for size in [FontSize::Title, FontSize::Heading] {
             let (bold_width, _) = fonts.measure("Connections", size, Face::Text);
-            let (plain_width, _) = regular.measure_run("Connections", size, Face::Text, None, None);
+            let (plain_width, _) =
+                regular.measure_run("Connections", size, Face::Text, None, [None, None]);
             assert!(
                 bold_width > plain_width,
                 "{size:?} was set no wider than the regular cut: {bold_width} against {plain_width}"
@@ -2004,7 +2056,8 @@ mod tests {
         // a screen shouting every word of itself.
         for size in [FontSize::Caption, FontSize::Body] {
             let (through, _) = fonts.measure("Connections", size, Face::Text);
-            let (plain, _) = regular.measure_run("Connections", size, Face::Text, None, None);
+            let (plain, _) =
+                regular.measure_run("Connections", size, Face::Text, None, [None, None]);
             assert_eq!(through, plain, "{size:?} was not set in the regular cut");
         }
     }

@@ -524,6 +524,9 @@ pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
         .collect::<Result<Vec<_>, ParseError>>()?;
     Ok(ContentDetail {
         id: unsigned(data, "id", "data.id")?,
+        title: optional_bounded_string(data, "title", "data.title", MAX_TITLE_BYTES)?
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_owned),
         episodes,
     })
 }
@@ -1473,6 +1476,7 @@ mod tests {
       "result":"SUCCESS",
       "data":{
         "id":41,
+        "title":"\u7375\u4eba\u53ea\u60f3\u5b89\u975c\u751f\u6d3b",
         "episodes":[
           {"id":101,"alias":"sample","title":"Free preview","type":"PREVIEW","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
           {"id":102,"alias":"free","title":"Free episode","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
@@ -2309,6 +2313,7 @@ mod tests {
     fn content_detail_retains_ids_access_expiry_and_safe_prices() {
         let parsed = content_detail(CONTENT).expect("valid content response");
         assert_eq!(parsed.id, 41);
+        assert_eq!(parsed.title.as_deref(), Some("獵人只想安靜生活"));
         assert_eq!(parsed.episodes.len(), 8);
         assert_eq!(parsed.episodes[0].id, 101);
         assert_eq!(parsed.episodes[3].rent_expires_at, Some(7_200_001));

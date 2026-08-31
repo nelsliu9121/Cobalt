@@ -50,8 +50,9 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// Version 12 adds pixel-format bytes to the startup metrics and inline
 /// pictures, plus the start of chunked picture uploads. Version 13 adds the
 /// runtime's local Gregorian day and `CredentialScope`; v12 runtimes cannot
-/// decode the new task.
-pub const VERSION: u8 = 13;
+/// decode the new task. Version 14 adds the busy reading-chrome tag; v13
+/// runtimes would reject that reading surface.
+pub const VERSION: u8 = 14;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -4369,6 +4370,7 @@ fn encode_screen(
             output.push(match surface.chrome {
                 ReadingChrome::Hidden => 1,
                 ReadingChrome::Overlay => 2,
+                ReadingChrome::OverlayBusy => 3,
             });
             push_u32(output, surface.id.0);
             push_u32(output, surface.picture.handle.0);
@@ -5290,13 +5292,14 @@ fn decode_reading_surface(
 ) -> Result<Option<ReadingSurface>, ProtocolError> {
     Ok(match reader.u8()? {
         0 => None,
-        mode @ (1 | 2) => Some(ReadingSurface::new(
+        mode @ 1..=3 => Some(ReadingSurface::new(
             NodeId(reader.u32()?),
             TilePicture::new(PictureHandle(reader.u32()?), reader.u32()?, reader.u32()?),
-            if mode == 1 {
-                ReadingChrome::Hidden
-            } else {
-                ReadingChrome::Overlay
+            match mode {
+                1 => ReadingChrome::Hidden,
+                2 => ReadingChrome::Overlay,
+                3 => ReadingChrome::OverlayBusy,
+                _ => unreachable!("reading surface mode was matched above"),
             },
         )),
         _ => return Err(ProtocolError::InvalidValue("reading surface flag")),
@@ -7551,7 +7554,11 @@ mod node_coverage_tests {
 
     #[test]
     fn screen_round_trip_preserves_reading_surface_and_chrome() {
-        for chrome in [ReadingChrome::Hidden, ReadingChrome::Overlay] {
+        for chrome in [
+            ReadingChrome::Hidden,
+            ReadingChrome::Overlay,
+            ReadingChrome::OverlayBusy,
+        ] {
             let screen =
                 Screen::new(17, Vec::new()).with_reading_surface(Some(ReadingSurface::new(
                     NodeId(9),
@@ -7563,8 +7570,22 @@ mod node_coverage_tests {
     }
 
     #[test]
+    fn screen_decodes_busy_reading_chrome() {
+        let mut bytes = vec![3];
+        for value in [9, 42, 1_072, 1_448] {
+            push_u32(&mut bytes, value);
+        }
+        let mut reader = Reader::new(&bytes);
+        let surface = decode_reading_surface(&mut reader)
+            .expect("busy reading surface")
+            .expect("reading surface");
+        assert_ne!(surface.chrome, ReadingChrome::Hidden);
+        assert_ne!(surface.chrome, ReadingChrome::Overlay);
+    }
+
+    #[test]
     fn screen_rejects_unknown_reading_surface_flag() {
-        let mut reader = Reader::new(&[3]);
+        let mut reader = Reader::new(&[4]);
         assert_eq!(
             decode_reading_surface(&mut reader),
             Err(ProtocolError::InvalidValue("reading surface flag"))
@@ -8321,8 +8342,8 @@ mod store_tests {
     }
 
     #[test]
-    fn credential_scope_uses_protocol_version_thirteen_and_rejects_v12() {
-        assert_eq!(VERSION, 13);
+    fn credential_scope_uses_current_protocol_version_and_rejects_v13() {
+        assert_eq!(VERSION, 14);
         let frame = Frame {
             request_id: 10,
             message: Message::Spawn {
@@ -8333,11 +8354,11 @@ mod store_tests {
             },
         };
         let mut encoded = encode(&frame).expect("encode credential scope");
-        assert_eq!(encoded[4], 13);
+        assert_eq!(encoded[4], 14);
         assert_eq!(decode(&encoded), Ok(frame));
 
-        encoded[4] = 12;
-        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(12)));
+        encoded[4] = 13;
+        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(13)));
     }
 
     #[test]

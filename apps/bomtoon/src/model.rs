@@ -32,6 +32,7 @@ const HOUR_MS: i64 = 60 * 60 * 1_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentDetail {
     pub id: usize,
+    pub title: Option<String>,
     pub episodes: Vec<Episode>,
 }
 
