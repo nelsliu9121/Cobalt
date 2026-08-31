@@ -4,7 +4,6 @@ use kobo_sdk::{Credential, Header, Task};
 
 const HOMEPAGE_URL: &str = "https://www.bomtoon.tw/comic/main";
 const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
-const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
@@ -16,7 +15,6 @@ const PURCHASE_URL: &str = "https://www.bomtoon.tw/api/balcony-api/purchase";
 const COMMENTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/contents/";
 const REPLIES_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/reply/CONTENTS/";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
-const CONTENT_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
@@ -94,12 +92,12 @@ pub fn recent(page: usize) -> Task {
     )
 }
 
-pub fn content(alias: &str) -> Task {
+pub fn detail(alias: &str) -> Task {
     fetch(
-        format!("{CONTENT_URL}{alias}?isNotLoginAdult=false&isPorch=false"),
-        CONTENT_BYTES,
+        format!("{DETAIL_URL}{alias}"),
+        PUBLIC_HTML_BYTES,
         Credential::bearer("bomtoon-access-token"),
-        balcony_headers(),
+        response_headers("text/html"),
     )
 }
 
@@ -260,7 +258,7 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        account_scope, asset_summary, comments, content, expiration_history, homepage, image,
+        account_scope, asset_summary, comments, detail, expiration_history, homepage, image,
         images, library, public_detail, purchase, quote, recent, replies, title_gifts,
         CommentOrder, ACCEPT_LANGUAGE,
     };
@@ -318,21 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn content_uses_exact_bearer_json_endpoint() {
+    fn detail_uses_managed_bearer_html_endpoint() {
         let Task::Fetch {
             url,
             offset,
             max_bytes,
             credential,
-            ..
-        } = content("hunter_q")
+            headers,
+        } = detail("365")
         else {
-            panic!("expected fetch task");
+            panic!("detail must be a fetch");
         };
-        assert_eq!(
-            url,
-            "https://www.bomtoon.tw/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
-        );
+        assert_eq!(url, "https://www.bomtoon.tw/detail/365");
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 512 * 1024);
         assert!(matches!(
@@ -341,27 +336,13 @@ mod tests {
                 if value.secret == "bomtoon-access-token"
                     && value.header == SecretHeader::Bearer
         ));
-    }
-
-    #[test]
-    fn content_request_uses_managed_bearer_and_json_headers() {
-        let Task::Fetch {
-            credential,
+        assert_eq!(
             headers,
-            ..
-        } = content("365")
-        else {
-            panic!("expected fetch task");
-        };
-        assert!(matches!(
-            credential,
-            Some(value)
-                if value.secret == "bomtoon-access-token"
-                    && value.header == SecretHeader::Bearer
-        ));
-        assert!(headers.iter().any(|header| {
-            header.name.eq_ignore_ascii_case("accept") && header.value == "application/json"
-        }));
+            vec![
+                Header::new("Accept", "text/html"),
+                Header::new("Accept-Language", ACCEPT_LANGUAGE),
+            ]
+        );
         assert!(headers.iter().all(|header| {
             !header.name.eq_ignore_ascii_case("cookie")
                 && !header.name.eq_ignore_ascii_case("authorization")
@@ -467,7 +448,7 @@ mod tests {
     #[test]
     fn credentials_never_enter_urls_or_regular_headers() {
         for task in [
-            content("hunter_q"),
+            detail("hunter_q"),
             library(2),
             recent(0),
             asset_summary(),
@@ -493,7 +474,7 @@ mod tests {
 
     #[test]
     fn requests_use_endpoint_headers_without_browser_fingerprints() {
-        for task in [content("365"), library(0), recent(0)] {
+        for task in [library(0), recent(0)] {
             let Task::Fetch { headers, .. } = task else {
                 panic!("expected fetch task");
             };

@@ -28,6 +28,11 @@ const MAX_COMMENT_PAGES: usize = 10_000;
 const MAX_COMMENTS_PER_RESPONSE: usize = 20;
 const MAX_COMMENT_AUTHOR_BYTES: usize = 256;
 const MAX_COMMENT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_DETAIL_CREATORS: usize = 32;
+const MAX_CREATOR_NAME_BYTES: usize = 256;
+const MAX_SYNOPSIS_BYTES: usize = 16 * 1024;
+const MAX_EPISODES: usize = 512;
+const MAX_EPISODE_THUMBNAILS: usize = 8;
 const BOMTOON_TITLE_SUFFIX: &str = " - 漫畫 - BOMTOON";
 const HTML_ENTITIES: &[(&str, &str)] = &[
     ("amp", "&"),
@@ -72,6 +77,10 @@ const PUBLIC_IMAGE_PATHS: &[&str] = &[
     "/BOMTOON_TW/co_thumbnail/",
 ];
 const PUBLIC_SQUARE_IMAGE_PATHS: &[&str] = &["/tw/co_thumbnail/", "/BOMTOON_TW/co_thumbnail/"];
+const EPISODE_THUMBNAIL_PATHS: &[&str] = &[
+    "/tw/ep_thumbnail/",
+    "/BOMTOON_TW/ep_thumbnail/",
+];
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -470,70 +479,160 @@ pub fn expiration_history(bytes: &[u8], kind: AssetKind) -> Result<Vec<Expiratio
     Ok(rows)
 }
 
-pub fn content_detail(bytes: &[u8]) -> Result<ContentDetail, ParseError> {
-    let root = parse_json(bytes)?;
-    require_success(&root)?;
-    let data = field(&root, "data", "data")?;
-    let episodes = array(data, "episodes", "data.episodes")?
-        .iter()
-        .map(|item| {
-            let coin_kind = optional_bounded_string(
+pub fn content_detail(
+    bytes: &[u8],
+    expected_alias: &str,
+) -> Result<ContentDetail, ParseError> {
+    if !valid_alias(expected_alias) {
+        return Err(ParseError::InvalidValue("detail alias"));
+    }
+    let html = str::from_utf8(bytes).map_err(ParseError::Utf8)?;
+    let payload = next_data_payload(html).ok_or(ParseError::Missing("__NEXT_DATA__"))?;
+    let root = kobo_json::parse(payload).map_err(ParseError::Json)?;
+    let props = field(&root, "props", "props")?;
+    let page_props = field(props, "pageProps", "props.pageProps")?;
+    if !boolean(
+        page_props,
+        "ssrPersonalized",
+        "props.pageProps.ssrPersonalized",
+    )? {
+        return Err(ParseError::InvalidValue(
+            "props.pageProps.ssrPersonalized",
+        ));
+    }
+    let detail = field(page_props, "ssrDetail", "props.pageProps.ssrDetail")?;
+    let alias = bounded_string(detail, "alias", "ssrDetail.alias", MAX_ALIAS_BYTES)?;
+    if alias != expected_alias {
+        return Err(ParseError::InvalidValue("ssrDetail.alias"));
+    }
+    let title = bounded_string(detail, "title", "ssrDetail.title", MAX_TITLE_BYTES)?;
+    if title.trim().is_empty() {
+        return Err(ParseError::InvalidValue("ssrDetail.title"));
+    }
+    let creator_values = bounded_array(
+        detail,
+        "creators",
+        "ssrDetail.creators",
+        MAX_DETAIL_CREATORS,
+    )?;
+    let mut creators = Vec::with_capacity(creator_values.len());
+    for creator in creator_values {
+        let name = bounded_string(
+            creator,
+            "name",
+            "creator.name",
+            MAX_CREATOR_NAME_BYTES,
+        )?;
+        if name.trim().is_empty() {
+            return Err(ParseError::InvalidValue("creator.name"));
+        }
+        creators.push(name.to_owned());
+    }
+    let synopsis = bounded_string(
+        detail,
+        "synopsis",
+        "ssrDetail.synopsis",
+        MAX_SYNOPSIS_BYTES,
+    )?;
+    if synopsis.trim().is_empty() {
+        return Err(ParseError::InvalidValue("ssrDetail.synopsis"));
+    }
+    let episodes = bounded_array(
+        detail,
+        "episodes",
+        "ssrDetail.episodes",
+        MAX_EPISODES,
+    )?
+    .iter()
+    .map(|item| {
+        let coin_kind = optional_bounded_string(
+            item,
+            "coinKind",
+            "episode.coinKind",
+            MAX_REMOTE_CODE_BYTES,
+        )?;
+        let possession_coin =
+            optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
+        let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
+        let permanent_coin = optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
+        let availability = EpisodeAvailability {
+            status: bounded_nullable_string(
                 item,
-                "coinKind",
-                "episode.coinKind",
+                "purchaseStatus",
+                "episode.purchaseStatus",
                 MAX_REMOTE_CODE_BYTES,
-            )?;
-            let possession_coin =
-                optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
-            let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
-            let permanent_coin = optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
-            let availability = EpisodeAvailability {
-                status: bounded_nullable_string(
-                    item,
-                    "purchaseStatus",
-                    "episode.purchaseStatus",
-                    MAX_REMOTE_CODE_BYTES,
-                )?,
-                episode_type: optional_string(item, "type", "episode.type")?,
-                is_sample: boolean(item, "isSample", "episode.isSample")?,
-                paid: optional_boolean(item, "paid", "episode.paid")?,
-                possession_coin,
-                rent_coin,
-            };
-            let paid_with_coin = coin_kind == Some("COIN");
-            let purchase_coin = if paid_with_coin
-                && permanent_coin.is_none_or(|coin| Some(coin) == possession_coin)
-            {
+            )?,
+            episode_type: optional_string(item, "type", "episode.type")?,
+            is_sample: boolean(item, "isSample", "episode.isSample")?,
+            paid: optional_boolean(item, "paid", "episode.paid")?,
+            possession_coin,
+            rent_coin,
+        };
+        let paid_with_coin = coin_kind == Some("COIN");
+        let purchase_coin =
+            if paid_with_coin && permanent_coin.is_none_or(|coin| Some(coin) == possession_coin) {
                 possession_coin
             } else {
                 None
             };
-            Ok(Episode {
-                id: unsigned(item, "id", "episode.id")?,
-                alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?
-                    .to_owned(),
-                title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?
-                    .to_owned(),
-                purchase: PurchaseState::from_remote(availability),
-                rent_expires_at: optional_timestamp(
-                    item,
-                    "rentExpiredAt",
-                    "episode.rentExpiredAt",
-                )?,
-                rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
-                purchase_coin,
-                gift_eligible: optional_boolean(item, "isRentGift", "episode.isRentGift")?
-                    .unwrap_or(false),
-            })
+        Ok(Episode {
+            id: unsigned(item, "id", "episode.id")?,
+            alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?
+                .to_owned(),
+            title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?
+                .to_owned(),
+            opened_at: positive_i64(item, "openedAt", "episode.openedAt")?,
+            thumbnail_url: episode_thumbnail(item)?,
+            purchase: PurchaseState::from_remote(availability),
+            rent_expires_at: optional_timestamp(
+                item,
+                "rentExpiredAt",
+                "episode.rentExpiredAt",
+            )?,
+            rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
+            purchase_coin,
+            gift_eligible: optional_boolean(item, "isRentGift", "episode.isRentGift")?
+                .unwrap_or(false),
         })
-        .collect::<Result<Vec<_>, ParseError>>()?;
+    })
+    .collect::<Result<Vec<_>, ParseError>>()?;
     Ok(ContentDetail {
-        id: unsigned(data, "id", "data.id")?,
-        title: optional_bounded_string(data, "title", "data.title", MAX_TITLE_BYTES)?
-            .filter(|title| !title.trim().is_empty())
-            .map(str::to_owned),
+        id: unsigned(detail, "id", "ssrDetail.id")?,
+        title: title.to_owned(),
+        creators,
+        synopsis: synopsis.to_owned(),
         episodes,
     })
+}
+
+fn episode_thumbnail(value: &Value) -> Result<Option<String>, ParseError> {
+    let Some(thumbnails) = value.get("thumbnails") else {
+        return Ok(None);
+    };
+    let thumbnails = thumbnails
+        .as_array()
+        .ok_or(ParseError::WrongType("episode.thumbnails"))?;
+    if thumbnails.len() > MAX_EPISODE_THUMBNAILS {
+        return Err(ParseError::InvalidValue("episode.thumbnails"));
+    }
+    let mut selected = None;
+    for thumbnail in thumbnails {
+        if thumbnail.get("type").and_then(Value::as_str) != Some("COMMON") {
+            continue;
+        }
+        if selected.replace(thumbnail).is_some() {
+            return Err(ParseError::InvalidValue("episode.thumbnails"));
+        }
+    }
+    let Some(thumbnail) = selected else {
+        return Ok(None);
+    };
+    let url = string(
+        thumbnail,
+        "imagePath",
+        "episode.thumbnail.imagePath",
+    )?;
+    Ok(public_image_url(url, EPISODE_THUMBNAIL_PATHS).then(|| url.to_owned()))
 }
 
 pub fn gift_balance(bytes: &[u8]) -> Result<GiftBalance, ParseError> {
@@ -1477,23 +1576,67 @@ mod tests {
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
-    const CONTENT: &[u8] = br#"{
-      "result":"SUCCESS",
-      "data":{
-        "id":41,
-        "title":"\u7375\u4eba\u53ea\u60f3\u5b89\u975c\u751f\u6d3b",
-        "episodes":[
-          {"id":101,"alias":"sample","title":"Free preview","type":"PREVIEW","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
-          {"id":102,"alias":"free","title":"Free episode","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"possessionCoin":0,"rentCoin":0},
-          {"id":103,"alias":"paid","title":"Paid episode","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":null,"coinKind":"COIN","possessionCoin":3,"rentCoin":2,"permanentCoin":3,"isRentGift":true},
-          {"id":104,"alias":"rented","title":"Rented episode","type":"GENERAL","isSample":false,"purchaseStatus":"RENT","paid":true,"rentExpiredAt":7200001},
-          {"id":105,"alias":"owned","title":"Owned episode","type":"PREVIEW","isSample":true,"purchaseStatus":"POSSESSION","paid":false,"possessionCoin":0,"rentCoin":0},
-          {"id":106,"alias":"future","title":"Future status","type":"PREVIEW","isSample":true,"purchaseStatus":"FUTURE","paid":false,"possessionCoin":0,"rentCoin":0},
-          {"id":107,"alias":"ticket","title":"Ticket is not episode payment","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"TICKET","possessionCoin":4,"rentCoin":1},
-          {"id":108,"alias":"conflict","title":"Conflicting permanent price","type":"GENERAL","isSample":false,"purchaseStatus":"NONE","paid":true,"coinKind":"COIN","possessionCoin":4,"rentCoin":2,"permanentCoin":5}
-        ]
-      }
-    }"#;
+    fn personalized_detail_html(personalized: bool, alias: &str, episodes: &str) -> Vec<u8> {
+        format!(
+            concat!(
+                "<!doctype html><html><head>",
+                "<script id=\"__NEXT_DATA__\" type=\"application/json\">",
+                "{{\"props\":{{\"pageProps\":{{",
+                "\"ssrPersonalized\":{personalized},",
+                "\"userData\":{{\"ignored\":true}},",
+                "\"ssrDetail\":{{",
+                "\"id\":41,\"alias\":\"{alias}\",\"title\":\"Hunter Q\",",
+                "\"creators\":[{{\"creatorId\":1,\"name\":\"Writer\",\"type\":\"WRITER\"}},",
+                "{{\"creatorId\":2,\"name\":\"Artist\",\"type\":\"ARTIST\"}}],",
+                "\"synopsis\":\"A complete synopsis.\",",
+                "\"episodes\":[{episodes}]",
+                "}}}}}}}}",
+                "</script></head></html>"
+            ),
+            personalized = personalized,
+            alias = alias,
+            episodes = episodes,
+        )
+        .into_bytes()
+    }
+
+    const OWNED_EPISODE: &str = concat!(
+        "{\"id\":101,\"alias\":\"ep-1\",\"title\":\"Episode One\",",
+        "\"openedAt\":1709136000000,",
+        "\"thumbnails\":[{\"type\":\"COMMON\",",
+        "\"imagePath\":\"https://image.balcony.studio/tw/ep_thumbnail/101/cover.webp\"}],",
+        "\"type\":\"GENERAL\",\"isSample\":false,",
+        "\"purchaseStatus\":\"POSSESSION\",\"paid\":true,",
+        "\"coinKind\":\"COIN\",\"possessionCoin\":2,\"rentCoin\":1,",
+        "\"permanentCoin\":2,\"isRentGift\":false}"
+    );
+
+    const CONTENT_EPISODES: &str = concat!(
+        "{\"id\":101,\"alias\":\"sample\",\"title\":\"Free preview\",\"openedAt\":1709136000001,\"type\":\"PREVIEW\",\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":null,\"possessionCoin\":0,\"rentCoin\":0},",
+        "{\"id\":102,\"alias\":\"free\",\"title\":\"Free episode\",\"openedAt\":1709136000002,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":null,\"possessionCoin\":0,\"rentCoin\":0},",
+        "{\"id\":103,\"alias\":\"paid\",\"title\":\"Paid episode\",\"openedAt\":1709136000003,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":null,\"coinKind\":\"COIN\",\"possessionCoin\":3,\"rentCoin\":2,\"permanentCoin\":3,\"isRentGift\":true},",
+        "{\"id\":104,\"alias\":\"rented\",\"title\":\"Rented episode\",\"openedAt\":1709136000004,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"RENT\",\"paid\":true,\"rentExpiredAt\":7200001},",
+        "{\"id\":105,\"alias\":\"owned\",\"title\":\"Owned episode\",\"openedAt\":1709136000005,\"type\":\"PREVIEW\",\"isSample\":true,\"purchaseStatus\":\"POSSESSION\",\"paid\":false,\"possessionCoin\":0,\"rentCoin\":0},",
+        "{\"id\":106,\"alias\":\"future\",\"title\":\"Future status\",\"openedAt\":1709136000006,\"type\":\"PREVIEW\",\"isSample\":true,\"purchaseStatus\":\"FUTURE\",\"paid\":false,\"possessionCoin\":0,\"rentCoin\":0},",
+        "{\"id\":107,\"alias\":\"ticket\",\"title\":\"Ticket is not episode payment\",\"openedAt\":1709136000007,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"TICKET\",\"possessionCoin\":4,\"rentCoin\":1},",
+        "{\"id\":108,\"alias\":\"conflict\",\"title\":\"Conflicting permanent price\",\"openedAt\":1709136000008,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"possessionCoin\":4,\"rentCoin\":2,\"permanentCoin\":5}"
+    );
+
+    fn detail_episode(opened_at: &str, thumbnails: &str, purchase_status: &str) -> String {
+        format!(
+            concat!(
+                "{{\"id\":101,\"alias\":\"ep-1\",\"title\":\"Episode One\",",
+                "\"openedAt\":{opened_at}{thumbnails},",
+                "\"type\":\"GENERAL\",\"isSample\":false,",
+                "\"purchaseStatus\":\"{purchase_status}\",\"paid\":true,",
+                "\"coinKind\":\"COIN\",\"possessionCoin\":2,\"rentCoin\":1,",
+                "\"permanentCoin\":2,\"isRentGift\":false}}"
+            ),
+            opened_at = opened_at,
+            thumbnails = thumbnails,
+            purchase_status = purchase_status,
+        )
+    }
 
     fn signed(path: &str, policy: &str, signature: &str, key: &str) -> String {
         format!(
@@ -2316,12 +2459,265 @@ mod tests {
     }
 
     #[test]
-    fn content_detail_retains_ids_access_expiry_and_safe_prices() {
-        let parsed = content_detail(CONTENT).expect("valid content response");
+    fn personalized_detail_html_retains_metadata_episode_date_thumbnail_and_access() {
+        let parsed = content_detail(
+            &personalized_detail_html(true, "hunter_q", OWNED_EPISODE),
+            "hunter_q",
+        )
+        .expect("personalized detail");
         assert_eq!(parsed.id, 41);
-        assert_eq!(parsed.title.as_deref(), Some("獵人只想安靜生活"));
+        assert_eq!(parsed.title, "Hunter Q");
+        assert_eq!(
+            parsed.creators,
+            vec!["Writer".to_owned(), "Artist".to_owned()]
+        );
+        assert_eq!(parsed.synopsis, "A complete synopsis.");
+        assert_eq!(parsed.episodes[0].opened_at, 1_709_136_000_000);
+        assert_eq!(
+            parsed.episodes[0].thumbnail_url.as_deref(),
+            Some("https://image.balcony.studio/tw/ep_thumbnail/101/cover.webp")
+        );
+        assert_eq!(parsed.episodes[0].purchase, PurchaseState::Owned);
+    }
+
+    #[test]
+    fn detail_rejects_unpersonalized_or_wrong_alias_without_reading_user_data() {
+        assert!(matches!(
+            content_detail(
+                &personalized_detail_html(false, "hunter_q", OWNED_EPISODE),
+                "hunter_q"
+            ),
+            Err(ParseError::InvalidValue("props.pageProps.ssrPersonalized"))
+        ));
+        assert!(matches!(
+            content_detail(
+                &personalized_detail_html(true, "another", OWNED_EPISODE),
+                "hunter_q"
+            ),
+            Err(ParseError::InvalidValue("ssrDetail.alias"))
+        ));
+    }
+
+    #[test]
+    fn detail_requires_active_next_data_and_boolean_personalization() {
+        assert!(matches!(
+            content_detail(b"<!doctype html><p>No detail</p>", "hunter_q"),
+            Err(ParseError::Missing("__NEXT_DATA__"))
+        ));
+        assert!(matches!(
+            content_detail(
+                br#"<!--<script id="__NEXT_DATA__">{"props":{}}</script>-->"#,
+                "hunter_q"
+            ),
+            Err(ParseError::Missing("__NEXT_DATA__"))
+        ));
+        let wrong_type = String::from_utf8(personalized_detail_html(
+            true,
+            "hunter_q",
+            OWNED_EPISODE,
+        ))
+        .expect("synthetic HTML")
+        .replace("\"ssrPersonalized\":true", "\"ssrPersonalized\":\"true\"");
+        assert!(matches!(
+            content_detail(wrong_type.as_bytes(), "hunter_q"),
+            Err(ParseError::WrongType("props.pageProps.ssrPersonalized"))
+        ));
+    }
+
+    #[test]
+    fn detail_bounds_creator_names_and_synopsis() {
+        let valid = String::from_utf8(personalized_detail_html(
+            true,
+            "hunter_q",
+            OWNED_EPISODE,
+        ))
+        .expect("synthetic HTML");
+        for (from, to, expected) in [
+            (
+                "\"name\":\"Writer\"".to_owned(),
+                "\"name\":\"\"".to_owned(),
+                "creator.name",
+            ),
+            (
+                "\"name\":\"Writer\"".to_owned(),
+                format!("\"name\":\"{}\"", "W".repeat(257)),
+                "creator.name",
+            ),
+            (
+                "\"name\":\"Writer\"".to_owned(),
+                "\"name\":1".to_owned(),
+                "creator.name",
+            ),
+            (
+                "\"synopsis\":\"A complete synopsis.\"".to_owned(),
+                "\"synopsis\":\"\"".to_owned(),
+                "ssrDetail.synopsis",
+            ),
+            (
+                "\"synopsis\":\"A complete synopsis.\"".to_owned(),
+                format!("\"synopsis\":\"{}\"", "S".repeat(16 * 1024 + 1)),
+                "ssrDetail.synopsis",
+            ),
+        ] {
+            let body = valid.replace(&from, &to);
+            assert!(
+                matches!(
+                    content_detail(body.as_bytes(), "hunter_q"),
+                    Err(ParseError::InvalidValue(name)) | Err(ParseError::WrongType(name))
+                        if name == expected
+                ),
+                "{expected}"
+            );
+        }
+
+        let creators = (0..33)
+            .map(|index| format!("{{\"name\":\"Creator {index}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let too_many = valid.replace(
+            concat!(
+                "{\"creatorId\":1,\"name\":\"Writer\",\"type\":\"WRITER\"},",
+                "{\"creatorId\":2,\"name\":\"Artist\",\"type\":\"ARTIST\"}"
+            ),
+            &creators,
+        );
+        assert!(matches!(
+            content_detail(too_many.as_bytes(), "hunter_q"),
+            Err(ParseError::InvalidValue("ssrDetail.creators"))
+        ));
+    }
+
+    #[test]
+    fn detail_bounds_episode_count_and_requires_positive_opened_at() {
+        let episodes = (0..513)
+            .map(|index| {
+                format!(
+                    "{{\"id\":{},\"alias\":\"ep-{index}\",\"title\":\"Episode {index}\",\"openedAt\":1709136000000,\"type\":\"GENERAL\",\"isSample\":false,\"purchaseStatus\":\"NONE\"}}",
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            content_detail(
+                &personalized_detail_html(true, "hunter_q", &episodes),
+                "hunter_q"
+            ),
+            Err(ParseError::InvalidValue("ssrDetail.episodes"))
+        ));
+
+        for opened_at in ["0", "-1"] {
+            let episode = detail_episode(opened_at, "", "NONE");
+            assert!(matches!(
+                content_detail(
+                    &personalized_detail_html(true, "hunter_q", &episode),
+                    "hunter_q"
+                ),
+                Err(ParseError::InvalidValue("episode.openedAt"))
+            ));
+        }
+        let episode = detail_episode("\"1709136000000\"", "", "NONE");
+        assert!(matches!(
+            content_detail(
+                &personalized_detail_html(true, "hunter_q", &episode),
+                "hunter_q"
+            ),
+            Err(ParseError::WrongType("episode.openedAt"))
+        ));
+    }
+
+    #[test]
+    fn detail_thumbnail_selection_is_bounded_unambiguous_and_public() {
+        let non_common = detail_episode(
+            "1709136000000",
+            r#","thumbnails":[{"type":"SQUARE","imagePath":"https://image.balcony.studio/tw/ep_thumbnail/101/cover.webp"}]"#,
+            "NONE",
+        );
+        let parsed = content_detail(
+            &personalized_detail_html(true, "hunter_q", &non_common),
+            "hunter_q",
+        )
+        .expect("non-COMMON thumbnail is ignored");
+        assert_eq!(parsed.episodes[0].thumbnail_url, None);
+
+        let missing = detail_episode("1709136000000", "", "NONE");
+        let parsed = content_detail(
+            &personalized_detail_html(true, "hunter_q", &missing),
+            "hunter_q",
+        )
+        .expect("missing thumbnail falls back to glyph");
+        assert_eq!(parsed.episodes[0].thumbnail_url, None);
+
+        for url in [
+            "https://attacker.invalid/tw/ep_thumbnail/101/cover.webp",
+            "https://image.balcony.studio/tw/ep_thumbnail/101/cover.webp?token=x",
+            "https://image.balcony.studio/tw/ep_thumbnail/101/cover.webp#x",
+            "https://image.balcony.studio/tw/ep_thumbnail/101/cover.png",
+            "https://image.balcony.studio/tw/contents/101/cover.webp",
+        ] {
+            let thumbnails =
+                format!(",\"thumbnails\":[{{\"type\":\"COMMON\",\"imagePath\":\"{url}\"}}]");
+            let episode = detail_episode("1709136000000", &thumbnails, "NONE");
+            let parsed = content_detail(
+                &personalized_detail_html(true, "hunter_q", &episode),
+                "hunter_q",
+            )
+            .expect("hostile thumbnail degrades to glyph");
+            assert_eq!(parsed.episodes[0].thumbnail_url, None, "{url}");
+        }
+
+        let duplicate = detail_episode(
+            "1709136000000",
+            concat!(
+                ",\"thumbnails\":[",
+                "{\"type\":\"COMMON\",\"imagePath\":\"https://image.balcony.studio/tw/ep_thumbnail/101/one.webp\"},",
+                "{\"type\":\"COMMON\",\"imagePath\":\"https://image.balcony.studio/tw/ep_thumbnail/101/two.webp\"}]"
+            ),
+            "NONE",
+        );
+        assert!(matches!(
+            content_detail(
+                &personalized_detail_html(true, "hunter_q", &duplicate),
+                "hunter_q"
+            ),
+            Err(ParseError::InvalidValue("episode.thumbnails"))
+        ));
+    }
+
+    #[test]
+    fn detail_rejects_invalid_selected_thumbnail_shapes() {
+        for thumbnails in [
+            r#","thumbnails":{}"#.to_owned(),
+            r#","thumbnails":[{"type":"COMMON"}]"#.to_owned(),
+            r#","thumbnails":[{"type":"COMMON","imagePath":1}]"#.to_owned(),
+            format!(
+                ",\"thumbnails\":[{}]",
+                (0..9)
+                    .map(|_| "{\"type\":\"SQUARE\"}")
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ] {
+            let episode = detail_episode("1709136000000", &thumbnails, "NONE");
+            assert!(
+                content_detail(
+                    &personalized_detail_html(true, "hunter_q", &episode),
+                    "hunter_q"
+                )
+                .is_err(),
+                "{thumbnails}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_detail_retains_pricing_rental_gift_and_unknown_status_logic() {
+        let parsed = content_detail(
+            &personalized_detail_html(true, "hunter_q", CONTENT_EPISODES),
+            "hunter_q",
+        )
+        .expect("valid content response");
         assert_eq!(parsed.episodes.len(), 8);
-        assert_eq!(parsed.episodes[0].id, 101);
         assert_eq!(parsed.episodes[3].rent_expires_at, Some(7_200_001));
         assert_eq!(
             parsed
@@ -2340,42 +2736,17 @@ mod tests {
                 PurchaseState::NotOwned,
             ]
         );
-
         let paid = &parsed.episodes[2];
         assert_eq!(paid.rent_coin, Some(2));
         assert_eq!(paid.purchase_coin, Some(3));
         assert!(paid.gift_eligible);
-
         let ticket = &parsed.episodes[6];
         assert_eq!(ticket.rent_coin, None);
         assert_eq!(ticket.purchase_coin, None);
         assert!(!ticket.gift_eligible);
-
         let conflict = &parsed.episodes[7];
         assert_eq!(conflict.rent_coin, Some(2));
         assert_eq!(conflict.purchase_coin, None);
-    }
-
-    #[test]
-    fn content_detail_rejects_non_json_and_invalid_identity_or_expiry() {
-        let html = br#"<script type="application/json">{"result":"SUCCESS","data":{"id":1,"episodes":[]}}</script>"#;
-        assert!(matches!(content_detail(html), Err(ParseError::Json(_))));
-
-        for body in [
-            br#"{"result":"SUCCESS","data":{"id":-1,"episodes":[]}}"#.as_slice(),
-            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":-1,"alias":"one","title":"One","purchaseStatus":"NONE","isSample":false}]}}"#
-                .as_slice(),
-            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":false,"isSample":false}]}}"#
-                .as_slice(),
-            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":-1}]}}"#
-                .as_slice(),
-            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":1.5}]}}"#
-                .as_slice(),
-            br#"{"result":"SUCCESS","data":{"id":1,"episodes":[{"id":1,"alias":"one","title":"One","purchaseStatus":"RENT","isSample":false,"rentExpiredAt":9223372036854775808}]}}"#
-                .as_slice(),
-        ] {
-            assert!(content_detail(body).is_err());
-        }
     }
 
     #[test]
@@ -2389,48 +2760,58 @@ mod tests {
             r#""permanentCoin":-1"#,
             r#""isRentGift":"true""#,
         ] {
-            let body = format!(
-                r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
-                  "id":1,"alias":"one","title":"One","purchaseStatus":null,"isSample":false,{field}
-                }}]}}}}"#
+            let episode = format!(
+                concat!(
+                    "{{\"id\":1,\"alias\":\"one\",\"title\":\"One\",",
+                    "\"openedAt\":1709136000000,\"purchaseStatus\":null,",
+                    "\"isSample\":false,{field}}}"
+                ),
+                field = field,
             );
-            assert!(content_detail(body.as_bytes()).is_err(), "{field}");
+            assert!(
+                content_detail(
+                    &personalized_detail_html(true, "hunter_q", &episode),
+                    "hunter_q"
+                )
+                .is_err(),
+                "{field}"
+            );
         }
     }
 
     #[test]
     fn commerce_aliases_and_episode_titles_use_utf8_byte_limits() {
-        let content_body = |alias: &str, title: &str| {
-            format!(
-                r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
-                  "id":2,"alias":"{alias}","title":"{title}",
-                  "purchaseStatus":"NONE","isSample":false
-                }}]}}}}"#
-            )
+        let content_body = |alias: &str, title: &str, status: &str| {
+            let episode = format!(
+                concat!(
+                    "{{\"id\":2,\"alias\":\"{alias}\",\"title\":\"{title}\",",
+                    "\"openedAt\":1709136000000,\"purchaseStatus\":\"{status}\",",
+                    "\"isSample\":false}}"
+                ),
+                alias = alias,
+                title = title,
+                status = status,
+            );
+            personalized_detail_html(true, "hunter_q", &episode)
         };
         let alias_128 = "a".repeat(128);
         let title_512 = "T".repeat(512);
-        let exact = content_body(&alias_128, &title_512);
-        assert!(content_detail(exact.as_bytes()).is_ok());
+        let exact = content_body(&alias_128, &title_512, "NONE");
+        assert!(content_detail(&exact, "hunter_q").is_ok());
 
         let alias_129 = "a".repeat(129);
-        let too_long_alias = content_body(&alias_129, "One");
-        assert!(content_detail(too_long_alias.as_bytes()).is_err());
+        let too_long_alias = content_body(&alias_129, "One", "NONE");
+        assert!(content_detail(&too_long_alias, "hunter_q").is_err());
         let multibyte_alias = "界".repeat(43);
-        let too_many_alias_bytes = content_body(&multibyte_alias, "One");
-        assert!(content_detail(too_many_alias_bytes.as_bytes()).is_err());
+        let too_many_alias_bytes = content_body(&multibyte_alias, "One", "NONE");
+        assert!(content_detail(&too_many_alias_bytes, "hunter_q").is_err());
 
         let title_513 = "界".repeat(171);
-        let too_long_title = content_body("one", &title_513);
-        assert!(content_detail(too_long_title.as_bytes()).is_err());
+        let too_long_title = content_body("one", &title_513, "NONE");
+        assert!(content_detail(&too_long_title, "hunter_q").is_err());
         let status_129 = "F".repeat(129);
-        let oversized_status = format!(
-            r#"{{"result":"SUCCESS","data":{{"id":1,"episodes":[{{
-              "id":2,"alias":"one","title":"One",
-              "purchaseStatus":"{status_129}","isSample":false
-            }}]}}}}"#
-        );
-        assert!(content_detail(oversized_status.as_bytes()).is_err());
+        let oversized_status = content_body("one", "One", &status_129);
+        assert!(content_detail(&oversized_status, "hunter_q").is_err());
 
         let quote_body = |alias: &str| {
             format!(

@@ -33,7 +33,9 @@ const HOUR_MS: i64 = 60 * 60 * 1_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentDetail {
     pub id: usize,
-    pub title: Option<String>,
+    pub title: String,
+    pub creators: Vec<String>,
+    pub synopsis: String,
     pub episodes: Vec<Episode>,
 }
 
@@ -42,6 +44,8 @@ pub struct Episode {
     pub id: usize,
     pub alias: String,
     pub title: String,
+    pub opened_at: i64,
+    pub thumbnail_url: Option<String>,
     pub purchase: PurchaseState,
     pub rent_expires_at: Option<i64>,
     pub rent_coin: Option<usize>,
@@ -321,6 +325,8 @@ mod tests {
             id: 17,
             alias: "episode-17".to_owned(),
             title: "Episode 17".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
             purchase: PurchaseState::Rented,
             rent_expires_at,
             rent_coin: Some(2),
