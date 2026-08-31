@@ -77,10 +77,7 @@ const PUBLIC_IMAGE_PATHS: &[&str] = &[
     "/BOMTOON_TW/co_thumbnail/",
 ];
 const PUBLIC_SQUARE_IMAGE_PATHS: &[&str] = &["/tw/co_thumbnail/", "/BOMTOON_TW/co_thumbnail/"];
-const EPISODE_THUMBNAIL_PATHS: &[&str] = &[
-    "/tw/ep_thumbnail/",
-    "/BOMTOON_TW/ep_thumbnail/",
-];
+const EPISODE_THUMBNAIL_PATHS: &[&str] = &["/tw/ep_thumbnail/", "/BOMTOON_TW/ep_thumbnail/"];
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -479,10 +476,7 @@ pub fn expiration_history(bytes: &[u8], kind: AssetKind) -> Result<Vec<Expiratio
     Ok(rows)
 }
 
-pub fn content_detail(
-    bytes: &[u8],
-    expected_alias: &str,
-) -> Result<ContentDetail, ParseError> {
+pub fn content_detail(bytes: &[u8], expected_alias: &str) -> Result<ContentDetail, ParseError> {
     if !valid_alias(expected_alias) {
         return Err(ParseError::InvalidValue("detail alias"));
     }
@@ -496,9 +490,7 @@ pub fn content_detail(
         "ssrPersonalized",
         "props.pageProps.ssrPersonalized",
     )? {
-        return Err(ParseError::InvalidValue(
-            "props.pageProps.ssrPersonalized",
-        ));
+        return Err(ParseError::InvalidValue("props.pageProps.ssrPersonalized"));
     }
     let detail = field(page_props, "ssrDetail", "props.pageProps.ssrDetail")?;
     let alias = bounded_string(detail, "alias", "ssrDetail.alias", MAX_ALIAS_BYTES)?;
@@ -517,91 +509,66 @@ pub fn content_detail(
     )?;
     let mut creators = Vec::with_capacity(creator_values.len());
     for creator in creator_values {
-        let name = bounded_string(
-            creator,
-            "name",
-            "creator.name",
-            MAX_CREATOR_NAME_BYTES,
-        )?;
+        let name = bounded_string(creator, "name", "creator.name", MAX_CREATOR_NAME_BYTES)?;
         if name.trim().is_empty() {
             return Err(ParseError::InvalidValue("creator.name"));
         }
         creators.push(name.to_owned());
     }
-    let synopsis = bounded_string(
-        detail,
-        "synopsis",
-        "ssrDetail.synopsis",
-        MAX_SYNOPSIS_BYTES,
-    )?;
+    let synopsis = bounded_string(detail, "synopsis", "ssrDetail.synopsis", MAX_SYNOPSIS_BYTES)?;
     if synopsis.trim().is_empty() {
         return Err(ParseError::InvalidValue("ssrDetail.synopsis"));
     }
-    let episodes = bounded_array(
-        detail,
-        "episodes",
-        "ssrDetail.episodes",
-        MAX_EPISODES,
-    )?
-    .iter()
-    .map(|item| {
-        let coin_kind = optional_bounded_string(
-            item,
-            "coinKind",
-            "episode.coinKind",
-            MAX_REMOTE_CODE_BYTES,
-        )?;
-        let possession_coin =
-            optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
-        let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
-        let permanent_coin = optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
-        let availability = EpisodeAvailability {
-            status: bounded_nullable_string(
-                item,
-                "purchaseStatus",
-                "episode.purchaseStatus",
-                MAX_REMOTE_CODE_BYTES,
-            )?,
-            episode_type: optional_string(item, "type", "episode.type")?,
-            is_sample: boolean(item, "isSample", "episode.isSample")?,
-            paid: optional_boolean(item, "paid", "episode.paid")?,
-            possession_coin,
-            rent_coin,
-        };
-        let paid_with_coin = coin_kind == Some("COIN");
-        let purchase_coin =
-            if paid_with_coin && permanent_coin.is_none_or(|coin| Some(coin) == possession_coin) {
-                possession_coin
-            } else {
-                None
-            };
-        Ok(Episode {
-            id: unsigned(item, "id", "episode.id")?,
-            alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?
-                .to_owned(),
-            title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?
-                .to_owned(),
-            opened_at: positive_i64(item, "openedAt", "episode.openedAt")?,
-            thumbnail_url: episode_thumbnail(item)?,
-            purchase: PurchaseState::from_remote(availability),
-            rent_expires_at: optional_timestamp(
-                item,
-                "rentExpiredAt",
-                "episode.rentExpiredAt",
-            )?,
-            rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
-            purchase_coin,
-            gift_eligible: optional_boolean(item, "isRentGift", "episode.isRentGift")?
-                .unwrap_or(false),
-        })
-    })
-    .collect::<Result<Vec<_>, ParseError>>()?;
+    let episodes = bounded_array(detail, "episodes", "ssrDetail.episodes", MAX_EPISODES)?
+        .iter()
+        .map(parse_episode)
+        .collect::<Result<Vec<_>, ParseError>>()?;
     Ok(ContentDetail {
         id: unsigned(detail, "id", "ssrDetail.id")?,
         title: title.to_owned(),
         creators,
         synopsis: synopsis.to_owned(),
         episodes,
+    })
+}
+
+fn parse_episode(item: &Value) -> Result<Episode, ParseError> {
+    let coin_kind =
+        optional_bounded_string(item, "coinKind", "episode.coinKind", MAX_REMOTE_CODE_BYTES)?;
+    let possession_coin = optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
+    let rent_coin = optional_unsigned(item, "rentCoin", "episode.rentCoin")?;
+    let permanent_coin = optional_unsigned(item, "permanentCoin", "episode.permanentCoin")?;
+    let availability = EpisodeAvailability {
+        status: bounded_nullable_string(
+            item,
+            "purchaseStatus",
+            "episode.purchaseStatus",
+            MAX_REMOTE_CODE_BYTES,
+        )?,
+        episode_type: optional_string(item, "type", "episode.type")?,
+        is_sample: boolean(item, "isSample", "episode.isSample")?,
+        paid: optional_boolean(item, "paid", "episode.paid")?,
+        possession_coin,
+        rent_coin,
+    };
+    let paid_with_coin = coin_kind == Some("COIN");
+    let purchase_coin =
+        if paid_with_coin && permanent_coin.is_none_or(|coin| Some(coin) == possession_coin) {
+            possession_coin
+        } else {
+            None
+        };
+    Ok(Episode {
+        id: unsigned(item, "id", "episode.id")?,
+        alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?.to_owned(),
+        title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?.to_owned(),
+        opened_at: positive_i64(item, "openedAt", "episode.openedAt")?,
+        thumbnail_url: episode_thumbnail(item)?,
+        purchase: PurchaseState::from_remote(availability),
+        rent_expires_at: optional_timestamp(item, "rentExpiredAt", "episode.rentExpiredAt")?,
+        rent_coin: paid_with_coin.then_some(rent_coin).flatten(),
+        purchase_coin,
+        gift_eligible: optional_boolean(item, "isRentGift", "episode.isRentGift")?.unwrap_or(false),
     })
 }
 
@@ -627,11 +594,7 @@ fn episode_thumbnail(value: &Value) -> Result<Option<String>, ParseError> {
     let Some(thumbnail) = selected else {
         return Ok(None);
     };
-    let url = string(
-        thumbnail,
-        "imagePath",
-        "episode.thumbnail.imagePath",
-    )?;
+    let url = string(thumbnail, "imagePath", "episode.thumbnail.imagePath")?;
     Ok(public_image_url(url, EPISODE_THUMBNAIL_PATHS).then(|| url.to_owned()))
 }
 
@@ -2511,13 +2474,10 @@ mod tests {
             ),
             Err(ParseError::Missing("__NEXT_DATA__"))
         ));
-        let wrong_type = String::from_utf8(personalized_detail_html(
-            true,
-            "hunter_q",
-            OWNED_EPISODE,
-        ))
-        .expect("synthetic HTML")
-        .replace("\"ssrPersonalized\":true", "\"ssrPersonalized\":\"true\"");
+        let wrong_type =
+            String::from_utf8(personalized_detail_html(true, "hunter_q", OWNED_EPISODE))
+                .expect("synthetic HTML")
+                .replace("\"ssrPersonalized\":true", "\"ssrPersonalized\":\"true\"");
         assert!(matches!(
             content_detail(wrong_type.as_bytes(), "hunter_q"),
             Err(ParseError::WrongType("props.pageProps.ssrPersonalized"))
@@ -2526,12 +2486,8 @@ mod tests {
 
     #[test]
     fn detail_bounds_creator_names_and_synopsis() {
-        let valid = String::from_utf8(personalized_detail_html(
-            true,
-            "hunter_q",
-            OWNED_EPISODE,
-        ))
-        .expect("synthetic HTML");
+        let valid = String::from_utf8(personalized_detail_html(true, "hunter_q", OWNED_EPISODE))
+            .expect("synthetic HTML");
         for (from, to, expected) in [
             (
                 "\"name\":\"Writer\"".to_owned(),
@@ -2563,7 +2519,7 @@ mod tests {
             assert!(
                 matches!(
                     content_detail(body.as_bytes(), "hunter_q"),
-                    Err(ParseError::InvalidValue(name)) | Err(ParseError::WrongType(name))
+                    Err(ParseError::InvalidValue(name) | ParseError::WrongType(name))
                         if name == expected
                 ),
                 "{expected}"

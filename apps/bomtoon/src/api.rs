@@ -96,7 +96,7 @@ pub fn detail(alias: &str) -> Task {
     fetch(
         format!("{DETAIL_URL}{alias}"),
         PUBLIC_HTML_BYTES,
-        Credential::bearer("bomtoon-access-token"),
+        Credential::in_header("bomtoon-session", "Cookie"),
         response_headers("text/html"),
     )
 }
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_uses_managed_bearer_html_endpoint() {
+    fn detail_uses_managed_session_cookie_html_endpoint() {
         let Task::Fetch {
             url,
             offset,
@@ -330,12 +330,10 @@ mod tests {
         assert_eq!(url, "https://www.bomtoon.tw/detail/365");
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 512 * 1024);
-        assert!(matches!(
+        assert_eq!(
             credential,
-            Some(value)
-                if value.secret == "bomtoon-access-token"
-                    && value.header == SecretHeader::Bearer
-        ));
+            Some(Credential::in_header("bomtoon-session", "Cookie"))
+        );
         assert_eq!(
             headers,
             vec![

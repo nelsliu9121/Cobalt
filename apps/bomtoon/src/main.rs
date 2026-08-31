@@ -238,13 +238,16 @@ fn synopsis_page_break(text: &str, start: usize, end: usize) -> Option<usize> {
             return Some(boundary);
         }
     }
-    candidate.char_indices().rev().find_map(|(offset, character)| {
-        character.is_whitespace().then(|| {
-            start
-                .saturating_add(offset)
-                .saturating_add(character.len_utf8())
+    candidate
+        .char_indices()
+        .rev()
+        .find_map(|(offset, character)| {
+            character.is_whitespace().then(|| {
+                start
+                    .saturating_add(offset)
+                    .saturating_add(character.len_utf8())
+            })
         })
-    })
 }
 
 fn synopsis_pages(text: &str) -> Vec<std::ops::Range<usize>> {
@@ -293,7 +296,6 @@ fn synopsis_pages(text: &str) -> Vec<std::ops::Range<usize>> {
     }
     pages
 }
-
 
 fn comment_detail_page(text: &str, page: usize) -> Option<(&str, usize)> {
     let page_end = |start: usize| {
@@ -590,9 +592,7 @@ fn episode_status(episode: &Episode, now_ms: Option<i64>) -> String {
         model::PurchaseState::Free => "Free".to_owned(),
         model::PurchaseState::Sample => "Sample".to_owned(),
         model::PurchaseState::NotOwned => String::new(),
-        model::PurchaseState::Other(_) => {
-            display_text(episode.purchase.label(), "Other status")
-        }
+        model::PurchaseState::Other(_) => display_text(episode.purchase.label(), "Other status"),
     }
 }
 
@@ -601,10 +601,7 @@ fn episode_screen_layout_fits(screen: &Screen) -> bool {
         let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
         if diagnostics.issues.iter().any(|issue| {
             issue.severity == DiagnosticSeverity::Error
-                && !matches!(
-                    issue.kind,
-                    LayoutIssueKind::UnsupportedCharacter { .. }
-                )
+                && !matches!(issue.kind, LayoutIssueKind::UnsupportedCharacter { .. })
         }) {
             return false;
         }
@@ -1319,12 +1316,7 @@ impl Bomtoon {
             let visible_set = visible.iter().cloned().collect::<BTreeSet<_>>();
             let episode_urls = self.episode_thumbnail_urls();
             let public_urls = self.public_cover_urls();
-            self.evict_episode_thumbnails(
-                context,
-                &visible_set,
-                &episode_urls,
-                &public_urls,
-            );
+            self.evict_episode_thumbnails(context, &visible_set, &episode_urls, &public_urls);
             let obsolete = self
                 .covers
                 .tasks
@@ -1969,9 +1961,7 @@ impl Bomtoon {
         );
         let pages = self.episodes.len().max(1);
         (0..pages).all(|page| {
-            let screen = self
-                .add_episode_body(header.clone(), 1, page, true)
-                .build();
+            let screen = self.add_episode_body(header.clone(), 1, page, true).build();
             !screen
                 .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
                 .has_errors()
@@ -2050,11 +2040,10 @@ impl Bomtoon {
         );
         let mut stable_capacity = EPISODE_ITEMS_PER_PAGE;
         for _ in 0..2 {
-            let measured_capacity =
-                (1..=EPISODE_ITEMS_PER_PAGE).rev().find(|rows_per_page| {
-                    self.episode_items_per_page = Some(*rows_per_page);
-                    self.episode_capacity_fits(&header, *rows_per_page)
-                });
+            let measured_capacity = (1..=EPISODE_ITEMS_PER_PAGE).rev().find(|rows_per_page| {
+                self.episode_items_per_page = Some(*rows_per_page);
+                self.episode_capacity_fits(&header, *rows_per_page)
+            });
             let Some(measured_capacity) = measured_capacity else {
                 self.episode_items_per_page = None;
                 return None;
@@ -2078,10 +2067,7 @@ impl Bomtoon {
         let creators_fit_default =
             normalized_header_len(&self.selected_creators) <= EPISODE_CREATORS_PREVIEW_BYTES;
         for (title_bytes, creator_bytes) in [
-            (
-                EPISODE_TITLE_PREVIEW_BYTES,
-                EPISODE_CREATORS_PREVIEW_BYTES,
-            ),
+            (EPISODE_TITLE_PREVIEW_BYTES, EPISODE_CREATORS_PREVIEW_BYTES),
             (96, 96),
             (48, 48),
             (24, 24),
@@ -2145,11 +2131,8 @@ impl Bomtoon {
         if self.view != View::Episodes {
             return None;
         }
-        let (start, end) = page_bounds(
-            self.page,
-            self.episodes.len(),
-            self.episode_rows_per_page(),
-        );
+        let (start, end) =
+            page_bounds(self.page, self.episodes.len(), self.episode_rows_per_page());
         (start < end).then(|| self.episodes[start].id)
     }
 
@@ -2168,7 +2151,6 @@ impl Bomtoon {
                 |index| index / rows_per_page,
             );
     }
-
 
     fn add_episode_body(
         &self,
@@ -2218,12 +2200,10 @@ impl Bomtoon {
             )
         }));
         let episode_pages = self.episodes.len().div_ceil(rows_per_page).max(1);
-        screen
-            .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-            .page_position(
-                u16::try_from(page.saturating_add(1)).unwrap_or(u16::MAX),
-                u16::try_from(episode_pages).unwrap_or(u16::MAX),
-            )
+        screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+            u16::try_from(page.saturating_add(1)).unwrap_or(u16::MAX),
+            u16::try_from(episode_pages).unwrap_or(u16::MAX),
+        )
     }
 
     fn episode_screen_for(&self, page: usize, rows_per_page: usize, modal: bool) -> Screen {
@@ -2231,12 +2211,14 @@ impl Bomtoon {
             self.add_episode_header(ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"));
         let mut screen = self.add_episode_body(header, rows_per_page, page, false);
         if modal {
-            if let Some((synopsis_page, range)) = self.synopsis.open_page.and_then(|synopsis_page| {
-                self.synopsis
-                    .pages
-                    .get(synopsis_page)
-                    .map(|range| (synopsis_page, range))
-            }) {
+            if let Some((synopsis_page, range)) =
+                self.synopsis.open_page.and_then(|synopsis_page| {
+                    self.synopsis
+                        .pages
+                        .get(synopsis_page)
+                        .map(|range| (synopsis_page, range))
+                })
+            {
                 let synopsis = &self.selected_synopsis[range.clone()];
                 screen = screen.modal("Synopsis", |modal| {
                     let mut modal = modal.text(synopsis);
@@ -2824,7 +2806,6 @@ impl Bomtoon {
         self.page = self.page.min(last_page);
     }
 
-
     fn owns_public_cover_url(&self, url: &str) -> bool {
         self.featured
             .featured
@@ -2845,7 +2826,11 @@ impl Bomtoon {
             CoverSource::Protected => {
                 self.account == AccountState::Active
                     && self.covers.visible_source == Some(CoverSource::Protected)
-                    && self.covers.visible_urls.iter().any(|visible| visible == url)
+                    && self
+                        .covers
+                        .visible_urls
+                        .iter()
+                        .any(|visible| visible == url)
             }
         }
     }
@@ -2868,9 +2853,7 @@ impl Bomtoon {
             .covers
             .tasks
             .iter()
-            .filter(|(_, task)| {
-                episode_urls.contains(&task.url) && !retained.contains(&task.url)
-            })
+            .filter(|(_, task)| episode_urls.contains(&task.url) && !retained.contains(&task.url))
             .map(|(task, cover)| (*task, cover.url.clone()))
             .collect::<Vec<_>>();
         for (task, url) in obsolete_tasks {
@@ -2910,12 +2893,7 @@ impl Bomtoon {
         let public_urls = self.public_cover_urls();
         self.covers.generation = self.covers.generation.wrapping_add(1);
         let generation = self.covers.generation;
-        self.evict_episode_thumbnails(
-            context,
-            &BTreeSet::new(),
-            &episode_urls,
-            &public_urls,
-        );
+        self.evict_episode_thumbnails(context, &BTreeSet::new(), &episode_urls, &public_urls);
         for task in self.covers.tasks.values_mut() {
             task.generation = generation;
             if public_urls.contains(&task.url) {
@@ -3320,7 +3298,7 @@ impl Bomtoon {
         &mut self,
         context: &mut Context,
         command: commerce::CommerceCommand,
-    ) -> Result<(), commerce::CommerceCommand> {
+    ) -> Option<commerce::CommerceCommand> {
         match command {
             commerce::CommerceCommand::FetchQuote {
                 selection,
@@ -3329,15 +3307,11 @@ impl Bomtoon {
                 let Some(account_scope) = self.current_commerce_scope() else {
                     let effects = self.commerce.quote_failed();
                     self.apply_commerce_effects(context, effects);
-                    return Ok(());
+                    return None;
                 };
-                let work = api::quote(
-                    &selection.title_alias,
-                    &selection.episode_alias,
-                    purchase,
-                );
+                let work = api::quote(&selection.title_alias, &selection.episode_alias, purchase);
                 let Some(id) = context.spawn(work) else {
-                    return Err(commerce::CommerceCommand::FetchQuote {
+                    return Some(commerce::CommerceCommand::FetchQuote {
                         selection,
                         purchase,
                     });
@@ -3352,13 +3326,13 @@ impl Bomtoon {
                         purchase,
                     },
                 });
-                Ok(())
+                None
             }
             commerce::CommerceCommand::Post(marker) => {
                 let work =
                     api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
                 let Some(id) = context.spawn(work) else {
-                    return Err(commerce::CommerceCommand::Post(marker));
+                    return Some(commerce::CommerceCommand::Post(marker));
                 };
                 self.commerce_generation = self.commerce_generation.wrapping_add(1);
                 self.commerce_task = Some(CommerceTask {
@@ -3369,7 +3343,7 @@ impl Bomtoon {
                         marker,
                     },
                 });
-                Ok(())
+                None
             }
             commerce::CommerceCommand::SaveMarker(_)
             | commerce::CommerceCommand::ForgetMarker
@@ -3386,11 +3360,10 @@ impl Bomtoon {
         let Some(command) = self.queued_commerce_command.take() else {
             return;
         };
-        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+        if let Some(command) = self.try_spawn_commerce_command(context, command) {
             self.queued_commerce_command = Some(command);
         }
     }
-
 
     fn apply_commerce_effects(
         &mut self,
@@ -3415,10 +3388,12 @@ impl Bomtoon {
                     self.marker_store = Some(MarkerStoreOperation::Forget);
                     context.store().forget(commerce::MARKER_KEY);
                 }
-                Some(command @ commerce::CommerceCommand::FetchQuote { .. })
-                | Some(command @ commerce::CommerceCommand::Post(_)) => {
+                Some(
+                    command @ (commerce::CommerceCommand::FetchQuote { .. }
+                    | commerce::CommerceCommand::Post(_)),
+                ) => {
                     if self.covers.tasks.is_empty() {
-                        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+                        if let Some(command) = self.try_spawn_commerce_command(context, command) {
                             let effects = match command {
                                 commerce::CommerceCommand::FetchQuote { .. } => {
                                     self.commerce.quote_failed()
@@ -3437,7 +3412,7 @@ impl Bomtoon {
                         }
                     } else {
                         self.preempt_cover_tasks(context);
-                        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+                        if let Some(command) = self.try_spawn_commerce_command(context, command) {
                             self.queued_commerce_command = Some(command);
                         }
                     }
@@ -6203,8 +6178,7 @@ impl Bomtoon {
         cover: CoverTask,
         outcome: TaskOutcome,
     ) -> bool {
-        let loading =
-            self.covers.entries.get(&cover.url) == Some(&CoverState::Loading(task));
+        let loading = self.covers.entries.get(&cover.url) == Some(&CoverState::Loading(task));
         if cover.generation != self.covers.generation
             || !loading
             || !self.cover_url_owned(cover.source, &cover.url)
@@ -8492,9 +8466,7 @@ mod tests {
                 _ => None,
             })
             .expect("episode rows");
-        assert!(rows
-            .iter()
-            .any(|row| row.action == action_id("episode-0")));
+        assert!(rows.iter().any(|row| row.action == action_id("episode-0")));
         assert!(rows.iter().any(|row| {
             row.title == "Paid Episode"
                 && row.action == action_id("episode-disabled-1")
@@ -9095,10 +9067,7 @@ mod tests {
         let (mut runner, _) = loaded_library_with_metrics(metrics);
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
         (runner, manifest_task, commands)
@@ -10076,13 +10045,18 @@ mod tests {
     const EXPECTED_SYNOPSIS_CLOSE: &str = "synopsis-close";
 
     fn long_synopsis() -> String {
-        (0..80)
-            .map(|number| {
-                format!(
-                    "Part {number}: 사냥꾼 Q follows the signal through the old city while every clue changes what the team believes.\n\n"
-                )
-            })
-            .collect()
+        use std::fmt::Write as _;
+
+        let mut synopsis = String::new();
+        for number in 0..80 {
+            writeln!(
+                synopsis,
+                "Part {number}: 사냥꾼 Q follows the signal through the old city while every clue changes what the team believes."
+            )
+            .expect("writing to String");
+            synopsis.push('\n');
+        }
+        synopsis
     }
 
     fn episode_metadata_app(synopsis: String) -> Bomtoon {
@@ -10137,12 +10111,10 @@ mod tests {
         app
     }
     fn episode_metadata_runner(synopsis: String) -> AppRunner<Bomtoon> {
-        let mut runner =
-            AppRunner::with_metrics(episode_metadata_app(synopsis), CLARA_BW_METRICS);
+        let mut runner = AppRunner::with_metrics(episode_metadata_app(synopsis), CLARA_BW_METRICS);
         runner.app_mut().prepare_episode_layout();
         runner
     }
-
 
     fn screen_button_actions(screen: &Screen) -> Vec<ActionId> {
         screen
@@ -10424,19 +10396,16 @@ mod tests {
             commerce::Authentication::Authenticated(test_scope(READER)),
             commerce::Connectivity::Online,
         );
-        assert!(runner
-            .app()
-            .commerce
-            .marker_belongs_to_another_account());
+        assert!(runner.app().commerce.marker_belongs_to_another_account());
         assert_eq!(snapshot(runner.app()), baseline);
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn episode_rows_show_thumbnail_date_and_truthful_access_status() {
         const HOUR_MS: i64 = 60 * 60 * 1_000;
         let now_ms = unix_time_ms().expect("host clock");
-        let thumbnail_url =
-            "https://image.balcony.studio/tw/ep_thumbnail/owned.webp".to_owned();
+        let thumbnail_url = "https://image.balcony.studio/tw/ep_thumbnail/owned.webp".to_owned();
         let picture = TilePicture::new(PictureHandle(73), 60, 60);
         let episode = |id: usize,
                        title: &str,
@@ -10493,12 +10462,11 @@ mod tests {
                 None,
             ),
         ];
-        app.covers.entries.insert(
-            thumbnail_url,
-            CoverState::Ready(picture),
-        );
+        app.covers
+            .entries
+            .insert(thumbnail_url, CoverState::Ready(picture));
         app.episode_items_per_page = Some(app.episodes.len());
-        let account_scope = app.account_scope.clone().expect("account scope");
+        let account_scope = app.account_scope.expect("account scope");
         let _ = app.commerce.marker_loaded(None);
         let _ = app.commerce.safety_changed(
             commerce::Authentication::Authenticated(account_scope),
@@ -10536,10 +10504,7 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::Spawn { .. })));
         assert_eq!(runner.app().view, View::Episodes);
-        assert_eq!(
-            runner.app().commerce.state(),
-            commerce::CommerceState::Idle
-        );
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
 
         let commands = runner.action(action_id("episode-4"));
         assert!(commands
@@ -10598,9 +10563,7 @@ mod tests {
             assert!(!rows.is_empty());
             for row in rows {
                 let index = (0..runner.app().episodes.len())
-                    .find(|index| {
-                        row.action == action_id(&format!("episode-disabled-{index}"))
-                    })
+                    .find(|index| row.action == action_id(&format!("episode-disabled-{index}")))
                     .expect("row action identifies an episode");
                 assert!(observed.insert(index), "episode {index} was duplicated");
             }
@@ -10759,18 +10722,13 @@ mod tests {
         assert!((start..end).contains(&refreshed_index));
     }
 
-
-
     #[test]
     fn accepting_content_precomputes_synopsis_pages() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
 
-        runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         assert_eq!(
             runner.app().synopsis.pages,
             synopsis_pages(&runner.app().selected_synopsis)
@@ -10814,8 +10772,6 @@ mod tests {
         assert_eq!(runner.app().synopsis.open_page, None);
         assert!(runner.app().screen().overlay.is_none());
     }
-
-
 
     #[test]
     fn synopsis_modal_pages_preserve_all_text_and_close_to_same_episode_page() {
@@ -10903,16 +10859,12 @@ mod tests {
         }
     }
 
-
     #[test]
     fn readable_and_not_owned_episode_rows_are_actions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let capacity = runner.app().episode_rows_per_page();
         let pages = runner.app().episodes.len().div_ceil(capacity);
         let mut actions = Vec::new();
@@ -10952,10 +10904,8 @@ mod tests {
         });
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
         assert!(!drawn.contains("Tickets 4"));
@@ -10996,10 +10946,8 @@ mod tests {
             Task::Fetch { ref url, .. }
                 if url.contains("/detail/hunter_q")
         ));
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (_, gift_work) = only_spawn(&commands);
         assert_eq!(gift_work, api::title_gifts(41));
         assert!(spawns(&commands).iter().all(
@@ -11083,10 +11031,8 @@ mod tests {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let episode_screen = last_screen(&commands);
         assert!(format!("{episode_screen:?}").contains("Episode One"));
 
@@ -12740,10 +12686,7 @@ mod tests {
 
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let commands = runner.action(action_id("episode-0"));
         let (manifest_task, _) = only_spawn(&commands);
         assert_eq!(runner.tasks_in_flight(), 4);
@@ -14389,8 +14332,8 @@ mod tests {
         assert!(matches!(
             credential,
             Some(value)
-                if value.secret == "bomtoon-access-token"
-                    && value.header == SecretHeader::Bearer
+                if value.secret == "bomtoon-session"
+                    && value.header == SecretHeader::Named("Cookie".to_owned())
         ));
 
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Unauthorized));
@@ -16894,7 +16837,9 @@ mod tests {
         let mut runner = episode_thumbnail_runner(12);
         let rows = runner.app().episode_rows_per_page();
         assert!(runner.app().episodes.len() > rows);
-        let first_page = (0..rows).map(episode_thumbnail_url).collect::<BTreeSet<_>>();
+        let first_page = (0..rows)
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
         let second_page = (rows..rows.saturating_mul(2).min(12))
             .map(episode_thumbnail_url)
             .collect::<BTreeSet<_>>();
@@ -16915,15 +16860,14 @@ mod tests {
         );
 
         let (ready_task, ready_url) = fetches[0].clone();
-        let commands =
-            runner.task_outcome(ready_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let commands = runner.task_outcome(ready_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         assert_eq!(put_picture_handles(&commands).len(), 1);
         assert!(matches!(
             first_episode_lead(&last_screen(&commands)),
             RowLead::Picture(_, Glyph::Book)
         ));
-        let ready_picture = ready_cover(&runner.app().covers, Some(&ready_url))
-            .expect("visible thumbnail picture");
+        let ready_picture =
+            ready_cover(&runner.app().covers, Some(&ready_url)).expect("visible thumbnail picture");
         let stale = runner
             .app()
             .covers
@@ -16980,8 +16924,7 @@ mod tests {
         let commands = runner.action(action_id(NEXT_PAGE));
         assert!(!cancelled_tasks(&commands).contains(&shared_task));
 
-        let commands =
-            runner.task_outcome(shared_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        let commands = runner.task_outcome(shared_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         assert_eq!(put_picture_handles(&commands).len(), 1);
         assert!(matches!(
             first_episode_lead(&last_screen(&commands)),
@@ -17006,13 +16949,8 @@ mod tests {
         assert!(cover_fetches(&runner.action(action_id("refresh-layout"))).is_empty());
     }
 
-    fn cached_episode_thumbnail_runner() -> (
-        AppRunner<Bomtoon>,
-        String,
-        TilePicture,
-        String,
-        TilePicture,
-    ) {
+    fn cached_episode_thumbnail_runner(
+    ) -> (AppRunner<Bomtoon>, String, TilePicture, String, TilePicture) {
         let shared = episode_thumbnail_url(0);
         let episode_only = episode_thumbnail_url(1);
         let shared_picture = TilePicture::new(PictureHandle(301), 1, 1);
@@ -17031,10 +16969,7 @@ mod tests {
         };
         app.covers.entries = BTreeMap::from([
             (shared.clone(), CoverState::Ready(shared_picture)),
-            (
-                episode_only.clone(),
-                CoverState::Ready(episode_picture),
-            ),
+            (episode_only.clone(), CoverState::Ready(episode_picture)),
         ]);
         app.covers.visible_urls = vec![shared.clone(), episode_only.clone()];
         app.covers.visible_source = Some(CoverSource::Protected);
@@ -17136,11 +17071,7 @@ mod tests {
         (loading_url, ready_url)
     }
 
-    fn assert_episode_thumbnail_cache_cleared(
-        app: &Bomtoon,
-        loading_url: &str,
-        ready_url: &str,
-    ) {
+    fn assert_episode_thumbnail_cache_cleared(app: &Bomtoon, loading_url: &str, ready_url: &str) {
         assert!(!app.covers.entries.contains_key(loading_url));
         assert!(!app.covers.entries.contains_key(ready_url));
         assert!(app.covers.tasks.is_empty());
@@ -17304,11 +17235,7 @@ mod tests {
             commerce::CommerceState::Quoting
         );
         assert!(cover_fetches(&commands).is_empty());
-        let quote_work = api::quote(
-            "hunter_q",
-            "thumbnail-0",
-            model::PurchaseType::Possession,
-        );
+        let quote_work = api::quote("hunter_q", "thumbnail-0", model::PurchaseType::Possession);
         let mut quote = spawns(&commands)
             .into_iter()
             .find(|(_, work)| *work == quote_work);
@@ -17976,9 +17903,9 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.trailing.as_deref() == Some("Owned")));
-        assert!(rows.iter().any(|row| {
-            row.action == action_id("episode-3") && row.trailing.is_none()
-        }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.action == action_id("episode-3") && row.trailing.is_none() }));
         assert_fits(&screen);
     }
 
@@ -18041,10 +17968,8 @@ mod tests {
 
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (gift_task, gift_work) = only_spawn(&commands);
         assert_eq!(gift_work, api::title_gifts(41));
         let loading = format!("{:?}", last_screen(&commands));
@@ -18067,8 +17992,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
 
         let commands = runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
@@ -18104,10 +18028,8 @@ mod tests {
         });
 
         let (content_task, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands = runner.task_outcome(
-            content_task,
-            TaskOutcome::Completed(content_response()),
-        );
+        let commands =
+            runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
         let (gift_task, _) = only_spawn(&commands);
         runner.task_outcome(gift_task, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
 
@@ -18162,8 +18084,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -18205,8 +18126,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -18234,8 +18154,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
@@ -18255,6 +18174,7 @@ mod tests {
     #[test]
     fn accepted_coin_rent_reconciles_exact_content_and_wallet_before_forget() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1,"useGoldCoin":1,"useBonusCoin":0,"useFreeCoin":0}}"#;
+        const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let rented_content = || {
             detail_response(
                 41,
@@ -18264,7 +18184,6 @@ mod tests {
             )
         };
 
-        const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let title = runner.app().selected_title.clone();
         let page = runner.app().page;
@@ -18277,8 +18196,7 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
 
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(rented_content()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(rented_content()));
         assert!(!commands
             .iter()
             .any(|command| matches!(command, Command::Store(StoreRequest::Forget { .. }))));
@@ -18312,6 +18230,7 @@ mod tests {
     #[test]
     fn accepted_gift_rent_requires_entitlement_and_exact_gift_decrement() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT_GIFT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":0}}"#;
+        const ZERO_GIFTS: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":1}],"receivableGifts":[]}}"#;
         let rented_content = || {
             detail_response(
                 41,
@@ -18320,7 +18239,6 @@ mod tests {
                 "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1819728000000,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
             )
         };
-        const ZERO_GIFTS: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":1}],"receivableGifts":[]}}"#;
         let (mut runner, post) = runner_waiting_for_gift_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
@@ -18549,6 +18467,8 @@ mod tests {
     }
     #[test]
     fn zero_hour_rental_refreshes_content_before_starting_reader() {
+        const NO_GIFTS: &[u8] =
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
         let expired_rent = || {
             detail_response(
                 41,
@@ -18557,8 +18477,6 @@ mod tests {
                 "{\"id\":104,\"alias\":\"rented\",\"title\":\"Rented Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
             )
         };
-        const NO_GIFTS: &[u8] =
-            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
@@ -18626,6 +18544,7 @@ mod tests {
     #[test]
     fn back_is_consumed_during_reconciliation_and_marker_clearing() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"RENT","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":1}}"#;
+        const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let rented_content = || {
             detail_response(
                 41,
@@ -18634,7 +18553,6 @@ mod tests {
                 "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1819728000000,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
             )
         };
-        const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
         let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
@@ -18682,6 +18600,8 @@ mod tests {
 
     #[test]
     fn stale_episode_action_during_quote_keeps_original_episode_bound() {
+        const NO_GIFTS: &[u8] =
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
         let two_unowned = || {
             detail_response(
                 41,
@@ -18693,8 +18613,6 @@ mod tests {
                 ),
             )
         };
-        const NO_GIFTS: &[u8] =
-            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.store_result(StoreResult::Loaded {
@@ -18739,6 +18657,9 @@ mod tests {
 
     #[test]
     fn quote_heading_names_the_selected_unowned_episode() {
+        const NO_GIFTS: &[u8] =
+            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
+        const SECOND_QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":106,"contentsAlias":"hunter_q","episodeAlias":"second","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
         let two_unowned = || {
             detail_response(
                 41,
@@ -18750,9 +18671,6 @@ mod tests {
                 ),
             )
         };
-        const NO_GIFTS: &[u8] =
-            br#"{"result":"SUCCESS","data":{"receivedGifts":[],"receivableGifts":[]}}"#;
-        const SECOND_QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":106,"contentsAlias":"hunter_q","episodeAlias":"second","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         runner.store_result(StoreResult::Loaded {
@@ -18777,8 +18695,7 @@ mod tests {
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         runner.task_outcome(gift, TaskOutcome::Completed(TWO_GIFTS.to_vec()));
         assert_eq!(runner.app().gifts.available, Some(2));
@@ -18844,8 +18761,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
         let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
         runner.task_outcome(quote, TaskOutcome::Completed(QUOTE.to_vec()));
@@ -18865,6 +18781,7 @@ mod tests {
     #[test]
     fn accepted_coin_possession_reconciles_and_back_reloads_library() {
         const RECEIPT: &[u8] = br#"{"result":"SUCCESS","data":{"purchaseType":"POSSESSION","contentsAlias":"hunter_q","episodeAlias":"paid","useCoin":2,"useGoldCoin":2,"useBonusCoin":0,"useFreeCoin":0}}"#;
+        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let owned_content = || {
             detail_response(
                 41,
@@ -18873,7 +18790,6 @@ mod tests {
                 "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
             )
         };
-        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
@@ -18901,6 +18817,8 @@ mod tests {
 
     #[test]
     fn ambiguous_purchase_with_entitlement_and_exact_delta_clears_without_repost() {
+        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
+        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
         let owned_content = || {
             detail_response(
                 41,
@@ -18909,8 +18827,6 @@ mod tests {
                 "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"POSSESSION\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true}",
             )
         };
-        const EIGHT_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":5,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
-        const ONE_GIFT: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
@@ -18949,8 +18865,7 @@ mod tests {
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(gift, TaskOutcome::Completed(ONE_GIFT.to_vec()));
         assert_no_post_or_marker_forget(&commands);
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         assert_no_post_or_marker_forget(&commands);
         let commands = runner.task_outcome(wallet, TaskOutcome::Completed(EIGHT_COINS.to_vec()));
         assert_eq!(
@@ -19002,8 +18917,7 @@ mod tests {
             value: None,
         });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
-        let commands =
-            runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         fetch_task_with(&commands, "/gift/contents/detail?");
         runner.app_mut().view = View::Main;
         runner.action(action_id(ACCOUNT));
