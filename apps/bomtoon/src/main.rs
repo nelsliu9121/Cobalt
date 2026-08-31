@@ -2835,6 +2835,12 @@ impl Bomtoon {
         }
     }
 
+    fn is_episode_thumbnail_url(&self, url: &str) -> bool {
+        self.episodes
+            .iter()
+            .any(|episode| episode.thumbnail_url.as_deref() == Some(url))
+    }
+
     fn episode_thumbnail_urls(&self) -> BTreeSet<String> {
         self.episodes
             .iter()
@@ -6710,7 +6716,10 @@ impl KoboApp for Bomtoon {
             return;
         }
         if let Some(cover) = self.covers.tasks.remove(&task) {
-            self.observe_connectivity(context, &outcome);
+            if cover.source != CoverSource::Protected || !self.is_episode_thumbnail_url(&cover.url)
+            {
+                self.observe_connectivity(context, &outcome);
+            }
             self.resume_queued_foreground(context);
             let changed = self.handle_cover_outcome(context, task, cover, outcome);
             if changed {
@@ -16933,8 +16942,10 @@ mod tests {
     }
 
     #[test]
-    fn episode_thumbnail_failure_keeps_glyph_without_page_error() {
-        let mut runner = episode_thumbnail_runner(1);
+    fn episode_thumbnail_failure_keeps_glyph_and_commerce_online_without_page_error() {
+        let mut app = episode_thumbnail_app(1);
+        app.episodes[0].purchase = model::PurchaseState::NotOwned;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
         let commands = runner.action(action_id("refresh-layout"));
         let thumbnail = cover_fetches(&commands)[0].0;
 
@@ -16942,6 +16953,7 @@ mod tests {
 
         assert!(put_picture_handles(&commands).is_empty());
         assert!(runner.app().problem.is_none());
+        assert_eq!(runner.app().connection, ConnectionState::Online);
         assert_eq!(
             first_episode_lead(&runner.app().screen()),
             RowLead::Icon(Glyph::Book)

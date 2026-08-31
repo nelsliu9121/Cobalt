@@ -533,6 +533,10 @@ pub fn content_detail(bytes: &[u8], expected_alias: &str) -> Result<ContentDetai
 }
 
 fn parse_episode(item: &Value) -> Result<Episode, ParseError> {
+    let alias = bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?;
+    if !valid_alias_with_limit(alias, MAX_COMMERCE_ALIAS_BYTES) {
+        return Err(ParseError::InvalidValue("episode.alias"));
+    }
     let coin_kind =
         optional_bounded_string(item, "coinKind", "episode.coinKind", MAX_REMOTE_CODE_BYTES)?;
     let possession_coin = optional_unsigned(item, "possessionCoin", "episode.possessionCoin")?;
@@ -560,7 +564,7 @@ fn parse_episode(item: &Value) -> Result<Episode, ParseError> {
         };
     Ok(Episode {
         id: unsigned(item, "id", "episode.id")?,
-        alias: bounded_string(item, "alias", "episode.alias", MAX_COMMERCE_ALIAS_BYTES)?.to_owned(),
+        alias: alias.to_owned(),
         title: bounded_string(item, "title", "episode.title", MAX_EPISODE_TITLE_BYTES)?.to_owned(),
         opened_at: positive_i64(item, "openedAt", "episode.openedAt")?,
         thumbnail_url: episode_thumbnail(item)?,
@@ -888,12 +892,16 @@ fn banner_alias(banner: &Value) -> Option<&str> {
     None
 }
 
-fn valid_alias(alias: &str) -> bool {
+fn valid_alias_with_limit(alias: &str, maximum_bytes: usize) -> bool {
     !alias.is_empty()
-        && alias.len() <= MAX_ALIAS_BYTES
+        && alias.len() <= maximum_bytes
         && alias
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_alias(alias: &str) -> bool {
+    valid_alias_with_limit(alias, MAX_ALIAS_BYTES)
 }
 
 fn public_thumbnail(
@@ -2754,6 +2762,14 @@ mod tests {
         let title_512 = "T".repeat(512);
         let exact = content_body(&alias_128, &title_512, "NONE");
         assert!(content_detail(&exact, "hunter_q").is_ok());
+
+        for alias in ["", "episode/one", "episode?one", "episode%2Done", "第一話"] {
+            let invalid_alias = content_body(alias, "One", "NONE");
+            assert!(matches!(
+                content_detail(&invalid_alias, "hunter_q"),
+                Err(ParseError::InvalidValue("episode.alias"))
+            ));
+        }
 
         let alias_129 = "a".repeat(129);
         let too_long_alias = content_body(&alias_129, "One", "NONE");
