@@ -1,8 +1,8 @@
 use crate::model::{
     AssetAmounts, AssetKind, AssetSubtype, BannerComic, CoinUse, Comic, Comment, ContentDetail,
     Episode, EpisodeAvailability, EpisodeImage, ExpirationRow, FeatureComic, GiftBalance, Homepage,
-    PublicDetail, PurchaseReceipt, PurchaseState, PurchaseType, Quote, RecentEntry, ThemeCollection,
-    WalletSummary,
+    PublicDetail, PurchaseReceipt, PurchaseState, PurchaseType, Quote, RecentEntry,
+    ThemeCollection, WalletSummary,
 };
 use http::Uri;
 use kobo_json::Value;
@@ -249,8 +249,7 @@ pub fn public_detail(bytes: &[u8], expected_alias: &str) -> Result<PublicDetail,
     }
     let synopsis = match open_graph_content(html, "og:description") {
         Some(raw) => {
-            let synopsis =
-                decode_entities_bounded(raw, MAX_SYNOPSIS_BYTES, "detail synopsis")?;
+            let synopsis = decode_entities_bounded(raw, MAX_SYNOPSIS_BYTES, "detail synopsis")?;
             (!synopsis.trim().is_empty()).then_some(synopsis)
         }
         None => None,
@@ -856,19 +855,18 @@ fn feature_comic(value: &Value, adult_key: &str) -> Option<FeatureComic> {
         .and_then(Value::as_integer_str)
         .and_then(|count| count.parse::<u64>().ok())
         .filter(|count| *count > 0);
-    let (vertical_url, square_url) =
-        if matches!(value.get(adult_key), Some(Value::Bool(false))) {
-            let vertical_url = public_thumbnail(
-                value,
-                &["VERTICAL_NON_ADULT", "VERTICAL", "COVER"],
-                PUBLIC_IMAGE_PATHS,
-            );
-            let square_url = public_thumbnail(value, &["SQUARE"], PUBLIC_IMAGE_PATHS)
-                .or_else(|| vertical_url.clone());
-            (vertical_url, square_url)
-        } else {
-            (None, None)
-        };
+    let (vertical_url, square_url) = if matches!(value.get(adult_key), Some(Value::Bool(false))) {
+        let vertical_url = public_thumbnail(
+            value,
+            &["VERTICAL_NON_ADULT", "VERTICAL", "COVER"],
+            PUBLIC_IMAGE_PATHS,
+        );
+        let square_url = public_thumbnail(value, &["SQUARE"], PUBLIC_IMAGE_PATHS)
+            .or_else(|| vertical_url.clone());
+        (vertical_url, square_url)
+    } else {
+        (None, None)
+    };
     Some(FeatureComic {
         alias: alias.to_owned(),
         title: title.to_owned(),
@@ -3218,9 +3216,9 @@ mod tests {
             ]
         );
         assert!(comics.iter().all(|comic| comic.view_count.is_none()));
-        assert!(comics[2..].iter().all(|comic| {
-            comic.vertical_url.is_none() && comic.square_url.is_none()
-        }));
+        assert!(comics[2..]
+            .iter()
+            .all(|comic| { comic.vertical_url.is_none() && comic.square_url.is_none() }));
     }
 
     #[test]
@@ -3480,8 +3478,7 @@ mod tests {
                 .synopsis,
             None
         );
-        let empty =
-            format!(r#"{title}<meta property="og:description" content="   &nbsp; ">"#);
+        let empty = format!(r#"{title}<meta property="og:description" content="   &nbsp; ">"#);
         assert_eq!(
             public_detail(empty.as_bytes(), "safe")
                 .expect("empty synopsis")

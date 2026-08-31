@@ -22,13 +22,13 @@ pub use kobo_ui::{
     BandSlot, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome,
     ControlState, DiagnosticSeverity, DisplayMetrics, Emphasis, Face, Fold, FontHandle, Freeform,
     Glyph, InlineFormula, LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind,
-    ParagraphAlignment, ParagraphPresentation, Percent, PictureFit, PictureHandle, PicturePixelsRef,
-    ProseArea, ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowLineLimits, RowState,
-    Screen, SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape,
-    TileState, TopBar, TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS,
-    MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS, MAX_INLINE_FORMULAE,
-    MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS,
-    MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
+    ParagraphAlignment, ParagraphPresentation, Percent, PictureFit, PictureHandle,
+    PicturePixelsRef, ProseArea, ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead,
+    RowLineLimits, RowState, Screen, SlotWidth, Space, TextHit, TextPresentation, TextSelection,
+    Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure, CLARA_BW_METRICS,
+    MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS,
+    MAX_INLINE_FORMULAE, MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS,
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -752,11 +752,7 @@ impl ScreenBuilder {
 
     /// Names a group and makes the heading itself a target.
     #[must_use]
-    pub fn tappable_section(
-        mut self,
-        name: impl AsRef<str>,
-        title: impl Into<String>,
-    ) -> Self {
+    pub fn tappable_section(mut self, name: impl AsRef<str>, title: impl Into<String>) -> Self {
         let id = self.next_id();
         let action = self.register(name.as_ref());
         self.nodes.push(Node::Section {
@@ -2017,11 +2013,8 @@ impl ScreenBuilder {
         let id = self.next_id();
         let mut source = items.into_iter();
         let mut tiles = Vec::new();
-        for (name, title, summary, glyph, picture) in
-            source.by_ref().take(MAX_MEDIA_GRID_ITEMS)
-        {
-            let tile = Tile::new(self.register(name.as_ref()), title, glyph)
-                .with_subtitle(summary);
+        for (name, title, summary, glyph, picture) in source.by_ref().take(MAX_MEDIA_GRID_ITEMS) {
+            let tile = Tile::new(self.register(name.as_ref()), title, glyph).with_subtitle(summary);
             tiles.push(match picture {
                 Some(picture) => tile.with_picture(picture.with_fit(PictureFit::Cover)),
                 None => tile,
@@ -2199,9 +2192,7 @@ impl ScreenBuilder {
         let id = self.next_id();
         let mut source = rows.into_iter();
         let mut rows = Vec::new();
-        for (name, title, summary, description, lead, trailing) in
-            source.by_ref().take(MAX_ROWS)
-        {
+        for (name, title, summary, description, lead, trailing) in source.by_ref().take(MAX_ROWS) {
             let row = Row::new(self.register(name.as_ref()), title, summary, lead)
                 .with_description(description);
             let trailing = trailing.into();
@@ -6243,14 +6234,7 @@ mod tests {
         let unlimited = ScreenBuilder::new("unlimited")
             .described_rows_with_trailing(
                 RowLineLimits::default(),
-                [(
-                    "entry",
-                    "Title",
-                    "Creator",
-                    "Description",
-                    Glyph::Book,
-                    "",
-                )],
+                [("entry", "Title", "Creator", "Description", Glyph::Book, "")],
             )
             .build();
         let Node::Rows { rows, .. } = &unlimited.nodes[0] else {

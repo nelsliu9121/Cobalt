@@ -4896,8 +4896,17 @@ fn fitted_picture(source: (u32, u32), target: Rect, fit: PictureFit) -> FittedPi
     let source_height = usize::try_from(source.1).unwrap_or(0);
     if source_width == 0 || source_height == 0 || target.width <= 0 || target.height <= 0 {
         return FittedPicture {
-            target: Rect { width: 0, height: 0, ..target },
-            source: SourceWindow { x: 0, y: 0, width: 0, height: 0 },
+            target: Rect {
+                width: 0,
+                height: 0,
+                ..target
+            },
+            source: SourceWindow {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
         };
     }
     if fit == PictureFit::Contain {
@@ -4909,7 +4918,12 @@ fn fitted_picture(source: (u32, u32), target: Rect, fit: PictureFit) -> FittedPi
                 width,
                 height,
             },
-            source: SourceWindow { x: 0, y: 0, width: source_width, height: source_height },
+            source: SourceWindow {
+                x: 0,
+                y: 0,
+                width: source_width,
+                height: source_height,
+            },
         };
     }
     let target_width = usize::try_from(target.width).unwrap_or(0);
@@ -4917,9 +4931,15 @@ fn fitted_picture(source: (u32, u32), target: Rect, fit: PictureFit) -> FittedPi
     let (crop_width, crop_height) = if source_width.saturating_mul(target_height)
         > source_height.saturating_mul(target_width)
     {
-        (source_height.saturating_mul(target_width) / target_height.max(1), source_height)
+        (
+            source_height.saturating_mul(target_width) / target_height.max(1),
+            source_height,
+        )
     } else {
-        (source_width, source_width.saturating_mul(target_height) / target_width.max(1))
+        (
+            source_width,
+            source_width.saturating_mul(target_height) / target_width.max(1),
+        )
     };
     FittedPicture {
         target,
@@ -7050,8 +7070,7 @@ fn layout_node(
                 }
                 let column = position as i32 % columns;
                 let row = position as i32 / columns;
-                let cell_x =
-                    x.saturating_add(column * (cell_width.saturating_add(column_gap)));
+                let cell_x = x.saturating_add(column * (cell_width.saturating_add(column_gap)));
                 let cell_y = y.saturating_add(row * (cell_height.saturating_add(row_gap)));
                 if cell_y.saturating_add(cell_height) > bottom {
                     // Retain the first omitted cell as a non-drawing marker so
@@ -7129,11 +7148,7 @@ fn layout_node(
                         height: summary_height,
                     },
                     kind: LayoutKind::RowSummary,
-                    text_lines: vec![one_line(
-                        &tile.subtitle,
-                        text_width,
-                        FontSize::Caption,
-                    )],
+                    text_lines: vec![one_line(&tile.subtitle, text_width, FontSize::Caption)],
                 });
             }
             if placed_rows == 0 {
@@ -8935,20 +8950,19 @@ pub fn paginate_described_rows_with_trailing(
     area: ProseArea,
 ) -> Vec<Vec<usize>> {
     paginate_row_heights(
-        rows.iter()
-            .map(|(title, summary, description, trailing)| {
-                measured_row_height(
-                    metrics,
-                    area,
-                    title,
-                    summary,
-                    description,
-                    trailing,
-                    false,
-                    metrics.touch_target_default(),
-                    limits,
-                )
-            }),
+        rows.iter().map(|(title, summary, description, trailing)| {
+            measured_row_height(
+                metrics,
+                area,
+                title,
+                summary,
+                description,
+                trailing,
+                false,
+                metrics.touch_target_default(),
+                limits,
+            )
+        }),
         area,
     )
 }
@@ -11391,21 +11405,16 @@ fn draw_picture_window(
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
                 let local_from_y = row * window_height / target_height;
-                let local_to_y = max(
-                    local_from_y + 1,
-                    (row + 1) * window_height / target_height,
-                )
-                .min(window_height);
+                let local_to_y = max(local_from_y + 1, (row + 1) * window_height / target_height)
+                    .min(window_height);
                 let from_y = window.y + local_from_y;
                 let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
                     let local_from_x = column * window_width / target_width;
-                    let local_to_x = max(
-                        local_from_x + 1,
-                        (column + 1) * window_width / target_width,
-                    )
-                    .min(window_width);
+                    let local_to_x =
+                        max(local_from_x + 1, (column + 1) * window_width / target_width)
+                            .min(window_width);
                     let from_x = window.x + local_from_x;
                     let to_x = window.x + local_to_x;
                     let mut total = 0u64;
@@ -11438,21 +11447,16 @@ fn draw_picture_window(
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
                 let local_from_y = row * window_height / target_height;
-                let local_to_y = max(
-                    local_from_y + 1,
-                    (row + 1) * window_height / target_height,
-                )
-                .min(window_height);
+                let local_to_y = max(local_from_y + 1, (row + 1) * window_height / target_height)
+                    .min(window_height);
                 let from_y = window.y + local_from_y;
                 let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
                     let local_from_x = column * window_width / target_width;
-                    let local_to_x = max(
-                        local_from_x + 1,
-                        (column + 1) * window_width / target_width,
-                    )
-                    .min(window_width);
+                    let local_to_x =
+                        max(local_from_x + 1, (column + 1) * window_width / target_width)
+                            .min(window_width);
                     let from_x = window.x + local_from_x;
                     let to_x = window.x + local_to_x;
                     let mut totals = [0u64; 3];
@@ -12876,8 +12880,7 @@ fn draw_row_lead(
                     .unwrap_or(picture.source);
                 let fitted = match picture.fit {
                     PictureFit::Contain => {
-                        let (width, height) =
-                            fit_within(picture.source, rect.width, rect.height);
+                        let (width, height) = fit_within(picture.source, rect.width, rect.height);
                         Rect {
                             x: rect.x + (rect.width - width) / 2,
                             y: rect.y + (rect.height - height) / 2,
@@ -14993,8 +14996,7 @@ mod page_turn_tests {
                 .nodes
                 .iter()
                 .find(|node| {
-                    node.kind
-                        == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
+                    node.kind == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
                 })
                 .expect("reading picture")
                 .rect
@@ -15584,10 +15586,7 @@ mod row_tests {
             description.rect.y,
             summary.rect.y.saturating_add(summary.rect.height)
         );
-        assert_eq!(
-            description.rect.height,
-            2 * FontSize::Caption.line_height()
-        );
+        assert_eq!(description.rect.height, 2 * FontSize::Caption.line_height());
     }
 
     #[test]
@@ -15656,12 +15655,8 @@ mod row_tests {
                                 title,
                                 creator,
                                 RowLead::Picture(
-                                    TilePicture::new(
-                                        PictureHandle(index as u32 + 100),
-                                        300,
-                                        300,
-                                    )
-                                    .with_fit(PictureFit::Cover),
+                                    TilePicture::new(PictureHandle(index as u32 + 100), 300, 300)
+                                        .with_fit(PictureFit::Cover),
                                     Glyph::Book,
                                 ),
                             )
@@ -15681,11 +15676,9 @@ mod row_tests {
                     .count(),
                 expected
             );
-            assert!(
-                !screen
-                    .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-                    .has_errors()
-            );
+            assert!(!screen
+                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                .has_errors());
         }
     }
 
@@ -15700,23 +15693,18 @@ mod row_tests {
         )
         .is_empty());
         assert!(paginate_rows_with_trailing(&[], &CLARA_BW_METRICS, area).is_empty());
-        assert!(
-            paginate_ranked_rows_with_trailing(&[], &CLARA_BW_METRICS, area, 12).is_empty()
-        );
+        assert!(paginate_ranked_rows_with_trailing(&[], &CLARA_BW_METRICS, area, 12).is_empty());
         assert!(paginate_rows_with_menu(&[], &CLARA_BW_METRICS, area).is_empty());
     }
 
     #[test]
     fn unsupported_described_row_text_is_reported() {
-        let row = Row::new(ActionId(1), "Title", "Creator", Glyph::Book)
-            .with_description("\u{10ffff}");
+        let row =
+            Row::new(ActionId(1), "Title", "Creator", Glyph::Book).with_description("\u{10ffff}");
         let mut issues = Vec::new();
-        check_row_text_coverage_with(
-            NodeId(41),
-            &row,
-            &mut issues,
-            |text, _face| text.contains('\u{10ffff}').then_some('\u{10ffff}'),
-        );
+        check_row_text_coverage_with(NodeId(41), &row, &mut issues, |text, _face| {
+            text.contains('\u{10ffff}').then_some('\u{10ffff}')
+        });
         assert!(issues.iter().any(|issue| {
             issue.node == Some(NodeId(41))
                 && matches!(
@@ -15738,13 +15726,8 @@ mod row_tests {
         let row = Row::new(ActionId(1), "T", "", Glyph::Book)
             .with_description(description)
             .with_line_limits(RowLineLimits::new(0, 0, 1));
-        let text_width = row_title_width_beside(
-            &metrics,
-            area,
-            "",
-            false,
-            row_mark_column(&metrics),
-        );
+        let text_width =
+            row_title_width_beside(&metrics, area, "", false, row_mark_column(&metrics));
         let clamped = clamp_lines(description, text_width, FontSize::Caption, 1);
         let expected = measure_text(&clamped, FontSize::Caption)
             .0
@@ -16441,7 +16424,8 @@ mod prose_tests {
     #[test]
     fn drawable_text_rejects_an_unsupported_clock_but_retains_cjk() {
         assert_eq!(
-            drawable_text_with("給我一次重來的機會🕙", |character| character != '🕙'),
+            drawable_text_with("給我一次重來的機會🕙", |character| character
+                != '🕙'),
             "給我一次重來的機會"
         );
     }
@@ -17573,13 +17557,9 @@ mod prose_tests {
         )
         .layout();
         assert!(
-            screen
-                .nodes
-                .iter()
-                .any(|node| {
-                    node.kind
-                        == LayoutKind::FramedPicture(PictureHandle(3), PictureFit::Contain)
-                }),
+            screen.nodes.iter().any(|node| {
+                node.kind == LayoutKind::FramedPicture(PictureHandle(3), PictureFit::Contain)
+            }),
             "a cover was drawn without the edge that separates it from the shelf"
         );
     }
@@ -17647,15 +17627,17 @@ mod prose_tests {
 
         #[test]
         fn cover_fit_crops_the_source_center_without_stretching() {
-            let source = PicturePixelsRef::Gray8(&[
-                10, 20, 30, 40,
-                50, 60, 70, 80,
-            ]);
+            let source = PicturePixelsRef::Gray8(&[10, 20, 30, 40, 50, 60, 70, 80]);
             let mut surface = Surface::new(2, 2);
             let bounds = surface.bounds();
             draw_fitted_picture(
                 &mut surface,
-                Rect { x: 0, y: 0, width: 2, height: 2 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
                 (4, 2),
                 source,
                 bounds,
@@ -17670,14 +17652,19 @@ mod prose_tests {
         #[test]
         fn rgb_cover_fit_crops_center_columns_without_channel_shift() {
             let source = PicturePixelsRef::Rgb8(&[
-                1, 2, 3, 10, 20, 30, 40, 50, 60, 7, 8, 9,
-                4, 5, 6, 70, 80, 90, 100, 110, 120, 11, 12, 13,
+                1, 2, 3, 10, 20, 30, 40, 50, 60, 7, 8, 9, 4, 5, 6, 70, 80, 90, 100, 110, 120, 11,
+                12, 13,
             ]);
             let mut surface = Surface::new_in(2, 2, PictureFormat::Rgb8);
             let bounds = surface.bounds();
             draw_fitted_picture(
                 &mut surface,
-                Rect { x: 0, y: 0, width: 2, height: 2 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
                 (4, 2),
                 source,
                 bounds,
@@ -17691,10 +17678,31 @@ mod prose_tests {
 
         #[test]
         fn contain_fit_keeps_the_existing_letterbox_geometry() {
-            let target = Rect { x: 0, y: 0, width: 100, height: 100 };
+            let target = Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            };
             let fitted = fitted_picture((200, 100), target, PictureFit::Contain);
-            assert_eq!(fitted.target, Rect { x: 0, y: 25, width: 100, height: 50 });
-            assert_eq!(fitted.source, SourceWindow { x: 0, y: 0, width: 200, height: 100 });
+            assert_eq!(
+                fitted.target,
+                Rect {
+                    x: 0,
+                    y: 25,
+                    width: 100,
+                    height: 50
+                }
+            );
+            assert_eq!(
+                fitted.source,
+                SourceWindow {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 100
+                }
+            );
         }
     }
 
@@ -18441,10 +18449,7 @@ mod prose_tests {
                         ActionId(1),
                         "With a cover",
                         "",
-                        RowLead::Picture(
-                            TilePicture::new(PictureHandle(1), 60, 90),
-                            Glyph::Book,
-                        ),
+                        RowLead::Picture(TilePicture::new(PictureHandle(1), 60, 90), Glyph::Book),
                     ),
                     Row::new(ActionId(2), "With a mark", "", RowLead::Icon(Glyph::Book)),
                 ],
@@ -21220,25 +21225,18 @@ mod feature_feed_tests {
             .filter(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), 3);
-        assert!(
-            targets
-                .windows(2)
-                .all(|pair| pair[0].rect.width == pair[1].rect.width)
-        );
-        assert!(
-            layout
-                .nodes
-                .iter()
-                .all(|node| node.kind != LayoutKind::TileLabel)
-        );
+        assert!(targets
+            .windows(2)
+            .all(|pair| pair[0].rect.width == pair[1].rect.width));
+        assert!(layout
+            .nodes
+            .iter()
+            .all(|node| node.kind != LayoutKind::TileLabel));
         assert_eq!(
             layout
                 .nodes
                 .iter()
-                .filter(|node| matches!(
-                    node.kind,
-                    LayoutKind::FramedPicture(_, PictureFit::Cover)
-                ))
+                .filter(|node| matches!(node.kind, LayoutKind::FramedPicture(_, PictureFit::Cover)))
                 .count(),
             3
         );
@@ -21279,9 +21277,10 @@ mod feature_feed_tests {
                 .content_used(),
             0
         );
-        assert!(!empty.validate(&CLARA_BW_METRICS).iter().any(|issue| {
-            matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. })
-        }));
+        assert!(!empty
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. }) }));
     }
 
     #[test]
@@ -21291,8 +21290,7 @@ mod feature_feed_tests {
             vec![Node::ImageStrip {
                 id: NodeId(1),
                 tiles: vec![
-                    Tile::new(ActionId(1), "", Glyph::Book)
-                        .with_state(TileState::Unavailable),
+                    Tile::new(ActionId(1), "", Glyph::Book).with_state(TileState::Unavailable)
                 ],
             }],
         )
@@ -21301,9 +21299,7 @@ mod feature_feed_tests {
         let tile = layout
             .nodes
             .iter()
-            .find(|node| {
-                node.kind == LayoutKind::Tile(ActionId(1), ControlState::Disabled)
-            })
+            .find(|node| node.kind == LayoutKind::Tile(ActionId(1), ControlState::Disabled))
             .expect("disabled strip tile");
         assert_eq!(layout.hit_test(tile.rect.x + 1, tile.rect.y + 1), None);
     }
@@ -21314,18 +21310,15 @@ mod feature_feed_tests {
             1,
             vec![Node::ImageStrip {
                 id: NodeId(1),
-                tiles: vec![
-                    Tile::new(ActionId(1), "\u{10ffff} (kept)", Glyph::Book)
-                        .with_subtitle("\u{10ffff}")
-                        .with_state(TileState::Held),
-                ],
+                tiles: vec![Tile::new(ActionId(1), "\u{10ffff} (kept)", Glyph::Book)
+                    .with_subtitle("\u{10ffff}")
+                    .with_state(TileState::Held)],
             }],
         );
         assert!(!screen.validate(&CLARA_BW_METRICS).iter().any(|issue| {
             matches!(
                 issue.kind,
-                LayoutIssueKind::UnsupportedCharacter { .. }
-                    | LayoutIssueKind::StateInLabel
+                LayoutIssueKind::UnsupportedCharacter { .. } | LayoutIssueKind::StateInLabel
             )
         }));
     }
@@ -21338,12 +21331,8 @@ mod feature_feed_tests {
                 id: NodeId(1),
                 tiles: (0..6)
                     .map(|index| {
-                        Tile::new(
-                            ActionId(index + 1),
-                            format!("Title {index}"),
-                            Glyph::Book,
-                        )
-                        .with_subtitle(format!("Creator {index}"))
+                        Tile::new(ActionId(index + 1), format!("Title {index}"), Glyph::Book)
+                            .with_subtitle(format!("Creator {index}"))
                     })
                     .collect(),
             }],
@@ -21357,9 +21346,9 @@ mod feature_feed_tests {
         assert_eq!(cards.len(), 6);
         assert_eq!(cards[0].rect.y, cards[1].rect.y);
         assert!(cards[2].rect.y > cards[0].rect.y);
-        assert!(cards.iter().all(
-            |card| card.rect.height >= CLARA_BW_METRICS.touch_target_minimum()
-        ));
+        assert!(cards
+            .iter()
+            .all(|card| card.rect.height >= CLARA_BW_METRICS.touch_target_minimum()));
         for card in cards {
             let LayoutKind::MediaCard(action) = card.kind else {
                 unreachable!()
@@ -21374,8 +21363,7 @@ mod feature_feed_tests {
     #[test]
     fn media_grid_reports_partial_fit() {
         let chrome = Chrome::default();
-        let baseline =
-            Screen::new(0, Vec::new()).layout_with(&CLARA_BW_METRICS, &chrome);
+        let baseline = Screen::new(0, Vec::new()).layout_with(&CLARA_BW_METRICS, &chrome);
         let mut metrics = CLARA_BW_METRICS;
         let overhead = metrics.height.saturating_sub(baseline.content.height);
         metrics.height = overhead
@@ -21400,7 +21388,10 @@ mod feature_feed_tests {
             .iter()
             .filter(|node| matches!(node.kind, LayoutKind::MediaCard(_)))
             .count();
-        assert!((1..6).contains(&cards), "expected a partial grid, got {cards}");
+        assert!(
+            (1..6).contains(&cards),
+            "expected a partial grid, got {cards}"
+        );
         assert!(diagnostics.issues.iter().any(|issue| {
             matches!(
                 issue.kind,
@@ -21443,9 +21434,7 @@ mod feature_feed_tests {
             .layout
             .nodes
             .iter()
-            .filter(|node| {
-                matches!(node.kind, LayoutKind::RowTitle | LayoutKind::RowSummary)
-            })
+            .filter(|node| { matches!(node.kind, LayoutKind::RowTitle | LayoutKind::RowSummary) })
             .all(|node| node.text_lines.len() <= 1));
     }
 
@@ -21464,9 +21453,10 @@ mod feature_feed_tests {
                 .content_used(),
             0
         );
-        assert!(!screen.validate(&CLARA_BW_METRICS).iter().any(|issue| {
-            matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. })
-        }));
+        assert!(!screen
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. }) }));
     }
 
     #[test]
@@ -21514,8 +21504,7 @@ mod feature_feed_tests {
                 action: Some(ActionId(42)),
             }],
         );
-        let diagnostics =
-            tappable_screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
+        let diagnostics = tappable_screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
         let target = diagnostics
             .layout
             .nodes
@@ -21532,18 +21521,17 @@ mod feature_feed_tests {
                 .height,
             FontSize::Caption.line_height()
         );
-        assert!(
-            target.rect.height >= CLARA_BW_METRICS.touch_target_minimum()
-        );
+        assert!(target.rect.height >= CLARA_BW_METRICS.touch_target_minimum());
         assert_eq!(
             diagnostics
                 .layout
                 .hit_test(target.rect.x + 1, target.rect.y + target.rect.height - 1),
             Some(ActionId(42))
         );
-        assert!(!diagnostics.issues.iter().any(|issue| {
-            matches!(issue.kind, LayoutIssueKind::TouchTargetTooSmall { .. })
-        }));
+        assert!(!diagnostics
+            .issues
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::TouchTargetTooSmall { .. }) }));
     }
 
     #[test]

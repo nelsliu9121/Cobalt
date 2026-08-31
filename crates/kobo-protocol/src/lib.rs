@@ -12,8 +12,7 @@ use kobo_ui::{
     FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureFit,
     PictureHandle, ReadingChrome, ReadingSurface, Row, RowLead, RowLineLimits, RowState, Screen,
     Space, TextScale, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
-    MAX_BAR_ACTIONS,
-    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
+    MAX_BAR_ACTIONS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
 
@@ -6282,8 +6281,7 @@ fn decode_node(
                     Some(menu)
                 };
                 let description = reader.string()?;
-                let line_limits =
-                    RowLineLimits::new(reader.u8()?, reader.u8()?, reader.u8()?);
+                let line_limits = RowLineLimits::new(reader.u8()?, reader.u8()?, reader.u8()?);
                 rows.push(Row {
                     action,
                     title,
@@ -7441,10 +7439,7 @@ mod node_coverage_tests {
                     ActionId(67),
                     "Bleak House",
                     "Charles Dickens",
-                    RowLead::Picture(
-                        TilePicture::new(PictureHandle(9), 190, 300),
-                        Glyph::Book,
-                    ),
+                    RowLead::Picture(TilePicture::new(PictureHandle(9), 190, 300), Glyph::Book),
                 )],
             },
             Node::Field {
@@ -8984,8 +8979,9 @@ mod picture_tests {
                 vec![
                     Node::TileGrid {
                         id: NodeId(1),
-                        tiles: vec![Tile::new(ActionId(1), "Cover", Glyph::Book)
-                            .with_picture(picture)],
+                        tiles: vec![
+                            Tile::new(ActionId(1), "Cover", Glyph::Book).with_picture(picture)
+                        ],
                         shape: TileShape::Portrait,
                     },
                     Node::Rows {
@@ -9342,9 +9338,7 @@ mod feature_feed_tests {
     #[test]
     fn feature_feed_nodes_round_trip() {
         let decorated = Tile::new(ActionId(7), "Title", Glyph::Book)
-            .with_picture(
-                TilePicture::new(PictureHandle(9), 300, 500).with_fit(PictureFit::Cover),
-            )
+            .with_picture(TilePicture::new(PictureHandle(9), 300, 500).with_fit(PictureFit::Cover))
             .with_state(TileState::Held)
             .with_badge("12")
             .with_subtitle("Creator");

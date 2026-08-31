@@ -69,7 +69,10 @@ pub struct FeatureSnapshot {
 }
 
 impl FeatureSnapshot {
-    #[allow(dead_code, reason = "the grouped Feature UI consumes collections by stable id")]
+    #[allow(
+        dead_code,
+        reason = "the grouped Feature UI consumes collections by stable id"
+    )]
     pub fn collection(&self, id: &str) -> Option<&FeatureCollection> {
         self.collections
             .iter()
@@ -193,6 +196,10 @@ impl CollectionView {
         self.pages.last().map_or(0, |page| page.end)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the pure planning API is tested directly; the runtime queues in place to avoid allocation"
+    )]
     #[must_use]
     pub fn next_detail_window(
         &self,
@@ -385,11 +392,7 @@ impl FeaturedState {
     }
 
     pub fn observe_day(&mut self, day: LocalDay) -> bool {
-        if let Some(batch) = self
-            .batch
-            .as_mut()
-            .filter(|batch| !batch.settled())
-        {
+        if let Some(batch) = self.batch.as_mut().filter(|batch| !batch.settled()) {
             if batch.refresh_day.is_none() {
                 batch.refresh_day = Some(day);
             } else if batch.refresh_day != Some(day) {
@@ -414,11 +417,7 @@ impl FeaturedState {
             .and_then(|batch| batch.queued.front().copied())
     }
 
-    pub fn mark_source_pending(
-        &mut self,
-        generation: u64,
-        source: FeatureSource,
-    ) -> bool {
+    pub fn mark_source_pending(&mut self, generation: u64, source: FeatureSource) -> bool {
         let Some(batch) = self
             .batch
             .as_mut()
@@ -505,20 +504,13 @@ impl FeaturedState {
     }
 
     pub fn pending_banner_aliases(&self) -> impl Iterator<Item = &str> {
-        self.batch.iter().flat_map(|batch| {
-            batch
-                .pending_banner_aliases
-                .iter()
-                .map(String::as_str)
-        })
+        self.batch
+            .iter()
+            .flat_map(|batch| batch.pending_banner_aliases.iter().map(String::as_str))
     }
 
     #[allow(dead_code, reason = "the pure state API settles the active generation")]
-    pub fn settle_banner_detail(
-        &mut self,
-        alias: &str,
-        detail: Option<PublicDetail>,
-    ) -> bool {
+    pub fn settle_banner_detail(&mut self, alias: &str, detail: Option<PublicDetail>) -> bool {
         self.settle_banner_detail_generation(self.generation, alias, detail)
     }
 
@@ -560,10 +552,7 @@ impl FeaturedState {
 
     pub fn publish_ready_banner_details(&mut self) -> Option<&FeatureSnapshot> {
         self.prepare_banner_details();
-        let ready = self
-            .batch
-            .as_ref()
-            .is_some_and(FeatureBatch::settled);
+        let ready = self.batch.as_ref().is_some_and(FeatureBatch::settled);
         if !ready {
             return None;
         }
@@ -612,11 +601,7 @@ impl FeaturedState {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.snapshot.is_none()
-            && self
-                .batch
-                .as_ref()
-                .is_some_and(|batch| !batch.settled())
+        self.snapshot.is_none() && self.batch.as_ref().is_some_and(|batch| !batch.settled())
     }
 
     pub fn is_failed(&self) -> bool {
@@ -643,11 +628,7 @@ impl FeaturedState {
     }
 
     fn prepare_banner_details(&mut self) {
-        let Some(batch) = self
-            .batch
-            .as_mut()
-            .filter(|batch| batch.sources_settled())
-        else {
+        let Some(batch) = self.batch.as_mut().filter(|batch| batch.sources_settled()) else {
             return;
         };
         for banner in batch.banners.iter().take(3) {
@@ -669,9 +650,7 @@ impl FeaturedState {
             if let Some(comic) = matching {
                 batch.resolved_banners.insert(banner.alias.clone(), comic);
             } else {
-                batch
-                    .pending_banner_aliases
-                    .push_back(banner.alias.clone());
+                batch.pending_banner_aliases.push_back(banner.alias.clone());
             }
         }
     }
@@ -714,15 +693,13 @@ fn homepage_collections(homepage: Homepage) -> Vec<FeatureCollection> {
     .into_iter()
     .filter(|(_, _, _, comics)| !comics.is_empty())
     .enumerate()
-    .map(
-        |(order, (id, label, priority, comics))| FeatureCollection {
-            id: id.to_owned(),
-            label: label.to_owned(),
-            priority,
-            order,
-            comics,
-        },
-    )
+    .map(|(order, (id, label, priority, comics))| FeatureCollection {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        priority,
+        order,
+        comics,
+    })
     .collect()
 }
 
@@ -736,19 +713,17 @@ fn source_collection(
         FeatureSource::Freetime => ("freetime", "免費看", 10),
         FeatureSource::Homepage | FeatureSource::Themes => return None,
     };
-    Some(
-        (!comics.is_empty())
-            .then(|| {
-                vec![FeatureCollection {
-                    id: id.to_owned(),
-                    label: label.to_owned(),
-                    priority,
-                    order: 0,
-                    comics,
-                }]
-            })
-            .unwrap_or_default(),
-    )
+    Some(if comics.is_empty() {
+        Vec::new()
+    } else {
+        vec![FeatureCollection {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            priority,
+            order: 0,
+            comics,
+        }]
+    })
 }
 
 fn theme_collections(themes: Vec<ThemeCollection>) -> Vec<FeatureCollection> {
@@ -781,7 +756,9 @@ mod tests {
             title: format!("Title {alias}"),
             creators: "Creator".to_owned(),
             view_count: Some(1),
-            vertical_url: Some(format!("https://image.balcony.studio/tw/contents/{alias}.webp")),
+            vertical_url: Some(format!(
+                "https://image.balcony.studio/tw/contents/{alias}.webp"
+            )),
             square_url: None,
         }
     }
@@ -965,7 +942,10 @@ mod tests {
             state.settle(result);
             assert_eq!(state.snapshot(), Some(&before));
         }
-        state.settle(SourceResult::collection(FeatureSource::Freetime, Vec::new()));
+        state.settle(SourceResult::collection(
+            FeatureSource::Freetime,
+            Vec::new(),
+        ));
         state.publish_ready_banner_details();
         assert_ne!(state.snapshot(), Some(&before));
         assert_eq!(state.loaded_day, Some(next_day));
@@ -1089,7 +1069,10 @@ mod tests {
             ],
         );
         let snapshot = state.snapshot().expect("snapshot");
-        assert_eq!(snapshot.collection("newest").expect("newest").comics.len(), 2);
+        assert_eq!(
+            snapshot.collection("newest").expect("newest").comics.len(),
+            2
+        );
         for id in ["weekday", "ranking", "most-favorited", "freetime"] {
             assert_eq!(snapshot.collection(id).expect(id).comics.len(), 1);
         }
@@ -1132,8 +1115,17 @@ mod tests {
             .iter()
             .filter(|group| group.priority == 9)
             .collect::<Vec<_>>();
-        assert_eq!(themes.iter().map(|group| group.id.as_str()).collect::<Vec<_>>(), ["theme-20", "theme-10"]);
-        assert_eq!(themes.iter().map(|group| group.order).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            themes
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            ["theme-20", "theme-10"]
+        );
+        assert_eq!(
+            themes.iter().map(|group| group.order).collect::<Vec<_>>(),
+            [0, 1]
+        );
     }
 
     #[test]
@@ -1147,15 +1139,13 @@ mod tests {
             SourceResult::failure(FeatureSource::Homepage),
         ));
         assert_eq!(state, before);
-        assert!(state.settle_generation(
-            generation,
-            SourceResult::failure(FeatureSource::Homepage),
-        ));
+        assert!(
+            state.settle_generation(generation, SourceResult::failure(FeatureSource::Homepage),)
+        );
         let settled = state.clone();
-        assert!(!state.settle_generation(
-            generation,
-            SourceResult::failure(FeatureSource::Homepage),
-        ));
+        assert!(
+            !state.settle_generation(generation, SourceResult::failure(FeatureSource::Homepage),)
+        );
         assert_eq!(state, settled);
     }
 
@@ -1185,7 +1175,10 @@ mod tests {
                 synopsis: Some("Synopsis".to_owned()),
             }),
         );
-        let recovered = &state.publish_ready_banner_details().expect("snapshot").banners[0];
+        let recovered = &state
+            .publish_ready_banner_details()
+            .expect("snapshot")
+            .banners[0];
         assert_eq!(recovered.title, "Recovered");
         assert!(recovered.creators.is_empty());
         assert_eq!(recovered.vertical_url, None);
@@ -1193,16 +1186,26 @@ mod tests {
 
         state.begin_full_batch(None);
         state.settle(SourceResult::homepage(Homepage {
-            banners: vec![BannerComic { alias: "glyph".to_owned() }],
+            banners: vec![BannerComic {
+                alias: "glyph".to_owned(),
+            }],
             newest: comics("new", 1),
             week_day: Vec::new(),
             only_bom: Vec::new(),
         }));
-        for source in [FeatureSource::Ranking, FeatureSource::MostFavorited, FeatureSource::Themes, FeatureSource::Freetime] {
+        for source in [
+            FeatureSource::Ranking,
+            FeatureSource::MostFavorited,
+            FeatureSource::Themes,
+            FeatureSource::Freetime,
+        ] {
             state.settle(SourceResult::failure(source));
         }
         state.settle_banner_detail("glyph", None);
-        let placeholder = &state.publish_ready_banner_details().expect("snapshot").banners[0];
+        let placeholder = &state
+            .publish_ready_banner_details()
+            .expect("snapshot")
+            .banners[0];
         assert_eq!(placeholder.title, "glyph");
         assert_eq!(placeholder.vertical_url, None);
     }
@@ -1245,14 +1248,12 @@ mod tests {
     }
 
     fn feed_snapshot_fixture() -> FeatureSnapshot {
-        let collection = |id: &str, label: &str, priority: u8, order: usize| {
-            FeatureCollection {
-                id: id.to_owned(),
-                label: label.to_owned(),
-                priority,
-                order,
-                comics: comics(id, 8),
-            }
+        let collection = |id: &str, label: &str, priority: u8, order: usize| FeatureCollection {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            priority,
+            order,
+            comics: comics(id, 8),
         };
         FeatureSnapshot {
             banners: comics("banner", 4),
@@ -1340,9 +1341,7 @@ mod tests {
     }
 
     fn aliases(count: usize) -> Vec<String> {
-        (0..count)
-            .map(|index| format!("comic-{index}"))
-            .collect()
+        (0..count).map(|index| format!("comic-{index}")).collect()
     }
 
     fn detail(alias: &str) -> PublicDetail {
@@ -1382,10 +1381,7 @@ mod tests {
                 DetailState::Ready(detail("cached-ready")),
             ),
             ("cached-failed".to_owned(), DetailState::Failed),
-            (
-                "cached-loading".to_owned(),
-                DetailState::Loading(TaskId(9)),
-            ),
+            ("cached-loading".to_owned(), DetailState::Loading(TaskId(9))),
         ]);
         let mut view = CollectionView::new("ranking", 3, aliases.len());
         view.queue_detail_window(&aliases, &cache);
@@ -1410,10 +1406,7 @@ mod tests {
 
         assert_eq!(view.pages, vec![0..4]);
         assert_eq!(view.next_start(), 4);
-        assert_eq!(
-            view.next_detail_window(&aliases, &cache),
-            aliases[4..10]
-        );
+        assert_eq!(view.next_detail_window(&aliases, &cache), aliases[4..10]);
     }
 
     #[test]

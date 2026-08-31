@@ -3,12 +3,12 @@ mod commerce;
 mod feature;
 mod model;
 mod parse;
-use feature::{
-    compact_count, feed_blocks, CollectionView, DetailState, FeedBlock, FeedPage, FeatureSnapshot,
-    FeatureSource, FeaturedState, SourceResult,
-};
 #[cfg(test)]
 use feature::FEATURE_SOURCES;
+use feature::{
+    compact_count, feed_blocks, CollectionView, DetailState, FeatureSnapshot, FeatureSource,
+    FeaturedState, FeedBlock, FeedPage, SourceResult,
+};
 
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
@@ -17,12 +17,12 @@ use kobo_sdk::{
     RowLead, RowLineLimits, Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome,
     TilePicture, CLARA_BW_METRICS,
 };
+#[cfg(test)]
+use model::FeatureComic;
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
     RecentEntry, WalletSummary,
 };
-#[cfg(test)]
-use model::FeatureComic;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -375,18 +375,12 @@ fn add_feed_blocks(
                     screen = screen.section("編輯精選");
                 }
                 screen = screen
-                    .tappable_section(
-                        collection_action(&collection.id),
-                        collection.label.clone(),
-                    )
+                    .tappable_section(collection_action(&collection.id), collection.label.clone())
                     .media_grid(collection.comics.iter().take(6).enumerate().map(
                         |(index, comic)| {
                             (
                                 comic_action(&collection.id, index),
-                                display_text(
-                                    &comic.title,
-                                    &format!("BOMTOON {}", comic.alias),
-                                ),
+                                display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
                                 display_text(&comic.creators, ""),
                                 Glyph::Book,
                                 ready_cover(covers, comic.vertical_url.as_deref()),
@@ -399,10 +393,7 @@ fn add_feed_blocks(
     screen
 }
 
-fn add_feed_warning(
-    screen: ScreenBuilder,
-    warning: Option<&str>,
-) -> ScreenBuilder {
+fn add_feed_warning(screen: ScreenBuilder, warning: Option<&str>) -> ScreenBuilder {
     match warning {
         Some(warning) => screen
             .banner(BannerLevel::Attention, warning)
@@ -439,11 +430,7 @@ fn page_fits_with_warning(
 }
 
 #[cfg(test)]
-fn page_fits(
-    page: &FeedPage,
-    snapshot: &FeatureSnapshot,
-    metrics: &DisplayMetrics,
-) -> bool {
+fn page_fits(page: &FeedPage, snapshot: &FeatureSnapshot, metrics: &DisplayMetrics) -> bool {
     page_fits_with_warning(page, snapshot, snapshot.warning.as_deref(), metrics)
 }
 
@@ -1020,14 +1007,12 @@ impl Bomtoon {
             }
         };
         if self.view == View::FeatureCollection {
-            if let Some((view, collection)) =
-                self.featured.collection.as_ref().and_then(|view| {
-                    self.featured
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.collection(&view.collection_id))
-                        .map(|collection| (view, collection))
-                })
-            {
+            if let Some((view, collection)) = self.featured.collection.as_ref().and_then(|view| {
+                self.featured
+                    .snapshot()
+                    .and_then(|snapshot| snapshot.collection(&view.collection_id))
+                    .map(|collection| (view, collection))
+            }) {
                 if let Some(range) = view.pages.get(view.page) {
                     for comic in &collection.comics[range.clone()] {
                         push(comic.square_url.as_ref().or(comic.vertical_url.as_ref()));
@@ -1045,12 +1030,7 @@ impl Bomtoon {
                     match *block {
                         FeedBlock::Banners => {
                             for comic in snapshot.banners.iter().take(3) {
-                                push(
-                                    comic
-                                        .vertical_url
-                                        .as_ref()
-                                        .or(comic.square_url.as_ref()),
-                                );
+                                push(comic.vertical_url.as_ref().or(comic.square_url.as_ref()));
                             }
                         }
                         FeedBlock::Collection(index) | FeedBlock::ThemeWithHeading(index) => {
@@ -1081,9 +1061,7 @@ impl Bomtoon {
     }
 
     fn visible_cover_source(&self) -> Option<CoverSource> {
-        if self.pending.is_some()
-            || self.problem.is_some()
-            || self.foreground_reader_task.is_some()
+        if self.pending.is_some() || self.problem.is_some() || self.foreground_reader_task.is_some()
         {
             return None;
         }
@@ -1518,7 +1496,10 @@ impl Bomtoon {
                         synopsis_for(&self.featured.detail_cache, &comic.alias),
                         collection_cover_lead(
                             &self.covers,
-                            comic.square_url.as_deref().or(comic.vertical_url.as_deref()),
+                            comic
+                                .square_url
+                                .as_deref()
+                                .or(comic.vertical_url.as_deref()),
                         ),
                         compact_count(comic.view_count),
                     )
@@ -1532,7 +1513,7 @@ impl Bomtoon {
             .pages
             .last()
             .is_some_and(|range| range.end >= collection.comics.len());
-        let total = complete.then_some(view.pages.len()).unwrap_or(0);
+        let total = if complete { view.pages.len() } else { 0 };
         screen
             .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
             .page_position(
@@ -3251,10 +3232,8 @@ impl Bomtoon {
             context.cancel(task);
             return false;
         }
-        self.feature_tasks.insert(
-            task,
-            FeatureTaskPurpose::Source { generation, source },
-        );
+        self.feature_tasks
+            .insert(task, FeatureTaskPurpose::Source { generation, source });
         true
     }
 
@@ -3415,9 +3394,7 @@ impl Bomtoon {
                     return false;
                 }
                 let detail = match outcome {
-                    TaskOutcome::Completed(bytes) => {
-                        parse::public_detail(&bytes, &alias).ok()
-                    }
+                    TaskOutcome::Completed(bytes) => parse::public_detail(&bytes, &alias).ok(),
                     TaskOutcome::Failed(_) | TaskOutcome::Cancelled => None,
                 };
                 if !self
@@ -3450,8 +3427,7 @@ impl Bomtoon {
                 }
                 let detail = match outcome {
                     TaskOutcome::Completed(bytes) => parse::public_detail(&bytes, &alias)
-                        .map(DetailState::Ready)
-                        .unwrap_or(DetailState::Failed),
+                        .map_or(DetailState::Failed, DetailState::Ready),
                     TaskOutcome::Failed(_) | TaskOutcome::Cancelled => DetailState::Failed,
                 };
                 self.featured.detail_cache.insert(alias.clone(), detail);
@@ -4495,8 +4471,8 @@ impl Bomtoon {
     fn open_selected_comic(
         &mut self,
         context: &mut Context,
-        alias: String,
-        title: String,
+        alias: &str,
+        title: &str,
         pending_index: usize,
     ) {
         if self.featured.collection.is_some() {
@@ -4517,8 +4493,9 @@ impl Bomtoon {
         self.page = 0;
         self.clear_title_gifts(context);
         self.selected_content_id = None;
-        self.selected_content_alias.clone_from(&alias);
-        self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
+        self.selected_content_alias.clear();
+        self.selected_content_alias.push_str(alias);
+        self.selected_title = display_text(title, &format!("BOMTOON {alias}"));
         self.problem = None;
         self.retry = Retry::Restart;
         self.request_foreground(context, Pending::Content(pending_index));
@@ -4540,7 +4517,7 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
-        self.open_selected_comic(context, alias, title, index);
+        self.open_selected_comic(context, &alias, &title, index);
     }
 
     fn open_collection(&mut self, context: &mut Context, id: &str) {
@@ -5990,7 +5967,9 @@ impl KoboApp for Bomtoon {
                                 .featured
                                 .snapshot()
                                 .and_then(|snapshot| snapshot.collection(&view.collection_id))
-                                .is_some_and(|collection| view.next_start() < collection.comics.len())
+                                .is_some_and(|collection| {
+                                    view.next_start() < collection.comics.len()
+                                })
                     });
                     if can_discover {
                         self.queue_collection_window(context);
@@ -6007,13 +5986,12 @@ impl KoboApp for Bomtoon {
                     .and_then(|snapshot| snapshot.collection(&view.collection_id))?;
                 range.clone().find_map(|index| {
                     let comic = &collection.comics[index];
-                    (action == action_id(&comic_action(&collection.id, index))).then(|| {
-                        (comic.alias.clone(), comic.title.clone(), index)
-                    })
+                    (action == action_id(&comic_action(&collection.id, index)))
+                        .then(|| (comic.alias.clone(), comic.title.clone(), index))
                 })
             });
             if let Some((alias, title, index)) = selected {
-                self.open_selected_comic(context, alias, title, index);
+                self.open_selected_comic(context, &alias, &title, index);
                 return;
             }
             self.show(context);
@@ -6127,8 +6105,7 @@ impl KoboApp for Bomtoon {
                 let last_page = featured_feed_pages(&self.featured, &CLARA_BW_METRICS)
                     .len()
                     .saturating_sub(1);
-                self.featured.feed_page =
-                    self.featured.feed_page.min(last_page).saturating_sub(1);
+                self.featured.feed_page = self.featured.feed_page.min(last_page).saturating_sub(1);
                 self.show(context);
                 return;
             }
@@ -6149,25 +6126,20 @@ impl KoboApp for Bomtoon {
                     .take(3)
                     .enumerate()
                     .find(|(index, _)| action == action_id(&format!("feature-banner-{index}")))
-                    .map(|(index, comic)| {
-                        (comic.alias.clone(), comic.title.clone(), index)
-                    })
+                    .map(|(index, comic)| (comic.alias.clone(), comic.title.clone(), index))
                     .or_else(|| {
                         snapshot.collections.iter().find_map(|collection| {
                             collection.comics.iter().take(6).enumerate().find_map(
                                 |(index, comic)| {
-                                    (action
-                                        == action_id(&comic_action(&collection.id, index)))
-                                    .then(|| {
-                                        (comic.alias.clone(), comic.title.clone(), index)
-                                    })
+                                    (action == action_id(&comic_action(&collection.id, index)))
+                                        .then(|| (comic.alias.clone(), comic.title.clone(), index))
                                 },
                             )
                         })
                     })
             });
             if let Some((alias, title, index)) = selected {
-                self.open_selected_comic(context, alias, title, index);
+                self.open_selected_comic(context, &alias, &title, index);
                 return;
             }
             let collection_id = self.featured.snapshot().and_then(|snapshot| {
@@ -6330,8 +6302,7 @@ impl KoboApp for Bomtoon {
             self.resume_capacity_work(context);
             if changed
                 && (self.view == View::FeatureCollection
-                    || (self.view == View::Main
-                        && self.destination == MainDestination::Featured))
+                    || (self.view == View::Main && self.destination == MainDestination::Featured))
             {
                 self.show(context);
             }
@@ -7808,7 +7779,6 @@ mod tests {
         runner.task_outcome(summary, TaskOutcome::Completed(ASSET_RESPONSE.to_vec()));
         (runner, homepage)
     }
-
 
     fn spawns(commands: &[Command]) -> Vec<(TaskId, Task)> {
         commands
@@ -9501,12 +9471,7 @@ mod tests {
             ..Bomtoon::default()
         };
         let mut context = Context::default();
-        app.open_selected_comic(
-            &mut context,
-            "public-comic".to_owned(),
-            "Public Comic".to_owned(),
-            0,
-        );
+        app.open_selected_comic(&mut context, "public-comic", "Public Comic", 0);
         assert_eq!(app.view, View::Status);
         assert_eq!(app.destination, MainDestination::Featured);
         assert_eq!(app.page, 0);
@@ -14284,47 +14249,6 @@ mod tests {
         }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fn shelf(alias: &str, title: &str) -> model::FeatureComic {
         model::FeatureComic {
             alias: alias.to_owned(),
@@ -14366,22 +14290,16 @@ mod tests {
     }
 
     fn grouped_feature_state(warning: Option<&str>) -> FeaturedState {
-        let collection = |id: &str, label: &str, priority: u8, order: usize| {
-            model::FeatureCollection {
+        let collection =
+            |id: &str, label: &str, priority: u8, order: usize| model::FeatureCollection {
                 id: id.to_owned(),
                 label: label.to_owned(),
                 priority,
                 order,
                 comics: (0..8)
-                    .map(|index| {
-                        shelf(
-                            &format!("{id}-{index}"),
-                            &format!("{label} title {index}"),
-                        )
-                    })
+                    .map(|index| shelf(&format!("{id}-{index}"), &format!("{label} title {index}")))
                     .collect(),
-            }
-        };
+            };
         let collections = vec![
             collection("freetime", "免費看", 10, 0),
             collection("theme-20", "Theme First", 9, 0),
@@ -14429,8 +14347,7 @@ mod tests {
                 .filter(|block| {
                     matches!(
                         block,
-                        feature::FeedBlock::Collection(_)
-                            | feature::FeedBlock::ThemeWithHeading(_)
+                        feature::FeedBlock::Collection(_) | feature::FeedBlock::ThemeWithHeading(_)
                     )
                 })
                 .count();
@@ -14441,6 +14358,62 @@ mod tests {
         }
     }
 
+    type GroupedFeatureSections = Vec<(String, Option<ActionId>)>;
+    type GroupedFeatureGrids = Vec<Vec<kobo_sdk::Tile>>;
+
+    fn grouped_feature_page_evidence(
+        app: &mut Bomtoon,
+        pages: &[FeedPage],
+        page_index: usize,
+    ) -> (GroupedFeatureSections, GroupedFeatureGrids) {
+        let page = &pages[page_index];
+        app.featured.feed_page = page_index;
+        let screen = app.main_screen();
+        let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+        assert!(
+            !diagnostics.has_errors(),
+            "page {page_index}: {:?}",
+            diagnostics.issues
+        );
+        let turns = screen.page_turns.as_ref().expect("Feature page turns");
+        assert_eq!(
+            turns.position,
+            Some((
+                u16::try_from(page_index + 1).expect("small page"),
+                u16::try_from(pages.len()).expect("small page count")
+            ))
+        );
+        let mut sections = Vec::new();
+        let mut grids = Vec::new();
+        for node in &screen.nodes {
+            match node {
+                Node::ImageStrip { tiles, .. } => {
+                    assert_eq!(page_index, 0);
+                    assert_eq!(tiles.len(), 3);
+                    assert!(tiles.iter().enumerate().all(|(index, tile)| {
+                        tile.label.is_empty()
+                            && tile.action == action_id(&format!("feature-banner-{index}"))
+                    }));
+                }
+                Node::Section { title, action, .. } => sections.push((title.clone(), *action)),
+                Node::MediaGrid { tiles, .. } => grids.push(tiles.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            page.blocks
+                .iter()
+                .filter(|block| matches!(block, feature::FeedBlock::Banners))
+                .count(),
+            screen
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, Node::ImageStrip { .. }))
+                .count()
+        );
+        (sections, grids)
+    }
+
     #[test]
     fn grouped_feature_feed_renders_exact_banners_collections_and_theme_group() {
         let mut app = grouped_feature_app(None);
@@ -14448,53 +14421,11 @@ mod tests {
         let pages = feed_pages(&snapshot, &CLARA_BW_METRICS);
         let mut sections = Vec::new();
         let mut grids = Vec::new();
-        for (page_index, page) in pages.iter().enumerate() {
-            app.featured.feed_page = page_index;
-            let screen = app.main_screen();
-            let diagnostics =
-                screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
-            assert!(
-                !diagnostics.has_errors(),
-                "page {page_index}: {:?}",
-                diagnostics.issues
-            );
-            let turns = screen.page_turns.as_ref().expect("Feature page turns");
-            assert_eq!(
-                turns.position,
-                Some((
-                    u16::try_from(page_index + 1).expect("small page"),
-                    u16::try_from(pages.len()).expect("small page count")
-                ))
-            );
-            for node in &screen.nodes {
-                match node {
-                    Node::ImageStrip { tiles, .. } => {
-                        assert_eq!(page_index, 0);
-                        assert_eq!(tiles.len(), 3);
-                        assert!(tiles.iter().enumerate().all(|(index, tile)| {
-                            tile.label.is_empty()
-                                && tile.action
-                                    == action_id(&format!("feature-banner-{index}"))
-                        }));
-                    }
-                    Node::Section { title, action, .. } => {
-                        sections.push((title.clone(), *action));
-                    }
-                    Node::MediaGrid { tiles, .. } => grids.push(tiles.clone()),
-                    _ => {}
-                }
-            }
-            assert_eq!(
-                page.blocks
-                    .iter()
-                    .filter(|block| matches!(block, feature::FeedBlock::Banners))
-                    .count(),
-                screen
-                    .nodes
-                    .iter()
-                    .filter(|node| matches!(node, Node::ImageStrip { .. }))
-                    .count()
-            );
+        for page_index in 0..pages.len() {
+            let (page_sections, page_grids) =
+                grouped_feature_page_evidence(&mut app, &pages, page_index);
+            sections.extend(page_sections);
+            grids.extend(page_grids);
         }
         let titles = sections
             .iter()
@@ -14524,16 +14455,19 @@ mod tests {
                 .iter()
                 .find(|collection| collection.label == *title)
                 .expect("section collection");
-            assert_eq!(
-                *action,
-                Some(action_id(&collection_action(&collection.id)))
-            );
+            assert_eq!(*action, Some(action_id(&collection_action(&collection.id))));
         }
         assert_eq!(grids.len(), snapshot.collections.len());
         for (grid, collection) in grids.iter().zip(
-            ["newest", "only-in-bomtoon", "theme-20", "theme-10", "freetime"]
-                .into_iter()
-                .map(|id| snapshot.collection(id).expect(id)),
+            [
+                "newest",
+                "only-in-bomtoon",
+                "theme-20",
+                "theme-10",
+                "freetime",
+            ]
+            .into_iter()
+            .map(|id| snapshot.collection(id).expect(id)),
         ) {
             assert_eq!(grid.len(), 6);
             assert!(grid.iter().enumerate().all(|(index, tile)| {
@@ -14604,8 +14538,7 @@ mod tests {
 
     #[test]
     fn grouped_feature_feed_banner_action_opens_exact_banner_placement() {
-        let mut runner =
-            AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
+        let mut runner = AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
 
         let commands = runner.action(action_id("feature-banner-1"));
 
@@ -14618,9 +14551,7 @@ mod tests {
 
     #[test]
     fn grouped_feature_feed_warning_shares_content_page_and_retry_keeps_position() {
-        let mut app = grouped_feature_app(Some(
-            "Some Featured collections could not be loaded.",
-        ));
+        let mut app = grouped_feature_app(Some("Some Featured collections could not be loaded."));
         let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
         snapshot.failed_sources.insert(FeatureSource::Ranking);
         app.featured.feed_page = 1;
@@ -14630,12 +14561,10 @@ mod tests {
             .nodes
             .iter()
             .any(|node| matches!(node, Node::Banner { .. })));
-        assert!(screen.nodes.iter().any(|node| {
-            matches!(
-                node,
-                Node::ImageStrip { .. } | Node::MediaGrid { .. }
-            )
-        }));
+        assert!(screen
+            .nodes
+            .iter()
+            .any(|node| { matches!(node, Node::ImageStrip { .. } | Node::MediaGrid { .. }) }));
         assert_fits(&screen);
 
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
@@ -14647,12 +14576,10 @@ mod tests {
         assert!(runner.app().featured.snapshot().is_some());
         let screen = last_screen(&commands);
         assert_eq!(retry_button_count(&screen), 1);
-        assert!(screen.nodes.iter().any(|node| {
-            matches!(
-                node,
-                Node::ImageStrip { .. } | Node::MediaGrid { .. }
-            )
-        }));
+        assert!(screen
+            .nodes
+            .iter()
+            .any(|node| { matches!(node, Node::ImageStrip { .. } | Node::MediaGrid { .. }) }));
     }
 
     #[test]
@@ -14673,8 +14600,7 @@ mod tests {
 
     #[test]
     fn visible_feature_covers_cancel_obsolete_page_tasks() {
-        let mut runner =
-            AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
+        let mut runner = AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
         let commands = runner.action(action_id("refresh-layout"));
         let first_tasks = cover_fetches(&commands)
             .into_iter()
@@ -14720,8 +14646,12 @@ mod tests {
         let mut app = grouped_feature_app(None);
         let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
         let shared = snapshot.banners[0].vertical_url.clone();
-        snapshot.collections[0].comics[0].vertical_url.clone_from(&shared);
-        snapshot.collections[4].comics[0].vertical_url.clone_from(&shared);
+        snapshot.collections[0].comics[0]
+            .vertical_url
+            .clone_from(&shared);
+        snapshot.collections[4].comics[0]
+            .vertical_url
+            .clone_from(&shared);
         let snapshot = snapshot.clone();
         let pages = feed_pages(&snapshot, &CLARA_BW_METRICS);
         let first_blocks = pages[0].blocks.clone();
@@ -14824,9 +14754,9 @@ mod tests {
         match source {
             FeatureSource::Homepage => homepage_response(&[], &alias),
             FeatureSource::Themes => themes_response(&alias),
-            FeatureSource::Ranking
-            | FeatureSource::MostFavorited
-            | FeatureSource::Freetime => collection_response(&alias),
+            FeatureSource::Ranking | FeatureSource::MostFavorited | FeatureSource::Freetime => {
+                collection_response(&alias)
+            }
         }
     }
 
@@ -14927,8 +14857,7 @@ mod tests {
         assert!(runner.app().feature_tasks.len() <= 4);
         let scope = scope_task(&commands);
 
-        let commands =
-            runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        let commands = runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
         let protected = cancelled_tasks(&commands);
         assert_eq!(protected.len(), 2);
         for task in protected {
@@ -15077,11 +15006,7 @@ mod tests {
 
         let mut commands = Vec::new();
         for source in FEATURE_SOURCES {
-            commands = settle_source(
-                &mut runner,
-                source,
-                TaskOutcome::Failed(TaskError::Offline),
-            );
+            commands = settle_source(&mut runner, source, TaskOutcome::Failed(TaskError::Offline));
         }
 
         let screen = last_screen(&commands);
@@ -15094,13 +15019,10 @@ mod tests {
 
     #[test]
     fn feature_source_batch_partial_failure_publishes_one_retry_action() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(30), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(30), "old"), CLARA_BW_METRICS);
         observe_day_with_runner(&mut runner, local_day(31));
-        let commands =
-            complete_feature_batch(&mut runner, "fresh", Some(FeatureSource::Ranking));
+        let commands = complete_feature_batch(&mut runner, "fresh", Some(FeatureSource::Ranking));
         let snapshot = runner.app().featured.snapshot().expect("partial snapshot");
         assert_eq!(
             snapshot.failed_sources,
@@ -15111,10 +15033,8 @@ mod tests {
 
     #[test]
     fn failed_source_retry_emits_only_the_failed_public_endpoint() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(30), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(30), "old"), CLARA_BW_METRICS);
         observe_day_with_runner(&mut runner, local_day(31));
         complete_feature_batch(&mut runner, "fresh", Some(FeatureSource::Ranking));
 
@@ -15133,10 +15053,8 @@ mod tests {
 
     #[test]
     fn daily_refresh_keeps_old_aliases_until_the_last_new_source_result() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(30), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(30), "old"), CLARA_BW_METRICS);
         let before = runner.app().featured.snapshot().expect("old").clone();
         observe_day_with_runner(&mut runner, local_day(31));
         for source in FEATURE_SOURCES.into_iter().take(4) {
@@ -15157,20 +15075,14 @@ mod tests {
 
     #[test]
     fn daily_refresh_total_failure_keeps_old_feed_with_one_retry_action() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(30), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(30), "old"), CLARA_BW_METRICS);
         let before = runner.app().featured.snapshot().expect("old").clone();
         observe_day_with_runner(&mut runner, local_day(31));
 
         let mut commands = Vec::new();
         for source in FEATURE_SOURCES {
-            commands = settle_source(
-                &mut runner,
-                source,
-                TaskOutcome::Failed(TaskError::Offline),
-            );
+            commands = settle_source(&mut runner, source, TaskOutcome::Failed(TaskError::Offline));
         }
 
         assert_eq!(runner.app().featured.snapshot(), Some(&before));
@@ -15179,33 +15091,26 @@ mod tests {
             .featured
             .batch
             .as_ref()
-            .is_some_and(|batch| batch.settled()));
+            .is_some_and(feature::FeatureBatch::settled));
         assert_eq!(retry_button_count(&last_screen(&commands)), 1);
         let screen = last_screen(&commands);
         let drawn = format!("{screen:?}");
         assert!(drawn.contains("Some Featured collections could not be loaded."));
         assert!(!drawn.contains("Featured could not be loaded."));
         assert_eq!(
-            screen
-                .page_turns
-                .as_ref()
-                .and_then(|turns| turns.position),
+            screen.page_turns.as_ref().and_then(|turns| turns.position),
             Some((1, 1))
         );
-        assert!(screen.nodes.iter().any(|node| {
-            matches!(
-                node,
-                Node::ImageStrip { .. } | Node::MediaGrid { .. }
-            )
-        }));
+        assert!(screen
+            .nodes
+            .iter()
+            .any(|node| { matches!(node, Node::ImageStrip { .. } | Node::MediaGrid { .. }) }));
     }
 
     #[test]
     fn newer_local_day_starts_after_the_older_atomic_refresh_settles() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(29), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(29), "old"), CLARA_BW_METRICS);
         observe_day_with_runner(&mut runner, local_day(30));
         observe_day_with_runner(&mut runner, local_day(31));
         assert_eq!(runner.app().featured.desired_day, Some(local_day(31)));
@@ -15228,10 +15133,8 @@ mod tests {
 
     #[test]
     fn feature_exit_cancellation_and_stale_outcomes_never_publish() {
-        let mut runner = AppRunner::with_metrics(
-            ready_featured(local_day(30), "old"),
-            CLARA_BW_METRICS,
-        );
+        let mut runner =
+            AppRunner::with_metrics(ready_featured(local_day(30), "old"), CLARA_BW_METRICS);
         observe_day_with_runner(&mut runner, local_day(31));
         let stale = feature_task(&runner, FeatureSource::Homepage);
         let cancelled = runner.exit();
@@ -15251,9 +15154,8 @@ mod tests {
         let (mut runner, commands) = started();
         let scope = scope_task(&commands);
         let mut command_batches = vec![commands];
-        command_batches.push(
-            runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential)),
-        );
+        command_batches
+            .push(runner.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential)));
         for source in FEATURE_SOURCES {
             command_batches.push(settle_source(
                 &mut runner,
@@ -15807,10 +15709,7 @@ mod tests {
                         snapshot: Some(FeatureSnapshot {
                             banners: vec![shared],
                             collections: vec![collection.clone()],
-                            sources: BTreeMap::from([(
-                                FeatureSource::Homepage,
-                                vec![collection],
-                            )]),
+                            sources: BTreeMap::from([(FeatureSource::Homepage, vec![collection])]),
                             failed_sources: BTreeSet::new(),
                             warning: None,
                         }),
@@ -15832,9 +15731,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|node| match node {
-                Node::ImageStrip { tiles, .. } => {
-                    tiles.first().and_then(|tile| tile.picture)
-                }
+                Node::ImageStrip { tiles, .. } => tiles.first().and_then(|tile| tile.picture),
                 _ => None,
             })
             .expect("Feature banner picture");
@@ -15842,9 +15739,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|node| match node {
-                Node::MediaGrid { tiles, .. } => {
-                    tiles.first().and_then(|tile| tile.picture)
-                }
+                Node::MediaGrid { tiles, .. } => tiles.first().and_then(|tile| tile.picture),
                 _ => None,
             })
             .or_else(|| {
@@ -15895,7 +15790,13 @@ mod tests {
         assert!(cover_fetches(&commands).is_empty());
         assert_eq!(runner.tasks_in_flight(), 4);
 
-        let sources = runner.app().feature_tasks.keys().copied().take(2).collect::<Vec<_>>();
+        let sources = runner
+            .app()
+            .feature_tasks
+            .keys()
+            .copied()
+            .take(2)
+            .collect::<Vec<_>>();
         assert_eq!(sources.len(), 2);
         for source in sources {
             let commands = runner.task_outcome(source, TaskOutcome::Cancelled);
@@ -17013,13 +16914,13 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         for (index, url) in urls.into_iter().enumerate() {
+            let index = u32::try_from(index).expect("cover fixture index fits u32");
+            let handle = 1_000_u32
+                .checked_add(index)
+                .expect("cover fixture handle fits u32");
             app.covers.entries.insert(
                 url,
-                CoverState::Ready(TilePicture::new(
-                    PictureHandle(1_000 + index as u32),
-                    300,
-                    300,
-                )),
+                CoverState::Ready(TilePicture::new(PictureHandle(handle), 300, 300)),
             );
         }
     }
@@ -17030,9 +16931,7 @@ mod tests {
             .feature_tasks
             .iter()
             .filter_map(|(task, purpose)| match purpose {
-                FeatureTaskPurpose::CollectionDetail { alias, .. } => {
-                    Some((*task, alias.clone()))
-                }
+                FeatureTaskPurpose::CollectionDetail { alias, .. } => Some((*task, alias.clone())),
                 FeatureTaskPurpose::Source { .. } | FeatureTaskPurpose::BannerDetail { .. } => None,
             })
             .collect()
@@ -17093,8 +16992,10 @@ mod tests {
 
     #[test]
     fn collection_detail_requests_begin_only_after_heading_tap_and_fill_bounded_capacity() {
-        let mut runner =
-            AppRunner::with_metrics(full_collection_app(AccountState::SignedOut, 14), CLARA_BW_METRICS);
+        let mut runner = AppRunner::with_metrics(
+            full_collection_app(AccountState::SignedOut, 14),
+            CLARA_BW_METRICS,
+        );
         assert!(collection_detail_tasks(&runner).is_empty());
 
         let commands = runner.action(action_id(&collection_action("ranking")));
@@ -17113,11 +17014,9 @@ mod tests {
                 .len(),
             2
         );
-        assert!(active
+        assert!(active.iter().all(|(_, alias)| spawns(&commands)
             .iter()
-            .all(|(_, alias)| spawns(&commands).iter().any(|(_, work)| {
-                work == &api::public_detail(alias)
-            })));
+            .any(|(_, work)| { work == &api::public_detail(alias) })));
         assert!(spawns(&commands).len() <= 4);
     }
 
@@ -17130,7 +17029,10 @@ mod tests {
         let commands = runner.action(action_id(&collection_action("ranking")));
         let spawned = spawns(&commands);
 
-        assert_eq!(spawned.first().map(|(_, work)| work), Some(&api::asset_summary()));
+        assert_eq!(
+            spawned.first().map(|(_, work)| work),
+            Some(&api::asset_summary())
+        );
         assert_eq!(collection_detail_tasks(&runner).len(), 3);
         let summary = spawned[0].0;
 
@@ -17179,8 +17081,10 @@ mod tests {
 
     #[test]
     fn collection_boundary_waits_for_every_queued_and_pending_detail() {
-        let mut runner =
-            AppRunner::with_metrics(full_collection_app(AccountState::SignedOut, 6), CLARA_BW_METRICS);
+        let mut runner = AppRunner::with_metrics(
+            full_collection_app(AccountState::SignedOut, 6),
+            CLARA_BW_METRICS,
+        );
         runner.action(action_id(&collection_action("ranking")));
 
         for settled in 0..6 {
@@ -17210,12 +17114,14 @@ mod tests {
     fn adaptive_collection_screen_renders_exact_bounded_rows_counts_actions_and_square_crops() {
         let mut app = full_collection_app(AccountState::SignedOut, 6);
         for index in 0..6 {
-            let url = format!(
-                "https://image.balcony.studio/tw/contents/full-{index}-square.webp"
-            );
+            let index_u32 = u32::try_from(index).expect("cover fixture index fits u32");
+            let handle = 70_u32
+                .checked_add(index_u32)
+                .expect("cover fixture handle fits u32");
+            let url = format!("https://image.balcony.studio/tw/contents/full-{index}-square.webp");
             app.covers.entries.insert(
                 url,
-                CoverState::Ready(TilePicture::new(PictureHandle(70 + index as u32), 300, 180)),
+                CoverState::Ready(TilePicture::new(PictureHandle(handle), 300, 180)),
             );
         }
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
@@ -17241,9 +17147,10 @@ mod tests {
                 Glyph::Book
             )
         ));
-        if let Some(failed) = rows.iter().find(|row| {
-            row.action == action_id(&comic_action("ranking", 1))
-        }) {
+        if let Some(failed) = rows
+            .iter()
+            .find(|row| row.action == action_id(&comic_action("ranking", 1)))
+        {
             assert!(failed.description.is_empty());
             assert_eq!(failed.trailing, None);
             assert_eq!(failed.state, kobo_sdk::RowState::Open);
@@ -17260,9 +17167,7 @@ mod tests {
             runner.app().covers.visible_urls,
             visible_range
                 .map(|index| {
-                    format!(
-                        "https://image.balcony.studio/tw/contents/full-{index}-square.webp"
-                    )
+                    format!("https://image.balcony.studio/tw/contents/full-{index}-square.webp")
                 })
                 .collect::<Vec<_>>()
         );
@@ -17303,9 +17208,9 @@ mod tests {
         assert_eq!(rows[0].trailing, None);
         assert_eq!(rows[1].trailing, None);
         assert_eq!(rows[2].trailing.as_deref(), Some("999"));
-        assert!(rows.iter().all(|row| {
-            row.description.is_empty() && row.state == kobo_sdk::RowState::Open
-        }));
+        assert!(rows
+            .iter()
+            .all(|row| { row.description.is_empty() && row.state == kobo_sdk::RowState::Open }));
         assert!(collection_detail_tasks(&runner).is_empty());
         assert_fits(&screen);
     }
@@ -17349,15 +17254,17 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(aliases, expected);
         settle_open_collection_window(&mut runner, None);
-        assert!(runner
-            .app()
-            .featured
-            .collection
-            .as_ref()
-            .expect("collection")
-            .pages
-            .len()
-            > 1);
+        assert!(
+            runner
+                .app()
+                .featured
+                .collection
+                .as_ref()
+                .expect("collection")
+                .pages
+                .len()
+                > 1
+        );
         runner.action(action_id(PREVIOUS_PAGE));
         let view = runner
             .app()
