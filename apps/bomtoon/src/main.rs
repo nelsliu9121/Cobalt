@@ -1329,11 +1329,7 @@ impl Bomtoon {
                 .covers
                 .tasks
                 .iter()
-                .filter(|(_, task)| {
-                    !visible_set.contains(&task.url)
-                        && !(episode_urls.contains(&task.url)
-                            && public_urls.contains(&task.url))
-                })
+                .filter(|(_, task)| !visible_set.contains(&task.url))
                 .map(|(task, cover)| (*task, cover.url.clone()))
                 .collect::<Vec<_>>();
             for (task, url) in obsolete {
@@ -1349,9 +1345,6 @@ impl Bomtoon {
                     if let Some(source) = visible_source {
                         task.source = source;
                     }
-                } else if episode_urls.contains(&task.url) && public_urls.contains(&task.url) {
-                    task.generation = generation;
-                    task.source = CoverSource::Public;
                 }
             }
             for url in &visible {
@@ -1377,6 +1370,9 @@ impl Bomtoon {
             return;
         };
         for url in self.covers.visible_urls.clone() {
+            if !self.cover_url_owned(source, &url) {
+                continue;
+            }
             if self.covers.entries.contains_key(&url) {
                 continue;
             }
@@ -2843,6 +2839,17 @@ impl Bomtoon {
             .any(|comic| comic.cover_url.as_deref() == Some(url))
     }
 
+    fn cover_url_owned(&self, source: CoverSource, url: &str) -> bool {
+        match source {
+            CoverSource::Public => self.owns_public_cover_url(url),
+            CoverSource::Protected => {
+                self.account == AccountState::Active
+                    && self.covers.visible_source == Some(CoverSource::Protected)
+                    && self.covers.visible_urls.iter().any(|visible| visible == url)
+            }
+        }
+    }
+
     fn episode_thumbnail_urls(&self) -> BTreeSet<String> {
         self.episodes
             .iter()
@@ -2862,9 +2869,7 @@ impl Bomtoon {
             .tasks
             .iter()
             .filter(|(_, task)| {
-                episode_urls.contains(&task.url)
-                    && !retained.contains(&task.url)
-                    && !public_urls.contains(&task.url)
+                episode_urls.contains(&task.url) && !retained.contains(&task.url)
             })
             .map(|(task, cover)| (*task, cover.url.clone()))
             .collect::<Vec<_>>();
@@ -2896,16 +2901,7 @@ impl Bomtoon {
         self.covers
             .visible_urls
             .retain(|url| !episode_urls.contains(url) || retained.contains(url));
-        for task in self.covers.tasks.values_mut() {
-            if episode_urls.contains(&task.url)
-                && !retained.contains(&task.url)
-                && public_urls.contains(&task.url)
-            {
-                task.source = CoverSource::Public;
-            }
-        }
     }
-
     fn clear_episode_thumbnail_cache(&mut self, context: &mut Context) {
         let episode_urls = self.episode_thumbnail_urls();
         if episode_urls.is_empty() {
@@ -6207,17 +6203,15 @@ impl Bomtoon {
         cover: CoverTask,
         outcome: TaskOutcome,
     ) -> bool {
+        let loading =
+            self.covers.entries.get(&cover.url) == Some(&CoverState::Loading(task));
         if cover.generation != self.covers.generation
-            || self.covers.entries.get(&cover.url) != Some(&CoverState::Loading(task))
-            || match cover.source {
-                CoverSource::Public => !self.owns_public_cover_url(&cover.url),
-                CoverSource::Protected => {
-                    self.account != AccountState::Active
-                        || self.covers.visible_source != Some(CoverSource::Protected)
-                        || !self.covers.visible_urls.contains(&cover.url)
-                }
-            }
+            || !loading
+            || !self.cover_url_owned(cover.source, &cover.url)
         {
+            if loading {
+                self.covers.entries.remove(&cover.url);
+            }
             return false;
         }
         let state = match outcome {
@@ -17328,6 +17322,167 @@ mod tests {
             }
         }
         assert!(quote.is_some(), "quote did not resume before thumbnails");
+    }
+
+    fn add_public_episode_covers(app: &mut Bomtoon, urls: &[String]) {
+        app.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: urls
+                .iter()
+                .enumerate()
+                .map(|(index, url)| ShelfComic {
+                    title: format!("Public shared {index}"),
+                    alias: format!("public-shared-{index}"),
+                    cover_url: Some(url.clone()),
+                })
+                .collect(),
+            ..FeaturedState::default()
+        };
+    }
+
+    #[test]
+    fn shared_public_loading_episode_tasks_yield_to_reader_and_next_page() {
+        let mut reader_app = episode_thumbnail_app(12);
+        let public_urls = (0..4).map(episode_thumbnail_url).collect::<Vec<_>>();
+        add_public_episode_covers(&mut reader_app, &public_urls);
+        let mut reader = AppRunner::with_metrics(reader_app, CLARA_BW_METRICS);
+        let commands = reader.action(action_id("refresh-layout"));
+        let reader_thumbnails = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(reader_thumbnails.len(), 4);
+
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), reader_thumbnails);
+        assert!(cover_fetches(&commands).is_empty());
+        let commands = reader.task_outcome(
+            *reader_thumbnails.iter().next().expect("thumbnail task"),
+            TaskOutcome::Cancelled,
+        );
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072)));
+        assert!(cover_fetches(&commands).is_empty());
+
+        let mut page_app = episode_thumbnail_app(12);
+        let rows = page_app.episode_rows_per_page();
+        let public_urls = (0..4).map(episode_thumbnail_url).collect::<Vec<_>>();
+        add_public_episode_covers(&mut page_app, &public_urls);
+        let second_page_urls = (rows..rows.saturating_mul(2).min(page_app.episodes.len()))
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
+        let mut page = AppRunner::with_metrics(page_app, CLARA_BW_METRICS);
+        let commands = page.action(action_id("refresh-layout"));
+        let first_page_tasks = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_page_tasks.len(), 4);
+
+        let commands = page.action(action_id(NEXT_PAGE));
+        assert_eq!(cancelled_tasks(&commands), first_page_tasks);
+        assert!(cover_fetches(&commands).is_empty());
+        let first_cancelled = *first_page_tasks.iter().next().expect("thumbnail task");
+        let commands = page.task_outcome(first_cancelled, TaskOutcome::Cancelled);
+        let resumed = cover_fetches(&commands);
+        assert_eq!(resumed.len(), 1);
+        assert!(second_page_urls.contains(&resumed[0].1));
+        assert!(!public_urls.contains(&resumed[0].1));
+        assert_eq!(
+            page.app()
+                .covers
+                .tasks
+                .get(&resumed[0].0)
+                .map(|task| task.source),
+            Some(CoverSource::Protected)
+        );
+        let mut second_page_tasks = BTreeSet::from([resumed[0].0]);
+        for task in first_page_tasks
+            .iter()
+            .copied()
+            .filter(|task| *task != first_cancelled)
+        {
+            let commands = page.task_outcome(task, TaskOutcome::Cancelled);
+            let resumed = cover_fetches(&commands);
+            assert_eq!(resumed.len(), 1);
+            assert!(second_page_urls.contains(&resumed[0].1));
+            assert!(!public_urls.contains(&resumed[0].1));
+            assert_eq!(
+                page.app()
+                    .covers
+                    .tasks
+                    .get(&resumed[0].0)
+                    .map(|cover| cover.source),
+                Some(CoverSource::Protected)
+            );
+            second_page_tasks.insert(resumed[0].0);
+        }
+        assert_eq!(second_page_tasks.len(), 4);
+
+        let commands = page.action(ActionId::BACK);
+        assert_eq!(cancelled_tasks(&commands), second_page_tasks);
+        assert!(cover_fetches(&commands).is_empty());
+        let commands = page.task_outcome(
+            *second_page_tasks.iter().next().expect("second-page task"),
+            TaskOutcome::Cancelled,
+        );
+        let shelf = cover_fetches(&commands);
+        assert_eq!(shelf.len(), 1);
+        assert!(public_urls.contains(&shelf[0].1));
+        assert_eq!(
+            page.app()
+                .covers
+                .tasks
+                .get(&shelf[0].0)
+                .map(|cover| cover.source),
+            Some(CoverSource::Public)
+        );
+    }
+
+    #[test]
+    fn rejected_shared_public_outcome_removes_loading_entry_and_retries_when_visible() {
+        let shared = episode_thumbnail_url(0);
+        let stale = TaskId(901);
+        let mut app = episode_thumbnail_app(1);
+        app.view = View::Main;
+        add_public_episode_covers(&mut app, std::slice::from_ref(&shared));
+        app.covers = CoverCache {
+            generation: 23,
+            entries: BTreeMap::from([(shared.clone(), CoverState::Loading(stale))]),
+            tasks: BTreeMap::from([(
+                stale,
+                CoverTask {
+                    generation: 23,
+                    url: shared.clone(),
+                    source: CoverSource::Public,
+                },
+            )]),
+            visible_urls: vec![shared.clone()],
+            visible_source: Some(CoverSource::Public),
+        };
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.app_mut().featured.featured.clear();
+
+        let commands = runner.task_outcome(stale, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert!(put_picture_handles(&commands).is_empty());
+        assert!(cover_fetches(&commands).is_empty());
+        assert!(!runner.app().covers.entries.contains_key(&shared));
+
+        runner.app_mut().view = View::Episodes;
+        let commands = runner.action(action_id("refresh-layout"));
+        let retry = cover_fetches(&commands);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, shared);
+        assert_eq!(
+            runner
+                .app()
+                .covers
+                .tasks
+                .get(&retry[0].0)
+                .map(|task| task.source),
+            Some(CoverSource::Protected)
+        );
     }
 
     #[test]
