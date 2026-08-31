@@ -4,6 +4,8 @@ use kobo_sdk::{Credential, Header, Task};
 
 const HOMEPAGE_URL: &str = "https://www.bomtoon.tw/comic/main";
 const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
+const MAIN_API: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/main/";
+const THEME_API: &str = "https://www.bomtoon.tw/api/balcony-api-v2/theme";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
 const LIBRARY_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library";
 const RECENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/library/recent";
@@ -15,6 +17,7 @@ const PURCHASE_URL: &str = "https://www.bomtoon.tw/api/balcony-api/purchase";
 const COMMENTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/contents/";
 const REPLIES_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/reply/CONTENTS/";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
+const PUBLIC_COLLECTION_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
 const ASSET_SUMMARY_BYTES: u32 = 64 * 1024;
@@ -41,6 +44,24 @@ pub fn homepage() -> Task {
 
 pub fn public_detail(alias: &str) -> Task {
     public_fetch(format!("{DETAIL_URL}{alias}"))
+}
+
+pub fn ranking() -> Task {
+    public_json_fetch(format!("{MAIN_API}ranking/COMIC?adultToggle=true&contentsThumbnailType=VERTICAL,MAIN,SQUARE,DETAIL,HORIZONTAL_TYPE_A&mainGenre=ALL"))
+}
+
+pub fn most_favorited() -> Task {
+    public_json_fetch(format!("{MAIN_API}favorite/COMIC?adultToggle=true&contentsThumbnailType=VERTICAL,MAIN,SQUARE,VERTICAL_NON_ADULT&mainGenre=ALL"))
+}
+
+pub fn themes() -> Task {
+    public_json_fetch(format!(
+        "{THEME_API}?isIncludeAdult=true&displayRange=COMIC&displayPosition="
+    ))
+}
+
+pub fn freetime() -> Task {
+    public_json_fetch(format!("{MAIN_API}free/COMIC?adultToggle=true&contentsFreeFilter=FREETIME&contentsThumbnailType=VERTICAL,MAIN,SQUARE,VERTICAL_NON_ADULT&mainGenre=ALL"))
 }
 
 pub fn asset_summary() -> Task {
@@ -235,6 +256,16 @@ fn balcony_headers() -> Vec<Header> {
     headers
 }
 
+fn public_json_fetch(url: String) -> Task {
+    Task::Fetch {
+        url,
+        offset: 0,
+        max_bytes: PUBLIC_COLLECTION_BYTES,
+        credential: None,
+        headers: balcony_headers(),
+    }
+}
+
 fn public_fetch(url: String) -> Task {
     Task::Fetch {
         url,
@@ -258,9 +289,9 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        account_scope, asset_summary, comments, detail, expiration_history, homepage, image,
-        images, library, public_detail, purchase, quote, recent, replies, title_gifts,
-        CommentOrder, ACCEPT_LANGUAGE,
+        account_scope, asset_summary, comments, detail, expiration_history, freetime, homepage,
+        image, images, library, most_favorited, public_detail, purchase, quote, ranking, recent,
+        replies, themes, title_gifts, CommentOrder, ACCEPT_LANGUAGE, PUBLIC_COLLECTION_BYTES,
     };
     use crate::model::{AssetKind, PurchaseType};
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
@@ -313,6 +344,69 @@ mod tests {
                 Header::new("Accept-Language", ACCEPT_LANGUAGE),
             ]
         );
+    }
+
+    #[test]
+    fn feature_collection_requests_are_public_and_exact() {
+        let expected_headers = vec![
+            Header::new("Accept", "application/json"),
+            Header::new("Accept-Language", ACCEPT_LANGUAGE),
+            Header::new("x-balcony-id", "BOMTOON_TW"),
+            Header::new("x-balcony-timezone", "Asia/Taipei"),
+            Header::new("x-platform", "MOBILE_IOS"),
+        ];
+        for (task, expected_url) in [
+            (
+                ranking(),
+                concat!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/main/ranking/COMIC",
+                    "?adultToggle=true",
+                    "&contentsThumbnailType=VERTICAL,MAIN,SQUARE,DETAIL,HORIZONTAL_TYPE_A",
+                    "&mainGenre=ALL"
+                ),
+            ),
+            (
+                most_favorited(),
+                concat!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/main/favorite/COMIC",
+                    "?adultToggle=true",
+                    "&contentsThumbnailType=VERTICAL,MAIN,SQUARE,VERTICAL_NON_ADULT",
+                    "&mainGenre=ALL"
+                ),
+            ),
+            (
+                themes(),
+                concat!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/theme",
+                    "?isIncludeAdult=true&displayRange=COMIC&displayPosition="
+                ),
+            ),
+            (
+                freetime(),
+                concat!(
+                    "https://www.bomtoon.tw/api/balcony-api-v2/contents/main/free/COMIC",
+                    "?adultToggle=true&contentsFreeFilter=FREETIME",
+                    "&contentsThumbnailType=VERTICAL,MAIN,SQUARE,VERTICAL_NON_ADULT",
+                    "&mainGenre=ALL"
+                ),
+            ),
+        ] {
+            let Task::Fetch {
+                url,
+                offset,
+                max_bytes,
+                credential,
+                headers,
+            } = task
+            else {
+                panic!("feature collection request must be a fetch");
+            };
+            assert_eq!(url, expected_url);
+            assert_eq!(offset, 0);
+            assert_eq!(max_bytes, PUBLIC_COLLECTION_BYTES);
+            assert_eq!(credential, None);
+            assert_eq!(headers, expected_headers);
+        }
     }
 
     #[test]

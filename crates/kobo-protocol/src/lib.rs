@@ -9,10 +9,10 @@ pub use kobo_pixels::{PictureFormat, PicturePixels};
 
 use kobo_ui::{
     ActionId, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, ControlState,
-    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle,
-    ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale, Tile,
-    TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
-    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
+    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureFit,
+    PictureHandle, ReadingChrome, ReadingSurface, Row, RowLead, RowLineLimits, RowState, Screen,
+    Space, TextScale, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
+    MAX_BAR_ACTIONS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
 
@@ -49,10 +49,14 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// requests/results. Version 11 adds the runtime-owned reading surface.
 /// Version 12 adds pixel-format bytes to the startup metrics and inline
 /// pictures, plus the start of chunked picture uploads. Version 13 adds the
-/// runtime's local Gregorian day and `CredentialScope`. Version 14 adds the
-/// runtime-owned device identity request and result. Version 15 adds the busy
-/// reading-chrome tag; v14 runtimes would reject that reading surface.
-pub const VERSION: u8 = 15;
+/// runtime's local Gregorian day and `CredentialScope`; v12 runtimes cannot
+/// decode the new task. Version 14 adds the runtime-owned device identity
+/// request and result. Version 15 adds the busy reading-chrome tag; v14
+/// runtimes would reject that reading surface. Version 16 adds picture-fit
+/// bytes to retained pictures; v15 peers would misread subsequent fields.
+/// Version 17 appends a description and three line-limit bytes to every row;
+/// v16 peers would read the description length as the next row's action.
+pub const VERSION: u8 = 17;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -3554,10 +3558,10 @@ fn encoded_screen_len(
     if screen.reading_font.is_some() {
         add_encoded_len(&mut length, 4)?;
     }
-    // One flag byte, plus the reading surface's four u32 values when present.
+    // One flag byte, plus the reading surface's id and tile-picture payload when present.
     add_encoded_len(&mut length, 1)?;
     if screen.reading_surface.is_some() {
-        add_encoded_len(&mut length, 16)?;
+        add_encoded_len(&mut length, 17)?;
     }
     if let Some(nav_bar) = &screen.nav_bar {
         if nav_bar.destinations.len() > u8::MAX as usize {
@@ -3592,6 +3596,19 @@ fn encoded_screen_len(
         for node in &overlay.nodes {
             add_encoded_len(&mut length, encoded_node_len(node, depth, count)?)?;
         }
+    }
+    Ok(length)
+}
+
+fn encoded_tile_len(tile: &Tile) -> Result<usize, ProtocolError> {
+    // Action, glyph, state and picture flag, plus the three strings and the
+    // optional picture payload.
+    let mut length = 7;
+    add_encoded_len(&mut length, encoded_string_len(&tile.label)?)?;
+    add_encoded_len(&mut length, encoded_string_len(&tile.badge)?)?;
+    add_encoded_len(&mut length, encoded_string_len(&tile.subtitle)?)?;
+    if tile.picture.is_some() {
+        add_encoded_len(&mut length, 13)?;
     }
     Ok(length)
 }
@@ -3658,9 +3675,14 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             }
             length
         }
-        Node::Section { title, value, .. } => {
-            // id, then the title, then a byte saying whether a value follows.
-            let mut length = 6;
+        Node::Section {
+            title,
+            value,
+            action,
+            ..
+        } => {
+            // Id and title, then presence bytes for the value and action.
+            let mut length = 7 + if action.is_some() { 4 } else { 0 };
             add_encoded_len(&mut length, encoded_string_len(title)?)?;
             if let Some(value) = value {
                 add_encoded_len(&mut length, encoded_string_len(value)?)?;
@@ -3787,11 +3809,13 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             let mut length = 6;
             for row in rows {
                 // Four bytes of action, the fixed-width lead, one of state,
-                // one saying whether a trailing value follows and one saying
-                // whether an overflow action does, then the strings.
-                add_encoded_len(&mut length, 7 + ROW_LEAD_LEN)?;
+                // one saying whether a trailing value follows, one saying
+                // whether an overflow action does and three line limits, then
+                // the strings.
+                add_encoded_len(&mut length, 10 + ROW_LEAD_LEN)?;
                 add_encoded_len(&mut length, encoded_string_len(&row.title)?)?;
                 add_encoded_len(&mut length, encoded_string_len(&row.summary)?)?;
+                add_encoded_len(&mut length, encoded_string_len(&row.description)?)?;
                 if let Some(trailing) = &row.trailing {
                     add_encoded_len(&mut length, encoded_string_len(trailing)?)?;
                 }
@@ -3807,17 +3831,21 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             }
             let mut length = 7;
             for tile in tiles {
-                add_encoded_len(&mut length, 7)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.label)?)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.badge)?)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.subtitle)?)?;
-                if tile.picture.is_some() {
-                    add_encoded_len(&mut length, 12)?;
-                }
+                add_encoded_len(&mut length, encoded_tile_len(tile)?)?;
             }
             length
         }
-        Node::Picture { .. } => 20,
+        Node::ImageStrip { tiles, .. } | Node::MediaGrid { tiles, .. } => {
+            if tiles.len() > u8::MAX as usize {
+                return Err(ProtocolError::TooManyNodes);
+            }
+            let mut length = 6;
+            for tile in tiles {
+                add_encoded_len(&mut length, encoded_tile_len(tile)?)?;
+            }
+            length
+        }
+        Node::Picture { .. } => 21,
         Node::Table { rows, weights, .. } => {
             if rows.len() > u8::MAX as usize || weights.len() > u8::MAX as usize {
                 return Err(ProtocolError::TooManyNodes);
@@ -4561,9 +4589,7 @@ fn encode_screen(
                 ReadingChrome::OverlayBusy => 3,
             });
             push_u32(output, surface.id.0);
-            push_u32(output, surface.picture.handle.0);
-            push_u32(output, surface.picture.source.0);
-            push_u32(output, surface.picture.source.1);
+            encode_tile_picture(output, surface.picture);
         }
     }
     push_u16(
@@ -4802,13 +4828,25 @@ fn encode_node(
             push_u32(output, id.0);
             push_string(output, text)?;
         }
-        Node::Section { id, title, value } => {
+        Node::Section {
+            id,
+            title,
+            value,
+            action,
+        } => {
             output.push(21);
             push_u32(output, id.0);
             push_string(output, title)?;
             output.push(u8::from(value.is_some()));
             if let Some(value) = value {
                 push_string(output, value)?;
+            }
+            match action {
+                Some(action) => {
+                    output.push(1);
+                    push_u32(output, action.0);
+                }
+                None => output.push(0),
             }
         }
         Node::Quote {
@@ -5035,6 +5073,10 @@ fn encode_node(
                 if let Some(menu) = row.menu {
                     push_u32(output, menu.0);
                 }
+                push_string(output, &row.description)?;
+                output.push(row.line_limits.title);
+                output.push(row.line_limits.summary);
+                output.push(row.line_limits.description);
             }
         }
         Node::TileGrid { id, tiles, shape } => {
@@ -5044,34 +5086,23 @@ fn encode_node(
                 TileShape::Square => 0,
                 TileShape::Portrait => 1,
             });
-            output.push(u8::try_from(tiles.len()).map_err(|_| ProtocolError::TooManyNodes)?);
-            for tile in tiles {
-                push_u32(output, tile.action.0);
-                push_string(output, &tile.label)?;
-                output.push(encode_glyph(tile.glyph));
-                output.push(match tile.state {
-                    TileState::Normal => 0,
-                    TileState::Held => 1,
-                    TileState::Unavailable => 2,
-                    TileState::Busy => 3,
-                });
-                push_string(output, &tile.badge)?;
-                push_string(output, &tile.subtitle)?;
-                match tile.picture {
-                    Some(picture) => {
-                        output.push(1);
-                        push_u32(output, picture.handle.0);
-                        push_u32(output, picture.source.0);
-                        push_u32(output, picture.source.1);
-                    }
-                    None => output.push(0),
-                }
-            }
+            encode_tiles(output, tiles)?;
+        }
+        Node::ImageStrip { id, tiles } => {
+            output.push(31);
+            push_u32(output, id.0);
+            encode_tiles(output, tiles)?;
+        }
+        Node::MediaGrid { id, tiles } => {
+            output.push(32);
+            push_u32(output, id.0);
+            encode_tiles(output, tiles)?;
         }
         Node::Picture {
             id,
             handle,
             source,
+            fit,
             max_height_tenths_mm,
             framed,
         } => {
@@ -5082,6 +5113,10 @@ fn encode_node(
             push_u32(output, source.1);
             push_u16(output, *max_height_tenths_mm);
             output.push(u8::from(*framed));
+            output.push(match fit {
+                PictureFit::Contain => 0,
+                PictureFit::Cover => 1,
+            });
         }
         Node::Table { id, rows, weights } => {
             output.push(30);
@@ -5475,6 +5510,99 @@ const fn decode_glyph(tag: u8) -> Option<Glyph> {
     })
 }
 
+fn encode_tiles(output: &mut Vec<u8>, tiles: &[Tile]) -> Result<(), ProtocolError> {
+    output.push(u8::try_from(tiles.len()).map_err(|_| ProtocolError::TooManyNodes)?);
+    for tile in tiles {
+        encode_tile(output, tile)?;
+    }
+    Ok(())
+}
+
+fn encode_tile(output: &mut Vec<u8>, tile: &Tile) -> Result<(), ProtocolError> {
+    push_u32(output, tile.action.0);
+    push_string(output, &tile.label)?;
+    output.push(encode_glyph(tile.glyph));
+    output.push(match tile.state {
+        TileState::Normal => 0,
+        TileState::Held => 1,
+        TileState::Unavailable => 2,
+        TileState::Busy => 3,
+    });
+    push_string(output, &tile.badge)?;
+    push_string(output, &tile.subtitle)?;
+    match tile.picture {
+        Some(picture) => {
+            output.push(1);
+            encode_tile_picture(output, picture);
+        }
+        None => output.push(0),
+    }
+    Ok(())
+}
+
+fn encode_tile_picture(output: &mut Vec<u8>, picture: TilePicture) {
+    push_u32(output, picture.handle.0);
+    push_u32(output, picture.source.0);
+    push_u32(output, picture.source.1);
+    output.push(match picture.fit {
+        PictureFit::Contain => 0,
+        PictureFit::Cover => 1,
+    });
+}
+
+fn decode_tile_picture(reader: &mut Reader<'_>) -> Result<TilePicture, ProtocolError> {
+    let handle = PictureHandle(reader.u32()?);
+    let width = reader.u32()?;
+    let height = reader.u32()?;
+    let fit = match reader.u8()? {
+        0 => PictureFit::Contain,
+        1 => PictureFit::Cover,
+        _ => return Err(ProtocolError::InvalidValue("picture fit")),
+    };
+    Ok(TilePicture::new(handle, width, height).with_fit(fit))
+}
+
+fn decode_tiles(reader: &mut Reader<'_>) -> Result<Vec<Tile>, ProtocolError> {
+    let len = usize::from(reader.u8()?);
+    let mut tiles = Vec::with_capacity(len);
+    for _ in 0..len {
+        tiles.push(decode_tile(reader)?);
+    }
+    Ok(tiles)
+}
+
+fn decode_tile(reader: &mut Reader<'_>) -> Result<Tile, ProtocolError> {
+    let action = ActionId(reader.u32()?);
+    if action.is_reserved() {
+        return Err(ProtocolError::InvalidValue("reserved action id"));
+    }
+    let label = reader.string()?;
+    let glyph = decode_glyph(reader.u8()?).ok_or(ProtocolError::InvalidValue("tile glyph"))?;
+    let state = match reader.u8()? {
+        0 => TileState::Normal,
+        1 => TileState::Held,
+        2 => TileState::Unavailable,
+        3 => TileState::Busy,
+        _ => return Err(ProtocolError::InvalidValue("tile state")),
+    };
+    let badge = reader.string()?;
+    let subtitle = reader.string()?;
+    let picture = match reader.u8()? {
+        0 => None,
+        1 => Some(decode_tile_picture(reader)?),
+        _ => return Err(ProtocolError::InvalidValue("tile picture flag")),
+    };
+    Ok(Tile {
+        action,
+        label,
+        glyph,
+        picture,
+        state,
+        badge,
+        subtitle,
+    })
+}
+
 fn decode_reading_surface(
     reader: &mut Reader<'_>,
 ) -> Result<Option<ReadingSurface>, ProtocolError> {
@@ -5482,7 +5610,7 @@ fn decode_reading_surface(
         0 => None,
         mode @ 1..=3 => Some(ReadingSurface::new(
             NodeId(reader.u32()?),
-            TilePicture::new(PictureHandle(reader.u32()?), reader.u32()?, reader.u32()?),
+            decode_tile_picture(reader)?,
             match mode {
                 1 => ReadingChrome::Hidden,
                 2 => ReadingChrome::Overlay,
@@ -5876,7 +6004,23 @@ fn decode_node(
             } else {
                 Some(reader.string()?)
             };
-            Ok(Node::Section { id, title, value })
+            let action = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let action = ActionId(reader.u32()?);
+                    if action.is_reserved() {
+                        return Err(ProtocolError::InvalidValue("reserved action id"));
+                    }
+                    Some(action)
+                }
+                _ => return Err(ProtocolError::InvalidValue("section action flag")),
+            };
+            Ok(Node::Section {
+                id,
+                title,
+                value,
+                action,
+            })
         }
         4 => {
             let child_count = usize::from(reader.u16()?);
@@ -6036,52 +6180,39 @@ fn decode_node(
                 1 => TileShape::Portrait,
                 _ => return Err(ProtocolError::InvalidValue("tile shape")),
             };
-            let len = usize::from(reader.u8()?);
-            let mut tiles = Vec::with_capacity(len);
-            for _ in 0..len {
-                let action = ActionId(reader.u32()?);
-                if action.is_reserved() {
-                    return Err(ProtocolError::InvalidValue("reserved action id"));
-                }
-                let label = reader.string()?;
-                let glyph =
-                    decode_glyph(reader.u8()?).ok_or(ProtocolError::InvalidValue("tile glyph"))?;
-                let state = match reader.u8()? {
-                    0 => TileState::Normal,
-                    1 => TileState::Held,
-                    2 => TileState::Unavailable,
-                    3 => TileState::Busy,
-                    _ => return Err(ProtocolError::InvalidValue("tile state")),
-                };
-                let badge = reader.string()?;
-                let subtitle = reader.string()?;
-                let picture = match reader.u8()? {
-                    0 => None,
-                    1 => Some(TilePicture {
-                        handle: PictureHandle(reader.u32()?),
-                        source: (reader.u32()?, reader.u32()?),
-                    }),
-                    _ => return Err(ProtocolError::InvalidValue("tile picture flag")),
-                };
-                tiles.push(Tile {
-                    action,
-                    label,
-                    glyph,
-                    picture,
-                    state,
-                    badge,
-                    subtitle,
-                });
-            }
-            Ok(Node::TileGrid { id, tiles, shape })
+            Ok(Node::TileGrid {
+                id,
+                tiles: decode_tiles(reader)?,
+                shape,
+            })
         }
-        17 => Ok(Node::Picture {
+        31 => Ok(Node::ImageStrip {
             id,
-            handle: PictureHandle(reader.u32()?),
-            source: (reader.u32()?, reader.u32()?),
-            max_height_tenths_mm: reader.u16()?,
-            framed: reader.u8()? != 0,
+            tiles: decode_tiles(reader)?,
         }),
+        32 => Ok(Node::MediaGrid {
+            id,
+            tiles: decode_tiles(reader)?,
+        }),
+        17 => {
+            let handle = PictureHandle(reader.u32()?);
+            let source = (reader.u32()?, reader.u32()?);
+            let max_height_tenths_mm = reader.u16()?;
+            let framed = reader.u8()? != 0;
+            let fit = match reader.u8()? {
+                0 => PictureFit::Contain,
+                1 => PictureFit::Cover,
+                _ => return Err(ProtocolError::InvalidValue("picture fit")),
+            };
+            Ok(Node::Picture {
+                id,
+                handle,
+                source,
+                fit,
+                max_height_tenths_mm,
+                framed,
+            })
+        }
         10 => {
             let prompt = reader.string()?;
             let len = usize::from(reader.u8()?);
@@ -6338,10 +6469,14 @@ fn decode_node(
                     }
                     Some(menu)
                 };
+                let description = reader.string()?;
+                let line_limits = RowLineLimits::new(reader.u8()?, reader.u8()?, reader.u8()?);
                 rows.push(Row {
                     action,
                     title,
                     summary,
+                    description,
+                    line_limits,
                     lead,
                     state,
                     trailing,
@@ -6370,6 +6505,10 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
             output.push(0);
             push_u16(output, u16::from(encode_glyph(glyph)));
         }
+        RowLead::CoverSlot(glyph) => {
+            output.push(3);
+            push_u16(output, u16::from(encode_glyph(glyph)));
+        }
         RowLead::Number(number) => {
             output.push(1);
             push_u16(output, number);
@@ -6377,9 +6516,7 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
         RowLead::Picture(picture, glyph) => {
             output.push(2);
             push_u16(output, u16::from(encode_glyph(glyph)));
-            push_u32(output, picture.handle.0);
-            push_u32(output, picture.source.0);
-            push_u32(output, picture.source.1);
+            encode_tile_picture(output, picture);
         }
     }
     output.resize(before + ROW_LEAD_LEN, 0);
@@ -6387,7 +6524,7 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
 }
 
 /// The fixed width of an encoded row lead.
-const ROW_LEAD_LEN: usize = 15;
+const ROW_LEAD_LEN: usize = 16;
 
 fn read_row_lead(reader: &mut Reader<'_>) -> Result<RowLead, ProtocolError> {
     let tag = reader.u8()?;
@@ -6401,16 +6538,13 @@ fn read_row_lead(reader: &mut Reader<'_>) -> Result<RowLead, ProtocolError> {
     let lead = match tag {
         0 => RowLead::Icon(glyph()?),
         1 => RowLead::Number(value),
-        2 => {
-            let handle = PictureHandle(reader.u32()?);
-            let source = (reader.u32()?, reader.u32()?);
-            RowLead::Picture(TilePicture { handle, source }, glyph()?)
-        }
+        2 => RowLead::Picture(decode_tile_picture(reader)?, glyph()?),
+        3 => RowLead::CoverSlot(glyph()?),
         _ => return Err(ProtocolError::InvalidValue("row lead")),
     };
     // The padding the encoder wrote, so every lead costs the same however it
     // was built.
-    let written = if tag == 2 { 15 } else { 3 };
+    let written = if tag == 2 { 16 } else { 3 };
     for _ in written..ROW_LEAD_LEN {
         reader.u8()?;
     }
@@ -7435,6 +7569,23 @@ mod tests {
     }
 
     #[test]
+    fn described_rows_round_trip_empty_and_bounded_fields() {
+        assert_round_trip(Message::SetScreen(Screen::new(
+            19,
+            vec![Node::Rows {
+                id: NodeId(7),
+                rows: vec![
+                    Row::new(ActionId(1), "Plain", "Creator", Glyph::Book),
+                    Row::new(ActionId(2), "Described", "Creator", Glyph::Book)
+                        .with_description("A synopsis")
+                        .with_trailing("12K")
+                        .with_line_limits(RowLineLimits::new(1, 1, 2)),
+                ],
+            }],
+        )));
+    }
+
+    #[test]
     fn encoder_preflights_payload_limit() {
         // The full node budget with the longest string each node may carry:
         // 512 × 16 KiB is the frame limit exactly, and the envelope around
@@ -7553,13 +7704,7 @@ mod node_coverage_tests {
                     ActionId(67),
                     "Bleak House",
                     "Charles Dickens",
-                    RowLead::Picture(
-                        TilePicture {
-                            handle: PictureHandle(9),
-                            source: (190, 300),
-                        },
-                        Glyph::Book,
-                    ),
+                    RowLead::Picture(TilePicture::new(PictureHandle(9), 190, 300), Glyph::Book),
                 )],
             },
             Node::Field {
@@ -7651,11 +7796,13 @@ mod node_coverage_tests {
                 id: NodeId(23),
                 title: "Details".into(),
                 value: None,
+                action: None,
             },
             Node::Section {
                 id: NodeId(24),
                 title: "Popular".into(),
                 value: Some("32".into()),
+                action: Some(ActionId(68)),
             },
             Node::Flex { id: NodeId(90) },
             Node::Spacer {
@@ -7834,12 +7981,13 @@ mod node_coverage_tests {
         for value in [9, 42, 1_072, 1_448] {
             push_u32(&mut bytes, value);
         }
+        bytes.push(0);
         let mut reader = Reader::new(&bytes);
         let surface = decode_reading_surface(&mut reader)
             .expect("busy reading surface")
             .expect("reading surface");
-        assert_ne!(surface.chrome, ReadingChrome::Hidden);
-        assert_ne!(surface.chrome, ReadingChrome::Overlay);
+        assert_eq!(surface.chrome, ReadingChrome::OverlayBusy);
+        assert_eq!(surface.picture.fit, PictureFit::Contain);
     }
 
     #[test]
@@ -8601,8 +8749,8 @@ mod store_tests {
     }
 
     #[test]
-    fn current_protocol_uses_version_fifteen_and_rejects_v14() {
-        assert_eq!(VERSION, 15);
+    fn current_protocol_uses_version_seventeen_and_rejects_v16() {
+        assert_eq!(VERSION, 17);
         let frame = Frame {
             request_id: 10,
             message: Message::Spawn {
@@ -8613,11 +8761,11 @@ mod store_tests {
             },
         };
         let mut encoded = encode(&frame).expect("encode credential scope");
-        assert_eq!(encoded[4], 15);
+        assert_eq!(encoded[4], VERSION);
         assert_eq!(decode(&encoded), Ok(frame));
 
-        encoded[4] = 14;
-        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(14)));
+        encoded[4] = 16;
+        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(16)));
     }
 
     #[test]
@@ -9075,6 +9223,113 @@ mod task_error_tests {
 mod picture_tests {
     use super::*;
 
+    fn round_trip(screen: Screen) -> Screen {
+        let frame = Frame {
+            request_id: 7,
+            message: Message::SetScreen(screen),
+        };
+        let bytes = encode(&frame).expect("encode");
+        match decode(&bytes).expect("decode").message {
+            Message::SetScreen(screen) => screen,
+            other => panic!("expected a screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picture_fit_round_trips_in_tiles_rows_and_reading_surfaces() {
+        for fit in [PictureFit::Contain, PictureFit::Cover] {
+            let picture = TilePicture::new(PictureHandle(9), 190, 300).with_fit(fit);
+            let screen = Screen::new(
+                1,
+                vec![
+                    Node::TileGrid {
+                        id: NodeId(1),
+                        tiles: vec![
+                            Tile::new(ActionId(1), "Cover", Glyph::Book).with_picture(picture)
+                        ],
+                        shape: TileShape::Portrait,
+                    },
+                    Node::Rows {
+                        id: NodeId(2),
+                        rows: vec![Row::new(
+                            ActionId(2),
+                            "Title",
+                            "Creator",
+                            RowLead::Picture(picture, Glyph::Book),
+                        )],
+                    },
+                    Node::Picture {
+                        id: NodeId(4),
+                        handle: picture.handle,
+                        source: picture.source,
+                        fit,
+                        max_height_tenths_mm: 600,
+                        framed: true,
+                    },
+                ],
+            )
+            .with_reading_surface(Some(ReadingSurface::new(
+                NodeId(3),
+                picture,
+                ReadingChrome::Hidden,
+            )));
+            assert_eq!(round_trip(screen.clone()), screen);
+        }
+    }
+
+    #[test]
+    fn cover_slot_row_lead_round_trips_and_unknown_leads_stay_closed() {
+        let screen = Screen::new(
+            1,
+            vec![Node::Rows {
+                id: NodeId(1),
+                rows: vec![Row::new(
+                    ActionId(2),
+                    "Title",
+                    "Creator",
+                    RowLead::CoverSlot(Glyph::Book),
+                )],
+            }],
+        );
+        assert_eq!(round_trip(screen.clone()), screen);
+
+        let mut unknown = vec![4, 0, 0];
+        unknown.resize(ROW_LEAD_LEN, 0);
+        assert_eq!(
+            read_row_lead(&mut Reader::new(&unknown)),
+            Err(ProtocolError::InvalidValue("row lead"))
+        );
+    }
+
+    #[test]
+    fn invalid_picture_fit_is_rejected() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 9);
+        push_u32(&mut bytes, 190);
+        push_u32(&mut bytes, 300);
+        bytes.push(2);
+        assert_eq!(
+            decode_tile_picture(&mut Reader::new(&bytes)),
+            Err(ProtocolError::InvalidValue("picture fit"))
+        );
+    }
+
+    #[test]
+    fn invalid_node_picture_fit_is_rejected() {
+        let mut bytes = vec![17];
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 9);
+        push_u32(&mut bytes, 190);
+        push_u32(&mut bytes, 300);
+        push_u16(&mut bytes, 600);
+        bytes.push(1);
+        bytes.push(2);
+        assert_eq!(
+            decode_node(&mut Reader::new(&bytes), 0, &mut 0),
+            Err(ProtocolError::InvalidValue("picture fit"))
+        );
+    }
+
     #[test]
     fn a_picture_on_a_shelf_survives_the_wire() {
         let screen = Screen::new(
@@ -9093,6 +9348,7 @@ mod picture_tests {
                     id: NodeId(2),
                     handle: PictureHandle(7),
                     source: (190, 300),
+                    fit: PictureFit::Contain,
                     max_height_tenths_mm: 600,
                     framed: true,
                 },
@@ -9349,5 +9605,71 @@ mod picture_tests {
             panic!("not a spawn");
         };
         assert_eq!(back, work);
+    }
+}
+
+#[cfg(test)]
+mod feature_feed_tests {
+    use super::*;
+
+    fn round_trip(screen: Screen) -> Screen {
+        let frame = Frame {
+            request_id: 7,
+            message: Message::SetScreen(screen),
+        };
+        let bytes = encode(&frame).expect("encode feature feed");
+        match decode(&bytes).expect("decode feature feed").message {
+            Message::SetScreen(screen) => screen,
+            other => panic!("expected a screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_feed_nodes_round_trip() {
+        let decorated = Tile::new(ActionId(7), "Title", Glyph::Book)
+            .with_picture(TilePicture::new(PictureHandle(9), 300, 500).with_fit(PictureFit::Cover))
+            .with_state(TileState::Held)
+            .with_badge("12")
+            .with_subtitle("Creator");
+        let screen = Screen::new(
+            1,
+            vec![
+                Node::ImageStrip {
+                    id: NodeId(1),
+                    tiles: vec![decorated.clone()],
+                },
+                Node::MediaGrid {
+                    id: NodeId(2),
+                    tiles: vec![decorated],
+                },
+                Node::Section {
+                    id: NodeId(3),
+                    title: "Plain".into(),
+                    value: Some("6".into()),
+                    action: None,
+                },
+                Node::Section {
+                    id: NodeId(4),
+                    title: "More".into(),
+                    value: None,
+                    action: Some(ActionId(42)),
+                },
+            ],
+        );
+        assert_eq!(round_trip(screen.clone()), screen);
+    }
+
+    #[test]
+    fn feature_feed_nodes_reject_unknown_section_action_flag() {
+        let mut bytes = vec![21];
+        push_u32(&mut bytes, 1);
+        push_string(&mut bytes, "Section").expect("title");
+        bytes.push(0);
+        bytes.push(2);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            decode_node(&mut reader, 0, &mut 0),
+            Err(ProtocolError::InvalidValue("section action flag"))
+        );
     }
 }

@@ -9,10 +9,36 @@ pub struct Comic {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShelfComic {
+pub struct FeatureComic {
     pub alias: String,
     pub title: String,
-    pub cover_url: Option<String>,
+    pub creators: String,
+    pub view_count: Option<u64>,
+    pub vertical_url: Option<String>,
+    pub square_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeatureCollection {
+    pub id: String,
+    pub label: String,
+    pub priority: u8,
+    pub order: usize,
+    pub comics: Vec<FeatureComic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThemeCollection {
+    pub id: u64,
+    pub label: String,
+    pub comics: Vec<FeatureComic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicDetail {
+    pub alias: String,
+    pub title: String,
+    pub synopsis: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,9 +49,9 @@ pub struct BannerComic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Homepage {
     pub banners: Vec<BannerComic>,
-    pub newest: Vec<ShelfComic>,
-    pub week_day: Vec<ShelfComic>,
-    pub only_bom: Vec<ShelfComic>,
+    pub newest: Vec<FeatureComic>,
+    pub week_day: Vec<FeatureComic>,
+    pub only_bom: Vec<FeatureComic>,
 }
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;

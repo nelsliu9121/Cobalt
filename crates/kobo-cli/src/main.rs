@@ -6660,6 +6660,23 @@ mod tests {
                     );
                 }
             }
+
+            #[test]
+            fn bomtoon_feature_release_requires_current_runtime() {
+                let registry = workspace_manifest()
+                    .parent()
+                    .expect("workspace root")
+                    .join("apps/catalog.json");
+                let apps = read_release_registry(&registry).expect("registry");
+                let bomtoon = apps
+                    .iter()
+                    .find(|app| app.id == "bomtoon")
+                    .expect("Bomtoon registry entry");
+
+                assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
+                assert_eq!(bomtoon.version, "0.6.0");
+                assert_eq!(bomtoon.minimum_cobalt_version, env!("CARGO_PKG_VERSION"));
+            }
         }
     }
 

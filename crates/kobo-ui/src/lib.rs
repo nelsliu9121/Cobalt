@@ -259,6 +259,12 @@ pub const MAX_QUOTE_DEPTH: u8 = 3;
 /// longer than this wants paging, which is a different primitive.
 pub const MAX_ROWS: usize = 32;
 
+/// The most cover targets one image strip may declare.
+pub const MAX_IMAGE_STRIP_ITEMS: usize = 3;
+
+/// The most cards one media grid may declare.
+pub const MAX_MEDIA_GRID_ITEMS: usize = 6;
+
 /// The most rows a [`Node::Terminal`] may carry.
 ///
 /// Sized from the panel this was built for rather than chosen round: the
@@ -1454,9 +1460,9 @@ impl PageTurns {
 
     /// The same, saying which page of how many this is.
     ///
-    /// `page` is one-based. A total of zero, or a page past the total, draws
-    /// nothing rather than "0 of 0": a count nobody can compute yet is better
-    /// left unsaid than said wrongly.
+    /// `page` is one-based. A total of zero means the total is still unknown:
+    /// the current page is drawn alone and Next remains available. Page zero,
+    /// or a known total smaller than `page`, draws nothing.
     #[must_use]
     pub const fn with_position(mut self, page: u16, of: u16) -> Self {
         self.position = Some((page, of));
@@ -1466,7 +1472,7 @@ impl PageTurns {
     /// The position to draw, once nonsense has been discarded.
     const fn drawable_position(self) -> Option<(u16, u16)> {
         match self.position {
-            Some((page, of)) if of > 0 && page >= 1 && page <= of => Some((page, of)),
+            Some((page, of)) if page >= 1 && (of == 0 || page <= of) => Some((page, of)),
             _ => None,
         }
     }
@@ -1503,11 +1509,16 @@ fn layout_page_position(
     metrics: &DisplayMetrics,
     layout: &mut Layout,
 ) {
+    let position = if of == 0 {
+        page.to_string()
+    } else {
+        format!("{page} of {of}")
+    };
     layout.nodes.push(LayoutNode {
         id: NodeId(0),
         rect: band,
         kind: LayoutKind::PagePosition,
-        text_lines: vec![format!("{page} of {of}")],
+        text_lines: vec![position],
     });
     let side = min(metrics.touch_target_default(), band.width / 3);
     if page > 1 {
@@ -1521,7 +1532,7 @@ fn layout_page_position(
             text_lines: Vec::new(),
         });
     }
-    if page < of {
+    if of == 0 || page < of {
         layout.nodes.push(LayoutNode {
             id: NodeId(0),
             rect: Rect {
@@ -1847,7 +1858,7 @@ impl Screen {
         layout.nodes.push(LayoutNode {
             id: surface.id,
             rect: panel,
-            kind: LayoutKind::Picture(surface.picture.handle),
+            kind: LayoutKind::Picture(surface.picture.handle, surface.picture.fit),
             text_lines: Vec::new(),
         });
 
@@ -2826,6 +2837,8 @@ pub enum Node {
         /// A count or a total, set against the right margin. The hairline is
         /// measured to stop short of it rather than run underneath it.
         value: Option<String>,
+        /// The heading's optional tap action.
+        action: Option<ActionId>,
     },
     /// A paragraph set in from the left, with a rule marking what it answers.
     ///
@@ -3032,6 +3045,16 @@ pub enum Node {
         tiles: Vec<Tile>,
         shape: TileShape,
     },
+    /// Three equal image-only cover targets.
+    ImageStrip {
+        id: NodeId,
+        tiles: Vec<Tile>,
+    },
+    /// Six media cards placed in two columns and three rows.
+    MediaGrid {
+        id: NodeId,
+        tiles: Vec<Tile>,
+    },
     /// The tap-first question primitive.
     ///
     /// Typing on a device with no keyboard and a refresh measured in tens of
@@ -3116,8 +3139,8 @@ pub enum Node {
         id: NodeId,
         lines: u8,
     },
-    /// A picture the runtime is already holding, drawn as large as the space
-    /// allows without changing its shape.
+    /// A picture the runtime is already holding, fitted into the space the
+    /// screen assigns it.
     ///
     /// The pixels are deliberately not here. A screen is re-sent on every
     /// change (that is what makes the model simple) and a book cover is eighty
@@ -3135,6 +3158,8 @@ pub enum Node {
         handle: PictureHandle,
         /// The picture's own size, in pixels, as handed over.
         source: (u32, u32),
+        /// Whether to preserve the whole picture or fill the target by cropping it.
+        fit: PictureFit,
         /// The tallest this may be drawn, in tenths of a millimetre, so a
         /// portrait picture cannot take a whole panel on one device and a
         /// third of it on another.
@@ -3302,11 +3327,21 @@ pub struct PictureHandle(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FontHandle(pub u32);
 
-/// A picture on a tile, together with the size it was handed over at.
+/// How a picture maps into the rectangle assigned to it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PictureFit {
+    /// Preserve the complete picture, leaving unused space when its shape differs.
+    #[default]
+    Contain,
+    /// Fill the target from a centered crop without changing proportions.
+    Cover,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TilePicture {
     pub handle: PictureHandle,
     pub source: (u32, u32),
+    pub fit: PictureFit,
 }
 
 impl TilePicture {
@@ -3315,7 +3350,14 @@ impl TilePicture {
         Self {
             handle,
             source: (width, height),
+            fit: PictureFit::Contain,
         }
+    }
+
+    #[must_use]
+    pub const fn with_fit(mut self, fit: PictureFit) -> Self {
+        self.fit = fit;
+        self
     }
 }
 
@@ -3563,6 +3605,28 @@ pub struct TableRow {
     pub cells: Vec<String>,
 }
 
+/// Maximum wrapped lines for each text block in a row.
+///
+/// Zero means unlimited, preserving the layout of rows that do not opt into
+/// bounded text.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RowLineLimits {
+    pub title: u8,
+    pub summary: u8,
+    pub description: u8,
+}
+
+impl RowLineLimits {
+    #[must_use]
+    pub const fn new(title: u8, summary: u8, description: u8) -> Self {
+        Self {
+            title,
+            summary,
+            description,
+        }
+    }
+}
+
 /// One entry in a [`Node::Rows`] list.
 ///
 /// A title identifies, a summary explains and a glyph makes the row findable
@@ -3573,6 +3637,8 @@ pub struct Row {
     pub action: ActionId,
     pub title: String,
     pub summary: String,
+    pub description: String,
+    pub line_limits: RowLineLimits,
     pub lead: RowLead,
     pub state: RowState,
     /// A short value against the right edge: a score, a size, a date, a count.
@@ -3607,11 +3673,25 @@ impl Row {
             action,
             title: title.into(),
             summary: summary.into(),
+            description: String::new(),
+            line_limits: RowLineLimits::default(),
             lead: lead.into(),
             state: RowState::Open,
             trailing: None,
             menu: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_line_limits(mut self, limits: RowLineLimits) -> Self {
+        self.line_limits = limits;
+        self
     }
 
     /// The same, with a short value set against the right edge.
@@ -3657,6 +3737,12 @@ pub enum RowLead {
     Icon(Glyph),
     /// The row's position in an ordered list, drawn as digits.
     Number(u16),
+    /// A cover-sized slot whose picture is not ready, drawn with `glyph`.
+    ///
+    /// It deliberately keeps the same full lead column and vertical placement
+    /// as [`Self::Picture`] so loading, failed, and absent artwork cannot
+    /// reflow the row text.
+    CoverSlot(Glyph),
     /// A cover, letterboxed into the lead square, with a glyph for when the
     /// handle has not arrived or has been evicted from the cache.
     ///
@@ -3942,6 +4028,8 @@ impl Node {
             | Self::Rows { id, .. }
             | Self::Table { id, .. }
             | Self::TileGrid { id, .. }
+            | Self::ImageStrip { id, .. }
+            | Self::MediaGrid { id, .. }
             | Self::Choice { id, .. }
             | Self::Stepper { id, .. }
             | Self::Banner { id, .. }
@@ -4097,7 +4185,7 @@ pub enum LayoutKind {
     /// The name of a group, with a hairline to the right margin and an
     /// optional count against it. The value is carried in `text_lines` as the
     /// title followed by the count, so the drawing pass needs no tree.
-    Section,
+    Section(Option<ActionId>),
     /// An indented paragraph. The values are the clamped depth and what the
     /// paragraph is for, so the renderer can draw the gutter rules and pick a
     /// size without consulting the tree.
@@ -4189,12 +4277,15 @@ pub enum LayoutKind {
     /// A title whose work is finished: muted and struck through.
     RowTitleDone,
     RowSummary,
+    RowDescription,
     RowLead(RowLead),
     /// A tile's tap target: the whole cell, mark and name together. Carries a
     /// [`ControlState`] for the same reason a button does — an unavailable
     /// tile is still drawn, still occupies its place in the grid, and still
     /// must not answer a tap.
     Tile(ActionId, ControlState),
+    /// A media card's whole-cell tap target.
+    MediaCard(ActionId),
     TileLabel,
     /// A tile's second line. Muted, one line, and only emitted when at least
     /// one tile in the grid asked for one.
@@ -4212,12 +4303,12 @@ pub enum LayoutKind {
     /// inversion both belong to the thing underneath it. A glyph that was its
     /// own target would invert a square in the middle of a button.
     InlineGlyph(Glyph),
-    /// A picture, already placed. `rect` is where it goes; the renderer scales
-    /// it to fit only if the application handed over something larger.
-    Picture(PictureHandle),
+    /// A picture, already placed. `rect` is the fitting target and the second
+    /// value decides whether unused space or a centered crop resolves its shape.
+    Picture(PictureHandle, PictureFit),
     /// A picture with a rule drawn around it, which is what an illustration
     /// set into a page wants and what a formula does not.
-    FramedPicture(PictureHandle),
+    FramedPicture(PictureHandle, PictureFit),
     ChoicePrompt,
     /// A stepper's reading: what is being adjusted and where it stands. Set in
     /// the middle of the row, between the two controls, and not itself a
@@ -4270,6 +4361,8 @@ impl LayoutKind {
             | Self::NavDestination(action, ..)
             | Self::NavDestinationSelected(action, ..)
             | Self::Tile(action, ControlState::Enabled)
+            | Self::MediaCard(action)
+            | Self::Section(Some(action))
             | Self::Field(action)
             | Self::FieldClear(action)
             | Self::Chip(action, _)
@@ -4547,6 +4640,8 @@ impl Layout {
                         | LayoutKind::RowMenu(_)
                         | LayoutKind::Cell(..)
                         | LayoutKind::Tile(_, ControlState::Enabled)
+                        | LayoutKind::MediaCard(_)
+                        | LayoutKind::Section(Some(_))
                         | LayoutKind::Field(_)
                         | LayoutKind::FieldClear(_)
                         | LayoutKind::Chip(_, _)
@@ -4693,7 +4788,9 @@ impl Layout {
             // control: what the reader touched was not the page.
             if matches!(
                 node.kind,
-                LayoutKind::Button(_, ControlState::Disabled, _) | LayoutKind::Scrim { .. }
+                LayoutKind::Button(_, ControlState::Disabled, _)
+                    | LayoutKind::Tile(_, ControlState::Disabled)
+                    | LayoutKind::Scrim { .. }
             ) {
                 return true;
             }
@@ -4739,6 +4836,8 @@ impl Layout {
                 | LayoutKind::NavDestination(candidate, ..)
                 | LayoutKind::NavDestinationSelected(candidate, ..)
                 | LayoutKind::Tile(candidate, ControlState::Enabled)
+                | LayoutKind::MediaCard(candidate)
+                | LayoutKind::Section(Some(candidate))
                 | LayoutKind::Field(candidate)
                 | LayoutKind::FieldClear(candidate)
                 | LayoutKind::Chip(candidate, _)
@@ -4787,6 +4886,81 @@ fn fit_within(source: (u32, u32), max_width: i32, max_height: i32) -> (i32, i32)
         ),
         max_height,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceWindow {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FittedPicture {
+    target: Rect,
+    source: SourceWindow,
+}
+
+fn fitted_picture(source: (u32, u32), target: Rect, fit: PictureFit) -> FittedPicture {
+    let source_width = usize::try_from(source.0).unwrap_or(0);
+    let source_height = usize::try_from(source.1).unwrap_or(0);
+    if source_width == 0 || source_height == 0 || target.width <= 0 || target.height <= 0 {
+        return FittedPicture {
+            target: Rect {
+                width: 0,
+                height: 0,
+                ..target
+            },
+            source: SourceWindow {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+        };
+    }
+    if fit == PictureFit::Contain {
+        let (width, height) = fit_within(source, target.width, target.height);
+        return FittedPicture {
+            target: Rect {
+                x: target.x + (target.width - width) / 2,
+                y: target.y + (target.height - height) / 2,
+                width,
+                height,
+            },
+            source: SourceWindow {
+                x: 0,
+                y: 0,
+                width: source_width,
+                height: source_height,
+            },
+        };
+    }
+    let target_width = usize::try_from(target.width).unwrap_or(0);
+    let target_height = usize::try_from(target.height).unwrap_or(0);
+    let (crop_width, crop_height) = if source_width.saturating_mul(target_height)
+        > source_height.saturating_mul(target_width)
+    {
+        (
+            source_height.saturating_mul(target_width) / target_height.max(1),
+            source_height,
+        )
+    } else {
+        (
+            source_width,
+            source_width.saturating_mul(target_height) / target_width.max(1),
+        )
+    };
+    FittedPicture {
+        target,
+        source: SourceWindow {
+            x: (source_width - crop_width) / 2,
+            y: (source_height - crop_height) / 2,
+            width: crop_width.max(1),
+            height: crop_height.max(1),
+        },
+    }
 }
 
 /// The first line of `text`, marked with an ellipsis when there was more.
@@ -4874,9 +5048,34 @@ fn intrinsic_width(node: &Node, available: i32, metrics: &DisplayMetrics, prose:
         Node::Rows { rows, .. } => rows
             .iter()
             .map(|row| {
+                let text_width = row_title_width_beside(
+                    metrics,
+                    ProseArea {
+                        width: available,
+                        height: 0,
+                        gap: 0,
+                        face: Face::Text,
+                    },
+                    row.trailing.as_deref().unwrap_or(""),
+                    row.menu.is_some(),
+                    row_mark_column(metrics),
+                );
+                let description = limited_lines(
+                    &row.description,
+                    text_width,
+                    FontSize::Caption,
+                    row.line_limits.description,
+                )
+                .iter()
+                .map(|line| measure_text(line, FontSize::Caption).0)
+                .max()
+                .unwrap_or(0);
                 let mut text = max(
-                    measure_text(&row.title, FontSize::Body).0,
-                    measure_text(&row.summary, FontSize::Caption).0,
+                    max(
+                        measure_text(&row.title, FontSize::Body).0,
+                        measure_text(&row.summary, FontSize::Caption).0,
+                    ),
+                    description,
                 );
                 if let Some(trailing) = &row.trailing {
                     text = text
@@ -4957,7 +5156,7 @@ fn row_lead_column(metrics: &DisplayMetrics, rows: &[Row]) -> i32 {
         column = max(
             column,
             match row.lead {
-                RowLead::Picture(..) => target,
+                RowLead::Picture(..) | RowLead::CoverSlot(_) => target,
                 RowLead::Icon(_) => row_mark_column(metrics),
                 RowLead::Number(number) => row_rank_column(metrics, number),
             },
@@ -5067,13 +5266,13 @@ fn lead_rect(
     let side = match lead {
         // A cover is the content of its row and wants every pixel the column
         // has.
-        RowLead::Picture(..) | RowLead::Number(_) => column,
+        RowLead::Picture(..) | RowLead::CoverSlot(_) | RowLead::Number(_) => column,
         RowLead::Icon(_) => min(column, metrics.tenth_mm(FontSize::Body.tenth_mm() * 6 / 5)),
     };
     let top = match lead {
         // A cover is the row's content rather than a label on it, so it sits
         // against the whole row the way a picture beside a paragraph does.
-        RowLead::Picture(..) => y.saturating_add((height - side) / 2),
+        RowLead::Picture(..) | RowLead::CoverSlot(_) => y.saturating_add((height - side) / 2),
         // A mark labels the row, and what it labels is the title. Centred on
         // the row instead it sinks the moment a summary wraps to a second
         // line, until it sits against the summary and reads as a mark on
@@ -5280,7 +5479,7 @@ fn layout_node(
                                     width: drawn_width,
                                     height: drawn_height,
                                 },
-                                kind: LayoutKind::Picture(formula.handle),
+                                kind: LayoutKind::Picture(formula.handle, PictureFit::Contain),
                                 text_lines: Vec::new(),
                             });
                             run_x = run_x.saturating_add(drawn_width);
@@ -5441,10 +5640,20 @@ fn layout_node(
             });
             y.saturating_add(height)
         }
-        Node::Section { id, title, value } => {
+        Node::Section {
+            id,
+            title,
+            value,
+            action,
+        } => {
             let lead = metrics.space(Space::Small);
             let trail = metrics.space(Space::Tight);
             let line = FontSize::Caption.line_height();
+            let target_height = if action.is_some() {
+                max(line, metrics.touch_target_minimum())
+            } else {
+                line
+            };
             let gap = metrics.space(Space::Tight);
             // The value is measured first and the title clamped against what
             // is left, so a long name gives up its own hairline rather than
@@ -5474,13 +5683,13 @@ fn layout_node(
                     x,
                     y: y.saturating_add(lead),
                     width,
-                    height: line,
+                    height: target_height,
                 },
-                kind: LayoutKind::Section,
+                kind: LayoutKind::Section(*action),
                 text_lines,
             });
             y.saturating_add(lead)
-                .saturating_add(line)
+                .saturating_add(target_height)
                 .saturating_add(trail)
         }
         Node::Quote {
@@ -6330,10 +6539,10 @@ fn layout_node(
             let gap = metrics.space(Space::Tight);
             let icon = row_lead_column(metrics, rows);
             let text_x = x.saturating_add(icon).saturating_add(padding);
-            let text_width = max(1, width - icon - padding * 2);
+            let available_text_width = max(1, width - icon - padding * 2);
             let mut cursor = y;
             for (position, row) in rows.iter().take(MAX_ROWS).enumerate() {
-                if layout.nodes.len() + 6 > MAX_LAYOUT_NODES {
+                if layout.nodes.len() + 8 > MAX_LAYOUT_NODES {
                     break;
                 }
                 // Separators go between rows, never after the last one. A
@@ -6370,7 +6579,7 @@ fn layout_node(
                 } else {
                     0
                 };
-                let text_width = max(1, text_width - menu_column);
+                let trailing_text_width = max(1, available_text_width - menu_column);
                 // Measured before the title is wrapped, so the value keeps its
                 // room and the title gives up its own instead.
                 let trailing =
@@ -6378,26 +6587,35 @@ fn layout_node(
                         .as_ref()
                         .filter(|value| !value.is_empty())
                         .map(|value| {
-                            let value = one_line(value, text_width, FontSize::Caption);
+                            let value = one_line(value, trailing_text_width, FontSize::Caption);
                             let measured = measure_text(&value, FontSize::Caption).0;
                             (value, measured)
                         });
-                let text_width = trailing.as_ref().map_or(text_width, |(_, measured)| {
-                    max(1, text_width - measured - padding)
-                });
-                let title_lines = wrap_text(&row.title, text_width, FontSize::Body);
-                let summary_lines = if row.summary.is_empty() {
-                    Vec::new()
-                } else {
-                    wrap_text(&row.summary, text_width, FontSize::Caption)
-                };
-                let title_height = title_lines.len() as i32 * FontSize::Body.line_height();
-                let summary_height = summary_lines.len() as i32 * FontSize::Caption.line_height();
-                let content = title_height.saturating_add(summary_height);
-                // Never shorter than a finger, however terse the entry is.
-                let height = max(
-                    metrics.touch_target_default(),
-                    content.saturating_add(padding * 2),
+                let RowMeasurement {
+                    text_width,
+                    title_lines,
+                    summary_lines,
+                    description_lines,
+                    title_height,
+                    summary_height,
+                    description_height,
+                    content_height: content,
+                    height,
+                } = measure_row(
+                    metrics,
+                    ProseArea {
+                        width,
+                        height: bottom.saturating_sub(y),
+                        gap,
+                        face: prose,
+                    },
+                    &row.title,
+                    &row.summary,
+                    &row.description,
+                    row.trailing.as_deref().unwrap_or(""),
+                    row.menu.is_some(),
+                    icon,
+                    row.line_limits,
                 );
                 layout.nodes.push(LayoutNode {
                     id: *id,
@@ -6444,6 +6662,21 @@ fn layout_node(
                         text_lines: summary_lines,
                     });
                 }
+                if description_height > 0 {
+                    layout.nodes.push(LayoutNode {
+                        id: *id,
+                        rect: Rect {
+                            x: text_x,
+                            y: text_y
+                                .saturating_add(title_height)
+                                .saturating_add(summary_height),
+                            width: text_width,
+                            height: description_height,
+                        },
+                        kind: LayoutKind::RowDescription,
+                        text_lines: description_lines,
+                    });
+                }
                 if let Some((value, measured)) = trailing {
                     layout.nodes.push(LayoutNode {
                         id: *id,
@@ -6486,11 +6719,15 @@ fn layout_node(
             id,
             handle,
             source,
+            fit,
             max_height_tenths_mm,
             framed,
         } => {
             let ceiling = metrics.tenth_mm(i32::from(*max_height_tenths_mm));
-            let (drawn_width, drawn_height) = fit_within(*source, width, ceiling);
+            let (drawn_width, drawn_height) = match fit {
+                PictureFit::Contain => fit_within(*source, width, ceiling),
+                PictureFit::Cover => (width, ceiling),
+            };
             layout.nodes.push(LayoutNode {
                 id: *id,
                 rect: Rect {
@@ -6500,9 +6737,9 @@ fn layout_node(
                     height: drawn_height,
                 },
                 kind: if *framed {
-                    LayoutKind::FramedPicture(*handle)
+                    LayoutKind::FramedPicture(*handle, *fit)
                 } else {
-                    LayoutKind::Picture(*handle)
+                    LayoutKind::Picture(*handle, *fit)
                 },
                 text_lines: Vec::new(),
             });
@@ -6629,8 +6866,15 @@ fn layout_node(
                 // exactly the tile's proportion is letterboxed rather than
                 // stretched. A stretched face is worse than a smaller one.
                 let (mark, mark_width, mark_height) = if let Some(picture) = tile.picture {
-                    let (width, height) = fit_within(picture.source, cell, body);
-                    (LayoutKind::FramedPicture(picture.handle), width, height)
+                    let (width, height) = match picture.fit {
+                        PictureFit::Contain => fit_within(picture.source, cell, body),
+                        PictureFit::Cover => (cell, body),
+                    };
+                    (
+                        LayoutKind::FramedPicture(picture.handle, picture.fit),
+                        width,
+                        height,
+                    )
                 } else {
                     let size = metrics.tenth_mm(110);
                     (LayoutKind::TileGlyph(tile.glyph), size, size)
@@ -6745,6 +6989,184 @@ fn layout_node(
             };
             layout.nodes[index].rect.height = height;
             y.saturating_add(height)
+        }
+        Node::ImageStrip { id, tiles } => {
+            let columns = 3_i32;
+            let gutter = metrics.space(Space::Small);
+            let cell_width = (width - gutter * 2) / columns;
+            let cell_height = cell_width * TileShape::Portrait.eighths() / 8;
+            if tiles.is_empty() || y.saturating_add(cell_height) > bottom {
+                return y;
+            }
+            for (position, tile) in tiles.iter().take(MAX_IMAGE_STRIP_ITEMS).enumerate() {
+                if layout.nodes.len() + 2 > MAX_LAYOUT_NODES {
+                    break;
+                }
+                let cell_x =
+                    x.saturating_add(position as i32 * (cell_width.saturating_add(gutter)));
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x,
+                        y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    kind: LayoutKind::Tile(
+                        tile.action,
+                        if tile.state.is_tappable() {
+                            ControlState::Enabled
+                        } else {
+                            ControlState::Disabled
+                        },
+                    ),
+                    text_lines: Vec::new(),
+                });
+                let (kind, mark_width, mark_height) = if let Some(picture) = tile.picture {
+                    (
+                        LayoutKind::FramedPicture(picture.handle, PictureFit::Cover),
+                        cell_width,
+                        cell_height,
+                    )
+                } else {
+                    let size = min(
+                        metrics.tenth_mm(110),
+                        min(cell_width.max(0), cell_height.max(0)),
+                    );
+                    (LayoutKind::TileGlyph(tile.glyph), size, size)
+                };
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x.saturating_add((cell_width - mark_width) / 2),
+                        y: y.saturating_add((cell_height - mark_height) / 2),
+                        width: mark_width,
+                        height: mark_height,
+                    },
+                    kind,
+                    text_lines: Vec::new(),
+                });
+            }
+            y.saturating_add(cell_height)
+        }
+        Node::MediaGrid { id, tiles } => {
+            let columns = 2_i32;
+            let rows = 3_i32;
+            let column_gap = metrics.space(Space::Small);
+            let row_gap = metrics.space(Space::Tight);
+            let cell_width = (width - column_gap) / columns;
+            let cell_height = max(
+                metrics.touch_target_default(),
+                (bottom - y - row_gap * (rows - 1)) / rows,
+            );
+            let picture_width = min(cell_width * 2 / 5, cell_height * 2 / 3);
+            let picture_height = min(
+                cell_height,
+                picture_width * TileShape::Portrait.eighths() / 8,
+            );
+            let inset = metrics.space(Space::Tight);
+            let title_height = FontSize::Body.line_height();
+            let summary_height = FontSize::Caption.line_height();
+            let text_height = title_height.saturating_add(summary_height);
+            let text_width = max(
+                1,
+                cell_width
+                    .saturating_sub(picture_width)
+                    .saturating_sub(inset * 2),
+            );
+            let mut placed_rows = 0;
+            for (position, tile) in tiles.iter().take(MAX_MEDIA_GRID_ITEMS).enumerate() {
+                if layout.nodes.len() + 4 > MAX_LAYOUT_NODES {
+                    break;
+                }
+                let column = position as i32 % columns;
+                let row = position as i32 / columns;
+                let cell_x = x.saturating_add(column * (cell_width.saturating_add(column_gap)));
+                let cell_y = y.saturating_add(row * (cell_height.saturating_add(row_gap)));
+                if cell_y.saturating_add(cell_height) > bottom {
+                    // Retain the first omitted cell as a non-drawing marker so
+                    // diagnostics report that this fixed grid was not paged.
+                    layout.nodes.push(LayoutNode {
+                        id: *id,
+                        rect: Rect {
+                            x: cell_x,
+                            y: cell_y,
+                            width: cell_width,
+                            height: cell_height,
+                        },
+                        kind: LayoutKind::Spacer,
+                        text_lines: Vec::new(),
+                    });
+                    break;
+                }
+                placed_rows = row + 1;
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x,
+                        y: cell_y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    kind: LayoutKind::MediaCard(tile.action),
+                    text_lines: Vec::new(),
+                });
+                let picture_y =
+                    cell_y.saturating_add((cell_height.saturating_sub(picture_height)) / 2);
+                let (kind, mark_width, mark_height) = if let Some(picture) = tile.picture {
+                    (
+                        LayoutKind::FramedPicture(picture.handle, picture.fit),
+                        picture_width,
+                        picture_height,
+                    )
+                } else {
+                    let size = min(
+                        metrics.tenth_mm(110),
+                        min(picture_width.max(0), picture_height.max(0)),
+                    );
+                    (LayoutKind::TileGlyph(tile.glyph), size, size)
+                };
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x.saturating_add((picture_width - mark_width) / 2),
+                        y: picture_y.saturating_add((picture_height - mark_height) / 2),
+                        width: mark_width,
+                        height: mark_height,
+                    },
+                    kind,
+                    text_lines: Vec::new(),
+                });
+                let text_x = cell_x.saturating_add(picture_width).saturating_add(inset);
+                let text_y = cell_y.saturating_add((cell_height - text_height) / 2);
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: text_x,
+                        y: text_y,
+                        width: text_width,
+                        height: title_height,
+                    },
+                    kind: LayoutKind::RowTitle,
+                    text_lines: vec![one_line(&tile.label, text_width, FontSize::Body)],
+                });
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: text_x,
+                        y: text_y.saturating_add(title_height),
+                        width: text_width,
+                        height: summary_height,
+                    },
+                    kind: LayoutKind::RowSummary,
+                    text_lines: vec![one_line(&tile.subtitle, text_width, FontSize::Caption)],
+                });
+            }
+            if placed_rows == 0 {
+                y
+            } else {
+                y.saturating_add(placed_rows * cell_height + (placed_rows - 1) * row_gap)
+            }
         }
         Node::Stepper {
             id,
@@ -7672,6 +8094,28 @@ pub fn measure_text_in(text: &str, size: FontSize, face: Face) -> (i32, i32) {
     )
 }
 
+/// Removes characters the installed face cannot draw.
+///
+/// Without an installed typesetter the input is retained: the built-in
+/// fallback cannot authoritatively describe the runtime face's coverage.
+#[must_use]
+pub fn drawable_text_in(text: &str, face: Face) -> String {
+    with_typesetter(face, |typesetter| {
+        drawable_text_with(text, |character| typesetter.has_glyph(character, face))
+    })
+    .unwrap_or_else(|| text.to_owned())
+}
+
+fn drawable_text_with(text: &str, mut has_glyph: impl FnMut(char) -> bool) -> String {
+    let mut drawable = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_whitespace() || has_glyph(character) {
+            drawable.push(character);
+        }
+    }
+    drawable
+}
+
 /// The first character of `text` the installed face cannot draw, if any.
 ///
 /// A character with no glyph is drawn as an empty box, which on a panel reads
@@ -8270,8 +8714,10 @@ pub fn paginate_rows_in_sections(
             title,
             summary,
             "",
+            "",
             false,
             row_mark_column(metrics),
+            RowLineLimits::default(),
         ) + if section.is_some() { header } else { 0 };
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
@@ -8382,37 +8828,107 @@ fn trailing_height(
     cursor
 }
 
-/// How tall one row comes out, measured the way the layout engine measures it.
-///
-/// Including the columns a trailing value and an overflow mark keep for
-/// themselves. Pagination that ignores either wraps the title and the summary
-/// at a width the row will never have, comes back one row short per page, and
-/// the extra row is drawn under the bottom bar where it is clipped away.
+/// Wraps one row text block, applying an optional line limit.
+fn limited_lines(text: &str, width: i32, size: FontSize, limit: u8) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if limit == 0 {
+        wrap_text(text, width, size)
+    } else {
+        wrap_text(
+            &clamp_lines(text, width, size, usize::from(limit)),
+            width,
+            size,
+        )
+    }
+}
+
+struct RowMeasurement {
+    text_width: i32,
+    title_lines: Vec<String>,
+    summary_lines: Vec<String>,
+    description_lines: Vec<String>,
+    title_height: i32,
+    summary_height: i32,
+    description_height: i32,
+    content_height: i32,
+    height: i32,
+}
+
+/// Measures and wraps one row exactly as both layout and pagination use it.
+#[allow(clippy::too_many_arguments)]
+fn measure_row(
+    metrics: &DisplayMetrics,
+    area: ProseArea,
+    title: &str,
+    summary: &str,
+    description: &str,
+    trailing: &str,
+    menu: bool,
+    lead: i32,
+    limits: RowLineLimits,
+) -> RowMeasurement {
+    let padding = metrics.space(Space::Small);
+    let text_width = row_title_width_beside(metrics, area, trailing, menu, lead);
+    let title_lines = limited_lines(title, text_width, FontSize::Body, limits.title);
+    let summary_lines = limited_lines(summary, text_width, FontSize::Caption, limits.summary);
+    let description_lines = limited_lines(
+        description,
+        text_width,
+        FontSize::Caption,
+        limits.description,
+    );
+    let title_height = title_lines.len() as i32 * FontSize::Body.line_height();
+    let summary_height = summary_lines.len() as i32 * FontSize::Caption.line_height();
+    let description_height = description_lines.len() as i32 * FontSize::Caption.line_height();
+    let content_height = title_height
+        .saturating_add(summary_height)
+        .saturating_add(description_height);
+    // Never shorter than a finger, however terse the entry is: the same
+    // floor the layout engine applies.
+    let height = max(
+        metrics.touch_target_default(),
+        content_height.saturating_add(padding * 2),
+    );
+    RowMeasurement {
+        text_width,
+        title_lines,
+        summary_lines,
+        description_lines,
+        title_height,
+        summary_height,
+        description_height,
+        content_height,
+        height,
+    }
+}
+
+/// How tall one row comes out, measured by the same path that lays it out.
+#[allow(clippy::too_many_arguments)]
 fn measured_row_height(
     metrics: &DisplayMetrics,
     area: ProseArea,
     title: &str,
     summary: &str,
+    description: &str,
     trailing: &str,
     menu: bool,
     lead: i32,
+    limits: RowLineLimits,
 ) -> i32 {
-    let padding = metrics.space(Space::Small);
-    let text_width = row_title_width_beside(metrics, area, trailing, menu, lead);
-    let title_height =
-        wrap_text(title, text_width, FontSize::Body).len() as i32 * FontSize::Body.line_height();
-    let summary_height = if summary.is_empty() {
-        0
-    } else {
-        wrap_text(summary, text_width, FontSize::Caption).len() as i32
-            * FontSize::Caption.line_height()
-    };
-    // Never shorter than a finger, however terse the entry is: the same
-    // floor the layout engine applies.
-    max(
-        metrics.touch_target_default(),
-        title_height + summary_height + padding * 2,
+    measure_row(
+        metrics,
+        area,
+        title,
+        summary,
+        description,
+        trailing,
+        menu,
+        lead,
+        limits,
     )
+    .height
 }
 
 /// The same, for rows that carry a value at their trailing edge.
@@ -8427,6 +8943,39 @@ pub fn paginate_rows_with_trailing(
     area: ProseArea,
 ) -> Vec<Vec<usize>> {
     paginate_rows_measured(rows, metrics, area, false, row_mark_column(metrics))
+}
+
+/// Breaks bounded rows with descriptions and trailing values into pages.
+///
+/// This paginator serves collection rows, whose leads are cover pictures. It
+/// therefore reserves the full picture column rather than the narrower mark
+/// column; the tuple deliberately carries no second, contradictory lead shape.
+///
+/// Returns row indices so callers can build each page without cloning source
+/// data.
+#[must_use]
+pub fn paginate_described_rows_with_trailing(
+    rows: &[(&str, &str, &str, &str)],
+    limits: RowLineLimits,
+    metrics: &DisplayMetrics,
+    area: ProseArea,
+) -> Vec<Vec<usize>> {
+    paginate_row_heights(
+        rows.iter().map(|(title, summary, description, trailing)| {
+            measured_row_height(
+                metrics,
+                area,
+                title,
+                summary,
+                description,
+                trailing,
+                false,
+                metrics.touch_target_default(),
+                limits,
+            )
+        }),
+        area,
+    )
 }
 
 /// The same, for a ranked list, whose rows lead with digits rather than a mark.
@@ -8478,18 +9027,36 @@ fn paginate_rows_measured(
     menu: bool,
     lead: i32,
 ) -> Vec<Vec<usize>> {
+    paginate_row_heights(
+        rows.iter().map(|(title, summary, trailing)| {
+            measured_row_height(
+                metrics,
+                area,
+                title,
+                summary,
+                "",
+                trailing,
+                menu,
+                lead,
+                RowLineLimits::default(),
+            )
+        }),
+        area,
+    )
+}
+
+fn paginate_row_heights(
+    heights: impl IntoIterator<Item = i32>,
+    area: ProseArea,
+) -> Vec<Vec<usize>> {
     // A gap, the divider drawn inside it, then another gap: the engine
     // advances by the row's height and a gap, then leaves a second gap after
-    // the rule it draws before the next row. The rule's own thickness is not
-    // part of the stride, and counting it instead of the second gap made
-    // every separator eight pixels short -- enough, over four of them, to
-    // pull a whole extra row onto a page it then overflowed.
+    // the rule it draws before the next row.
     let separator = area.gap * 2;
     let mut pages: Vec<Vec<usize>> = Vec::new();
     let mut page: Vec<usize> = Vec::new();
     let mut used = 0;
-    for (index, (title, summary, trailing)) in rows.iter().enumerate() {
-        let height = measured_row_height(metrics, area, title, summary, trailing, menu, lead);
+    for (index, height) in heights.into_iter().enumerate() {
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
             pages.push(std::mem::take(&mut page));
@@ -8505,9 +9072,6 @@ fn paginate_rows_measured(
     }
     if !page.is_empty() {
         pages.push(page);
-    }
-    if pages.is_empty() {
-        pages.push(Vec::new());
     }
     pages
 }
@@ -8536,8 +9100,10 @@ pub fn paginate_rows(
             title,
             summary,
             "",
+            "",
             false,
             row_mark_column(metrics),
+            RowLineLimits::default(),
         );
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
@@ -9600,7 +10166,9 @@ fn nodes_reference_rgb(nodes: &[Node], pictures: &dyn Pictures) -> bool {
                 RowLead::Picture(picture, _) if picture_is_rgb(picture.handle, pictures)
             )
         }),
-        Node::TileGrid { tiles, .. } => tiles.iter().any(|tile| {
+        Node::TileGrid { tiles, .. }
+        | Node::ImageStrip { tiles, .. }
+        | Node::MediaGrid { tiles, .. } => tiles.iter().any(|tile| {
             tile.picture
                 .is_some_and(|picture| picture_is_rgb(picture.handle, pictures))
         }),
@@ -9832,7 +10400,7 @@ fn validate_composition(
 /// A label belonging to a node that has somewhere better to put its state.
 fn stateful_label(node: &Node) -> Option<(NodeId, &str)> {
     match node {
-        Node::TileGrid { id, tiles, .. } => tiles
+        Node::TileGrid { id, tiles, .. } | Node::MediaGrid { id, tiles } => tiles
             .iter()
             .find(|tile| state_written_into(&tile.label))
             .map(|tile| (*id, tile.label.as_str())),
@@ -9885,14 +10453,14 @@ fn going_back(node: &Node) -> Option<&str> {
 fn orphaned_section(layout: &Layout) -> Option<NodeId> {
     let mut nodes = layout.nodes.iter().peekable();
     while let Some(node) = nodes.next() {
-        if !matches!(node.kind, LayoutKind::Section) {
+        if !matches!(node.kind, LayoutKind::Section(_)) {
             continue;
         }
         match nodes.peek() {
             // Nothing after it at all, or another section immediately after
             // it: either way the header is standing on its own.
             None => return Some(node.id),
-            Some(next) if matches!(next.kind, LayoutKind::Section) => return Some(node.id),
+            Some(next) if matches!(next.kind, LayoutKind::Section(_)) => return Some(node.id),
             _ => {}
         }
     }
@@ -9911,18 +10479,22 @@ fn tones_used(layout: &Layout) -> usize {
             LayoutKind::Divider
             | LayoutKind::RowRule
             | LayoutKind::TabRule
-            | LayoutKind::Section => {
+            | LayoutKind::Section(_) => {
                 hairline = true;
             }
             LayoutKind::Secondary
             | LayoutKind::TileSubtitle
             | LayoutKind::RowSummary
+            | LayoutKind::RowDescription
             | LayoutKind::TableHeaderCell
             | LayoutKind::FactLabel
             | LayoutKind::PagePosition
             | LayoutKind::ActivityBytes
             | LayoutKind::ActivityFailure => muted = true,
-            LayoutKind::Card | LayoutKind::Tile(..) | LayoutKind::Overlay => surface = true,
+            LayoutKind::Card
+            | LayoutKind::Tile(..)
+            | LayoutKind::MediaCard(_)
+            | LayoutKind::Overlay => surface = true,
             LayoutKind::Banner(BannerLevel::Attention)
             | LayoutKind::NavDestinationSelected(..)
             | LayoutKind::Chip(_, true)
@@ -10105,13 +10677,44 @@ fn validate_node(
                 issues.push(limit_issue(id, "rows", rows.len(), MAX_ROWS));
             }
             for row in rows {
-                check_text_coverage(id, &row.title, Face::Text, issues);
-                check_text_coverage(id, &row.summary, Face::Text, issues);
+                check_row_text_coverage(id, row, issues);
             }
         }
         Node::TileGrid { tiles, .. } => {
             for tile in tiles {
                 check_text_coverage(id, &tile.label, Face::Text, issues);
+                if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
+                    check_picture(id, picture.handle, picture.source, pictures, issues);
+                }
+            }
+        }
+        Node::ImageStrip { tiles, .. } => {
+            if tiles.len() > MAX_IMAGE_STRIP_ITEMS {
+                issues.push(limit_issue(
+                    id,
+                    "image strip",
+                    tiles.len(),
+                    MAX_IMAGE_STRIP_ITEMS,
+                ));
+            }
+            for tile in tiles.iter().take(MAX_IMAGE_STRIP_ITEMS) {
+                if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
+                    check_picture(id, picture.handle, picture.source, pictures, issues);
+                }
+            }
+        }
+        Node::MediaGrid { tiles, .. } => {
+            if tiles.len() > MAX_MEDIA_GRID_ITEMS {
+                issues.push(limit_issue(
+                    id,
+                    "media grid",
+                    tiles.len(),
+                    MAX_MEDIA_GRID_ITEMS,
+                ));
+            }
+            for tile in tiles.iter().take(MAX_MEDIA_GRID_ITEMS) {
+                check_text_coverage(id, &tile.label, Face::Text, issues);
+                check_text_coverage(id, &tile.subtitle, Face::Text, issues);
                 if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
                     check_picture(id, picture.handle, picture.source, pictures, issues);
                 }
@@ -10239,6 +10842,31 @@ fn check_text_coverage(id: NodeId, text: &str, face: Face, issues: &mut Vec<Layo
     }
 }
 
+fn check_row_text_coverage(id: NodeId, row: &Row, issues: &mut Vec<LayoutIssue>) {
+    check_row_text_coverage_with(id, row, issues, undrawable_in);
+}
+
+fn check_row_text_coverage_with(
+    id: NodeId,
+    row: &Row,
+    issues: &mut Vec<LayoutIssue>,
+    mut undrawable: impl FnMut(&str, Face) -> Option<char>,
+) {
+    for text in [&row.title, &row.summary, &row.description] {
+        if let Some(character) = undrawable(text, Face::Text) {
+            issues.push(LayoutIssue {
+                severity: DiagnosticSeverity::Error,
+                node: Some(id),
+                kind: LayoutIssueKind::UnsupportedCharacter {
+                    character,
+                    face: Face::Text,
+                },
+                rect: None,
+            });
+        }
+    }
+}
+
 fn validate_content_bounds(
     nodes: &[&Node],
     layout: &Layout,
@@ -10254,6 +10882,8 @@ fn validate_content_bounds(
         // A flex draws nothing by design: it moves the cursor and leaves. So
         // does an empty list. Neither is content that layout hid.
         let expects_rect = !matches!(node, Node::Rows { rows, .. } if rows.is_empty())
+            && !matches!(node, Node::ImageStrip { tiles, .. } if tiles.is_empty())
+            && !matches!(node, Node::MediaGrid { tiles, .. } if tiles.is_empty())
             && !matches!(node, Node::Flex { .. });
         if expects_rect
             && (rects.is_empty()
@@ -10323,7 +10953,7 @@ fn validate_layout_nodes(layout: &Layout, metrics: &DisplayMetrics, issues: &mut
         // them beside each other on one line with the hairline between. Counting
         // them as two lines reported every `section_with_value` on every screen
         // as text overflowing a rect it fits inside perfectly well.
-        let rows = if matches!(node.kind, LayoutKind::Section) {
+        let rows = if matches!(node.kind, LayoutKind::Section(_)) {
             1
         } else {
             i32::try_from(node.text_lines.len()).unwrap_or(i32::MAX)
@@ -10361,6 +10991,8 @@ const fn is_tappable(kind: LayoutKind) -> bool {
             | LayoutKind::RowMenu(_)
             | LayoutKind::Cell(..)
             | LayoutKind::Tile(..)
+            | LayoutKind::MediaCard(_)
+            | LayoutKind::Section(Some(_))
             | LayoutKind::Field(_)
             | LayoutKind::FieldClear(_)
             | LayoutKind::Chip(_, _)
@@ -10387,11 +11019,12 @@ fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
         LayoutKind::TopBarTitle => BAR_TITLE,
         LayoutKind::OverlayTitle => FontSize::Title,
         LayoutKind::Secondary
-        | LayoutKind::Section
+        | LayoutKind::Section(_)
         | LayoutKind::TableHeaderCell
         | LayoutKind::FactLabel
         | LayoutKind::RowTrailing
         | LayoutKind::RowSummary
+        | LayoutKind::RowDescription
         | LayoutKind::TileLabel
         | LayoutKind::TileSubtitle
         | LayoutKind::TileBadge
@@ -10729,19 +11362,20 @@ pub fn render(screen: &Screen, surface: &mut Surface, dirty: Option<Rect>) {
     );
 }
 
-/// Draws `pixels` into `rect`, shrinking by averaging when the picture is
-/// larger than the space it was given.
+/// Draws one source window from `pixels` into `rect`, averaging when the
+/// window is larger than the space it was given.
 ///
 /// Averaging rather than sampling matters here: dropping pixels from a
 /// halftoned image produces moire, which on a sixteen-grey panel looks like
 /// damage. An application that fitted the picture before handing it over lands
 /// in the exact-size path and pays nothing.
-fn draw_picture(
+fn draw_picture_window(
     surface: &mut Surface,
     rect: Rect,
     source: (u32, u32),
     pixels: PicturePixelsRef<'_>,
     clip: Rect,
+    window: SourceWindow,
 ) {
     let Some(visible) = rect
         .intersection(clip)
@@ -10754,9 +11388,21 @@ fn draw_picture(
     else {
         return;
     };
-    if rect.width <= 0 || rect.height <= 0 || source_width == 0 || source_height == 0 {
+    if rect.width <= 0
+        || rect.height <= 0
+        || source_width == 0
+        || source_height == 0
+        || window.width == 0
+        || window.height == 0
+        || window.x >= source_width
+        || window.y >= source_height
+    {
         return;
     }
+    let window_right = window.x.saturating_add(window.width).min(source_width);
+    let window_bottom = window.y.saturating_add(window.height).min(source_height);
+    let window_width = window_right - window.x;
+    let window_height = window_bottom - window.y;
     let target_width = rect.width as usize;
     let target_height = rect.height as usize;
     match pixels {
@@ -10769,17 +11415,24 @@ fn draw_picture(
             }
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
-                let from_y = row * source_height / target_height;
-                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                let local_from_y = row * window_height / target_height;
+                let local_to_y = max(local_from_y + 1, (row + 1) * window_height / target_height)
+                    .min(window_height);
+                let from_y = window.y + local_from_y;
+                let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
-                    let from_x = column * source_width / target_width;
-                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let local_from_x = column * window_width / target_width;
+                    let local_to_x =
+                        max(local_from_x + 1, (column + 1) * window_width / target_width)
+                            .min(window_width);
+                    let from_x = window.x + local_from_x;
+                    let to_x = window.x + local_to_x;
                     let mut total = 0u64;
                     let mut counted = 0u64;
-                    for sample_y in from_y..to_y.min(source_height) {
+                    for sample_y in from_y..to_y {
                         let base = sample_y * source_width;
-                        for sample_x in from_x..to_x.min(source_width) {
+                        for sample_x in from_x..to_x {
                             total += u64::from(gray[base + sample_x]);
                             counted += 1;
                         }
@@ -10804,17 +11457,24 @@ fn draw_picture(
             }
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
-                let from_y = row * source_height / target_height;
-                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                let local_from_y = row * window_height / target_height;
+                let local_to_y = max(local_from_y + 1, (row + 1) * window_height / target_height)
+                    .min(window_height);
+                let from_y = window.y + local_from_y;
+                let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
-                    let from_x = column * source_width / target_width;
-                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let local_from_x = column * window_width / target_width;
+                    let local_to_x =
+                        max(local_from_x + 1, (column + 1) * window_width / target_width)
+                            .min(window_width);
+                    let from_x = window.x + local_from_x;
+                    let to_x = window.x + local_to_x;
                     let mut totals = [0u64; 3];
                     let mut counted = 0u64;
-                    for sample_y in from_y..to_y.min(source_height) {
+                    for sample_y in from_y..to_y {
                         let base = sample_y * source_width;
-                        for sample_x in from_x..to_x.min(source_width) {
+                        for sample_x in from_x..to_x {
                             let start = (base + sample_x) * 3;
                             for (total, channel) in totals.iter_mut().zip(&rgb[start..start + 3]) {
                                 *total += u64::from(*channel);
@@ -10834,6 +11494,45 @@ fn draw_picture(
                 }
             }
         }
+    }
+}
+
+fn draw_fitted_picture(
+    surface: &mut Surface,
+    target: Rect,
+    source: (u32, u32),
+    pixels: PicturePixelsRef<'_>,
+    clip: Rect,
+    fit: PictureFit,
+) {
+    let fitted = fitted_picture(source, target, fit);
+    draw_picture_window(surface, fitted.target, source, pixels, clip, fitted.source);
+}
+
+/// Draws into a target whose geometry was already settled by layout.
+fn draw_placed_picture(
+    surface: &mut Surface,
+    target: Rect,
+    source: (u32, u32),
+    pixels: PicturePixelsRef<'_>,
+    clip: Rect,
+    fit: PictureFit,
+) {
+    match fit {
+        PictureFit::Contain => draw_picture_window(
+            surface,
+            target,
+            source,
+            pixels,
+            clip,
+            SourceWindow {
+                x: 0,
+                y: 0,
+                width: usize::try_from(source.0).unwrap_or(0),
+                height: usize::try_from(source.1).unwrap_or(0),
+            },
+        ),
+        PictureFit::Cover => draw_fitted_picture(surface, target, source, pixels, clip, fit),
     }
 }
 
@@ -11366,7 +12065,7 @@ fn render_all_with_selected_font(
             // Title, hairline, count: one node, because the three are one
             // thing and splitting them would let a repaint move the rule
             // without the words it belongs to.
-            LayoutKind::Section => {
+            LayoutKind::Section(_) => {
                 let size = FontSize::Caption;
                 let thickness = metrics.rule_thickness();
                 let gap = metrics.space(Space::Tight);
@@ -11597,7 +12296,7 @@ fn render_all_with_selected_font(
                     clip,
                 );
             }
-            LayoutKind::Tile(..) => stroke_clipped(
+            LayoutKind::Tile(..) | LayoutKind::MediaCard(_) => stroke_clipped(
                 surface,
                 node.rect,
                 tone::RULE,
@@ -11634,6 +12333,15 @@ fn render_all_with_selected_font(
                 tone::MUTED,
                 clip,
             ),
+            LayoutKind::RowDescription => draw_lines(
+                surface,
+                &node.text_lines,
+                node.rect.x,
+                node.rect.y,
+                FontSize::Caption,
+                tone::MUTED,
+                clip,
+            ),
             LayoutKind::RowLead(lead) => draw_row_lead(surface, lead, node.rect, pictures, clip),
             // Inset from the finger-wide target it sits in, so the mark is the
             // size of a mark and the thing you press is the size of a finger.
@@ -11657,20 +12365,20 @@ fn render_all_with_selected_font(
             }
             // Bare, because a formula is part of a sentence and a rule round
             // one would read as a box drawn in the middle of the words.
-            LayoutKind::Picture(handle) => {
+            LayoutKind::Picture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_picture(surface, node.rect, source, pixels, clip);
+                        draw_placed_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
             }
             // Outlined, because a cover or a plate with pale edges on white
             // paper has no boundary at all and reads as text floating in
             // space.
-            LayoutKind::FramedPicture(handle) => {
+            LayoutKind::FramedPicture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_picture(surface, node.rect, source, pixels, clip);
+                        draw_placed_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
                 stroke_clipped(
@@ -12173,6 +12881,7 @@ fn draw_row_lead(
 ) {
     match lead {
         RowLead::Icon(glyph) => draw_glyph_icon(surface, glyph, rect, clip),
+        RowLead::CoverSlot(glyph) => draw_glyph_icon(surface, glyph, rect, clip),
         // The glyph is not a decoration to fall back to, it is the row still
         // working while the covers are arriving. A shelf that draws nothing
         // until every thumbnail has decoded is a shelf of empty squares.
@@ -12181,14 +12890,19 @@ fn draw_row_lead(
                 let source = pictures
                     .dimensions(picture.handle)
                     .unwrap_or(picture.source);
-                let (width, height) = fit_within(picture.source, rect.width, rect.height);
-                let fitted = Rect {
-                    x: rect.x + (rect.width - width) / 2,
-                    y: rect.y + (rect.height - height) / 2,
-                    width,
-                    height,
+                let fitted = match picture.fit {
+                    PictureFit::Contain => {
+                        let (width, height) = fit_within(picture.source, rect.width, rect.height);
+                        Rect {
+                            x: rect.x + (rect.width - width) / 2,
+                            y: rect.y + (rect.height - height) / 2,
+                            width,
+                            height,
+                        }
+                    }
+                    PictureFit::Cover => rect,
                 };
-                draw_picture(surface, fitted, source, pixels, clip);
+                draw_placed_picture(surface, fitted, source, pixels, clip, picture.fit);
                 stroke_clipped(surface, fitted, tone::RULE, 1, clip);
             }
             None => draw_glyph_icon(surface, glyph, rect, clip),
@@ -13214,7 +13928,12 @@ mod tests {
         let picture = layout
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, LayoutKind::Picture(PictureHandle(3))))
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    LayoutKind::Picture(PictureHandle(3), PictureFit::Contain)
+                )
+            })
             .expect("the formula should have been laid out");
         assert_eq!((picture.rect.width, picture.rect.height), (60, 30));
         // The words are still in the paragraph -- a search and a selection
@@ -13427,6 +14146,7 @@ mod tests {
                     id: NodeId(1),
                     handle: PictureHandle(7),
                     source: (10, 10),
+                    fit: PictureFit::Contain,
                     max_height_tenths_mm: 100,
                     framed,
                 }],
@@ -13435,13 +14155,13 @@ mod tests {
             .nodes
             .into_iter()
             .find_map(|node| match node.kind {
-                LayoutKind::Picture(_) | LayoutKind::FramedPicture(_) => Some(node.kind),
+                LayoutKind::Picture(..) | LayoutKind::FramedPicture(..) => Some(node.kind),
                 _ => None,
             })
             .expect("the picture should have been laid out")
         };
-        assert!(matches!(picture(true), LayoutKind::FramedPicture(_)));
-        assert!(matches!(picture(false), LayoutKind::Picture(_)));
+        assert!(matches!(picture(true), LayoutKind::FramedPicture(..)));
+        assert!(matches!(picture(false), LayoutKind::Picture(..)));
     }
 
     #[test]
@@ -13452,6 +14172,7 @@ mod tests {
                 id: NodeId(1),
                 handle: PictureHandle(7),
                 source: (10, 10),
+                fit: PictureFit::Contain,
                 max_height_tenths_mm: 100,
                 framed: true,
             }],
@@ -14286,7 +15007,9 @@ mod page_turn_tests {
             layout
                 .nodes
                 .iter()
-                .find(|node| node.kind == LayoutKind::Picture(PictureHandle(41)))
+                .find(|node| {
+                    node.kind == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
+                })
                 .expect("reading picture")
                 .rect
         };
@@ -14347,10 +15070,9 @@ mod page_turn_tests {
             )))
             .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
 
-        assert!(layout
-            .nodes
-            .iter()
-            .any(|node| node.kind == LayoutKind::Picture(PictureHandle(41))));
+        assert!(layout.nodes.iter().any(|node| {
+            node.kind == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
+        }));
         let status = layout
             .nodes
             .iter()
@@ -14675,6 +15397,15 @@ mod row_tests {
             .collect()
     }
 
+    fn lines_for(layout: &Layout, kind: LayoutKind) -> usize {
+        layout
+            .nodes
+            .iter()
+            .filter(|node| node.kind == kind)
+            .map(|node| node.text_lines.len())
+            .sum()
+    }
+
     #[test]
     fn every_row_is_large_enough_to_tap_on_every_panel() {
         for (name, metrics) in PANELS {
@@ -14827,6 +15558,260 @@ mod row_tests {
             "rows took {} and tiles took {}",
             rows.height,
             tiles.height
+        );
+    }
+
+    #[test]
+    fn described_row_clamps_title_creator_and_synopsis_to_one_one_two_lines() {
+        let row = Row::new(
+            ActionId(1),
+            "A very long title repeated repeatedly",
+            "Creator repeated repeatedly",
+            Glyph::Book,
+        )
+        .with_description(
+            "Synopsis repeated until it would occupy at least four lines on Clara ".repeat(8),
+        )
+        .with_line_limits(RowLineLimits::new(1, 1, 2));
+        let screen = Screen::new(
+            1,
+            vec![Node::Rows {
+                id: NodeId(1),
+                rows: vec![row],
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        assert_eq!(lines_for(&layout, LayoutKind::RowTitle), 1);
+        assert_eq!(lines_for(&layout, LayoutKind::RowSummary), 1);
+        assert_eq!(lines_for(&layout, LayoutKind::RowDescription), 2);
+        let summary = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::RowSummary)
+            .expect("a summary");
+        let description = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::RowDescription)
+            .expect("a description");
+        assert_eq!(
+            description.rect.y,
+            summary.rect.y.saturating_add(summary.rect.height)
+        );
+        assert_eq!(description.rect.height, 2 * FontSize::Caption.line_height());
+    }
+
+    #[test]
+    fn cover_slot_fallback_keeps_ready_picture_row_geometry() {
+        let layout = |lead| {
+            Screen::new(
+                1,
+                vec![Node::Rows {
+                    id: NodeId(1),
+                    rows: vec![Row::new(
+                        ActionId(1),
+                        "A deliberately long title beside a collection cover",
+                        "A deliberately long creator credit beside the same cover",
+                        lead,
+                    )
+                    .with_description(
+                        "A synopsis whose wrapping must not move when artwork becomes ready",
+                    )
+                    .with_line_limits(RowLineLimits::new(1, 1, 2))],
+                }],
+            )
+            .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+        };
+        let fallback = layout(RowLead::CoverSlot(Glyph::Book));
+        let ready = layout(RowLead::Picture(
+            TilePicture::new(PictureHandle(7), 300, 300).with_fit(PictureFit::Cover),
+            Glyph::Book,
+        ));
+        let text_geometry = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        LayoutKind::RowTitle | LayoutKind::RowSummary | LayoutKind::RowDescription
+                    )
+                })
+                .map(|node| (node.kind, node.rect, node.text_lines.clone()))
+                .collect::<Vec<_>>()
+        };
+        let lead_rect = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .find(|node| matches!(node.kind, LayoutKind::RowLead(_)))
+                .expect("row lead")
+                .rect
+        };
+
+        assert_eq!(text_geometry(&fallback), text_geometry(&ready));
+        assert_eq!(lead_rect(&fallback), lead_rect(&ready));
+        assert_eq!(
+            lead_rect(&fallback).width,
+            CLARA_BW_METRICS.touch_target_default()
+        );
+    }
+
+    #[test]
+    fn described_row_paginator_matches_drawable_described_rows() {
+        let area = CLARA_BW_METRICS.prose_area(true, false);
+        let mark_width = row_title_width_beside(
+            &CLARA_BW_METRICS,
+            area,
+            "1K",
+            false,
+            row_mark_column(&CLARA_BW_METRICS),
+        );
+        let picture_width = row_title_width_beside(
+            &CLARA_BW_METRICS,
+            area,
+            "1K",
+            false,
+            CLARA_BW_METRICS.touch_target_default(),
+        );
+        let source = "Synopsis words repeated until the narrower picture row wraps ".repeat(20);
+        let synopsis = (1..=source.len())
+            .filter(|end| source.is_char_boundary(*end))
+            .map(|end| source[..end].trim_end())
+            .find(|candidate| {
+                wrap_text(candidate, mark_width, FontSize::Caption).len() == 1
+                    && wrap_text(candidate, picture_width, FontSize::Caption).len() == 2
+            })
+            .expect("a synopsis that wraps only beside a picture")
+            .to_owned();
+        let rows = (0..12)
+            .map(|index| {
+                (
+                    format!("Title {index}"),
+                    format!("Creator {index}"),
+                    synopsis.clone(),
+                    "1K".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = rows
+            .iter()
+            .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), d.as_str()))
+            .collect::<Vec<_>>();
+        let pages = paginate_described_rows_with_trailing(
+            &borrowed,
+            RowLineLimits::new(1, 1, 2),
+            &CLARA_BW_METRICS,
+            area,
+        );
+        assert_eq!(
+            pages.iter().flatten().copied().collect::<Vec<_>>(),
+            (0..rows.len()).collect::<Vec<_>>()
+        );
+        for page in pages {
+            let expected = page.len();
+            let screen = Screen::new(
+                1,
+                vec![Node::Rows {
+                    id: NodeId(1),
+                    rows: page
+                        .into_iter()
+                        .map(|index| {
+                            let (title, creator, synopsis, trailing) = &rows[index];
+                            Row::new(
+                                ActionId(index as u32 + 1),
+                                title,
+                                creator,
+                                RowLead::Picture(
+                                    TilePicture::new(PictureHandle(index as u32 + 100), 300, 300)
+                                        .with_fit(PictureFit::Cover),
+                                    Glyph::Book,
+                                ),
+                            )
+                            .with_description(synopsis)
+                            .with_trailing(trailing)
+                            .with_line_limits(RowLineLimits::new(1, 1, 2))
+                        })
+                        .collect(),
+                }],
+            );
+            assert_eq!(
+                screen
+                    .layout_with(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                    .nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind, LayoutKind::Row(_)))
+                    .count(),
+                expected
+            );
+            assert!(!screen
+                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                .has_errors());
+        }
+    }
+
+    #[test]
+    fn empty_described_rows_and_existing_measured_paginators_have_no_pages() {
+        let area = CLARA_BW_METRICS.prose_area(true, false);
+        assert!(paginate_described_rows_with_trailing(
+            &[],
+            RowLineLimits::new(1, 1, 2),
+            &CLARA_BW_METRICS,
+            area,
+        )
+        .is_empty());
+        assert!(paginate_rows_with_trailing(&[], &CLARA_BW_METRICS, area).is_empty());
+        assert!(paginate_ranked_rows_with_trailing(&[], &CLARA_BW_METRICS, area, 12).is_empty());
+        assert!(paginate_rows_with_menu(&[], &CLARA_BW_METRICS, area).is_empty());
+    }
+
+    #[test]
+    fn unsupported_described_row_text_is_reported() {
+        let row =
+            Row::new(ActionId(1), "Title", "Creator", Glyph::Book).with_description("\u{10ffff}");
+        let mut issues = Vec::new();
+        check_row_text_coverage_with(NodeId(41), &row, &mut issues, |text, _face| {
+            text.contains('\u{10ffff}').then_some('\u{10ffff}')
+        });
+        assert!(issues.iter().any(|issue| {
+            issue.node == Some(NodeId(41))
+                && matches!(
+                    issue.kind,
+                    LayoutIssueKind::UnsupportedCharacter {
+                        character: '\u{10ffff}',
+                        face: Face::Text,
+                    }
+                )
+        }));
+    }
+
+    #[test]
+    fn described_rows_contribute_caption_text_to_natural_width() {
+        let metrics = CLARA_BW_METRICS;
+        let area = metrics.prose_area(false, false);
+        let description =
+            "A description long enough to determine the natural width of this row by itself";
+        let row = Row::new(ActionId(1), "T", "", Glyph::Book)
+            .with_description(description)
+            .with_line_limits(RowLineLimits::new(0, 0, 1));
+        let text_width =
+            row_title_width_beside(&metrics, area, "", false, row_mark_column(&metrics));
+        let clamped = clamp_lines(description, text_width, FontSize::Caption, 1);
+        let expected = measure_text(&clamped, FontSize::Caption)
+            .0
+            .saturating_add(row_mark_column(&metrics))
+            .saturating_add(2 * metrics.space(Space::Small));
+        assert_eq!(
+            intrinsic_width(
+                &Node::Rows {
+                    id: NodeId(1),
+                    rows: vec![row],
+                },
+                area.width,
+                &metrics,
+                Face::Text,
+            ),
+            expected
         );
     }
 
@@ -15503,6 +16488,24 @@ mod loading_tests {
 mod prose_tests {
     use super::tests::PANELS;
     use super::*;
+
+    #[test]
+    fn drawable_text_rejects_an_unsupported_clock_but_retains_cjk() {
+        assert_eq!(
+            drawable_text_with("給我一次重來的機會🕙", |character| character
+                != '🕙'),
+            "給我一次重來的機會"
+        );
+    }
+
+    #[test]
+    fn drawable_text_retains_input_without_an_installed_typesetter() {
+        assert!(!has_typesetter());
+        assert_eq!(
+            drawable_text_in("給我一次重來的機會🕙", Face::Text),
+            "給我一次重來的機會🕙"
+        );
+    }
 
     #[test]
     fn the_fallback_typesetter_treats_crlf_as_one_separator() {
@@ -16622,10 +17625,9 @@ mod prose_tests {
         )
         .layout();
         assert!(
-            screen
-                .nodes
-                .iter()
-                .any(|node| node.kind == LayoutKind::FramedPicture(PictureHandle(3))),
+            screen.nodes.iter().any(|node| {
+                node.kind == LayoutKind::FramedPicture(PictureHandle(3), PictureFit::Contain)
+            }),
             "a cover was drawn without the edge that separates it from the shelf"
         );
     }
@@ -16664,7 +17666,7 @@ mod prose_tests {
                 .filter(|node| {
                     matches!(
                         node.kind,
-                        LayoutKind::Picture(_) | LayoutKind::FramedPicture(_)
+                        LayoutKind::Picture(..) | LayoutKind::FramedPicture(..)
                     )
                 })
                 .count(),
@@ -16679,6 +17681,97 @@ mod prose_tests {
             2,
             "both tiles keep their label whatever is above it"
         );
+    }
+
+    mod picture_fit_tests {
+        use super::*;
+
+        #[test]
+        fn tile_picture_defaults_to_contain_and_can_request_cover() {
+            let picture = TilePicture::new(PictureHandle(7), 400, 200);
+            assert_eq!(picture.fit, PictureFit::Contain);
+            assert_eq!(picture.with_fit(PictureFit::Cover).fit, PictureFit::Cover);
+        }
+
+        #[test]
+        fn cover_fit_crops_the_source_center_without_stretching() {
+            let source = PicturePixelsRef::Gray8(&[10, 20, 30, 40, 50, 60, 70, 80]);
+            let mut surface = Surface::new(2, 2);
+            let bounds = surface.bounds();
+            draw_fitted_picture(
+                &mut surface,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                (4, 2),
+                source,
+                bounds,
+                PictureFit::Cover,
+            );
+            let PicturePixelsRef::Gray8(pixels) = surface.pixels() else {
+                panic!("expected grayscale surface");
+            };
+            assert_eq!(pixels, &[20, 30, 60, 70]);
+        }
+
+        #[test]
+        fn rgb_cover_fit_crops_center_columns_without_channel_shift() {
+            let source = PicturePixelsRef::Rgb8(&[
+                1, 2, 3, 10, 20, 30, 40, 50, 60, 7, 8, 9, 4, 5, 6, 70, 80, 90, 100, 110, 120, 11,
+                12, 13,
+            ]);
+            let mut surface = Surface::new_in(2, 2, PictureFormat::Rgb8);
+            let bounds = surface.bounds();
+            draw_fitted_picture(
+                &mut surface,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                (4, 2),
+                source,
+                bounds,
+                PictureFit::Cover,
+            );
+            assert_eq!(
+                surface.bytes(),
+                &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            );
+        }
+
+        #[test]
+        fn contain_fit_keeps_the_existing_letterbox_geometry() {
+            let target = Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            };
+            let fitted = fitted_picture((200, 100), target, PictureFit::Contain);
+            assert_eq!(
+                fitted.target,
+                Rect {
+                    x: 0,
+                    y: 25,
+                    width: 100,
+                    height: 50
+                }
+            );
+            assert_eq!(
+                fitted.source,
+                SourceWindow {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 100
+                }
+            );
+        }
     }
 
     #[test]
@@ -16805,12 +17898,13 @@ mod prose_tests {
             width: 8,
             height: 8,
         };
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             rect,
             (2, 2),
             cache.get(PictureHandle(1)).expect("held"),
             clip,
+            PictureFit::Contain,
         );
         for y in 0..8 {
             for x in 0..8 {
@@ -16845,7 +17939,7 @@ mod prose_tests {
             width: 1,
             height: 1,
         };
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             rect,
             (2, 2),
@@ -16856,6 +17950,7 @@ mod prose_tests {
                 width: 4,
                 height: 4,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.pixels[0], 127);
     }
@@ -16871,7 +17966,7 @@ mod prose_tests {
         ));
         let mut surface = Surface::new_in(2, 1, PictureFormat::Rgb8);
         surface.clear(tone::PAPER);
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             Rect {
                 x: 0,
@@ -16887,6 +17982,7 @@ mod prose_tests {
                 width: 2,
                 height: 1,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.bytes(), &[1, 2, 3, 4, 5, 6]);
     }
@@ -16897,7 +17993,7 @@ mod prose_tests {
         assert!(cache.put(PictureHandle(1), 1, 1, PicturePixels::Rgb8(vec![1, 2, 3]),));
         let mut surface = Surface::new(1, 1);
         surface.clear(tone::PAPER);
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             Rect {
                 x: 0,
@@ -16913,6 +18009,7 @@ mod prose_tests {
                 width: 1,
                 height: 1,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.bytes(), &[tone::PAPER]);
     }
@@ -17164,6 +18261,8 @@ mod prose_tests {
                     action: ActionId(6 + index as u32),
                     title: (*label).to_owned(),
                     summary: String::new(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead: RowLead::Icon(Glyph::Trash),
                     state: RowState::Open,
                     trailing: None,
@@ -17195,6 +18294,8 @@ mod prose_tests {
                     action: ActionId(2),
                     title: "A title".to_owned(),
                     summary: String::new(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead,
                     state: RowState::Open,
                     trailing: None,
@@ -17218,6 +18319,8 @@ mod prose_tests {
                               past the end of one line and onto a second, and \
                               very probably onto a third as well."
                         .to_owned(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead,
                     state: RowState::Open,
                     trailing: None,
@@ -17378,10 +18481,7 @@ mod prose_tests {
     fn a_cover_still_fills_the_column_it_leads_with() {
         // The size rule is about labels, not content. A cover is the row.
         let cover = first_lead(&row_with(RowLead::Picture(
-            TilePicture {
-                handle: PictureHandle(1),
-                source: (60, 90),
-            },
+            TilePicture::new(PictureHandle(1), 60, 90),
             Glyph::Book,
         )));
         assert_eq!(cover.width, CLARA_BW_METRICS.touch_target_default());
@@ -17417,13 +18517,7 @@ mod prose_tests {
                         ActionId(1),
                         "With a cover",
                         "",
-                        RowLead::Picture(
-                            TilePicture {
-                                handle: PictureHandle(1),
-                                source: (60, 90),
-                            },
-                            Glyph::Book,
-                        ),
+                        RowLead::Picture(TilePicture::new(PictureHandle(1), 60, 90), Glyph::Book),
                     ),
                     Row::new(ActionId(2), "With a mark", "", RowLead::Icon(Glyph::Book)),
                 ],
@@ -18175,8 +19269,58 @@ mod prose_tests {
     }
 
     #[test]
+    fn unknown_total_draws_the_current_page_and_both_discovered_turn_directions() {
+        let build = |page: u16| {
+            let mut screen = Screen::new(1, Vec::new()).with_page_turns(ActionId(7), ActionId(9));
+            screen.page_turns = screen.page_turns.map(|turns| turns.with_position(page, 0));
+            screen.layout()
+        };
+        let first = build(1);
+        let middle = build(2);
+        let shown = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .find(|node| node.kind == LayoutKind::PagePosition)
+                .expect("unknown-total page position")
+                .text_lines[0]
+                .clone()
+        };
+        let turns = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .map(|node| node.kind)
+                .filter(|kind| {
+                    matches!(kind, LayoutKind::PagePrevious(_) | LayoutKind::PageNext(_))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(shown(&first), "1");
+        assert_eq!(turns(&first), vec![LayoutKind::PageNext(ActionId(9))]);
+        assert_eq!(shown(&middle), "2");
+        assert_eq!(
+            turns(&middle),
+            vec![
+                LayoutKind::PagePrevious(ActionId(7)),
+                LayoutKind::PageNext(ActionId(9))
+            ]
+        );
+        assert_eq!(first.content.height, middle.content.height);
+        assert!(
+            first.content.height
+                < Screen::new(1, Vec::new())
+                    .with_page_turns(ActionId(7), ActionId(9))
+                    .layout()
+                    .content
+                    .height
+        );
+    }
+
+    #[test]
     fn a_page_position_nobody_can_compute_is_left_unsaid() {
-        for position in [(0, 0), (1, 0), (13, 12)] {
+        for position in [(0, 0), (13, 12)] {
             let mut screen = Screen::new(1, Vec::new()).with_page_turns(ActionId(1), ActionId(2));
             screen.page_turns = screen
                 .page_turns
@@ -18575,17 +19719,21 @@ mod prose_tests {
                 area,
                 title,
                 summary,
+                "",
                 "1,284 points and 312 comments",
                 false,
-                row_mark_column(&metrics)
+                row_mark_column(&metrics),
+                RowLineLimits::default(),
             ) > measured_row_height(
                 &metrics,
                 area,
                 title,
                 summary,
                 "",
+                "",
                 false,
-                row_mark_column(&metrics)
+                row_mark_column(&metrics),
+                RowLineLimits::default(),
             ),
             "a row with a value at its trailing edge measured no taller"
         );
@@ -18798,16 +19946,20 @@ mod prose_tests {
                 &title,
                 "a summary",
                 "",
+                "",
                 true,
-                row_mark_column(&CLARA_BW_METRICS)
+                row_mark_column(&CLARA_BW_METRICS),
+                RowLineLimits::default(),
             ) > measured_row_height(
                 &CLARA_BW_METRICS,
                 area,
                 &title,
                 "a summary",
                 "",
+                "",
                 false,
-                row_mark_column(&CLARA_BW_METRICS)
+                row_mark_column(&CLARA_BW_METRICS),
+                RowLineLimits::default(),
             ),
             "the overflow column cost the title nothing"
         );
@@ -19104,6 +20256,7 @@ mod prose_tests {
                     id: NodeId(2),
                     title: "Details".to_owned(),
                     value: None,
+                    action: None,
                 },
             ],
         );
@@ -19119,7 +20272,7 @@ mod prose_tests {
             node(2).rect.height < node(1).rect.height,
             "a section was not set smaller than the screen's own heading"
         );
-        assert_eq!(node(2).kind, LayoutKind::Section);
+        assert_eq!(node(2).kind, LayoutKind::Section(None));
     }
 
     #[test]
@@ -19131,6 +20284,7 @@ mod prose_tests {
                     id: NodeId(1),
                     title: title.to_owned(),
                     value: None,
+                    action: None,
                 }],
             );
             let rect = screen
@@ -19158,6 +20312,7 @@ mod prose_tests {
                 id: NodeId(1),
                 title: "A section title long enough to want the whole line".to_owned(),
                 value: Some("32".to_owned()),
+                action: None,
             }],
         );
         let node = screen
@@ -19737,6 +20892,7 @@ mod press_feedback_tests {
             id: NodeId(id),
             title: title.to_owned(),
             value: None,
+            action: None,
         };
         let orphan = Screen::new(1, vec![section(1, "Details")]);
         assert!(
@@ -20157,5 +21313,365 @@ mod figure_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_feed_tests {
+    use super::*;
+
+    #[test]
+    fn image_strip_is_three_equal_image_only_targets() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: (0..3)
+                    .map(|index| {
+                        Tile::new(ActionId(index + 1), "", Glyph::Book).with_picture(
+                            TilePicture::new(PictureHandle(index + 1), 300, 500)
+                                .with_fit(PictureFit::Cover),
+                        )
+                    })
+                    .collect(),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let targets = layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 3);
+        assert!(targets
+            .windows(2)
+            .all(|pair| pair[0].rect.width == pair[1].rect.width));
+        assert!(layout
+            .nodes
+            .iter()
+            .all(|node| node.kind != LayoutKind::TileLabel));
+        assert_eq!(
+            layout
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, LayoutKind::FramedPicture(_, PictureFit::Cover)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn image_strip_is_bounded_and_empty_is_zero_height() {
+        let oversized = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: (0..4)
+                    .map(|index| Tile::new(ActionId(index + 1), "", Glyph::Book))
+                    .collect(),
+            }],
+        );
+        assert!(oversized
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| matches!(
+                issue.kind,
+                LayoutIssueKind::CollectionTruncated {
+                    collection: "image strip",
+                    provided: 4,
+                    visible: MAX_IMAGE_STRIP_ITEMS,
+                }
+            )));
+        let empty = Screen::new(
+            2,
+            vec![Node::ImageStrip {
+                id: NodeId(2),
+                tiles: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            empty
+                .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+                .content_used(),
+            0
+        );
+        assert!(!empty
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. }) }));
+    }
+
+    #[test]
+    fn disabled_image_strip_tile_swallows_page_turn() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: vec![
+                    Tile::new(ActionId(1), "", Glyph::Book).with_state(TileState::Unavailable)
+                ],
+            }],
+        )
+        .with_page_turns(ActionId(10), ActionId(11));
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let tile = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Tile(ActionId(1), ControlState::Disabled))
+            .expect("disabled strip tile");
+        assert_eq!(layout.hit_test(tile.rect.x + 1, tile.rect.y + 1), None);
+    }
+
+    #[test]
+    fn image_strip_validation_ignores_hidden_tile_text() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: vec![Tile::new(ActionId(1), "\u{10ffff} (kept)", Glyph::Book)
+                    .with_subtitle("\u{10ffff}")
+                    .with_state(TileState::Held)],
+            }],
+        );
+        assert!(!screen.validate(&CLARA_BW_METRICS).iter().any(|issue| {
+            matches!(
+                issue.kind,
+                LayoutIssueKind::UnsupportedCharacter { .. } | LayoutIssueKind::StateInLabel
+            )
+        }));
+    }
+
+    #[test]
+    fn media_grid_places_six_cards_as_three_rows_by_two_columns() {
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: (0..6)
+                    .map(|index| {
+                        Tile::new(ActionId(index + 1), format!("Title {index}"), Glyph::Book)
+                            .with_subtitle(format!("Creator {index}"))
+                    })
+                    .collect(),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let cards = layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::MediaCard(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 6);
+        assert_eq!(cards[0].rect.y, cards[1].rect.y);
+        assert!(cards[2].rect.y > cards[0].rect.y);
+        assert!(cards
+            .iter()
+            .all(|card| card.rect.height >= CLARA_BW_METRICS.touch_target_minimum()));
+        for card in cards {
+            let LayoutKind::MediaCard(action) = card.kind else {
+                unreachable!()
+            };
+            assert_eq!(
+                layout.hit_test(card.rect.x + 1, card.rect.y + 1),
+                Some(action)
+            );
+        }
+    }
+
+    #[test]
+    fn media_grid_reports_partial_fit() {
+        let chrome = Chrome::default();
+        let baseline = Screen::new(0, Vec::new()).layout_with(&CLARA_BW_METRICS, &chrome);
+        let mut metrics = CLARA_BW_METRICS;
+        let overhead = metrics.height.saturating_sub(baseline.content.height);
+        metrics.height = overhead
+            .saturating_add(metrics.touch_target_default() * 2)
+            .saturating_add(metrics.space(Space::Tight));
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: (0..6)
+                    .map(|index| {
+                        Tile::new(ActionId(index + 1), format!("Title {index}"), Glyph::Book)
+                            .with_subtitle(format!("Creator {index}"))
+                    })
+                    .collect(),
+            }],
+        );
+        let diagnostics = screen.diagnostics(&metrics, &chrome);
+        let cards = diagnostics
+            .layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::MediaCard(_)))
+            .count();
+        assert!(
+            (1..6).contains(&cards),
+            "expected a partial grid, got {cards}"
+        );
+        assert!(diagnostics.issues.iter().any(|issue| {
+            matches!(
+                issue.kind,
+                LayoutIssueKind::Clipped | LayoutIssueKind::ContentOverflow { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn media_grid_clamps_copy_and_is_bounded() {
+        let tiles = (0..7)
+            .map(|index| {
+                Tile::new(
+                    ActionId(index + 1),
+                    "A title long enough to require ellipsis rather than a second line",
+                    Glyph::Book,
+                )
+                .with_subtitle(
+                    "A summary long enough to require ellipsis rather than a second line",
+                )
+            })
+            .collect();
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles,
+            }],
+        );
+        let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
+        assert!(diagnostics.issues.iter().any(|issue| matches!(
+            issue.kind,
+            LayoutIssueKind::CollectionTruncated {
+                collection: "media grid",
+                provided: 7,
+                visible: MAX_MEDIA_GRID_ITEMS,
+            }
+        )));
+        assert!(diagnostics
+            .layout
+            .nodes
+            .iter()
+            .filter(|node| { matches!(node.kind, LayoutKind::RowTitle | LayoutKind::RowSummary) })
+            .all(|node| node.text_lines.len() <= 1));
+    }
+
+    #[test]
+    fn media_grid_empty_is_valid_and_zero_height() {
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            screen
+                .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+                .content_used(),
+            0
+        );
+        assert!(!screen
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. }) }));
+    }
+
+    #[test]
+    fn tappable_section_uses_the_heading_rect_as_its_target() {
+        let action = ActionId(42);
+        let screen = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "人氣新作".to_owned(),
+                value: None,
+                action: Some(action),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let section = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(Some(action)))
+            .expect("section");
+        assert_eq!(
+            layout.hit_test(section.rect.x + 1, section.rect.y + 1),
+            Some(action)
+        );
+    }
+
+    #[test]
+    fn tappable_section_target_meets_clara_minimum_without_changing_plain_section() {
+        let plain = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "Plain".to_owned(),
+                value: None,
+                action: None,
+            }],
+        )
+        .layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let tappable_screen = Screen::new(
+            2,
+            vec![Node::Section {
+                id: NodeId(2),
+                title: "Tappable".to_owned(),
+                value: None,
+                action: Some(ActionId(42)),
+            }],
+        );
+        let diagnostics = tappable_screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
+        let target = diagnostics
+            .layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(Some(ActionId(42))))
+            .expect("tappable section target");
+        assert_eq!(
+            plain
+                .nodes
+                .iter()
+                .find(|node| node.kind == LayoutKind::Section(None))
+                .expect("plain section")
+                .rect
+                .height,
+            FontSize::Caption.line_height()
+        );
+        assert!(target.rect.height >= CLARA_BW_METRICS.touch_target_minimum());
+        assert_eq!(
+            diagnostics
+                .layout
+                .hit_test(target.rect.x + 1, target.rect.y + target.rect.height - 1),
+            Some(ActionId(42))
+        );
+        assert!(!diagnostics
+            .issues
+            .iter()
+            .any(|issue| { matches!(issue.kind, LayoutIssueKind::TouchTargetTooSmall { .. }) }));
+    }
+
+    #[test]
+    fn plain_section_remains_non_interactive() {
+        let screen = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "Details".to_owned(),
+                value: None,
+                action: None,
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let section = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(None))
+            .expect("section");
+        assert_eq!(
+            layout.hit_test(section.rect.x + 1, section.rect.y + 1),
+            None
+        );
     }
 }
