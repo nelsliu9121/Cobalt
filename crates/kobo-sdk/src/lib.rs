@@ -23,8 +23,9 @@ pub use kobo_ui::{
     DiagnosticSeverity, DisplayMetrics, Emphasis, Fold, FontHandle, Freeform, Glyph, InlineFormula,
     LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind, ParagraphAlignment,
     ParagraphPresentation, Percent, PictureFit, PictureHandle, PicturePixelsRef, ProseArea,
-    ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space,
-    TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape, TileState, TopBar,
+    ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowLineLimits, RowState, Screen,
+    SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape,
+    TileState, TopBar,
     TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS,
     MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS, MAX_INLINE_FORMULAE, MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH,
     MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
@@ -2176,6 +2177,48 @@ impl ScreenBuilder {
         self
     }
 
+    /// Rows with a third text block and a short value at the trailing edge.
+    ///
+    /// The limits apply independently to the title, summary and description;
+    /// zero leaves that block unlimited.
+    #[must_use]
+    pub fn described_rows_with_trailing<I, N, T, S, D, L, V>(
+        mut self,
+        limits: RowLineLimits,
+        rows: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (N, T, S, D, L, V)>,
+        N: AsRef<str>,
+        T: Into<String>,
+        S: Into<String>,
+        D: Into<String>,
+        L: Into<RowLead>,
+        V: Into<String>,
+    {
+        let id = self.next_id();
+        let mut source = rows.into_iter();
+        let mut rows = Vec::new();
+        for (name, title, summary, description, lead, trailing) in
+            source.by_ref().take(MAX_ROWS)
+        {
+            let row = Row::new(self.register(name.as_ref()), title, summary, lead)
+                .with_description(description);
+            let trailing = trailing.into();
+            let row = if trailing.is_empty() {
+                row
+            } else {
+                row.with_trailing(trailing)
+            };
+            rows.push(row.with_line_limits(limits));
+        }
+        if source.next().is_some() {
+            self.warn_limit(id, "rows", MAX_ROWS);
+        }
+        self.nodes.push(Node::Rows { id, rows });
+        self
+    }
+
     /// A list of things to be done, some of which are.
     ///
     /// The same rows, with the state carried rather than drawn: an application
@@ -3079,6 +3122,22 @@ impl Context {
         nav_bar: bool,
     ) -> Vec<Vec<usize>> {
         self.paginate_rows_with_trailing_at(rows, nav_bar, Position::AtTheFoot)
+    }
+
+    /// Paginates bounded rows with descriptions and trailing values.
+    #[must_use]
+    pub fn paginate_described_rows_with_trailing(
+        &self,
+        rows: &[(&str, &str, &str, &str)],
+        limits: RowLineLimits,
+        nav_bar: bool,
+    ) -> Vec<Vec<usize>> {
+        kobo_ui::paginate_described_rows_with_trailing(
+            rows,
+            limits,
+            &self.metrics,
+            self.paged_area(nav_bar),
+        )
     }
 
     /// The same, for a ranked list, whose rows lead with digits.
@@ -6152,6 +6211,66 @@ mod tests {
             )])
             .expect("send screen");
         daemon.join().expect("daemon");
+    }
+
+    #[test]
+    fn described_rows_builder_preserves_descriptions_limits_and_trailing_values() {
+        let limits = RowLineLimits::new(1, 1, 2);
+        let screen = ScreenBuilder::new("described")
+            .described_rows_with_trailing(
+                limits,
+                [
+                    ("empty", "Title", "Creator", "", Glyph::Book, ""),
+                    (
+                        "described",
+                        "Another title",
+                        "Another creator",
+                        "A synopsis",
+                        Glyph::Book,
+                        "12K",
+                    ),
+                ],
+            )
+            .build();
+        let Node::Rows { rows, .. } = &screen.nodes[0] else {
+            panic!("builder did not produce rows");
+        };
+        assert_eq!(rows[0].description, "");
+        assert_eq!(rows[0].trailing, None);
+        assert_eq!(rows[0].line_limits, limits);
+        assert_eq!(rows[1].description, "A synopsis");
+        assert_eq!(rows[1].trailing.as_deref(), Some("12K"));
+        assert_eq!(rows[1].line_limits, limits);
+
+        let unlimited = ScreenBuilder::new("unlimited")
+            .described_rows_with_trailing(
+                RowLineLimits::default(),
+                [(
+                    "entry",
+                    "Title",
+                    "Creator",
+                    "Description",
+                    Glyph::Book,
+                    "",
+                )],
+            )
+            .build();
+        let Node::Rows { rows, .. } = &unlimited.nodes[0] else {
+            panic!("builder did not produce rows");
+        };
+        assert_eq!(rows[0].line_limits, RowLineLimits::new(0, 0, 0));
+
+        let context = Context::default();
+        let source = [("Title", "Creator", "Description", "12K")];
+        assert_eq!(
+            context.paginate_described_rows_with_trailing(&source, limits, false),
+            kobo_ui::paginate_described_rows_with_trailing(
+                &source,
+                limits,
+                &context.metrics,
+                context.paged_area(false),
+            )
+        );
     }
 
     #[test]

@@ -10,8 +10,9 @@ pub use kobo_pixels::{PictureFormat, PicturePixels};
 use kobo_ui::{
     ActionId, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, ControlState,
     FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureFit,
-    PictureHandle, ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale,
-    Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
+    PictureHandle, ReadingChrome, ReadingSurface, Row, RowLead, RowLineLimits, RowState, Screen,
+    Space, TextScale, Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure,
+    MAX_BAR_ACTIONS,
     MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
@@ -53,7 +54,9 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// decode the new task. Version 14 adds the busy reading-chrome tag; v13
 /// runtimes would reject that reading surface. Version 15 adds picture-fit
 /// bytes to retained pictures; v14 peers would misread subsequent fields.
-pub const VERSION: u8 = 15;
+/// Version 16 appends a description and three line-limit bytes to every row;
+/// v15 peers would read the description length as the next row's action.
+pub const VERSION: u8 = 16;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -3618,11 +3621,13 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             let mut length = 6;
             for row in rows {
                 // Four bytes of action, the fixed-width lead, one of state,
-                // one saying whether a trailing value follows and one saying
-                // whether an overflow action does, then the strings.
-                add_encoded_len(&mut length, 7 + ROW_LEAD_LEN)?;
+                // one saying whether a trailing value follows, one saying
+                // whether an overflow action does and three line limits, then
+                // the strings.
+                add_encoded_len(&mut length, 10 + ROW_LEAD_LEN)?;
                 add_encoded_len(&mut length, encoded_string_len(&row.title)?)?;
                 add_encoded_len(&mut length, encoded_string_len(&row.summary)?)?;
+                add_encoded_len(&mut length, encoded_string_len(&row.description)?)?;
                 if let Some(trailing) = &row.trailing {
                     add_encoded_len(&mut length, encoded_string_len(trailing)?)?;
                 }
@@ -4880,6 +4885,10 @@ fn encode_node(
                 if let Some(menu) = row.menu {
                     push_u32(output, menu.0);
                 }
+                push_string(output, &row.description)?;
+                output.push(row.line_limits.title);
+                output.push(row.line_limits.summary);
+                output.push(row.line_limits.description);
             }
         }
         Node::TileGrid { id, tiles, shape } => {
@@ -6272,10 +6281,15 @@ fn decode_node(
                     }
                     Some(menu)
                 };
+                let description = reader.string()?;
+                let line_limits =
+                    RowLineLimits::new(reader.u8()?, reader.u8()?, reader.u8()?);
                 rows.push(Row {
                     action,
                     title,
                     summary,
+                    description,
+                    line_limits,
                     lead,
                     state,
                     trailing,
@@ -7289,6 +7303,23 @@ mod tests {
             }),
             Err(ProtocolError::TooManyNodes)
         );
+    }
+
+    #[test]
+    fn described_rows_round_trip_empty_and_bounded_fields() {
+        assert_round_trip(Message::SetScreen(Screen::new(
+            19,
+            vec![Node::Rows {
+                id: NodeId(7),
+                rows: vec![
+                    Row::new(ActionId(1), "Plain", "Creator", Glyph::Book),
+                    Row::new(ActionId(2), "Described", "Creator", Glyph::Book)
+                        .with_description("A synopsis")
+                        .with_trailing("12K")
+                        .with_line_limits(RowLineLimits::new(1, 1, 2)),
+                ],
+            }],
+        )));
     }
 
     #[test]
@@ -8458,7 +8489,7 @@ mod store_tests {
 
     #[test]
     fn credential_scope_uses_current_protocol_version_and_rejects_v14() {
-        assert_eq!(VERSION, 15);
+        assert_eq!(VERSION, 16);
         let frame = Frame {
             request_id: 10,
             message: Message::Spawn {
@@ -8469,7 +8500,7 @@ mod store_tests {
             },
         };
         let mut encoded = encode(&frame).expect("encode credential scope");
-        assert_eq!(encoded[4], 15);
+        assert_eq!(encoded[4], VERSION);
         assert_eq!(decode(&encoded), Ok(frame));
 
         encoded[4] = 14;

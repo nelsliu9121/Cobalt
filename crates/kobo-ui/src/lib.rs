@@ -3600,6 +3600,28 @@ pub struct TableRow {
     pub cells: Vec<String>,
 }
 
+/// Maximum wrapped lines for each text block in a row.
+///
+/// Zero means unlimited, preserving the layout of rows that do not opt into
+/// bounded text.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RowLineLimits {
+    pub title: u8,
+    pub summary: u8,
+    pub description: u8,
+}
+
+impl RowLineLimits {
+    #[must_use]
+    pub const fn new(title: u8, summary: u8, description: u8) -> Self {
+        Self {
+            title,
+            summary,
+            description,
+        }
+    }
+}
+
 /// One entry in a [`Node::Rows`] list.
 ///
 /// A title identifies, a summary explains and a glyph makes the row findable
@@ -3610,6 +3632,8 @@ pub struct Row {
     pub action: ActionId,
     pub title: String,
     pub summary: String,
+    pub description: String,
+    pub line_limits: RowLineLimits,
     pub lead: RowLead,
     pub state: RowState,
     /// A short value against the right edge: a score, a size, a date, a count.
@@ -3644,11 +3668,25 @@ impl Row {
             action,
             title: title.into(),
             summary: summary.into(),
+            description: String::new(),
+            line_limits: RowLineLimits::default(),
             lead: lead.into(),
             state: RowState::Open,
             trailing: None,
             menu: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_line_limits(mut self, limits: RowLineLimits) -> Self {
+        self.line_limits = limits;
+        self
     }
 
     /// The same, with a short value set against the right edge.
@@ -4228,6 +4266,7 @@ pub enum LayoutKind {
     /// A title whose work is finished: muted and struck through.
     RowTitleDone,
     RowSummary,
+    RowDescription,
     RowLead(RowLead),
     /// A tile's tap target: the whole cell, mark and name together. Carries a
     /// [`ControlState`] for the same reason a button does — an unavailable
@@ -6444,10 +6483,10 @@ fn layout_node(
             let gap = metrics.space(Space::Tight);
             let icon = row_lead_column(metrics, rows);
             let text_x = x.saturating_add(icon).saturating_add(padding);
-            let text_width = max(1, width - icon - padding * 2);
+            let available_text_width = max(1, width - icon - padding * 2);
             let mut cursor = y;
             for (position, row) in rows.iter().take(MAX_ROWS).enumerate() {
-                if layout.nodes.len() + 6 > MAX_LAYOUT_NODES {
+                if layout.nodes.len() + 8 > MAX_LAYOUT_NODES {
                     break;
                 }
                 // Separators go between rows, never after the last one. A
@@ -6484,7 +6523,7 @@ fn layout_node(
                 } else {
                     0
                 };
-                let text_width = max(1, text_width - menu_column);
+                let trailing_text_width = max(1, available_text_width - menu_column);
                 // Measured before the title is wrapped, so the value keeps its
                 // room and the title gives up its own instead.
                 let trailing =
@@ -6492,26 +6531,35 @@ fn layout_node(
                         .as_ref()
                         .filter(|value| !value.is_empty())
                         .map(|value| {
-                            let value = one_line(value, text_width, FontSize::Caption);
+                            let value = one_line(value, trailing_text_width, FontSize::Caption);
                             let measured = measure_text(&value, FontSize::Caption).0;
                             (value, measured)
                         });
-                let text_width = trailing.as_ref().map_or(text_width, |(_, measured)| {
-                    max(1, text_width - measured - padding)
-                });
-                let title_lines = wrap_text(&row.title, text_width, FontSize::Body);
-                let summary_lines = if row.summary.is_empty() {
-                    Vec::new()
-                } else {
-                    wrap_text(&row.summary, text_width, FontSize::Caption)
-                };
-                let title_height = title_lines.len() as i32 * FontSize::Body.line_height();
-                let summary_height = summary_lines.len() as i32 * FontSize::Caption.line_height();
-                let content = title_height.saturating_add(summary_height);
-                // Never shorter than a finger, however terse the entry is.
-                let height = max(
-                    metrics.touch_target_default(),
-                    content.saturating_add(padding * 2),
+                let RowMeasurement {
+                    text_width,
+                    title_lines,
+                    summary_lines,
+                    description_lines,
+                    title_height,
+                    summary_height,
+                    description_height,
+                    content_height: content,
+                    height,
+                } = measure_row(
+                    metrics,
+                    ProseArea {
+                        width,
+                        height: bottom.saturating_sub(y),
+                        gap,
+                        face: prose,
+                    },
+                    &row.title,
+                    &row.summary,
+                    &row.description,
+                    row.trailing.as_deref().unwrap_or(""),
+                    row.menu.is_some(),
+                    icon,
+                    row.line_limits,
                 );
                 layout.nodes.push(LayoutNode {
                     id: *id,
@@ -6556,6 +6604,21 @@ fn layout_node(
                         },
                         kind: LayoutKind::RowSummary,
                         text_lines: summary_lines,
+                    });
+                }
+                if description_height > 0 {
+                    layout.nodes.push(LayoutNode {
+                        id: *id,
+                        rect: Rect {
+                            x: text_x,
+                            y: text_y
+                                .saturating_add(title_height)
+                                .saturating_add(summary_height),
+                            width: text_width,
+                            height: description_height,
+                        },
+                        kind: LayoutKind::RowDescription,
+                        text_lines: description_lines,
                     });
                 }
                 if let Some((value, measured)) = trailing {
@@ -8578,8 +8641,10 @@ pub fn paginate_rows_in_sections(
             title,
             summary,
             "",
+            "",
             false,
             row_mark_column(metrics),
+            RowLineLimits::default(),
         ) + if section.is_some() { header } else { 0 };
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
@@ -8690,37 +8755,103 @@ fn trailing_height(
     cursor
 }
 
-/// How tall one row comes out, measured the way the layout engine measures it.
-///
-/// Including the columns a trailing value and an overflow mark keep for
-/// themselves. Pagination that ignores either wraps the title and the summary
-/// at a width the row will never have, comes back one row short per page, and
-/// the extra row is drawn under the bottom bar where it is clipped away.
+/// Wraps one row text block, applying an optional line limit.
+fn limited_lines(text: &str, width: i32, size: FontSize, limit: u8) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if limit == 0 {
+        wrap_text(text, width, size)
+    } else {
+        wrap_text(
+            &clamp_lines(text, width, size, usize::from(limit)),
+            width,
+            size,
+        )
+    }
+}
+
+struct RowMeasurement {
+    text_width: i32,
+    title_lines: Vec<String>,
+    summary_lines: Vec<String>,
+    description_lines: Vec<String>,
+    title_height: i32,
+    summary_height: i32,
+    description_height: i32,
+    content_height: i32,
+    height: i32,
+}
+
+/// Measures and wraps one row exactly as both layout and pagination use it.
+#[allow(clippy::too_many_arguments)]
+fn measure_row(
+    metrics: &DisplayMetrics,
+    area: ProseArea,
+    title: &str,
+    summary: &str,
+    description: &str,
+    trailing: &str,
+    menu: bool,
+    lead: i32,
+    limits: RowLineLimits,
+) -> RowMeasurement {
+    let padding = metrics.space(Space::Small);
+    let text_width = row_title_width_beside(metrics, area, trailing, menu, lead);
+    let title_lines = limited_lines(title, text_width, FontSize::Body, limits.title);
+    let summary_lines = limited_lines(summary, text_width, FontSize::Caption, limits.summary);
+    let description_lines =
+        limited_lines(description, text_width, FontSize::Body, limits.description);
+    let title_height = title_lines.len() as i32 * FontSize::Body.line_height();
+    let summary_height = summary_lines.len() as i32 * FontSize::Caption.line_height();
+    let description_height = description_lines.len() as i32 * FontSize::Body.line_height();
+    let content_height = title_height
+        .saturating_add(summary_height)
+        .saturating_add(description_height);
+    // Never shorter than a finger, however terse the entry is: the same
+    // floor the layout engine applies.
+    let height = max(
+        metrics.touch_target_default(),
+        content_height.saturating_add(padding * 2),
+    );
+    RowMeasurement {
+        text_width,
+        title_lines,
+        summary_lines,
+        description_lines,
+        title_height,
+        summary_height,
+        description_height,
+        content_height,
+        height,
+    }
+}
+
+/// How tall one row comes out, measured by the same path that lays it out.
+#[allow(clippy::too_many_arguments)]
 fn measured_row_height(
     metrics: &DisplayMetrics,
     area: ProseArea,
     title: &str,
     summary: &str,
+    description: &str,
     trailing: &str,
     menu: bool,
     lead: i32,
+    limits: RowLineLimits,
 ) -> i32 {
-    let padding = metrics.space(Space::Small);
-    let text_width = row_title_width_beside(metrics, area, trailing, menu, lead);
-    let title_height =
-        wrap_text(title, text_width, FontSize::Body).len() as i32 * FontSize::Body.line_height();
-    let summary_height = if summary.is_empty() {
-        0
-    } else {
-        wrap_text(summary, text_width, FontSize::Caption).len() as i32
-            * FontSize::Caption.line_height()
-    };
-    // Never shorter than a finger, however terse the entry is: the same
-    // floor the layout engine applies.
-    max(
-        metrics.touch_target_default(),
-        title_height + summary_height + padding * 2,
+    measure_row(
+        metrics,
+        area,
+        title,
+        summary,
+        description,
+        trailing,
+        menu,
+        lead,
+        limits,
     )
+    .height
 }
 
 /// The same, for rows that carry a value at their trailing edge.
@@ -8735,6 +8866,36 @@ pub fn paginate_rows_with_trailing(
     area: ProseArea,
 ) -> Vec<Vec<usize>> {
     paginate_rows_measured(rows, metrics, area, false, row_mark_column(metrics))
+}
+
+/// Breaks bounded rows with descriptions and trailing values into pages.
+///
+/// Returns row indices so callers can build each page without cloning their
+/// source data.
+#[must_use]
+pub fn paginate_described_rows_with_trailing(
+    rows: &[(&str, &str, &str, &str)],
+    limits: RowLineLimits,
+    metrics: &DisplayMetrics,
+    area: ProseArea,
+) -> Vec<Vec<usize>> {
+    paginate_row_heights(
+        rows.iter()
+            .map(|(title, summary, description, trailing)| {
+                measured_row_height(
+                    metrics,
+                    area,
+                    title,
+                    summary,
+                    description,
+                    trailing,
+                    false,
+                    row_mark_column(metrics),
+                    limits,
+                )
+            }),
+        area,
+    )
 }
 
 /// The same, for a ranked list, whose rows lead with digits rather than a mark.
@@ -8786,18 +8947,36 @@ fn paginate_rows_measured(
     menu: bool,
     lead: i32,
 ) -> Vec<Vec<usize>> {
+    paginate_row_heights(
+        rows.iter().map(|(title, summary, trailing)| {
+            measured_row_height(
+                metrics,
+                area,
+                title,
+                summary,
+                "",
+                trailing,
+                menu,
+                lead,
+                RowLineLimits::default(),
+            )
+        }),
+        area,
+    )
+}
+
+fn paginate_row_heights(
+    heights: impl IntoIterator<Item = i32>,
+    area: ProseArea,
+) -> Vec<Vec<usize>> {
     // A gap, the divider drawn inside it, then another gap: the engine
     // advances by the row's height and a gap, then leaves a second gap after
-    // the rule it draws before the next row. The rule's own thickness is not
-    // part of the stride, and counting it instead of the second gap made
-    // every separator eight pixels short -- enough, over four of them, to
-    // pull a whole extra row onto a page it then overflowed.
+    // the rule it draws before the next row.
     let separator = area.gap * 2;
     let mut pages: Vec<Vec<usize>> = Vec::new();
     let mut page: Vec<usize> = Vec::new();
     let mut used = 0;
-    for (index, (title, summary, trailing)) in rows.iter().enumerate() {
-        let height = measured_row_height(metrics, area, title, summary, trailing, menu, lead);
+    for (index, height) in heights.into_iter().enumerate() {
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
             pages.push(std::mem::take(&mut page));
@@ -8844,8 +9023,10 @@ pub fn paginate_rows(
             title,
             summary,
             "",
+            "",
             false,
             row_mark_column(metrics),
+            RowLineLimits::default(),
         );
         let spacing = if page.is_empty() { 0 } else { separator };
         if !page.is_empty() && used + spacing + height > area.height {
@@ -10227,6 +10408,7 @@ fn tones_used(layout: &Layout) -> usize {
             LayoutKind::Secondary
             | LayoutKind::TileSubtitle
             | LayoutKind::RowSummary
+            | LayoutKind::RowDescription
             | LayoutKind::TableHeaderCell
             | LayoutKind::FactLabel
             | LayoutKind::PagePosition
@@ -10761,6 +10943,7 @@ fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
         | LayoutKind::BarAction(_)
         | LayoutKind::RowTitle
         | LayoutKind::RowTitleDone
+        | LayoutKind::RowDescription
         | LayoutKind::CellLabel
         | LayoutKind::ChoicePrompt
         | LayoutKind::ChoiceOption(_, _)
@@ -12029,6 +12212,15 @@ fn render_all_with_selected_font(
                 node.rect.x,
                 node.rect.y,
                 FontSize::Caption,
+                tone::MUTED,
+                clip,
+            ),
+            LayoutKind::RowDescription => draw_lines(
+                surface,
+                &node.text_lines,
+                node.rect.x,
+                node.rect.y,
+                FontSize::Body,
                 tone::MUTED,
                 clip,
             ),
@@ -15088,6 +15280,15 @@ mod row_tests {
             .collect()
     }
 
+    fn lines_for(layout: &Layout, kind: LayoutKind) -> usize {
+        layout
+            .nodes
+            .iter()
+            .filter(|node| node.kind == kind)
+            .map(|node| node.text_lines.len())
+            .sum()
+    }
+
     #[test]
     fn every_row_is_large_enough_to_tap_on_every_panel() {
         for (name, metrics) in PANELS {
@@ -15241,6 +15442,97 @@ mod row_tests {
             rows.height,
             tiles.height
         );
+    }
+
+    #[test]
+    fn described_row_clamps_title_creator_and_synopsis_to_one_one_two_lines() {
+        let row = Row::new(
+            ActionId(1),
+            "A very long title repeated repeatedly",
+            "Creator repeated repeatedly",
+            Glyph::Book,
+        )
+        .with_description(
+            "Synopsis repeated until it would occupy at least four lines on Clara",
+        )
+        .with_line_limits(RowLineLimits::new(1, 1, 2));
+        let screen = Screen::new(
+            1,
+            vec![Node::Rows {
+                id: NodeId(1),
+                rows: vec![row],
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        assert_eq!(lines_for(&layout, LayoutKind::RowTitle), 1);
+        assert_eq!(lines_for(&layout, LayoutKind::RowSummary), 1);
+        assert_eq!(lines_for(&layout, LayoutKind::RowDescription), 2);
+    }
+
+    #[test]
+    fn described_row_paginator_matches_drawable_described_rows() {
+        let rows = (0..12)
+            .map(|index| {
+                (
+                    format!("Title {index}"),
+                    format!("Creator {index}"),
+                    "Two line synopsis with enough text to wrap on Clara".to_owned(),
+                    format!("{}K", index + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = rows
+            .iter()
+            .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), d.as_str()))
+            .collect::<Vec<_>>();
+        let pages = paginate_described_rows_with_trailing(
+            &borrowed,
+            RowLineLimits::new(1, 1, 2),
+            &CLARA_BW_METRICS,
+            CLARA_BW_METRICS.prose_area(true, false),
+        );
+        assert_eq!(
+            pages.iter().flatten().copied().collect::<Vec<_>>(),
+            (0..rows.len()).collect::<Vec<_>>()
+        );
+        for page in pages {
+            let expected = page.len();
+            let screen = Screen::new(
+                1,
+                vec![Node::Rows {
+                    id: NodeId(1),
+                    rows: page
+                        .into_iter()
+                        .map(|index| {
+                            let (title, creator, synopsis, trailing) = &rows[index];
+                            Row::new(
+                                ActionId(index as u32 + 1),
+                                title,
+                                creator,
+                                Glyph::Book,
+                            )
+                            .with_description(synopsis)
+                            .with_trailing(trailing)
+                            .with_line_limits(RowLineLimits::new(1, 1, 2))
+                        })
+                        .collect(),
+                }],
+            );
+            assert_eq!(
+                screen
+                    .layout_with(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                    .nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind, LayoutKind::Row(_)))
+                    .count(),
+                expected
+            );
+            assert!(
+                !screen
+                    .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+                    .has_errors()
+            );
+        }
     }
 
     #[test]
@@ -17647,6 +17939,8 @@ mod prose_tests {
                     action: ActionId(6 + index as u32),
                     title: (*label).to_owned(),
                     summary: String::new(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead: RowLead::Icon(Glyph::Trash),
                     state: RowState::Open,
                     trailing: None,
@@ -17678,6 +17972,8 @@ mod prose_tests {
                     action: ActionId(2),
                     title: "A title".to_owned(),
                     summary: String::new(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead,
                     state: RowState::Open,
                     trailing: None,
@@ -17701,6 +17997,8 @@ mod prose_tests {
                               past the end of one line and onto a second, and \
                               very probably onto a third as well."
                         .to_owned(),
+                    description: String::new(),
+                    line_limits: RowLineLimits::default(),
                     lead,
                     state: RowState::Open,
                     trailing: None,
@@ -19052,17 +19350,21 @@ mod prose_tests {
                 area,
                 title,
                 summary,
+                "",
                 "1,284 points and 312 comments",
                 false,
-                row_mark_column(&metrics)
+                row_mark_column(&metrics),
+                RowLineLimits::default(),
             ) > measured_row_height(
                 &metrics,
                 area,
                 title,
                 summary,
                 "",
+                "",
                 false,
-                row_mark_column(&metrics)
+                row_mark_column(&metrics),
+                RowLineLimits::default(),
             ),
             "a row with a value at its trailing edge measured no taller"
         );
@@ -19275,16 +19577,20 @@ mod prose_tests {
                 &title,
                 "a summary",
                 "",
+                "",
                 true,
-                row_mark_column(&CLARA_BW_METRICS)
+                row_mark_column(&CLARA_BW_METRICS),
+                RowLineLimits::default(),
             ) > measured_row_height(
                 &CLARA_BW_METRICS,
                 area,
                 &title,
                 "a summary",
                 "",
+                "",
                 false,
-                row_mark_column(&CLARA_BW_METRICS)
+                row_mark_column(&CLARA_BW_METRICS),
+                RowLineLimits::default(),
             ),
             "the overflow column cost the title nothing"
         );
