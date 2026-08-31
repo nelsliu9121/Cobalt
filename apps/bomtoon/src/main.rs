@@ -188,6 +188,12 @@ fn comment_preview(text: &str, max_bytes: usize) -> (String, bool) {
     }
     (format!("{}...", text[..end].trim_end()), true)
 }
+
+fn normalized_header_preview(text: &str, max_bytes: usize, fallback: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = display_text(&normalized, fallback);
+    comment_preview(&visible, max_bytes).0
+}
 fn synopsis_modal_fits(text: &str) -> bool {
     let screen = ScreenBuilder::new("bomtoon-synopsis-measure")
         .top_bar("Episodes")
@@ -1146,6 +1152,8 @@ struct Bomtoon {
     selected_creators: String,
     selected_synopsis: String,
     synopsis: SynopsisState,
+    episode_title_preview: String,
+    episode_creators_preview: String,
     episode_items_per_page: Option<usize>,
     reader_selection: Option<EpisodeSelection>,
     reader_after_content_refresh: Option<usize>,
@@ -1873,10 +1881,10 @@ impl Bomtoon {
         preview: String,
         truncated: bool,
     ) -> ScreenBuilder {
-        let (title, _) = comment_preview(&self.selected_title, EPISODE_TITLE_PREVIEW_BYTES);
-        let (creators, _) =
-            comment_preview(&self.selected_creators, EPISODE_CREATORS_PREVIEW_BYTES);
-        let screen = screen.heading(title).text(creators).text(preview);
+        let screen = screen
+            .heading(self.episode_title_preview.clone())
+            .text(self.episode_creators_preview.clone())
+            .text(preview);
         if truncated {
             screen.button(SYNOPSIS_MORE, "More")
         } else {
@@ -1953,48 +1961,80 @@ impl Bomtoon {
         )
     }
 
-    fn measure_episode_page_capacity(&mut self) -> usize {
+    fn episode_capacity_fits(&self, header: &ScreenBuilder, rows_per_page: usize) -> bool {
+        let pages = self.episodes.len().div_ceil(rows_per_page).max(1);
+        (0..pages).all(|page| {
+            let actual = self.episode_screen_for(page, rows_per_page, false);
+            if !episode_screen_layout_fits(&actual) {
+                return false;
+            }
+            let reserved = self
+                .add_episode_body(header.clone(), rows_per_page, page, true)
+                .build();
+            episode_screen_layout_fits(&reserved)
+        })
+    }
+
+    fn measure_episode_page_capacity(&mut self) -> Option<usize> {
         let header = self.add_episode_header(
             ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
         );
         let mut stable_capacity = EPISODE_ITEMS_PER_PAGE;
         for _ in 0..2 {
-            let mut measured_capacity = 1;
-            for rows_per_page in (1..=EPISODE_ITEMS_PER_PAGE).rev() {
-                self.episode_items_per_page = Some(rows_per_page);
-                let pages = self.episodes.len().div_ceil(rows_per_page).max(1);
-                let all_pages_fit = (0..pages).all(|page| {
-                    let actual = self.episode_screen_for(page, rows_per_page, false);
-                    if !episode_screen_layout_fits(&actual) {
-                        return false;
-                    }
-                    let reserved = self
-                        .add_episode_body(header.clone(), rows_per_page, page, true)
-                        .build();
-                    episode_screen_layout_fits(&reserved)
+            let measured_capacity =
+                (1..=EPISODE_ITEMS_PER_PAGE).rev().find(|rows_per_page| {
+                    self.episode_items_per_page = Some(*rows_per_page);
+                    self.episode_capacity_fits(&header, *rows_per_page)
                 });
-                if all_pages_fit {
-                    measured_capacity = rows_per_page;
-                    break;
-                }
-            }
+            let Some(measured_capacity) = measured_capacity else {
+                self.episode_items_per_page = None;
+                return None;
+            };
             stable_capacity = stable_capacity.min(measured_capacity);
         }
-        if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES
+        let capacity = if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES
             || self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
         {
             1
         } else {
             stable_capacity
-        }
+        };
+        self.episode_capacity_fits(&header, capacity)
+            .then_some(capacity)
     }
 
     fn prepare_episode_layout(&mut self) {
+        for (title_bytes, creator_bytes) in [
+            (
+                EPISODE_TITLE_PREVIEW_BYTES,
+                EPISODE_CREATORS_PREVIEW_BYTES,
+            ),
+            (96, 96),
+            (48, 48),
+            (24, 24),
+        ] {
+            self.episode_items_per_page = None;
+            self.episode_title_preview =
+                normalized_header_preview(&self.selected_title, title_bytes, "Comic");
+            self.episode_creators_preview =
+                normalized_header_preview(&self.selected_creators, creator_bytes, "Creators");
+            let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
+            self.synopsis.preview = preview;
+            self.synopsis.preview_truncated = preview_truncated;
+            if let Some(rows_per_page) = self.measure_episode_page_capacity() {
+                self.episode_items_per_page = Some(rows_per_page);
+                return;
+            }
+        }
+
+        self.episode_title_preview = "Comic".to_owned();
+        self.episode_creators_preview = "Creators unavailable".to_owned();
+        self.synopsis.preview.clear();
+        self.synopsis.preview_truncated = !self.selected_synopsis.is_empty();
         self.episode_items_per_page = None;
-        let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
-        self.synopsis.preview = preview;
-        self.synopsis.preview_truncated = preview_truncated;
-        let rows_per_page = self.measure_episode_page_capacity();
+        let rows_per_page = self
+            .measure_episode_page_capacity()
+            .expect("minimal episode header must fit one measured row");
         self.episode_items_per_page = Some(rows_per_page);
     }
 
@@ -3432,6 +3472,8 @@ impl Bomtoon {
         self.selected_creators.clear();
         self.selected_synopsis.clear();
         self.synopsis = SynopsisState::default();
+        self.episode_title_preview.clear();
+        self.episode_creators_preview.clear();
         self.episode_items_per_page = None;
         self.reader_selection = None;
         self.problem = None;
@@ -4741,6 +4783,8 @@ impl Bomtoon {
         self.selected_creators.clear();
         self.selected_synopsis.clear();
         self.synopsis = SynopsisState::default();
+        self.episode_title_preview.clear();
+        self.episode_creators_preview.clear();
         self.episode_items_per_page = None;
         self.problem = None;
         self.retry = Retry::Restart;
@@ -10301,6 +10345,46 @@ mod tests {
         runner.app_mut().purchase_rejection_notice = Some("FAIL");
         assert_eq!(runner.app().episode_rows_per_page(), capacity);
         assert_fits(&runner.app().episode_screen());
+    }
+
+    #[test]
+    fn newline_heavy_maximum_episode_header_caches_only_a_fitted_capacity() {
+        let mut app = episode_metadata_app("Synopsis.".to_owned());
+        app.selected_title = "T\n".repeat(128);
+        app.selected_creators = "C\n".repeat(128);
+        assert_eq!(app.selected_title.len(), 256);
+        assert_eq!(app.selected_creators.len(), 256);
+        app.episodes = vec![Episode {
+            id: 900,
+            alias: "newline-heavy".to_owned(),
+            title: "Visible episode".to_owned(),
+            opened_at: 1_709_136_000_000,
+            thumbnail_url: None,
+            purchase: model::PurchaseState::Owned,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
+        }];
+
+        app.prepare_episode_layout();
+        assert_eq!(app.selected_title, "T\n".repeat(128));
+        assert_eq!(app.selected_creators, "C\n".repeat(128));
+        assert!(!app.episode_title_preview.contains('\n'));
+        assert!(!app.episode_creators_preview.contains('\n'));
+
+        assert!(app.episode_items_per_page.is_some());
+        let screen = app.episode_screen();
+        assert!(
+            episode_screen_layout_fits(&screen),
+            "cached capacity did not pass its one-row probe: {screen:?}"
+        );
+        assert!(screen.nodes.iter().any(|node| matches!(
+            node,
+            Node::Rows { rows, .. }
+                if rows.len() == 1 && rows[0].action == action_id("episode-0")
+        )));
+        assert_fits(&screen);
     }
 
     #[test]
