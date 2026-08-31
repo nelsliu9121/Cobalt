@@ -331,7 +331,7 @@ fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
 }
 
 fn collection_cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
-    ready_cover(covers, url).map_or(RowLead::Icon(Glyph::Book), |picture| {
+    ready_cover(covers, url).map_or(RowLead::CoverSlot(Glyph::Book), |picture| {
         RowLead::Picture(picture.with_fit(PictureFit::Cover), Glyph::Book)
     })
 }
@@ -1508,6 +1508,9 @@ impl Bomtoon {
         } else {
             screen = screen.activity("Loading collection details", None);
         }
+        if view.pages.get(view.page).is_none() {
+            return screen.build();
+        }
 
         let complete = view
             .pages
@@ -2382,11 +2385,11 @@ impl Bomtoon {
                         .flat_map(|collection| collection.comics.iter()),
                 )
             })
-            .filter_map(|comic| {
+            .flat_map(|comic| {
                 comic
                     .vertical_url
-                    .as_ref()
-                    .or(comic.square_url.as_ref())
+                    .iter()
+                    .chain(comic.square_url.iter())
                     .cloned()
             })
             .collect()
@@ -12253,6 +12256,7 @@ mod tests {
 
     struct SignOutScenario {
         public_url: String,
+        square_url: String,
         shared_url: String,
         shared_loading_url: String,
         protected_url: String,
@@ -12263,12 +12267,14 @@ mod tests {
         reader_task: TaskId,
         shared_cover_task: TaskId,
         shared_picture: TilePicture,
+        square_picture: TilePicture,
         protected_picture: TilePicture,
     }
 
     fn sign_out_scenario() -> SignOutScenario {
         SignOutScenario {
             public_url: "https://image.balcony.studio/tw/contents/public.webp".to_owned(),
+            square_url: "https://image.balcony.studio/tw/contents/public-square.webp".to_owned(),
             shared_url: "https://image.balcony.studio/tw/contents/shared.webp".to_owned(),
             shared_loading_url: "https://image.balcony.studio/tw/contents/shared-loading.webp"
                 .to_owned(),
@@ -12280,6 +12286,7 @@ mod tests {
             reader_task: TaskId(94),
             shared_cover_task: TaskId(95),
             shared_picture: TilePicture::new(PictureHandle(81), 10, 20),
+            square_picture: TilePicture::new(PictureHandle(83), 20, 20),
             protected_picture: TilePicture::new(PictureHandle(82), 10, 20),
         }
     }
@@ -12315,7 +12322,7 @@ mod tests {
                     creators: String::new(),
                     view_count: None,
                     vertical_url: Some(scenario.shared_url.clone()),
-                    square_url: None,
+                    square_url: Some(scenario.square_url.clone()),
                 },
                 FeatureComic {
                     title: "Shared loading".to_owned(),
@@ -12414,6 +12421,7 @@ mod tests {
         app.covers.generation = 11;
         app.covers.visible_urls = vec![
             scenario.public_url.clone(),
+            scenario.square_url.clone(),
             scenario.shared_loading_url.clone(),
             scenario.protected_url.clone(),
         ];
@@ -12425,6 +12433,10 @@ mod tests {
             (
                 scenario.shared_url.clone(),
                 CoverState::Ready(scenario.shared_picture),
+            ),
+            (
+                scenario.square_url.clone(),
+                CoverState::Ready(scenario.square_picture),
             ),
             (
                 scenario.shared_loading_url.clone(),
@@ -12505,6 +12517,10 @@ mod tests {
             Some(&CoverState::Ready(scenario.shared_picture))
         );
         assert_eq!(
+            app.covers.entries.get(&scenario.square_url),
+            Some(&CoverState::Ready(scenario.square_picture))
+        );
+        assert_eq!(
             app.covers.entries.get(&scenario.public_url),
             Some(&CoverState::Loading(scenario.public_cover_task))
         );
@@ -12555,6 +12571,7 @@ mod tests {
         assert!(commands.contains(&Command::DropPicture(PictureHandle(7))));
         assert!(commands.contains(&Command::DropPicture(scenario.protected_picture.handle)));
         assert!(!commands.contains(&Command::DropPicture(scenario.shared_picture.handle)));
+        assert!(!commands.contains(&Command::DropPicture(scenario.square_picture.handle)));
     }
 
     fn assert_protected_destinations_require_sign_in(runner: &mut AppRunner<Bomtoon>) {
@@ -12734,10 +12751,13 @@ mod tests {
     }
 
     #[test]
-    fn sign_out_retains_public_feed_pictures_and_tasks_while_clearing_protected_state() {
+    fn sign_out_retains_both_public_artwork_urls_and_tasks_while_clearing_protected_state() {
         let scenario = sign_out_scenario();
         let mut runner = sign_out_runner(&scenario);
         let public_featured = runner.app().featured.clone();
+        let public_urls = runner.app().public_cover_urls();
+        assert!(public_urls.contains(&scenario.shared_url));
+        assert!(public_urls.contains(&scenario.square_url));
 
         let account_commands = runner.action(action_id(ACCOUNT));
         assert_eq!(runner.app().view, View::Account);
@@ -14848,6 +14868,24 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::Device(DeviceRequest::ReadLocalDay))));
         runner.device_result(DeviceResult::LocalDay(Some(observed)))
+    }
+
+    #[test]
+    fn late_first_local_day_labels_published_startup_without_duplicate_source_tasks() {
+        let mut app = ready_featured(local_day(30), "initial");
+        app.featured.loaded_day = None;
+        let before = app.featured.snapshot().expect("startup snapshot").clone();
+        let generation = app.featured.generation;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = observe_day_with_runner(&mut runner, local_day(30));
+
+        assert!(spawns(&commands).is_empty());
+        assert!(runner.app().feature_tasks.is_empty());
+        assert!(runner.app().featured.batch.is_none());
+        assert_eq!(runner.app().featured.generation, generation);
+        assert_eq!(runner.app().featured.loaded_day, Some(local_day(30)));
+        assert_eq!(runner.app().featured.snapshot(), Some(&before));
     }
 
     #[test]
@@ -17177,6 +17215,57 @@ mod tests {
     }
 
     #[test]
+    fn unknown_collection_total_shows_current_page_and_discovered_turns() {
+        let mut app = full_collection_app(AccountState::SignedOut, 12);
+        cache_all_feature_covers(&mut app);
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        runner.action(action_id(&collection_action("ranking")));
+        let commands = settle_open_collection_window(&mut runner, None);
+        let first = last_screen(&commands);
+
+        assert_eq!(
+            first.page_turns.as_ref().and_then(|turns| turns.position),
+            Some((1, 0))
+        );
+        let first_layout = first.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let first_position = first_layout
+            .nodes
+            .iter()
+            .find(|node| {
+                node.text_lines.as_slice() == ["1"]
+                    && node.rect.y >= first_layout.content.y + first_layout.content.height
+            })
+            .expect("unknown-total page position");
+        assert_eq!(first_position.text_lines, ["1"]);
+        assert!(!first_layout
+            .nodes
+            .iter()
+            .any(|node| { node.kind.acts_on() == Some(action_id(PREVIOUS_PAGE)) }));
+        assert!(first_layout
+            .nodes
+            .iter()
+            .any(|node| { node.kind.acts_on() == Some(action_id(NEXT_PAGE)) }));
+
+        runner.action(action_id(NEXT_PAGE));
+        let commands = settle_open_collection_window(&mut runner, None);
+        let second = last_screen(&commands);
+        assert_eq!(
+            second.page_turns.as_ref().and_then(|turns| turns.position),
+            Some((2, 0))
+        );
+        let second_layout = second.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        assert!(second_layout
+            .nodes
+            .iter()
+            .any(|node| { node.kind.acts_on() == Some(action_id(PREVIOUS_PAGE)) }));
+        assert!(second_layout
+            .nodes
+            .iter()
+            .any(|node| { node.kind.acts_on() == Some(action_id(NEXT_PAGE)) }));
+        assert_fits(&second);
+    }
+
+    #[test]
     fn collection_failed_synopses_remain_actionable_and_zero_or_missing_counts_have_no_trailing() {
         let mut app = full_collection_app(AccountState::SignedOut, 3);
         let comics = &mut app
@@ -17213,6 +17302,38 @@ mod tests {
             .all(|row| { row.description.is_empty() && row.state == kobo_sdk::RowState::Open }));
         assert!(collection_detail_tasks(&runner).is_empty());
         assert_fits(&screen);
+    }
+
+    #[test]
+    fn collection_cover_fallback_retains_the_picture_slot_for_every_unready_state() {
+        let url = "https://image.balcony.studio/tw/contents/fallback.webp";
+        let mut covers = CoverCache::default();
+
+        assert_eq!(
+            collection_cover_lead(&covers, None),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+        covers
+            .entries
+            .insert(url.to_owned(), CoverState::Loading(TaskId(1)));
+        assert_eq!(
+            collection_cover_lead(&covers, Some(url)),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+        covers.entries.insert(url.to_owned(), CoverState::Failed);
+        assert_eq!(
+            collection_cover_lead(&covers, Some(url)),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+
+        let picture = TilePicture::new(PictureHandle(9), 300, 180);
+        covers
+            .entries
+            .insert(url.to_owned(), CoverState::Ready(picture));
+        assert_eq!(
+            collection_cover_lead(&covers, Some(url)),
+            RowLead::Picture(picture.with_fit(PictureFit::Cover), Glyph::Book)
+        );
     }
 
     #[test]

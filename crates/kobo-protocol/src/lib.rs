@@ -6316,6 +6316,10 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
             output.push(0);
             push_u16(output, u16::from(encode_glyph(glyph)));
         }
+        RowLead::CoverSlot(glyph) => {
+            output.push(3);
+            push_u16(output, u16::from(encode_glyph(glyph)));
+        }
         RowLead::Number(number) => {
             output.push(1);
             push_u16(output, number);
@@ -6346,6 +6350,7 @@ fn read_row_lead(reader: &mut Reader<'_>) -> Result<RowLead, ProtocolError> {
         0 => RowLead::Icon(glyph()?),
         1 => RowLead::Number(value),
         2 => RowLead::Picture(decode_tile_picture(reader)?, glyph()?),
+        3 => RowLead::CoverSlot(glyph()?),
         _ => return Err(ProtocolError::InvalidValue("row lead")),
     };
     // The padding the encoder wrote, so every lead costs the same however it
@@ -9010,6 +9015,30 @@ mod picture_tests {
             )));
             assert_eq!(round_trip(screen.clone()), screen);
         }
+    }
+
+    #[test]
+    fn cover_slot_row_lead_round_trips_and_unknown_leads_stay_closed() {
+        let screen = Screen::new(
+            1,
+            vec![Node::Rows {
+                id: NodeId(1),
+                rows: vec![Row::new(
+                    ActionId(2),
+                    "Title",
+                    "Creator",
+                    RowLead::CoverSlot(Glyph::Book),
+                )],
+            }],
+        );
+        assert_eq!(round_trip(screen.clone()), screen);
+
+        let mut unknown = vec![4, 0, 0];
+        unknown.resize(ROW_LEAD_LEN, 0);
+        assert_eq!(
+            read_row_lead(&mut Reader::new(&unknown)),
+            Err(ProtocolError::InvalidValue("row lead"))
+        );
     }
 
     #[test]

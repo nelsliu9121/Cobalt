@@ -6256,6 +6256,29 @@ mod tests {
     }
 
     #[test]
+    fn described_rows_preserve_an_explicit_cover_slot_without_changing_glyph_defaults() {
+        let screen = ScreenBuilder::new("cover-slot")
+            .described_rows_with_trailing(
+                RowLineLimits::new(1, 1, 2),
+                [(
+                    "fallback",
+                    "Title",
+                    "Creator",
+                    "Synopsis",
+                    RowLead::CoverSlot(Glyph::Book),
+                    "",
+                )],
+            )
+            .build();
+        let Node::Rows { rows, .. } = &screen.nodes[0] else {
+            panic!("builder did not produce rows");
+        };
+
+        assert_eq!(rows[0].lead, RowLead::CoverSlot(Glyph::Book));
+        assert_eq!(RowLead::from(Glyph::Book), RowLead::Icon(Glyph::Book));
+    }
+
+    #[test]
     fn client_transparently_chunks_a_full_width_picture() {
         let (client_stream, mut daemon_stream) = UnixStream::pair().expect("socket pair");
         let daemon = thread::spawn(move || {

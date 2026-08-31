@@ -10,9 +10,9 @@ description = "Capability, task, storage, and credential policy for Kobo applica
 
 [dependencies]
 fs4.workspace = true
-kobo-abi = { version = "0.4.0", path = "../kobo-abi" }
-kobo-dict = { version = "0.4.0", path = "../kobo-dict" }
-kobo-protocol = { version = "0.4.0", path = "../kobo-protocol" }
+kobo-abi = { version = "0.5.0", path = "../kobo-abi" }
+kobo-dict = { version = "0.5.0", path = "../kobo-dict" }
+kobo-protocol = { version = "0.5.0", path = "../kobo-protocol" }
 
 [lints]
 workspace = true

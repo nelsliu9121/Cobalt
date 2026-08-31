@@ -406,6 +406,11 @@ impl FeaturedState {
             }
             return false;
         }
+        if self.loaded_day.is_none() && self.snapshot.is_some() {
+            self.loaded_day = Some(day);
+            self.desired_day = None;
+            return false;
+        }
         self.desired_day = None;
         self.begin_full_batch(Some(day));
         true
@@ -632,14 +637,6 @@ impl FeaturedState {
             return;
         };
         for banner in batch.banners.iter().take(3) {
-            if batch.resolved_banners.contains_key(&banner.alias)
-                || batch
-                    .pending_banner_aliases
-                    .iter()
-                    .any(|pending| pending == &banner.alias)
-            {
-                continue;
-            }
             let matching = batch
                 .collections
                 .values()
@@ -649,9 +646,24 @@ impl FeaturedState {
                 .cloned();
             if let Some(comic) = matching {
                 batch.resolved_banners.insert(banner.alias.clone(), comic);
-            } else {
-                batch.pending_banner_aliases.push_back(banner.alias.clone());
+                if let Some(index) = batch
+                    .pending_banner_aliases
+                    .iter()
+                    .position(|pending| pending == &banner.alias)
+                {
+                    batch.pending_banner_aliases.remove(index);
+                }
+                continue;
             }
+            if batch.resolved_banners.contains_key(&banner.alias)
+                || batch
+                    .pending_banner_aliases
+                    .iter()
+                    .any(|pending| pending == &banner.alias)
+            {
+                continue;
+            }
+            batch.pending_banner_aliases.push_back(banner.alias.clone());
         }
     }
 
@@ -910,6 +922,50 @@ mod tests {
     }
 
     #[test]
+    fn recovered_source_replaces_a_preserved_banner_placeholder_with_safe_artwork() {
+        let recovered = comic("rank-0");
+        let mut homepage = homepage_fixture();
+        homepage.banners = vec![BannerComic {
+            alias: recovered.alias.clone(),
+        }];
+        let mut state = FeaturedState::default();
+        state.begin_full_batch(None);
+        state.settle(SourceResult::homepage(homepage));
+        state.settle(SourceResult::failure(FeatureSource::Ranking));
+        state.settle(SourceResult::collection(
+            FeatureSource::MostFavorited,
+            Vec::new(),
+        ));
+        state.settle(SourceResult::themes(Vec::new()));
+        state.settle(SourceResult::collection(
+            FeatureSource::Freetime,
+            Vec::new(),
+        ));
+        assert_eq!(state.next_banner_alias().as_deref(), Some("rank-0"));
+        state.settle_banner_detail("rank-0", None);
+        assert_eq!(
+            state
+                .publish_ready_banner_details()
+                .expect("partial snapshot")
+                .banners[0]
+                .vertical_url,
+            None
+        );
+
+        assert_eq!(state.begin_failed_retry(), vec![FeatureSource::Ranking]);
+        state.settle(SourceResult::collection(
+            FeatureSource::Ranking,
+            vec![recovered.clone()],
+        ));
+        let banner = &state
+            .publish_ready_banner_details()
+            .expect("recovered snapshot")
+            .banners[0];
+
+        assert_eq!(banner, &recovered);
+    }
+
+    #[test]
     fn first_observed_day_labels_an_undated_full_batch_without_duplicate_refresh() {
         let day = LocalDay::new(2026, 8, 31).expect("day");
         let mut state = FeaturedState {
@@ -924,6 +980,30 @@ mod tests {
             Some(day)
         );
         assert_eq!(state.desired_day, None);
+    }
+
+    #[test]
+    fn late_first_day_labels_an_undated_committed_snapshot_without_refreshing() {
+        let day = LocalDay::new(2026, 8, 31).expect("day");
+        let mut state = FeaturedState::default();
+        state.begin_full_batch(None);
+        settle_all_sources(&mut state, successful_results("initial"));
+        let before = state.snapshot().expect("snapshot").clone();
+        let generation = state.generation;
+
+        assert_eq!(state.loaded_day, None);
+        assert!(!state.observe_day(day));
+        assert_eq!(state.loaded_day, Some(day));
+        assert_eq!(state.generation, generation);
+        assert_eq!(state.snapshot(), Some(&before));
+        assert!(state.batch.is_none());
+
+        let next_day = LocalDay::new(2026, 9, 1).expect("day");
+        assert!(state.observe_day(next_day));
+        assert_eq!(
+            state.batch.as_ref().and_then(|batch| batch.refresh_day),
+            Some(next_day)
+        );
     }
 
     #[test]

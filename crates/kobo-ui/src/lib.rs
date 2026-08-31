@@ -1460,9 +1460,9 @@ impl PageTurns {
 
     /// The same, saying which page of how many this is.
     ///
-    /// `page` is one-based. A total of zero, or a page past the total, draws
-    /// nothing rather than "0 of 0": a count nobody can compute yet is better
-    /// left unsaid than said wrongly.
+    /// `page` is one-based. A total of zero means the total is still unknown:
+    /// the current page is drawn alone and Next remains available. Page zero,
+    /// or a known total smaller than `page`, draws nothing.
     #[must_use]
     pub const fn with_position(mut self, page: u16, of: u16) -> Self {
         self.position = Some((page, of));
@@ -1472,7 +1472,7 @@ impl PageTurns {
     /// The position to draw, once nonsense has been discarded.
     const fn drawable_position(self) -> Option<(u16, u16)> {
         match self.position {
-            Some((page, of)) if of > 0 && page >= 1 && page <= of => Some((page, of)),
+            Some((page, of)) if page >= 1 && (of == 0 || page <= of) => Some((page, of)),
             _ => None,
         }
     }
@@ -1509,11 +1509,16 @@ fn layout_page_position(
     metrics: &DisplayMetrics,
     layout: &mut Layout,
 ) {
+    let position = if of == 0 {
+        page.to_string()
+    } else {
+        format!("{page} of {of}")
+    };
     layout.nodes.push(LayoutNode {
         id: NodeId(0),
         rect: band,
         kind: LayoutKind::PagePosition,
-        text_lines: vec![format!("{page} of {of}")],
+        text_lines: vec![position],
     });
     let side = min(metrics.touch_target_default(), band.width / 3);
     if page > 1 {
@@ -1527,7 +1532,7 @@ fn layout_page_position(
             text_lines: Vec::new(),
         });
     }
-    if page < of {
+    if of == 0 || page < of {
         layout.nodes.push(LayoutNode {
             id: NodeId(0),
             rect: Rect {
@@ -3732,6 +3737,12 @@ pub enum RowLead {
     Icon(Glyph),
     /// The row's position in an ordered list, drawn as digits.
     Number(u16),
+    /// A cover-sized slot whose picture is not ready, drawn with `glyph`.
+    ///
+    /// It deliberately keeps the same full lead column and vertical placement
+    /// as [`Self::Picture`] so loading, failed, and absent artwork cannot
+    /// reflow the row text.
+    CoverSlot(Glyph),
     /// A cover, letterboxed into the lead square, with a glyph for when the
     /// handle has not arrived or has been evicted from the cache.
     ///
@@ -5145,7 +5156,7 @@ fn row_lead_column(metrics: &DisplayMetrics, rows: &[Row]) -> i32 {
         column = max(
             column,
             match row.lead {
-                RowLead::Picture(..) => target,
+                RowLead::Picture(..) | RowLead::CoverSlot(_) => target,
                 RowLead::Icon(_) => row_mark_column(metrics),
                 RowLead::Number(number) => row_rank_column(metrics, number),
             },
@@ -5255,13 +5266,13 @@ fn lead_rect(
     let side = match lead {
         // A cover is the content of its row and wants every pixel the column
         // has.
-        RowLead::Picture(..) | RowLead::Number(_) => column,
+        RowLead::Picture(..) | RowLead::CoverSlot(_) | RowLead::Number(_) => column,
         RowLead::Icon(_) => min(column, metrics.tenth_mm(FontSize::Body.tenth_mm() * 6 / 5)),
     };
     let top = match lead {
         // A cover is the row's content rather than a label on it, so it sits
         // against the whole row the way a picture beside a paragraph does.
-        RowLead::Picture(..) => y.saturating_add((height - side) / 2),
+        RowLead::Picture(..) | RowLead::CoverSlot(_) => y.saturating_add((height - side) / 2),
         // A mark labels the row, and what it labels is the title. Centred on
         // the row instead it sinks the moment a summary wraps to a second
         // line, until it sits against the summary and reads as a mark on
@@ -12870,6 +12881,7 @@ fn draw_row_lead(
 ) {
     match lead {
         RowLead::Icon(glyph) => draw_glyph_icon(surface, glyph, rect, clip),
+        RowLead::CoverSlot(glyph) => draw_glyph_icon(surface, glyph, rect, clip),
         // The glyph is not a decoration to fall back to, it is the row still
         // working while the covers are arriving. A shelf that draws nothing
         // until every thumbnail has decoded is a shelf of empty squares.
@@ -15587,6 +15599,62 @@ mod row_tests {
             summary.rect.y.saturating_add(summary.rect.height)
         );
         assert_eq!(description.rect.height, 2 * FontSize::Caption.line_height());
+    }
+
+    #[test]
+    fn cover_slot_fallback_keeps_ready_picture_row_geometry() {
+        let layout = |lead| {
+            Screen::new(
+                1,
+                vec![Node::Rows {
+                    id: NodeId(1),
+                    rows: vec![Row::new(
+                        ActionId(1),
+                        "A deliberately long title beside a collection cover",
+                        "A deliberately long creator credit beside the same cover",
+                        lead,
+                    )
+                    .with_description(
+                        "A synopsis whose wrapping must not move when artwork becomes ready",
+                    )
+                    .with_line_limits(RowLineLimits::new(1, 1, 2))],
+                }],
+            )
+            .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+        };
+        let fallback = layout(RowLead::CoverSlot(Glyph::Book));
+        let ready = layout(RowLead::Picture(
+            TilePicture::new(PictureHandle(7), 300, 300).with_fit(PictureFit::Cover),
+            Glyph::Book,
+        ));
+        let text_geometry = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        LayoutKind::RowTitle | LayoutKind::RowSummary | LayoutKind::RowDescription
+                    )
+                })
+                .map(|node| (node.kind, node.rect, node.text_lines.clone()))
+                .collect::<Vec<_>>()
+        };
+        let lead_rect = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .find(|node| matches!(node.kind, LayoutKind::RowLead(_)))
+                .expect("row lead")
+                .rect
+        };
+
+        assert_eq!(text_geometry(&fallback), text_geometry(&ready));
+        assert_eq!(lead_rect(&fallback), lead_rect(&ready));
+        assert_eq!(
+            lead_rect(&fallback).width,
+            CLARA_BW_METRICS.touch_target_default()
+        );
     }
 
     #[test]
@@ -19201,8 +19269,58 @@ mod prose_tests {
     }
 
     #[test]
+    fn unknown_total_draws_the_current_page_and_both_discovered_turn_directions() {
+        let build = |page: u16| {
+            let mut screen = Screen::new(1, Vec::new()).with_page_turns(ActionId(7), ActionId(9));
+            screen.page_turns = screen.page_turns.map(|turns| turns.with_position(page, 0));
+            screen.layout()
+        };
+        let first = build(1);
+        let middle = build(2);
+        let shown = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .find(|node| node.kind == LayoutKind::PagePosition)
+                .expect("unknown-total page position")
+                .text_lines[0]
+                .clone()
+        };
+        let turns = |layout: &Layout| {
+            layout
+                .nodes
+                .iter()
+                .map(|node| node.kind)
+                .filter(|kind| {
+                    matches!(kind, LayoutKind::PagePrevious(_) | LayoutKind::PageNext(_))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(shown(&first), "1");
+        assert_eq!(turns(&first), vec![LayoutKind::PageNext(ActionId(9))]);
+        assert_eq!(shown(&middle), "2");
+        assert_eq!(
+            turns(&middle),
+            vec![
+                LayoutKind::PagePrevious(ActionId(7)),
+                LayoutKind::PageNext(ActionId(9))
+            ]
+        );
+        assert_eq!(first.content.height, middle.content.height);
+        assert!(
+            first.content.height
+                < Screen::new(1, Vec::new())
+                    .with_page_turns(ActionId(7), ActionId(9))
+                    .layout()
+                    .content
+                    .height
+        );
+    }
+
+    #[test]
     fn a_page_position_nobody_can_compute_is_left_unsaid() {
-        for position in [(0, 0), (1, 0), (13, 12)] {
+        for position in [(0, 0), (13, 12)] {
             let mut screen = Screen::new(1, Vec::new()).with_page_turns(ActionId(1), ActionId(2));
             screen.page_turns = screen
                 .page_turns
