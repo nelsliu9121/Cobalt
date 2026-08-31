@@ -7721,12 +7721,13 @@ mod node_coverage_tests {
         for value in [9, 42, 1_072, 1_448] {
             push_u32(&mut bytes, value);
         }
+        bytes.push(0);
         let mut reader = Reader::new(&bytes);
         let surface = decode_reading_surface(&mut reader)
             .expect("busy reading surface")
             .expect("reading surface");
-        assert_ne!(surface.chrome, ReadingChrome::Hidden);
-        assert_ne!(surface.chrome, ReadingChrome::Overlay);
+        assert_eq!(surface.chrome, ReadingChrome::OverlayBusy);
+        assert_eq!(surface.picture.fit, PictureFit::Contain);
     }
 
     #[test]
