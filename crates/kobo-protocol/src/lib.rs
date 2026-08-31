@@ -3409,6 +3409,19 @@ fn encoded_screen_len(
     Ok(length)
 }
 
+fn encoded_tile_len(tile: &Tile) -> Result<usize, ProtocolError> {
+    // Action, glyph, state and picture flag, plus the three strings and the
+    // optional picture payload.
+    let mut length = 7;
+    add_encoded_len(&mut length, encoded_string_len(&tile.label)?)?;
+    add_encoded_len(&mut length, encoded_string_len(&tile.badge)?)?;
+    add_encoded_len(&mut length, encoded_string_len(&tile.subtitle)?)?;
+    if tile.picture.is_some() {
+        add_encoded_len(&mut length, 13)?;
+    }
+    Ok(length)
+}
+
 // One exhaustive match over every node kind. Splitting it would only move
 // arms out of reach of the compiler's exhaustiveness check, which is the one
 // thing making it impossible to add a node and forget the wire format. The
@@ -3471,9 +3484,14 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             }
             length
         }
-        Node::Section { title, value, .. } => {
-            // id, then the title, then a byte saying whether a value follows.
-            let mut length = 6;
+        Node::Section {
+            title,
+            value,
+            action,
+            ..
+        } => {
+            // Id and title, then presence bytes for the value and action.
+            let mut length = 7 + if action.is_some() { 4 } else { 0 };
             add_encoded_len(&mut length, encoded_string_len(title)?)?;
             if let Some(value) = value {
                 add_encoded_len(&mut length, encoded_string_len(value)?)?;
@@ -3620,13 +3638,17 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             }
             let mut length = 7;
             for tile in tiles {
-                add_encoded_len(&mut length, 7)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.label)?)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.badge)?)?;
-                add_encoded_len(&mut length, encoded_string_len(&tile.subtitle)?)?;
-                if tile.picture.is_some() {
-                    add_encoded_len(&mut length, 13)?;
-                }
+                add_encoded_len(&mut length, encoded_tile_len(tile)?)?;
+            }
+            length
+        }
+        Node::ImageStrip { tiles, .. } | Node::MediaGrid { tiles, .. } => {
+            if tiles.len() > u8::MAX as usize {
+                return Err(ProtocolError::TooManyNodes);
+            }
+            let mut length = 6;
+            for tile in tiles {
+                add_encoded_len(&mut length, encoded_tile_len(tile)?)?;
             }
             length
         }
@@ -4613,13 +4635,25 @@ fn encode_node(
             push_u32(output, id.0);
             push_string(output, text)?;
         }
-        Node::Section { id, title, value } => {
+        Node::Section {
+            id,
+            title,
+            value,
+            action,
+        } => {
             output.push(21);
             push_u32(output, id.0);
             push_string(output, title)?;
             output.push(u8::from(value.is_some()));
             if let Some(value) = value {
                 push_string(output, value)?;
+            }
+            match action {
+                Some(action) => {
+                    output.push(1);
+                    push_u32(output, action.0);
+                }
+                None => output.push(0),
             }
         }
         Node::Quote {
@@ -4855,27 +4889,17 @@ fn encode_node(
                 TileShape::Square => 0,
                 TileShape::Portrait => 1,
             });
-            output.push(u8::try_from(tiles.len()).map_err(|_| ProtocolError::TooManyNodes)?);
-            for tile in tiles {
-                push_u32(output, tile.action.0);
-                push_string(output, &tile.label)?;
-                output.push(encode_glyph(tile.glyph));
-                output.push(match tile.state {
-                    TileState::Normal => 0,
-                    TileState::Held => 1,
-                    TileState::Unavailable => 2,
-                    TileState::Busy => 3,
-                });
-                push_string(output, &tile.badge)?;
-                push_string(output, &tile.subtitle)?;
-                match tile.picture {
-                    Some(picture) => {
-                        output.push(1);
-                        encode_tile_picture(output, picture);
-                    }
-                    None => output.push(0),
-                }
-            }
+            encode_tiles(output, tiles)?;
+        }
+        Node::ImageStrip { id, tiles } => {
+            output.push(31);
+            push_u32(output, id.0);
+            encode_tiles(output, tiles)?;
+        }
+        Node::MediaGrid { id, tiles } => {
+            output.push(32);
+            push_u32(output, id.0);
+            encode_tiles(output, tiles)?;
         }
         Node::Picture {
             id,
@@ -5289,6 +5313,36 @@ const fn decode_glyph(tag: u8) -> Option<Glyph> {
     })
 }
 
+fn encode_tiles(output: &mut Vec<u8>, tiles: &[Tile]) -> Result<(), ProtocolError> {
+    output.push(u8::try_from(tiles.len()).map_err(|_| ProtocolError::TooManyNodes)?);
+    for tile in tiles {
+        encode_tile(output, tile)?;
+    }
+    Ok(())
+}
+
+fn encode_tile(output: &mut Vec<u8>, tile: &Tile) -> Result<(), ProtocolError> {
+    push_u32(output, tile.action.0);
+    push_string(output, &tile.label)?;
+    output.push(encode_glyph(tile.glyph));
+    output.push(match tile.state {
+        TileState::Normal => 0,
+        TileState::Held => 1,
+        TileState::Unavailable => 2,
+        TileState::Busy => 3,
+    });
+    push_string(output, &tile.badge)?;
+    push_string(output, &tile.subtitle)?;
+    match tile.picture {
+        Some(picture) => {
+            output.push(1);
+            encode_tile_picture(output, picture);
+        }
+        None => output.push(0),
+    }
+    Ok(())
+}
+
 fn encode_tile_picture(output: &mut Vec<u8>, picture: TilePicture) {
     push_u32(output, picture.handle.0);
     push_u32(output, picture.source.0);
@@ -5309,6 +5363,47 @@ fn decode_tile_picture(reader: &mut Reader<'_>) -> Result<TilePicture, ProtocolE
         _ => return Err(ProtocolError::InvalidValue("picture fit")),
     };
     Ok(TilePicture::new(handle, width, height).with_fit(fit))
+}
+
+fn decode_tiles(reader: &mut Reader<'_>) -> Result<Vec<Tile>, ProtocolError> {
+    let len = usize::from(reader.u8()?);
+    let mut tiles = Vec::with_capacity(len);
+    for _ in 0..len {
+        tiles.push(decode_tile(reader)?);
+    }
+    Ok(tiles)
+}
+
+fn decode_tile(reader: &mut Reader<'_>) -> Result<Tile, ProtocolError> {
+    let action = ActionId(reader.u32()?);
+    if action.is_reserved() {
+        return Err(ProtocolError::InvalidValue("reserved action id"));
+    }
+    let label = reader.string()?;
+    let glyph = decode_glyph(reader.u8()?).ok_or(ProtocolError::InvalidValue("tile glyph"))?;
+    let state = match reader.u8()? {
+        0 => TileState::Normal,
+        1 => TileState::Held,
+        2 => TileState::Unavailable,
+        3 => TileState::Busy,
+        _ => return Err(ProtocolError::InvalidValue("tile state")),
+    };
+    let badge = reader.string()?;
+    let subtitle = reader.string()?;
+    let picture = match reader.u8()? {
+        0 => None,
+        1 => Some(decode_tile_picture(reader)?),
+        _ => return Err(ProtocolError::InvalidValue("tile picture flag")),
+    };
+    Ok(Tile {
+        action,
+        label,
+        glyph,
+        picture,
+        state,
+        badge,
+        subtitle,
+    })
 }
 
 fn decode_reading_surface(
@@ -5712,7 +5807,23 @@ fn decode_node(
             } else {
                 Some(reader.string()?)
             };
-            Ok(Node::Section { id, title, value })
+            let action = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let action = ActionId(reader.u32()?);
+                    if action.is_reserved() {
+                        return Err(ProtocolError::InvalidValue("reserved action id"));
+                    }
+                    Some(action)
+                }
+                _ => return Err(ProtocolError::InvalidValue("section action flag")),
+            };
+            Ok(Node::Section {
+                id,
+                title,
+                value,
+                action,
+            })
         }
         4 => {
             let child_count = usize::from(reader.u16()?);
@@ -5872,42 +5983,20 @@ fn decode_node(
                 1 => TileShape::Portrait,
                 _ => return Err(ProtocolError::InvalidValue("tile shape")),
             };
-            let len = usize::from(reader.u8()?);
-            let mut tiles = Vec::with_capacity(len);
-            for _ in 0..len {
-                let action = ActionId(reader.u32()?);
-                if action.is_reserved() {
-                    return Err(ProtocolError::InvalidValue("reserved action id"));
-                }
-                let label = reader.string()?;
-                let glyph =
-                    decode_glyph(reader.u8()?).ok_or(ProtocolError::InvalidValue("tile glyph"))?;
-                let state = match reader.u8()? {
-                    0 => TileState::Normal,
-                    1 => TileState::Held,
-                    2 => TileState::Unavailable,
-                    3 => TileState::Busy,
-                    _ => return Err(ProtocolError::InvalidValue("tile state")),
-                };
-                let badge = reader.string()?;
-                let subtitle = reader.string()?;
-                let picture = match reader.u8()? {
-                    0 => None,
-                    1 => Some(decode_tile_picture(reader)?),
-                    _ => return Err(ProtocolError::InvalidValue("tile picture flag")),
-                };
-                tiles.push(Tile {
-                    action,
-                    label,
-                    glyph,
-                    picture,
-                    state,
-                    badge,
-                    subtitle,
-                });
-            }
-            Ok(Node::TileGrid { id, tiles, shape })
+            Ok(Node::TileGrid {
+                id,
+                tiles: decode_tiles(reader)?,
+                shape,
+            })
         }
+        31 => Ok(Node::ImageStrip {
+            id,
+            tiles: decode_tiles(reader)?,
+        }),
+        32 => Ok(Node::MediaGrid {
+            id,
+            tiles: decode_tiles(reader)?,
+        }),
         17 => {
             let handle = PictureHandle(reader.u32()?);
             let source = (reader.u32()?, reader.u32()?);
@@ -7416,11 +7505,13 @@ mod node_coverage_tests {
                 id: NodeId(23),
                 title: "Details".into(),
                 value: None,
+                action: None,
             },
             Node::Section {
                 id: NodeId(24),
                 title: "Popular".into(),
                 value: Some("32".into()),
+                action: Some(ActionId(68)),
             },
             Node::Flex { id: NodeId(90) },
             Node::Spacer {
@@ -9197,5 +9288,73 @@ mod picture_tests {
             panic!("not a spawn");
         };
         assert_eq!(back, work);
+    }
+}
+
+#[cfg(test)]
+mod feature_feed_tests {
+    use super::*;
+
+    fn round_trip(screen: Screen) -> Screen {
+        let frame = Frame {
+            request_id: 7,
+            message: Message::SetScreen(screen),
+        };
+        let bytes = encode(&frame).expect("encode feature feed");
+        match decode(&bytes).expect("decode feature feed").message {
+            Message::SetScreen(screen) => screen,
+            other => panic!("expected a screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_feed_nodes_round_trip() {
+        let decorated = Tile::new(ActionId(7), "Title", Glyph::Book)
+            .with_picture(
+                TilePicture::new(PictureHandle(9), 300, 500).with_fit(PictureFit::Cover),
+            )
+            .with_state(TileState::Held)
+            .with_badge("12")
+            .with_subtitle("Creator");
+        let screen = Screen::new(
+            1,
+            vec![
+                Node::ImageStrip {
+                    id: NodeId(1),
+                    tiles: vec![decorated.clone()],
+                },
+                Node::MediaGrid {
+                    id: NodeId(2),
+                    tiles: vec![decorated],
+                },
+                Node::Section {
+                    id: NodeId(3),
+                    title: "Plain".into(),
+                    value: Some("6".into()),
+                    action: None,
+                },
+                Node::Section {
+                    id: NodeId(4),
+                    title: "More".into(),
+                    value: None,
+                    action: Some(ActionId(42)),
+                },
+            ],
+        );
+        assert_eq!(round_trip(screen.clone()), screen);
+    }
+
+    #[test]
+    fn feature_feed_nodes_reject_unknown_section_action_flag() {
+        let mut bytes = vec![21];
+        push_u32(&mut bytes, 1);
+        push_string(&mut bytes, "Section").expect("title");
+        bytes.push(0);
+        bytes.push(2);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            decode_node(&mut reader, 0, &mut 0),
+            Err(ProtocolError::InvalidValue("section action flag"))
+        );
     }
 }

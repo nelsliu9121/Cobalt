@@ -26,8 +26,8 @@ pub use kobo_ui::{
     ReadingChrome, ReadingSurface, RichTextSpan, Row, RowLead, RowState, Screen, SlotWidth, Space,
     TextHit, TextPresentation, TextSelection, Tile, TilePicture, TileShape, TileState, TopBar,
     TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHIPS, MAX_CHOICE_OPTIONS,
-    MAX_COLUMNS, MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS,
-    MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
+    MAX_COLUMNS, MAX_IMAGE_STRIP_ITEMS, MAX_INLINE_FORMULAE, MAX_MEDIA_GRID_ITEMS, MAX_QUOTE_DEPTH,
+    MAX_ROWS, MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -744,6 +744,25 @@ impl ScreenBuilder {
             id,
             title: title.into(),
             value: None,
+            action: None,
+        });
+        self
+    }
+
+    /// Names a group and makes the heading itself a target.
+    #[must_use]
+    pub fn tappable_section(
+        mut self,
+        name: impl AsRef<str>,
+        title: impl Into<String>,
+    ) -> Self {
+        let id = self.next_id();
+        let action = self.register(name.as_ref());
+        self.nodes.push(Node::Section {
+            id,
+            title: title.into(),
+            value: None,
+            action: Some(action),
         });
         self
     }
@@ -764,6 +783,7 @@ impl ScreenBuilder {
             id,
             title: title.into(),
             value: Some(value.into()),
+            action: None,
         });
         self
     }
@@ -1957,6 +1977,59 @@ impl ScreenBuilder {
             })
             .collect();
         self.nodes.push(Node::TileGrid { id, tiles, shape });
+        self
+    }
+
+    /// Adds up to three equal image-only cover targets.
+    #[must_use]
+    pub fn image_strip<I, N>(mut self, items: I) -> Self
+    where
+        I: IntoIterator<Item = (N, Glyph, Option<TilePicture>)>,
+        N: AsRef<str>,
+    {
+        let id = self.next_id();
+        let mut source = items.into_iter();
+        let mut tiles = Vec::new();
+        for (name, glyph, picture) in source.by_ref().take(MAX_IMAGE_STRIP_ITEMS) {
+            let tile = Tile::new(self.register(name.as_ref()), "", glyph);
+            tiles.push(match picture {
+                Some(picture) => tile.with_picture(picture.with_fit(PictureFit::Cover)),
+                None => tile,
+            });
+        }
+        if source.next().is_some() {
+            self.warn_limit(id, "image strip", MAX_IMAGE_STRIP_ITEMS);
+        }
+        self.nodes.push(Node::ImageStrip { id, tiles });
+        self
+    }
+
+    /// Adds up to six media cards in a fixed two-column grid.
+    #[must_use]
+    pub fn media_grid<I, N, T, S>(mut self, items: I) -> Self
+    where
+        I: IntoIterator<Item = (N, T, S, Glyph, Option<TilePicture>)>,
+        N: AsRef<str>,
+        T: Into<String>,
+        S: Into<String>,
+    {
+        let id = self.next_id();
+        let mut source = items.into_iter();
+        let mut tiles = Vec::new();
+        for (name, title, summary, glyph, picture) in
+            source.by_ref().take(MAX_MEDIA_GRID_ITEMS)
+        {
+            let tile = Tile::new(self.register(name.as_ref()), title, glyph)
+                .with_subtitle(summary);
+            tiles.push(match picture {
+                Some(picture) => tile.with_picture(picture.with_fit(PictureFit::Cover)),
+                None => tile,
+            });
+        }
+        if source.next().is_some() {
+            self.warn_limit(id, "media grid", MAX_MEDIA_GRID_ITEMS);
+        }
+        self.nodes.push(Node::MediaGrid { id, tiles });
         self
     }
 
@@ -6651,5 +6724,105 @@ pub fn run_on<A: KoboApp>(name: &str, app: A, socket: &Path) -> Result<(), Clien
         if leaving {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_feed_tests {
+    use super::*;
+
+    #[test]
+    fn feature_feed_builders() {
+        let contain = TilePicture::new(PictureHandle(7), 300, 500);
+        let builder = ScreenBuilder::new("feed")
+            .image_strip([
+                ("strip-1", Glyph::Book, Some(contain)),
+                ("strip-2", Glyph::Book, None),
+                ("strip-3", Glyph::Book, None),
+                ("strip-4", Glyph::Book, None),
+            ])
+            .media_grid([
+                ("card-1", "First", "Creator", Glyph::Book, Some(contain)),
+                ("card-2", "Second", "Creator", Glyph::Book, None),
+                ("card-3", "Third", "Creator", Glyph::Book, None),
+                ("card-4", "Fourth", "Creator", Glyph::Book, None),
+                ("card-5", "Fifth", "Creator", Glyph::Book, None),
+                ("card-6", "Sixth", "Creator", Glyph::Book, None),
+                ("card-7", "Seventh", "Creator", Glyph::Book, None),
+            ])
+            .section("Plain")
+            .section_with_value("Counted", "6")
+            .tappable_section("more", "More");
+
+        assert_eq!(
+            builder
+                .actions
+                .iter()
+                .map(|(name, action)| (name.as_str(), *action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("strip-1", action_id("strip-1")),
+                ("strip-2", action_id("strip-2")),
+                ("strip-3", action_id("strip-3")),
+                ("card-1", action_id("card-1")),
+                ("card-2", action_id("card-2")),
+                ("card-3", action_id("card-3")),
+                ("card-4", action_id("card-4")),
+                ("card-5", action_id("card-5")),
+                ("card-6", action_id("card-6")),
+                ("more", action_id("more")),
+            ]
+        );
+        assert!(builder.warnings().iter().any(|issue| matches!(
+            issue.kind,
+            LayoutIssueKind::CollectionTruncated {
+                collection: "image strip",
+                provided: 4,
+                visible: MAX_IMAGE_STRIP_ITEMS,
+            }
+        )));
+        assert!(builder.warnings().iter().any(|issue| matches!(
+            issue.kind,
+            LayoutIssueKind::CollectionTruncated {
+                collection: "media grid",
+                provided: 7,
+                visible: MAX_MEDIA_GRID_ITEMS,
+            }
+        )));
+
+        let screen = builder.build();
+        let Node::ImageStrip { tiles, .. } = &screen.nodes[0] else {
+            panic!("image strip builder emitted another node");
+        };
+        assert_eq!(tiles.len(), MAX_IMAGE_STRIP_ITEMS);
+        assert_eq!(
+            tiles[0].picture.expect("strip picture").fit,
+            PictureFit::Cover
+        );
+        let Node::MediaGrid { tiles, .. } = &screen.nodes[1] else {
+            panic!("media grid builder emitted another node");
+        };
+        assert_eq!(tiles.len(), MAX_MEDIA_GRID_ITEMS);
+        assert_eq!(tiles[0].label, "First");
+        assert_eq!(tiles[0].subtitle, "Creator");
+        assert_eq!(
+            tiles[0].picture.expect("card picture").fit,
+            PictureFit::Cover
+        );
+        assert!(matches!(
+            &screen.nodes[2],
+            Node::Section { action: None, .. }
+        ));
+        assert!(matches!(
+            &screen.nodes[3],
+            Node::Section { action: None, .. }
+        ));
+        assert!(matches!(
+            &screen.nodes[4],
+            Node::Section {
+                action: Some(action),
+                ..
+            } if *action == action_id("more")
+        ));
     }
 }

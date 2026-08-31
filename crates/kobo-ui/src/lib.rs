@@ -259,6 +259,12 @@ pub const MAX_QUOTE_DEPTH: u8 = 3;
 /// longer than this wants paging, which is a different primitive.
 pub const MAX_ROWS: usize = 32;
 
+/// The most cover targets one image strip may declare.
+pub const MAX_IMAGE_STRIP_ITEMS: usize = 3;
+
+/// The most cards one media grid may declare.
+pub const MAX_MEDIA_GRID_ITEMS: usize = 6;
+
 /// The most rows a [`Node::Terminal`] may carry.
 ///
 /// Sized from the panel this was built for rather than chosen round: the
@@ -2826,6 +2832,8 @@ pub enum Node {
         /// A count or a total, set against the right margin. The hairline is
         /// measured to stop short of it rather than run underneath it.
         value: Option<String>,
+        /// The heading's optional tap action.
+        action: Option<ActionId>,
     },
     /// A paragraph set in from the left, with a rule marking what it answers.
     ///
@@ -3031,6 +3039,16 @@ pub enum Node {
         id: NodeId,
         tiles: Vec<Tile>,
         shape: TileShape,
+    },
+    /// Three equal image-only cover targets.
+    ImageStrip {
+        id: NodeId,
+        tiles: Vec<Tile>,
+    },
+    /// Six media cards placed in two columns and three rows.
+    MediaGrid {
+        id: NodeId,
+        tiles: Vec<Tile>,
     },
     /// The tap-first question primitive.
     ///
@@ -3961,6 +3979,8 @@ impl Node {
             | Self::Rows { id, .. }
             | Self::Table { id, .. }
             | Self::TileGrid { id, .. }
+            | Self::ImageStrip { id, .. }
+            | Self::MediaGrid { id, .. }
             | Self::Choice { id, .. }
             | Self::Stepper { id, .. }
             | Self::Banner { id, .. }
@@ -4116,7 +4136,7 @@ pub enum LayoutKind {
     /// The name of a group, with a hairline to the right margin and an
     /// optional count against it. The value is carried in `text_lines` as the
     /// title followed by the count, so the drawing pass needs no tree.
-    Section,
+    Section(Option<ActionId>),
     /// An indented paragraph. The values are the clamped depth and what the
     /// paragraph is for, so the renderer can draw the gutter rules and pick a
     /// size without consulting the tree.
@@ -4214,6 +4234,8 @@ pub enum LayoutKind {
     /// tile is still drawn, still occupies its place in the grid, and still
     /// must not answer a tap.
     Tile(ActionId, ControlState),
+    /// A media card's whole-cell tap target.
+    MediaCard(ActionId),
     TileLabel,
     /// A tile's second line. Muted, one line, and only emitted when at least
     /// one tile in the grid asked for one.
@@ -4289,6 +4311,8 @@ impl LayoutKind {
             | Self::NavDestination(action, ..)
             | Self::NavDestinationSelected(action, ..)
             | Self::Tile(action, ControlState::Enabled)
+            | Self::MediaCard(action)
+            | Self::Section(Some(action))
             | Self::Field(action)
             | Self::FieldClear(action)
             | Self::Chip(action, _)
@@ -4566,6 +4590,8 @@ impl Layout {
                         | LayoutKind::RowMenu(_)
                         | LayoutKind::Cell(..)
                         | LayoutKind::Tile(_, ControlState::Enabled)
+                        | LayoutKind::MediaCard(_)
+                        | LayoutKind::Section(Some(_))
                         | LayoutKind::Field(_)
                         | LayoutKind::FieldClear(_)
                         | LayoutKind::Chip(_, _)
@@ -4758,6 +4784,8 @@ impl Layout {
                 | LayoutKind::NavDestination(candidate, ..)
                 | LayoutKind::NavDestinationSelected(candidate, ..)
                 | LayoutKind::Tile(candidate, ControlState::Enabled)
+                | LayoutKind::MediaCard(candidate)
+                | LayoutKind::Section(Some(candidate))
                 | LayoutKind::Field(candidate)
                 | LayoutKind::FieldClear(candidate)
                 | LayoutKind::Chip(candidate, _)
@@ -5515,7 +5543,12 @@ fn layout_node(
             });
             y.saturating_add(height)
         }
-        Node::Section { id, title, value } => {
+        Node::Section {
+            id,
+            title,
+            value,
+            action,
+        } => {
             let lead = metrics.space(Space::Small);
             let trail = metrics.space(Space::Tight);
             let line = FontSize::Caption.line_height();
@@ -5550,7 +5583,7 @@ fn layout_node(
                     width,
                     height: line,
                 },
-                kind: LayoutKind::Section,
+                kind: LayoutKind::Section(*action),
                 text_lines,
             });
             y.saturating_add(lead)
@@ -6830,6 +6863,176 @@ fn layout_node(
             };
             layout.nodes[index].rect.height = height;
             y.saturating_add(height)
+        }
+        Node::ImageStrip { id, tiles } => {
+            let columns = 3_i32;
+            let gutter = metrics.space(Space::Small);
+            let cell_width = (width - gutter * 2) / columns;
+            let cell_height = cell_width * TileShape::Portrait.eighths() / 8;
+            if tiles.is_empty() || y.saturating_add(cell_height) > bottom {
+                return y;
+            }
+            for (position, tile) in tiles.iter().take(MAX_IMAGE_STRIP_ITEMS).enumerate() {
+                if layout.nodes.len() + 2 > MAX_LAYOUT_NODES {
+                    break;
+                }
+                let cell_x =
+                    x.saturating_add(position as i32 * (cell_width.saturating_add(gutter)));
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x,
+                        y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    kind: LayoutKind::Tile(
+                        tile.action,
+                        if tile.state.is_tappable() {
+                            ControlState::Enabled
+                        } else {
+                            ControlState::Disabled
+                        },
+                    ),
+                    text_lines: Vec::new(),
+                });
+                let (kind, mark_width, mark_height) = if let Some(picture) = tile.picture {
+                    (
+                        LayoutKind::FramedPicture(picture.handle, PictureFit::Cover),
+                        cell_width,
+                        cell_height,
+                    )
+                } else {
+                    let size = min(
+                        metrics.tenth_mm(110),
+                        min(cell_width.max(0), cell_height.max(0)),
+                    );
+                    (LayoutKind::TileGlyph(tile.glyph), size, size)
+                };
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x.saturating_add((cell_width - mark_width) / 2),
+                        y: y.saturating_add((cell_height - mark_height) / 2),
+                        width: mark_width,
+                        height: mark_height,
+                    },
+                    kind,
+                    text_lines: Vec::new(),
+                });
+            }
+            y.saturating_add(cell_height)
+        }
+        Node::MediaGrid { id, tiles } => {
+            let columns = 2_i32;
+            let rows = 3_i32;
+            let column_gap = metrics.space(Space::Small);
+            let row_gap = metrics.space(Space::Tight);
+            let cell_width = (width - column_gap) / columns;
+            let cell_height = max(
+                metrics.touch_target_default(),
+                (bottom - y - row_gap * (rows - 1)) / rows,
+            );
+            let picture_width = min(cell_width * 2 / 5, cell_height * 2 / 3);
+            let picture_height = min(
+                cell_height,
+                picture_width * TileShape::Portrait.eighths() / 8,
+            );
+            let inset = metrics.space(Space::Tight);
+            let title_height = FontSize::Body.line_height();
+            let summary_height = FontSize::Caption.line_height();
+            let text_height = title_height.saturating_add(summary_height);
+            let text_width = max(
+                1,
+                cell_width
+                    .saturating_sub(picture_width)
+                    .saturating_sub(inset * 2),
+            );
+            let mut placed_rows = 0;
+            for (position, tile) in tiles.iter().take(MAX_MEDIA_GRID_ITEMS).enumerate() {
+                if layout.nodes.len() + 4 > MAX_LAYOUT_NODES {
+                    break;
+                }
+                let column = position as i32 % columns;
+                let row = position as i32 / columns;
+                let cell_x =
+                    x.saturating_add(column * (cell_width.saturating_add(column_gap)));
+                let cell_y = y.saturating_add(row * (cell_height.saturating_add(row_gap)));
+                if cell_y.saturating_add(cell_height) > bottom {
+                    break;
+                }
+                placed_rows = row + 1;
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x,
+                        y: cell_y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    kind: LayoutKind::MediaCard(tile.action),
+                    text_lines: Vec::new(),
+                });
+                let picture_y =
+                    cell_y.saturating_add((cell_height.saturating_sub(picture_height)) / 2);
+                let (kind, mark_width, mark_height) = if let Some(picture) = tile.picture {
+                    (
+                        LayoutKind::FramedPicture(picture.handle, picture.fit),
+                        picture_width,
+                        picture_height,
+                    )
+                } else {
+                    let size = min(
+                        metrics.tenth_mm(110),
+                        min(picture_width.max(0), picture_height.max(0)),
+                    );
+                    (LayoutKind::TileGlyph(tile.glyph), size, size)
+                };
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: cell_x.saturating_add((picture_width - mark_width) / 2),
+                        y: picture_y.saturating_add((picture_height - mark_height) / 2),
+                        width: mark_width,
+                        height: mark_height,
+                    },
+                    kind,
+                    text_lines: Vec::new(),
+                });
+                let text_x = cell_x.saturating_add(picture_width).saturating_add(inset);
+                let text_y = cell_y.saturating_add((cell_height - text_height) / 2);
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: text_x,
+                        y: text_y,
+                        width: text_width,
+                        height: title_height,
+                    },
+                    kind: LayoutKind::RowTitle,
+                    text_lines: vec![one_line(&tile.label, text_width, FontSize::Body)],
+                });
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect: Rect {
+                        x: text_x,
+                        y: text_y.saturating_add(title_height),
+                        width: text_width,
+                        height: summary_height,
+                    },
+                    kind: LayoutKind::RowSummary,
+                    text_lines: vec![one_line(
+                        &tile.subtitle,
+                        text_width,
+                        FontSize::Caption,
+                    )],
+                });
+            }
+            if placed_rows == 0 {
+                y
+            } else {
+                y.saturating_add(placed_rows * cell_height + (placed_rows - 1) * row_gap)
+            }
         }
         Node::Stepper {
             id,
@@ -9685,7 +9888,9 @@ fn nodes_reference_rgb(nodes: &[Node], pictures: &dyn Pictures) -> bool {
                 RowLead::Picture(picture, _) if picture_is_rgb(picture.handle, pictures)
             )
         }),
-        Node::TileGrid { tiles, .. } => tiles.iter().any(|tile| {
+        Node::TileGrid { tiles, .. }
+        | Node::ImageStrip { tiles, .. }
+        | Node::MediaGrid { tiles, .. } => tiles.iter().any(|tile| {
             tile.picture
                 .is_some_and(|picture| picture_is_rgb(picture.handle, pictures))
         }),
@@ -9917,7 +10122,9 @@ fn validate_composition(
 /// A label belonging to a node that has somewhere better to put its state.
 fn stateful_label(node: &Node) -> Option<(NodeId, &str)> {
     match node {
-        Node::TileGrid { id, tiles, .. } => tiles
+        Node::TileGrid { id, tiles, .. }
+        | Node::ImageStrip { id, tiles }
+        | Node::MediaGrid { id, tiles } => tiles
             .iter()
             .find(|tile| state_written_into(&tile.label))
             .map(|tile| (*id, tile.label.as_str())),
@@ -9970,14 +10177,14 @@ fn going_back(node: &Node) -> Option<&str> {
 fn orphaned_section(layout: &Layout) -> Option<NodeId> {
     let mut nodes = layout.nodes.iter().peekable();
     while let Some(node) = nodes.next() {
-        if !matches!(node.kind, LayoutKind::Section) {
+        if !matches!(node.kind, LayoutKind::Section(_)) {
             continue;
         }
         match nodes.peek() {
             // Nothing after it at all, or another section immediately after
             // it: either way the header is standing on its own.
             None => return Some(node.id),
-            Some(next) if matches!(next.kind, LayoutKind::Section) => return Some(node.id),
+            Some(next) if matches!(next.kind, LayoutKind::Section(_)) => return Some(node.id),
             _ => {}
         }
     }
@@ -9996,7 +10203,7 @@ fn tones_used(layout: &Layout) -> usize {
             LayoutKind::Divider
             | LayoutKind::RowRule
             | LayoutKind::TabRule
-            | LayoutKind::Section => {
+            | LayoutKind::Section(_) => {
                 hairline = true;
             }
             LayoutKind::Secondary
@@ -10007,7 +10214,10 @@ fn tones_used(layout: &Layout) -> usize {
             | LayoutKind::PagePosition
             | LayoutKind::ActivityBytes
             | LayoutKind::ActivityFailure => muted = true,
-            LayoutKind::Card | LayoutKind::Tile(..) | LayoutKind::Overlay => surface = true,
+            LayoutKind::Card
+            | LayoutKind::Tile(..)
+            | LayoutKind::MediaCard(_)
+            | LayoutKind::Overlay => surface = true,
             LayoutKind::Banner(BannerLevel::Attention)
             | LayoutKind::NavDestinationSelected(..)
             | LayoutKind::Chip(_, true)
@@ -10202,6 +10412,40 @@ fn validate_node(
                 }
             }
         }
+        Node::ImageStrip { tiles, .. } => {
+            if tiles.len() > MAX_IMAGE_STRIP_ITEMS {
+                issues.push(limit_issue(
+                    id,
+                    "image strip",
+                    tiles.len(),
+                    MAX_IMAGE_STRIP_ITEMS,
+                ));
+            }
+            for tile in tiles.iter().take(MAX_IMAGE_STRIP_ITEMS) {
+                check_text_coverage(id, &tile.label, Face::Text, issues);
+                check_text_coverage(id, &tile.subtitle, Face::Text, issues);
+                if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
+                    check_picture(id, picture.handle, picture.source, pictures, issues);
+                }
+            }
+        }
+        Node::MediaGrid { tiles, .. } => {
+            if tiles.len() > MAX_MEDIA_GRID_ITEMS {
+                issues.push(limit_issue(
+                    id,
+                    "media grid",
+                    tiles.len(),
+                    MAX_MEDIA_GRID_ITEMS,
+                ));
+            }
+            for tile in tiles.iter().take(MAX_MEDIA_GRID_ITEMS) {
+                check_text_coverage(id, &tile.label, Face::Text, issues);
+                check_text_coverage(id, &tile.subtitle, Face::Text, issues);
+                if let (Some(pictures), Some(picture)) = (pictures, tile.picture) {
+                    check_picture(id, picture.handle, picture.source, pictures, issues);
+                }
+            }
+        }
         Node::Stepper { label, .. } => {
             check_text_coverage(id, label, Face::Text, issues);
         }
@@ -10339,6 +10583,8 @@ fn validate_content_bounds(
         // A flex draws nothing by design: it moves the cursor and leaves. So
         // does an empty list. Neither is content that layout hid.
         let expects_rect = !matches!(node, Node::Rows { rows, .. } if rows.is_empty())
+            && !matches!(node, Node::ImageStrip { tiles, .. } if tiles.is_empty())
+            && !matches!(node, Node::MediaGrid { tiles, .. } if tiles.is_empty())
             && !matches!(node, Node::Flex { .. });
         if expects_rect
             && (rects.is_empty()
@@ -10408,7 +10654,7 @@ fn validate_layout_nodes(layout: &Layout, metrics: &DisplayMetrics, issues: &mut
         // them beside each other on one line with the hairline between. Counting
         // them as two lines reported every `section_with_value` on every screen
         // as text overflowing a rect it fits inside perfectly well.
-        let rows = if matches!(node.kind, LayoutKind::Section) {
+        let rows = if matches!(node.kind, LayoutKind::Section(_)) {
             1
         } else {
             i32::try_from(node.text_lines.len()).unwrap_or(i32::MAX)
@@ -10446,6 +10692,8 @@ const fn is_tappable(kind: LayoutKind) -> bool {
             | LayoutKind::RowMenu(_)
             | LayoutKind::Cell(..)
             | LayoutKind::Tile(..)
+            | LayoutKind::MediaCard(_)
+            | LayoutKind::Section(Some(_))
             | LayoutKind::Field(_)
             | LayoutKind::FieldClear(_)
             | LayoutKind::Chip(_, _)
@@ -10472,7 +10720,7 @@ fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
         LayoutKind::TopBarTitle => BAR_TITLE,
         LayoutKind::OverlayTitle => FontSize::Title,
         LayoutKind::Secondary
-        | LayoutKind::Section
+        | LayoutKind::Section(_)
         | LayoutKind::TableHeaderCell
         | LayoutKind::FactLabel
         | LayoutKind::RowTrailing
@@ -11500,7 +11748,7 @@ fn render_all_with_selected_font(
             // Title, hairline, count: one node, because the three are one
             // thing and splitting them would let a repaint move the rule
             // without the words it belongs to.
-            LayoutKind::Section => {
+            LayoutKind::Section(_) => {
                 let size = FontSize::Caption;
                 let thickness = metrics.rule_thickness();
                 let gap = metrics.space(Space::Tight);
@@ -11731,7 +11979,7 @@ fn render_all_with_selected_font(
                     clip,
                 );
             }
-            LayoutKind::Tile(..) => stroke_clipped(
+            LayoutKind::Tile(..) | LayoutKind::MediaCard(_) => stroke_clipped(
                 surface,
                 node.rect,
                 tone::RULE,
@@ -19317,6 +19565,7 @@ mod prose_tests {
                     id: NodeId(2),
                     title: "Details".to_owned(),
                     value: None,
+                    action: None,
                 },
             ],
         );
@@ -19332,7 +19581,7 @@ mod prose_tests {
             node(2).rect.height < node(1).rect.height,
             "a section was not set smaller than the screen's own heading"
         );
-        assert_eq!(node(2).kind, LayoutKind::Section);
+        assert_eq!(node(2).kind, LayoutKind::Section(None));
     }
 
     #[test]
@@ -19344,6 +19593,7 @@ mod prose_tests {
                     id: NodeId(1),
                     title: title.to_owned(),
                     value: None,
+                    action: None,
                 }],
             );
             let rect = screen
@@ -19371,6 +19621,7 @@ mod prose_tests {
                 id: NodeId(1),
                 title: "A section title long enough to want the whole line".to_owned(),
                 value: Some("32".to_owned()),
+                action: None,
             }],
         );
         let node = screen
@@ -19950,6 +20201,7 @@ mod press_feedback_tests {
             id: NodeId(id),
             title: title.to_owned(),
             value: None,
+            action: None,
         };
         let orphan = Screen::new(1, vec![section(1, "Details")]);
         assert!(
@@ -20370,5 +20622,245 @@ mod figure_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_feed_tests {
+    use super::*;
+
+    #[test]
+    fn image_strip_is_three_equal_image_only_targets() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: (0..3)
+                    .map(|index| {
+                        Tile::new(ActionId(index + 1), "", Glyph::Book).with_picture(
+                            TilePicture::new(PictureHandle(index + 1), 300, 500)
+                                .with_fit(PictureFit::Cover),
+                        )
+                    })
+                    .collect(),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let targets = layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 3);
+        assert!(
+            targets
+                .windows(2)
+                .all(|pair| pair[0].rect.width == pair[1].rect.width)
+        );
+        assert!(
+            layout
+                .nodes
+                .iter()
+                .all(|node| node.kind != LayoutKind::TileLabel)
+        );
+        assert_eq!(
+            layout
+                .nodes
+                .iter()
+                .filter(|node| matches!(
+                    node.kind,
+                    LayoutKind::FramedPicture(_, PictureFit::Cover)
+                ))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn image_strip_is_bounded_and_empty_is_zero_height() {
+        let oversized = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: (0..4)
+                    .map(|index| Tile::new(ActionId(index + 1), "", Glyph::Book))
+                    .collect(),
+            }],
+        );
+        assert!(oversized
+            .validate(&CLARA_BW_METRICS)
+            .iter()
+            .any(|issue| matches!(
+                issue.kind,
+                LayoutIssueKind::CollectionTruncated {
+                    collection: "image strip",
+                    provided: 4,
+                    visible: MAX_IMAGE_STRIP_ITEMS,
+                }
+            )));
+        let empty = Screen::new(
+            2,
+            vec![Node::ImageStrip {
+                id: NodeId(2),
+                tiles: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            empty
+                .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+                .content_used(),
+            0
+        );
+        assert!(!empty.validate(&CLARA_BW_METRICS).iter().any(|issue| {
+            matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. })
+        }));
+    }
+
+    #[test]
+    fn media_grid_places_six_cards_as_three_rows_by_two_columns() {
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: (0..6)
+                    .map(|index| {
+                        Tile::new(
+                            ActionId(index + 1),
+                            format!("Title {index}"),
+                            Glyph::Book,
+                        )
+                        .with_subtitle(format!("Creator {index}"))
+                    })
+                    .collect(),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let cards = layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::MediaCard(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 6);
+        assert_eq!(cards[0].rect.y, cards[1].rect.y);
+        assert!(cards[2].rect.y > cards[0].rect.y);
+        assert!(cards.iter().all(
+            |card| card.rect.height >= CLARA_BW_METRICS.touch_target_minimum()
+        ));
+        for card in cards {
+            let LayoutKind::MediaCard(action) = card.kind else {
+                unreachable!()
+            };
+            assert_eq!(
+                layout.hit_test(card.rect.x + 1, card.rect.y + 1),
+                Some(action)
+            );
+        }
+    }
+
+    #[test]
+    fn media_grid_clamps_copy_and_is_bounded() {
+        let tiles = (0..7)
+            .map(|index| {
+                Tile::new(
+                    ActionId(index + 1),
+                    "A title long enough to require ellipsis rather than a second line",
+                    Glyph::Book,
+                )
+                .with_subtitle(
+                    "A summary long enough to require ellipsis rather than a second line",
+                )
+            })
+            .collect();
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles,
+            }],
+        );
+        let diagnostics = screen.diagnostics(&CLARA_BW_METRICS, &Chrome::default());
+        assert!(diagnostics.issues.iter().any(|issue| matches!(
+            issue.kind,
+            LayoutIssueKind::CollectionTruncated {
+                collection: "media grid",
+                provided: 7,
+                visible: MAX_MEDIA_GRID_ITEMS,
+            }
+        )));
+        assert!(diagnostics
+            .layout
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(node.kind, LayoutKind::RowTitle | LayoutKind::RowSummary)
+            })
+            .all(|node| node.text_lines.len() <= 1));
+    }
+
+    #[test]
+    fn media_grid_empty_is_valid_and_zero_height() {
+        let screen = Screen::new(
+            1,
+            vec![Node::MediaGrid {
+                id: NodeId(1),
+                tiles: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            screen
+                .layout_with(&CLARA_BW_METRICS, &Chrome::default())
+                .content_used(),
+            0
+        );
+        assert!(!screen.validate(&CLARA_BW_METRICS).iter().any(|issue| {
+            matches!(issue.kind, LayoutIssueKind::ContentOverflow { .. })
+        }));
+    }
+
+    #[test]
+    fn tappable_section_uses_the_heading_rect_as_its_target() {
+        let action = ActionId(42);
+        let screen = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "人氣新作".to_owned(),
+                value: None,
+                action: Some(action),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let section = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(Some(action)))
+            .expect("section");
+        assert_eq!(
+            layout.hit_test(section.rect.x + 1, section.rect.y + 1),
+            Some(action)
+        );
+    }
+
+    #[test]
+    fn plain_section_remains_non_interactive() {
+        let screen = Screen::new(
+            1,
+            vec![Node::Section {
+                id: NodeId(1),
+                title: "Details".to_owned(),
+                value: None,
+                action: None,
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let section = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::Section(None))
+            .expect("section");
+        assert_eq!(
+            layout.hit_test(section.rect.x + 1, section.rect.y + 1),
+            None
+        );
     }
 }
