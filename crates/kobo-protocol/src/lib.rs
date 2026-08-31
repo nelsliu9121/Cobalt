@@ -8874,6 +8874,14 @@ mod picture_tests {
                             RowLead::Picture(picture, Glyph::Book),
                         )],
                     },
+                    Node::Picture {
+                        id: NodeId(4),
+                        handle: picture.handle,
+                        source: picture.source,
+                        fit,
+                        max_height_tenths_mm: 600,
+                        framed: true,
+                    },
                 ],
             )
             .with_reading_surface(Some(ReadingSurface::new(

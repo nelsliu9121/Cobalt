@@ -16866,6 +16866,28 @@ mod prose_tests {
         }
 
         #[test]
+        fn rgb_cover_fit_crops_center_columns_without_channel_shift() {
+            let source = PicturePixelsRef::Rgb8(&[
+                1, 2, 3, 10, 20, 30, 40, 50, 60, 7, 8, 9,
+                4, 5, 6, 70, 80, 90, 100, 110, 120, 11, 12, 13,
+            ]);
+            let mut surface = Surface::new_in(2, 2, PictureFormat::Rgb8);
+            let bounds = surface.bounds();
+            draw_fitted_picture(
+                &mut surface,
+                Rect { x: 0, y: 0, width: 2, height: 2 },
+                (4, 2),
+                source,
+                bounds,
+                PictureFit::Cover,
+            );
+            assert_eq!(
+                surface.bytes(),
+                &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+            );
+        }
+
+        #[test]
         fn contain_fit_keeps_the_existing_letterbox_geometry() {
             let target = Rect { x: 0, y: 0, width: 100, height: 100 };
             let fitted = fitted_picture((200, 100), target, PictureFit::Contain);
