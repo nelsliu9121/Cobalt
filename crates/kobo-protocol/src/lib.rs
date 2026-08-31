@@ -51,8 +51,9 @@ pub const MAGIC: [u8; 4] = *b"KOBO";
 /// pictures, plus the start of chunked picture uploads. Version 13 adds the
 /// runtime's local Gregorian day and `CredentialScope`; v12 runtimes cannot
 /// decode the new task. Version 14 adds the busy reading-chrome tag; v13
-/// runtimes would reject that reading surface.
-pub const VERSION: u8 = 14;
+/// runtimes would reject that reading surface. Version 15 adds picture-fit
+/// bytes to retained pictures; v14 peers would misread subsequent fields.
+pub const VERSION: u8 = 15;
 pub const HEADER_LEN: usize = 14;
 /// The largest single frame either side will read.
 ///
@@ -8365,8 +8366,8 @@ mod store_tests {
     }
 
     #[test]
-    fn credential_scope_uses_current_protocol_version_and_rejects_v13() {
-        assert_eq!(VERSION, 14);
+    fn credential_scope_uses_current_protocol_version_and_rejects_v14() {
+        assert_eq!(VERSION, 15);
         let frame = Frame {
             request_id: 10,
             message: Message::Spawn {
@@ -8377,11 +8378,11 @@ mod store_tests {
             },
         };
         let mut encoded = encode(&frame).expect("encode credential scope");
-        assert_eq!(encoded[4], 14);
+        assert_eq!(encoded[4], 15);
         assert_eq!(decode(&encoded), Ok(frame));
 
-        encoded[4] = 13;
-        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(13)));
+        encoded[4] = 14;
+        assert_eq!(decode(&encoded), Err(ProtocolError::UnsupportedVersion(14)));
     }
 
     #[test]
