@@ -14392,10 +14392,7 @@ mod tests {
             featured
         };
         let shared_url = "https://image.balcony.studio/tw/contents/feature-a.webp".to_owned();
-        let picture = TilePicture {
-            handle: PictureHandle(77),
-            source: (1, 1),
-        };
+        let picture = TilePicture::new(PictureHandle(77), 1, 1);
         runner
             .app_mut()
             .covers
@@ -14419,12 +14416,13 @@ mod tests {
                 .entries
                 .entry(url)
                 .or_insert_with(|| {
-                    CoverState::Ready(TilePicture {
-                        handle: PictureHandle(
+                    CoverState::Ready(TilePicture::new(
+                        PictureHandle(
                             100_u32.saturating_add(u32::try_from(index).expect("cover index")),
                         ),
-                        source: (1, 1),
-                    })
+                        1,
+                        1,
+                    ))
                 });
         }
         let commands = observe_local_day(&mut runner, Some(local_day(31)));

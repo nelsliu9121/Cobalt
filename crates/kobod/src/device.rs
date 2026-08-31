@@ -3672,6 +3672,7 @@ mod tests {
                     id: kobo_ui::NodeId(u32::try_from(index + 1).expect("node id")),
                     handle: *handle,
                     source: *source,
+                    fit: kobo_ui::PictureFit::Contain,
                     max_height_tenths_mm: 100,
                     framed: false,
                 })

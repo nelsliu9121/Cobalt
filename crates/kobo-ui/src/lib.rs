@@ -1847,7 +1847,7 @@ impl Screen {
         layout.nodes.push(LayoutNode {
             id: surface.id,
             rect: panel,
-            kind: LayoutKind::Picture(surface.picture.handle),
+            kind: LayoutKind::Picture(surface.picture.handle, surface.picture.fit),
             text_lines: Vec::new(),
         });
 
@@ -3116,8 +3116,8 @@ pub enum Node {
         id: NodeId,
         lines: u8,
     },
-    /// A picture the runtime is already holding, drawn as large as the space
-    /// allows without changing its shape.
+    /// A picture the runtime is already holding, fitted into the space the
+    /// screen assigns it.
     ///
     /// The pixels are deliberately not here. A screen is re-sent on every
     /// change (that is what makes the model simple) and a book cover is eighty
@@ -3135,6 +3135,8 @@ pub enum Node {
         handle: PictureHandle,
         /// The picture's own size, in pixels, as handed over.
         source: (u32, u32),
+        /// Whether to preserve the whole picture or fill the target by cropping it.
+        fit: PictureFit,
         /// The tallest this may be drawn, in tenths of a millimetre, so a
         /// portrait picture cannot take a whole panel on one device and a
         /// third of it on another.
@@ -3302,11 +3304,21 @@ pub struct PictureHandle(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FontHandle(pub u32);
 
-/// A picture on a tile, together with the size it was handed over at.
+/// How a picture maps into the rectangle assigned to it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PictureFit {
+    /// Preserve the complete picture, leaving unused space when its shape differs.
+    #[default]
+    Contain,
+    /// Fill the target from a centered crop without changing proportions.
+    Cover,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TilePicture {
     pub handle: PictureHandle,
     pub source: (u32, u32),
+    pub fit: PictureFit,
 }
 
 impl TilePicture {
@@ -3315,7 +3327,14 @@ impl TilePicture {
         Self {
             handle,
             source: (width, height),
+            fit: PictureFit::Contain,
         }
+    }
+
+    #[must_use]
+    pub const fn with_fit(mut self, fit: PictureFit) -> Self {
+        self.fit = fit;
+        self
     }
 }
 
@@ -4212,12 +4231,12 @@ pub enum LayoutKind {
     /// inversion both belong to the thing underneath it. A glyph that was its
     /// own target would invert a square in the middle of a button.
     InlineGlyph(Glyph),
-    /// A picture, already placed. `rect` is where it goes; the renderer scales
-    /// it to fit only if the application handed over something larger.
-    Picture(PictureHandle),
+    /// A picture, already placed. `rect` is the fitting target and the second
+    /// value decides whether unused space or a centered crop resolves its shape.
+    Picture(PictureHandle, PictureFit),
     /// A picture with a rule drawn around it, which is what an illustration
     /// set into a page wants and what a formula does not.
-    FramedPicture(PictureHandle),
+    FramedPicture(PictureHandle, PictureFit),
     ChoicePrompt,
     /// A stepper's reading: what is being adjusted and where it stands. Set in
     /// the middle of the row, between the two controls, and not itself a
@@ -4789,6 +4808,61 @@ fn fit_within(source: (u32, u32), max_width: i32, max_height: i32) -> (i32, i32)
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceWindow {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FittedPicture {
+    target: Rect,
+    source: SourceWindow,
+}
+
+fn fitted_picture(source: (u32, u32), target: Rect, fit: PictureFit) -> FittedPicture {
+    let source_width = usize::try_from(source.0).unwrap_or(0);
+    let source_height = usize::try_from(source.1).unwrap_or(0);
+    if source_width == 0 || source_height == 0 || target.width <= 0 || target.height <= 0 {
+        return FittedPicture {
+            target: Rect { width: 0, height: 0, ..target },
+            source: SourceWindow { x: 0, y: 0, width: 0, height: 0 },
+        };
+    }
+    if fit == PictureFit::Contain {
+        let (width, height) = fit_within(source, target.width, target.height);
+        return FittedPicture {
+            target: Rect {
+                x: target.x + (target.width - width) / 2,
+                y: target.y + (target.height - height) / 2,
+                width,
+                height,
+            },
+            source: SourceWindow { x: 0, y: 0, width: source_width, height: source_height },
+        };
+    }
+    let target_width = usize::try_from(target.width).unwrap_or(0);
+    let target_height = usize::try_from(target.height).unwrap_or(0);
+    let (crop_width, crop_height) = if source_width.saturating_mul(target_height)
+        > source_height.saturating_mul(target_width)
+    {
+        (source_height.saturating_mul(target_width) / target_height.max(1), source_height)
+    } else {
+        (source_width, source_width.saturating_mul(target_height) / target_width.max(1))
+    };
+    FittedPicture {
+        target,
+        source: SourceWindow {
+            x: (source_width - crop_width) / 2,
+            y: (source_height - crop_height) / 2,
+            width: crop_width.max(1),
+            height: crop_height.max(1),
+        },
+    }
+}
+
 /// The first line of `text`, marked with an ellipsis when there was more.
 ///
 /// A label cut at a word boundary with nothing to show for it reads as a
@@ -5280,7 +5354,7 @@ fn layout_node(
                                     width: drawn_width,
                                     height: drawn_height,
                                 },
-                                kind: LayoutKind::Picture(formula.handle),
+                                kind: LayoutKind::Picture(formula.handle, PictureFit::Contain),
                                 text_lines: Vec::new(),
                             });
                             run_x = run_x.saturating_add(drawn_width);
@@ -6486,11 +6560,15 @@ fn layout_node(
             id,
             handle,
             source,
+            fit,
             max_height_tenths_mm,
             framed,
         } => {
             let ceiling = metrics.tenth_mm(i32::from(*max_height_tenths_mm));
-            let (drawn_width, drawn_height) = fit_within(*source, width, ceiling);
+            let (drawn_width, drawn_height) = match fit {
+                PictureFit::Contain => fit_within(*source, width, ceiling),
+                PictureFit::Cover => (width, ceiling),
+            };
             layout.nodes.push(LayoutNode {
                 id: *id,
                 rect: Rect {
@@ -6500,9 +6578,9 @@ fn layout_node(
                     height: drawn_height,
                 },
                 kind: if *framed {
-                    LayoutKind::FramedPicture(*handle)
+                    LayoutKind::FramedPicture(*handle, *fit)
                 } else {
-                    LayoutKind::Picture(*handle)
+                    LayoutKind::Picture(*handle, *fit)
                 },
                 text_lines: Vec::new(),
             });
@@ -6629,8 +6707,15 @@ fn layout_node(
                 // exactly the tile's proportion is letterboxed rather than
                 // stretched. A stretched face is worse than a smaller one.
                 let (mark, mark_width, mark_height) = if let Some(picture) = tile.picture {
-                    let (width, height) = fit_within(picture.source, cell, body);
-                    (LayoutKind::FramedPicture(picture.handle), width, height)
+                    let (width, height) = match picture.fit {
+                        PictureFit::Contain => fit_within(picture.source, cell, body),
+                        PictureFit::Cover => (cell, body),
+                    };
+                    (
+                        LayoutKind::FramedPicture(picture.handle, picture.fit),
+                        width,
+                        height,
+                    )
                 } else {
                     let size = metrics.tenth_mm(110);
                     (LayoutKind::TileGlyph(tile.glyph), size, size)
@@ -10729,19 +10814,20 @@ pub fn render(screen: &Screen, surface: &mut Surface, dirty: Option<Rect>) {
     );
 }
 
-/// Draws `pixels` into `rect`, shrinking by averaging when the picture is
-/// larger than the space it was given.
+/// Draws one source window from `pixels` into `rect`, averaging when the
+/// window is larger than the space it was given.
 ///
 /// Averaging rather than sampling matters here: dropping pixels from a
 /// halftoned image produces moire, which on a sixteen-grey panel looks like
 /// damage. An application that fitted the picture before handing it over lands
 /// in the exact-size path and pays nothing.
-fn draw_picture(
+fn draw_picture_window(
     surface: &mut Surface,
     rect: Rect,
     source: (u32, u32),
     pixels: PicturePixelsRef<'_>,
     clip: Rect,
+    window: SourceWindow,
 ) {
     let Some(visible) = rect
         .intersection(clip)
@@ -10754,9 +10840,21 @@ fn draw_picture(
     else {
         return;
     };
-    if rect.width <= 0 || rect.height <= 0 || source_width == 0 || source_height == 0 {
+    if rect.width <= 0
+        || rect.height <= 0
+        || source_width == 0
+        || source_height == 0
+        || window.width == 0
+        || window.height == 0
+        || window.x >= source_width
+        || window.y >= source_height
+    {
         return;
     }
+    let window_right = window.x.saturating_add(window.width).min(source_width);
+    let window_bottom = window.y.saturating_add(window.height).min(source_height);
+    let window_width = window_right - window.x;
+    let window_height = window_bottom - window.y;
     let target_width = rect.width as usize;
     let target_height = rect.height as usize;
     match pixels {
@@ -10769,17 +10867,29 @@ fn draw_picture(
             }
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
-                let from_y = row * source_height / target_height;
-                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                let local_from_y = row * window_height / target_height;
+                let local_to_y = max(
+                    local_from_y + 1,
+                    (row + 1) * window_height / target_height,
+                )
+                .min(window_height);
+                let from_y = window.y + local_from_y;
+                let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
-                    let from_x = column * source_width / target_width;
-                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let local_from_x = column * window_width / target_width;
+                    let local_to_x = max(
+                        local_from_x + 1,
+                        (column + 1) * window_width / target_width,
+                    )
+                    .min(window_width);
+                    let from_x = window.x + local_from_x;
+                    let to_x = window.x + local_to_x;
                     let mut total = 0u64;
                     let mut counted = 0u64;
-                    for sample_y in from_y..to_y.min(source_height) {
+                    for sample_y in from_y..to_y {
                         let base = sample_y * source_width;
-                        for sample_x in from_x..to_x.min(source_width) {
+                        for sample_x in from_x..to_x {
                             total += u64::from(gray[base + sample_x]);
                             counted += 1;
                         }
@@ -10804,17 +10914,29 @@ fn draw_picture(
             }
             for y in visible.y..visible.y + visible.height {
                 let row = (y - rect.y) as usize;
-                let from_y = row * source_height / target_height;
-                let to_y = max(from_y + 1, (row + 1) * source_height / target_height);
+                let local_from_y = row * window_height / target_height;
+                let local_to_y = max(
+                    local_from_y + 1,
+                    (row + 1) * window_height / target_height,
+                )
+                .min(window_height);
+                let from_y = window.y + local_from_y;
+                let to_y = window.y + local_to_y;
                 for x in visible.x..visible.x + visible.width {
                     let column = (x - rect.x) as usize;
-                    let from_x = column * source_width / target_width;
-                    let to_x = max(from_x + 1, (column + 1) * source_width / target_width);
+                    let local_from_x = column * window_width / target_width;
+                    let local_to_x = max(
+                        local_from_x + 1,
+                        (column + 1) * window_width / target_width,
+                    )
+                    .min(window_width);
+                    let from_x = window.x + local_from_x;
+                    let to_x = window.x + local_to_x;
                     let mut totals = [0u64; 3];
                     let mut counted = 0u64;
-                    for sample_y in from_y..to_y.min(source_height) {
+                    for sample_y in from_y..to_y {
                         let base = sample_y * source_width;
-                        for sample_x in from_x..to_x.min(source_width) {
+                        for sample_x in from_x..to_x {
                             let start = (base + sample_x) * 3;
                             for (total, channel) in totals.iter_mut().zip(&rgb[start..start + 3]) {
                                 *total += u64::from(*channel);
@@ -10835,6 +10957,18 @@ fn draw_picture(
             }
         }
     }
+}
+
+fn draw_fitted_picture(
+    surface: &mut Surface,
+    target: Rect,
+    source: (u32, u32),
+    pixels: PicturePixelsRef<'_>,
+    clip: Rect,
+    fit: PictureFit,
+) {
+    let fitted = fitted_picture(source, target, fit);
+    draw_picture_window(surface, fitted.target, source, pixels, clip, fitted.source);
 }
 
 /// Rasterizes a retained screen for a specific panel and runtime chrome.
@@ -11657,20 +11791,20 @@ fn render_all_with_selected_font(
             }
             // Bare, because a formula is part of a sentence and a rule round
             // one would read as a box drawn in the middle of the words.
-            LayoutKind::Picture(handle) => {
+            LayoutKind::Picture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_picture(surface, node.rect, source, pixels, clip);
+                        draw_fitted_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
             }
             // Outlined, because a cover or a plate with pale edges on white
             // paper has no boundary at all and reads as text floating in
             // space.
-            LayoutKind::FramedPicture(handle) => {
+            LayoutKind::FramedPicture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_picture(surface, node.rect, source, pixels, clip);
+                        draw_fitted_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
                 stroke_clipped(
@@ -12181,14 +12315,20 @@ fn draw_row_lead(
                 let source = pictures
                     .dimensions(picture.handle)
                     .unwrap_or(picture.source);
-                let (width, height) = fit_within(picture.source, rect.width, rect.height);
-                let fitted = Rect {
-                    x: rect.x + (rect.width - width) / 2,
-                    y: rect.y + (rect.height - height) / 2,
-                    width,
-                    height,
+                let fitted = match picture.fit {
+                    PictureFit::Contain => {
+                        let (width, height) =
+                            fit_within(picture.source, rect.width, rect.height);
+                        Rect {
+                            x: rect.x + (rect.width - width) / 2,
+                            y: rect.y + (rect.height - height) / 2,
+                            width,
+                            height,
+                        }
+                    }
+                    PictureFit::Cover => rect,
                 };
-                draw_picture(surface, fitted, source, pixels, clip);
+                draw_fitted_picture(surface, fitted, source, pixels, clip, picture.fit);
                 stroke_clipped(surface, fitted, tone::RULE, 1, clip);
             }
             None => draw_glyph_icon(surface, glyph, rect, clip),
@@ -13214,7 +13354,12 @@ mod tests {
         let picture = layout
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, LayoutKind::Picture(PictureHandle(3))))
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    LayoutKind::Picture(PictureHandle(3), PictureFit::Contain)
+                )
+            })
             .expect("the formula should have been laid out");
         assert_eq!((picture.rect.width, picture.rect.height), (60, 30));
         // The words are still in the paragraph -- a search and a selection
@@ -13427,6 +13572,7 @@ mod tests {
                     id: NodeId(1),
                     handle: PictureHandle(7),
                     source: (10, 10),
+                    fit: PictureFit::Contain,
                     max_height_tenths_mm: 100,
                     framed,
                 }],
@@ -13435,13 +13581,13 @@ mod tests {
             .nodes
             .into_iter()
             .find_map(|node| match node.kind {
-                LayoutKind::Picture(_) | LayoutKind::FramedPicture(_) => Some(node.kind),
+                LayoutKind::Picture(..) | LayoutKind::FramedPicture(..) => Some(node.kind),
                 _ => None,
             })
             .expect("the picture should have been laid out")
         };
-        assert!(matches!(picture(true), LayoutKind::FramedPicture(_)));
-        assert!(matches!(picture(false), LayoutKind::Picture(_)));
+        assert!(matches!(picture(true), LayoutKind::FramedPicture(..)));
+        assert!(matches!(picture(false), LayoutKind::Picture(..)));
     }
 
     #[test]
@@ -13452,6 +13598,7 @@ mod tests {
                 id: NodeId(1),
                 handle: PictureHandle(7),
                 source: (10, 10),
+                fit: PictureFit::Contain,
                 max_height_tenths_mm: 100,
                 framed: true,
             }],
@@ -14286,7 +14433,10 @@ mod page_turn_tests {
             layout
                 .nodes
                 .iter()
-                .find(|node| node.kind == LayoutKind::Picture(PictureHandle(41)))
+                .find(|node| {
+                    node.kind
+                        == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
+                })
                 .expect("reading picture")
                 .rect
         };
@@ -14347,10 +14497,9 @@ mod page_turn_tests {
             )))
             .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true));
 
-        assert!(layout
-            .nodes
-            .iter()
-            .any(|node| node.kind == LayoutKind::Picture(PictureHandle(41))));
+        assert!(layout.nodes.iter().any(|node| {
+            node.kind == LayoutKind::Picture(PictureHandle(41), PictureFit::Contain)
+        }));
         let status = layout
             .nodes
             .iter()
@@ -16625,7 +16774,10 @@ mod prose_tests {
             screen
                 .nodes
                 .iter()
-                .any(|node| node.kind == LayoutKind::FramedPicture(PictureHandle(3))),
+                .any(|node| {
+                    node.kind
+                        == LayoutKind::FramedPicture(PictureHandle(3), PictureFit::Contain)
+                }),
             "a cover was drawn without the edge that separates it from the shelf"
         );
     }
@@ -16664,7 +16816,7 @@ mod prose_tests {
                 .filter(|node| {
                     matches!(
                         node.kind,
-                        LayoutKind::Picture(_) | LayoutKind::FramedPicture(_)
+                        LayoutKind::Picture(..) | LayoutKind::FramedPicture(..)
                     )
                 })
                 .count(),
@@ -16679,6 +16831,47 @@ mod prose_tests {
             2,
             "both tiles keep their label whatever is above it"
         );
+    }
+
+    mod picture_fit_tests {
+        use super::*;
+
+        #[test]
+        fn tile_picture_defaults_to_contain_and_can_request_cover() {
+            let picture = TilePicture::new(PictureHandle(7), 400, 200);
+            assert_eq!(picture.fit, PictureFit::Contain);
+            assert_eq!(picture.with_fit(PictureFit::Cover).fit, PictureFit::Cover);
+        }
+
+        #[test]
+        fn cover_fit_crops_the_source_center_without_stretching() {
+            let source = PicturePixelsRef::Gray8(&[
+                10, 20, 30, 40,
+                50, 60, 70, 80,
+            ]);
+            let mut surface = Surface::new(2, 2);
+            let bounds = surface.bounds();
+            draw_fitted_picture(
+                &mut surface,
+                Rect { x: 0, y: 0, width: 2, height: 2 },
+                (4, 2),
+                source,
+                bounds,
+                PictureFit::Cover,
+            );
+            let PicturePixelsRef::Gray8(pixels) = surface.pixels() else {
+                panic!("expected grayscale surface");
+            };
+            assert_eq!(pixels, &[20, 30, 60, 70]);
+        }
+
+        #[test]
+        fn contain_fit_keeps_the_existing_letterbox_geometry() {
+            let target = Rect { x: 0, y: 0, width: 100, height: 100 };
+            let fitted = fitted_picture((200, 100), target, PictureFit::Contain);
+            assert_eq!(fitted.target, Rect { x: 0, y: 25, width: 100, height: 50 });
+            assert_eq!(fitted.source, SourceWindow { x: 0, y: 0, width: 200, height: 100 });
+        }
     }
 
     #[test]
@@ -16805,12 +16998,13 @@ mod prose_tests {
             width: 8,
             height: 8,
         };
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             rect,
             (2, 2),
             cache.get(PictureHandle(1)).expect("held"),
             clip,
+            PictureFit::Contain,
         );
         for y in 0..8 {
             for x in 0..8 {
@@ -16845,7 +17039,7 @@ mod prose_tests {
             width: 1,
             height: 1,
         };
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             rect,
             (2, 2),
@@ -16856,6 +17050,7 @@ mod prose_tests {
                 width: 4,
                 height: 4,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.pixels[0], 127);
     }
@@ -16871,7 +17066,7 @@ mod prose_tests {
         ));
         let mut surface = Surface::new_in(2, 1, PictureFormat::Rgb8);
         surface.clear(tone::PAPER);
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             Rect {
                 x: 0,
@@ -16887,6 +17082,7 @@ mod prose_tests {
                 width: 2,
                 height: 1,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.bytes(), &[1, 2, 3, 4, 5, 6]);
     }
@@ -16897,7 +17093,7 @@ mod prose_tests {
         assert!(cache.put(PictureHandle(1), 1, 1, PicturePixels::Rgb8(vec![1, 2, 3]),));
         let mut surface = Surface::new(1, 1);
         surface.clear(tone::PAPER);
-        draw_picture(
+        draw_fitted_picture(
             &mut surface,
             Rect {
                 x: 0,
@@ -16913,6 +17109,7 @@ mod prose_tests {
                 width: 1,
                 height: 1,
             },
+            PictureFit::Contain,
         );
         assert_eq!(surface.bytes(), &[tone::PAPER]);
     }
@@ -17378,10 +17575,7 @@ mod prose_tests {
     fn a_cover_still_fills_the_column_it_leads_with() {
         // The size rule is about labels, not content. A cover is the row.
         let cover = first_lead(&row_with(RowLead::Picture(
-            TilePicture {
-                handle: PictureHandle(1),
-                source: (60, 90),
-            },
+            TilePicture::new(PictureHandle(1), 60, 90),
             Glyph::Book,
         )));
         assert_eq!(cover.width, CLARA_BW_METRICS.touch_target_default());
@@ -17418,10 +17612,7 @@ mod prose_tests {
                         "With a cover",
                         "",
                         RowLead::Picture(
-                            TilePicture {
-                                handle: PictureHandle(1),
-                                source: (60, 90),
-                            },
+                            TilePicture::new(PictureHandle(1), 60, 90),
                             Glyph::Book,
                         ),
                     ),

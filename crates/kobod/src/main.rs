@@ -1172,6 +1172,7 @@ mod tests {
                 id: kobo_ui::NodeId(1),
                 handle,
                 source: (2, 1),
+                fit: kobo_ui::PictureFit::Contain,
                 max_height_tenths_mm: 100,
                 framed: false,
             }],

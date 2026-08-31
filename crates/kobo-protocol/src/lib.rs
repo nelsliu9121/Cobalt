@@ -9,9 +9,9 @@ pub use kobo_pixels::{PictureFormat, PicturePixels};
 
 use kobo_ui::{
     ActionId, BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, ControlState,
-    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureHandle,
-    ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale, Tile,
-    TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
+    FontHandle, Freeform, Glyph, NavBar, Node, NodeId, PageTurns, Percent, PictureFit,
+    PictureHandle, ReadingChrome, ReadingSurface, Row, RowLead, RowState, Screen, Space, TextScale,
+    Tile, TilePicture, TileShape, TileState, TopBar, TransferFailure, MAX_BAR_ACTIONS,
     MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_NAV_DESTINATIONS,
 };
 use std::cmp::min;
@@ -3366,10 +3366,10 @@ fn encoded_screen_len(
     if screen.reading_font.is_some() {
         add_encoded_len(&mut length, 4)?;
     }
-    // One flag byte, plus the reading surface's four u32 values when present.
+    // One flag byte, plus the reading surface's id and tile-picture payload when present.
     add_encoded_len(&mut length, 1)?;
     if screen.reading_surface.is_some() {
-        add_encoded_len(&mut length, 16)?;
+        add_encoded_len(&mut length, 17)?;
     }
     if let Some(nav_bar) = &screen.nav_bar {
         if nav_bar.destinations.len() > u8::MAX as usize {
@@ -3624,12 +3624,12 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
                 add_encoded_len(&mut length, encoded_string_len(&tile.badge)?)?;
                 add_encoded_len(&mut length, encoded_string_len(&tile.subtitle)?)?;
                 if tile.picture.is_some() {
-                    add_encoded_len(&mut length, 12)?;
+                    add_encoded_len(&mut length, 13)?;
                 }
             }
             length
         }
-        Node::Picture { .. } => 20,
+        Node::Picture { .. } => 21,
         Node::Table { rows, weights, .. } => {
             if rows.len() > u8::MAX as usize || weights.len() > u8::MAX as usize {
                 return Err(ProtocolError::TooManyNodes);
@@ -4373,9 +4373,7 @@ fn encode_screen(
                 ReadingChrome::OverlayBusy => 3,
             });
             push_u32(output, surface.id.0);
-            push_u32(output, surface.picture.handle.0);
-            push_u32(output, surface.picture.source.0);
-            push_u32(output, surface.picture.source.1);
+            encode_tile_picture(output, surface.picture);
         }
     }
     push_u16(
@@ -4872,9 +4870,7 @@ fn encode_node(
                 match tile.picture {
                     Some(picture) => {
                         output.push(1);
-                        push_u32(output, picture.handle.0);
-                        push_u32(output, picture.source.0);
-                        push_u32(output, picture.source.1);
+                        encode_tile_picture(output, picture);
                     }
                     None => output.push(0),
                 }
@@ -4884,6 +4880,7 @@ fn encode_node(
             id,
             handle,
             source,
+            fit,
             max_height_tenths_mm,
             framed,
         } => {
@@ -4894,6 +4891,10 @@ fn encode_node(
             push_u32(output, source.1);
             push_u16(output, *max_height_tenths_mm);
             output.push(u8::from(*framed));
+            output.push(match fit {
+                PictureFit::Contain => 0,
+                PictureFit::Cover => 1,
+            });
         }
         Node::Table { id, rows, weights } => {
             output.push(30);
@@ -5287,6 +5288,28 @@ const fn decode_glyph(tag: u8) -> Option<Glyph> {
     })
 }
 
+fn encode_tile_picture(output: &mut Vec<u8>, picture: TilePicture) {
+    push_u32(output, picture.handle.0);
+    push_u32(output, picture.source.0);
+    push_u32(output, picture.source.1);
+    output.push(match picture.fit {
+        PictureFit::Contain => 0,
+        PictureFit::Cover => 1,
+    });
+}
+
+fn decode_tile_picture(reader: &mut Reader<'_>) -> Result<TilePicture, ProtocolError> {
+    let handle = PictureHandle(reader.u32()?);
+    let width = reader.u32()?;
+    let height = reader.u32()?;
+    let fit = match reader.u8()? {
+        0 => PictureFit::Contain,
+        1 => PictureFit::Cover,
+        _ => return Err(ProtocolError::InvalidValue("picture fit")),
+    };
+    Ok(TilePicture::new(handle, width, height).with_fit(fit))
+}
+
 fn decode_reading_surface(
     reader: &mut Reader<'_>,
 ) -> Result<Option<ReadingSurface>, ProtocolError> {
@@ -5294,7 +5317,7 @@ fn decode_reading_surface(
         0 => None,
         mode @ 1..=3 => Some(ReadingSurface::new(
             NodeId(reader.u32()?),
-            TilePicture::new(PictureHandle(reader.u32()?), reader.u32()?, reader.u32()?),
+            decode_tile_picture(reader)?,
             match mode {
                 1 => ReadingChrome::Hidden,
                 2 => ReadingChrome::Overlay,
@@ -5869,10 +5892,7 @@ fn decode_node(
                 let subtitle = reader.string()?;
                 let picture = match reader.u8()? {
                     0 => None,
-                    1 => Some(TilePicture {
-                        handle: PictureHandle(reader.u32()?),
-                        source: (reader.u32()?, reader.u32()?),
-                    }),
+                    1 => Some(decode_tile_picture(reader)?),
                     _ => return Err(ProtocolError::InvalidValue("tile picture flag")),
                 };
                 tiles.push(Tile {
@@ -5887,13 +5907,25 @@ fn decode_node(
             }
             Ok(Node::TileGrid { id, tiles, shape })
         }
-        17 => Ok(Node::Picture {
-            id,
-            handle: PictureHandle(reader.u32()?),
-            source: (reader.u32()?, reader.u32()?),
-            max_height_tenths_mm: reader.u16()?,
-            framed: reader.u8()? != 0,
-        }),
+        17 => {
+            let handle = PictureHandle(reader.u32()?);
+            let source = (reader.u32()?, reader.u32()?);
+            let max_height_tenths_mm = reader.u16()?;
+            let framed = reader.u8()? != 0;
+            let fit = match reader.u8()? {
+                0 => PictureFit::Contain,
+                1 => PictureFit::Cover,
+                _ => return Err(ProtocolError::InvalidValue("picture fit")),
+            };
+            Ok(Node::Picture {
+                id,
+                handle,
+                source,
+                fit,
+                max_height_tenths_mm,
+                framed,
+            })
+        }
         10 => {
             let prompt = reader.string()?;
             let len = usize::from(reader.u8()?);
@@ -6189,9 +6221,7 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
         RowLead::Picture(picture, glyph) => {
             output.push(2);
             push_u16(output, u16::from(encode_glyph(glyph)));
-            push_u32(output, picture.handle.0);
-            push_u32(output, picture.source.0);
-            push_u32(output, picture.source.1);
+            encode_tile_picture(output, picture);
         }
     }
     output.resize(before + ROW_LEAD_LEN, 0);
@@ -6199,7 +6229,7 @@ fn push_row_lead(output: &mut Vec<u8>, lead: RowLead) {
 }
 
 /// The fixed width of an encoded row lead.
-const ROW_LEAD_LEN: usize = 15;
+const ROW_LEAD_LEN: usize = 16;
 
 fn read_row_lead(reader: &mut Reader<'_>) -> Result<RowLead, ProtocolError> {
     let tag = reader.u8()?;
@@ -6213,16 +6243,12 @@ fn read_row_lead(reader: &mut Reader<'_>) -> Result<RowLead, ProtocolError> {
     let lead = match tag {
         0 => RowLead::Icon(glyph()?),
         1 => RowLead::Number(value),
-        2 => {
-            let handle = PictureHandle(reader.u32()?);
-            let source = (reader.u32()?, reader.u32()?);
-            RowLead::Picture(TilePicture { handle, source }, glyph()?)
-        }
+        2 => RowLead::Picture(decode_tile_picture(reader)?, glyph()?),
         _ => return Err(ProtocolError::InvalidValue("row lead")),
     };
     // The padding the encoder wrote, so every lead costs the same however it
     // was built.
-    let written = if tag == 2 { 15 } else { 3 };
+    let written = if tag == 2 { 16 } else { 3 };
     for _ in written..ROW_LEAD_LEN {
         reader.u8()?;
     }
@@ -7295,10 +7321,7 @@ mod node_coverage_tests {
                     "Bleak House",
                     "Charles Dickens",
                     RowLead::Picture(
-                        TilePicture {
-                            handle: PictureHandle(9),
-                            source: (190, 300),
-                        },
+                        TilePicture::new(PictureHandle(9), 190, 300),
                         Glyph::Book,
                     ),
                 )],
@@ -8816,6 +8839,80 @@ mod task_error_tests {
 mod picture_tests {
     use super::*;
 
+    fn round_trip(screen: Screen) -> Screen {
+        let frame = Frame {
+            request_id: 7,
+            message: Message::SetScreen(screen),
+        };
+        let bytes = encode(&frame).expect("encode");
+        match decode(&bytes).expect("decode").message {
+            Message::SetScreen(screen) => screen,
+            other => panic!("expected a screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picture_fit_round_trips_in_tiles_rows_and_reading_surfaces() {
+        for fit in [PictureFit::Contain, PictureFit::Cover] {
+            let picture = TilePicture::new(PictureHandle(9), 190, 300).with_fit(fit);
+            let screen = Screen::new(
+                1,
+                vec![
+                    Node::TileGrid {
+                        id: NodeId(1),
+                        tiles: vec![Tile::new(ActionId(1), "Cover", Glyph::Book)
+                            .with_picture(picture)],
+                        shape: TileShape::Portrait,
+                    },
+                    Node::Rows {
+                        id: NodeId(2),
+                        rows: vec![Row::new(
+                            ActionId(2),
+                            "Title",
+                            "Creator",
+                            RowLead::Picture(picture, Glyph::Book),
+                        )],
+                    },
+                ],
+            )
+            .with_reading_surface(Some(ReadingSurface::new(
+                NodeId(3),
+                picture,
+                ReadingChrome::Hidden,
+            )));
+            assert_eq!(round_trip(screen.clone()), screen);
+        }
+    }
+
+    #[test]
+    fn invalid_picture_fit_is_rejected() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 9);
+        push_u32(&mut bytes, 190);
+        push_u32(&mut bytes, 300);
+        bytes.push(2);
+        assert_eq!(
+            decode_tile_picture(&mut Reader::new(&bytes)),
+            Err(ProtocolError::InvalidValue("picture fit"))
+        );
+    }
+
+    #[test]
+    fn invalid_node_picture_fit_is_rejected() {
+        let mut bytes = vec![17];
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 9);
+        push_u32(&mut bytes, 190);
+        push_u32(&mut bytes, 300);
+        push_u16(&mut bytes, 600);
+        bytes.push(1);
+        bytes.push(2);
+        assert_eq!(
+            decode_node(&mut Reader::new(&bytes), 0, &mut 0),
+            Err(ProtocolError::InvalidValue("picture fit"))
+        );
+    }
+
     #[test]
     fn a_picture_on_a_shelf_survives_the_wire() {
         let screen = Screen::new(
@@ -8834,6 +8931,7 @@ mod picture_tests {
                     id: NodeId(2),
                     handle: PictureHandle(7),
                     source: (190, 300),
+                    fit: PictureFit::Contain,
                     max_height_tenths_mm: 600,
                     framed: true,
                 },
