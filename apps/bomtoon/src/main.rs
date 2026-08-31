@@ -1141,6 +1141,7 @@ struct Bomtoon {
     marker_store: Option<MarkerStoreOperation>,
     commerce_generation: u64,
     commerce_task: Option<CommerceTask>,
+    queued_commerce_command: Option<commerce::CommerceCommand>,
     commerce_episode: Option<usize>,
     pending_purchase_rejection: Option<&'static str>,
     purchase_rejection_notice: Option<&'static str>,
@@ -1179,6 +1180,7 @@ struct Bomtoon {
     reader_generation: u64,
     reader_tasks: BTreeMap<TaskId, ReaderTaskEntry>,
     foreground_reader_task: Option<TaskId>,
+    reader_manifest_pending: bool,
     comment_appendix: CommentAppendixState,
     comment_task: Option<CommentTask>,
     comments: Option<CommentPageState>,
@@ -1209,8 +1211,10 @@ impl Bomtoon {
     }
 
     fn visible_cover_urls(&self) -> Vec<String> {
-        if self.view != View::Main
-            || self.pending.is_some()
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
         {
@@ -1225,56 +1229,82 @@ impl Bomtoon {
                 }
             }
         };
-        match self.destination {
-            MainDestination::Featured
-                if matches!(
-                    self.featured.status,
-                    FeaturedStatus::Loading | FeaturedStatus::Ready
-                ) =>
-            {
-                let first_page_rows = featured_page_zero_rows(&self.featured);
-                let Some(content_page) = featured_content_page(&self.featured) else {
-                    return visible;
-                };
-                let page = featured_page(&self.featured, content_page, first_page_rows);
-                for index in page.featured {
-                    push(self.featured.featured[index].cover_url.as_ref());
+        match self.view {
+            View::Main => match self.destination {
+                MainDestination::Featured
+                    if matches!(
+                        self.featured.status,
+                        FeaturedStatus::Loading | FeaturedStatus::Ready
+                    ) =>
+                {
+                    let first_page_rows = featured_page_zero_rows(&self.featured);
+                    let Some(content_page) = featured_content_page(&self.featured) else {
+                        return visible;
+                    };
+                    let page = featured_page(&self.featured, content_page, first_page_rows);
+                    for index in page.featured {
+                        push(self.featured.featured[index].cover_url.as_ref());
+                    }
+                    for index in page.recommended {
+                        push(self.featured.recommended[index].cover_url.as_ref());
+                    }
                 }
-                for index in page.recommended {
-                    push(self.featured.recommended[index].cover_url.as_ref());
+                MainDestination::Recent if self.recent_load.loaded => {
+                    let (start, end) =
+                        page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
+                    for entry in &self.recent[start..end] {
+                        push(entry.cover_url.as_ref());
+                    }
+                }
+                MainDestination::Library if self.library_load.loaded => {
+                    let (start, end) =
+                        page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
+                    for comic in &self.comics[start..end] {
+                        push(comic.cover_url.as_ref());
+                    }
+                }
+                MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
+            },
+            View::Episodes => {
+                let rows = self.episode_rows_per_page();
+                let (start, end) = page_bounds(self.page, self.episodes.len(), rows);
+                for episode in &self.episodes[start..end] {
+                    push(episode.thumbnail_url.as_ref());
                 }
             }
-            MainDestination::Recent if self.recent_load.loaded => {
-                let (start, end) =
-                    page_bounds(self.page, self.recent.len(), LIBRARY_ITEMS_PER_PAGE);
-                for entry in &self.recent[start..end] {
-                    push(entry.cover_url.as_ref());
-                }
-            }
-            MainDestination::Library if self.library_load.loaded => {
-                let (start, end) =
-                    page_bounds(self.page, self.comics.len(), LIBRARY_ITEMS_PER_PAGE);
-                for comic in &self.comics[start..end] {
-                    push(comic.cover_url.as_ref());
-                }
-            }
-            MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
+            View::Status
+            | View::Account
+            | View::Reader
+            | View::CommentAppendix
+            | View::Comments
+            | View::Replies => {}
         }
         visible
     }
 
     fn visible_cover_source(&self) -> Option<CoverSource> {
-        if self.view != View::Main
-            || self.pending.is_some()
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
             || self.problem.is_some()
             || self.foreground_reader_task.is_some()
         {
             return None;
         }
-        Some(match self.destination {
-            MainDestination::Featured => CoverSource::Public,
-            MainDestination::Recent | MainDestination::Library => CoverSource::Protected,
-        })
+        match self.view {
+            View::Main => Some(match self.destination {
+                MainDestination::Featured => CoverSource::Public,
+                MainDestination::Recent | MainDestination::Library => CoverSource::Protected,
+            }),
+            View::Episodes => Some(CoverSource::Protected),
+            View::Status
+            | View::Account
+            | View::Reader
+            | View::CommentAppendix
+            | View::Comments
+            | View::Replies => None,
+        }
     }
 
     fn sync_visible_covers(&mut self, context: &mut Context) {
@@ -1287,11 +1317,23 @@ impl Bomtoon {
             self.covers.generation = self.covers.generation.wrapping_add(1);
             let generation = self.covers.generation;
             let visible_set = visible.iter().cloned().collect::<BTreeSet<_>>();
+            let episode_urls = self.episode_thumbnail_urls();
+            let public_urls = self.public_cover_urls();
+            self.evict_episode_thumbnails(
+                context,
+                &visible_set,
+                &episode_urls,
+                &public_urls,
+            );
             let obsolete = self
                 .covers
                 .tasks
                 .iter()
-                .filter(|(_, task)| !visible_set.contains(&task.url))
+                .filter(|(_, task)| {
+                    !visible_set.contains(&task.url)
+                        && !(episode_urls.contains(&task.url)
+                            && public_urls.contains(&task.url))
+                })
                 .map(|(task, cover)| (*task, cover.url.clone()))
                 .collect::<Vec<_>>();
             for (task, url) in obsolete {
@@ -1307,6 +1349,9 @@ impl Bomtoon {
                     if let Some(source) = visible_source {
                         task.source = source;
                     }
+                } else if episode_urls.contains(&task.url) && public_urls.contains(&task.url) {
+                    task.generation = generation;
+                    task.source = CoverSource::Public;
                 }
             }
             for url in &visible {
@@ -1321,7 +1366,11 @@ impl Bomtoon {
     }
 
     fn spawn_visible_covers(&mut self, context: &mut Context) {
-        if self.pending.is_some() || self.queued_foreground.is_some() {
+        if self.pending.is_some()
+            || self.queued_foreground.is_some()
+            || self.commerce_task.is_some()
+            || self.queued_commerce_command.is_some()
+        {
             return;
         }
         let Some(source) = self.covers.visible_source else {
@@ -1483,6 +1532,12 @@ impl Bomtoon {
                     .activity(message, None)
                     .build();
             }
+        }
+        if self.reader_manifest_pending {
+            return ScreenBuilder::new("bomtoon-loading")
+                .top_bar(self.reader_title())
+                .activity("Loading comic pages", None)
+                .build();
         }
         if let Some(entry) = self
             .foreground_reader_task
@@ -2450,6 +2505,7 @@ impl Bomtoon {
     }
 
     fn cancel_reader(&mut self, context: &mut Context) {
+        self.reader_manifest_pending = false;
         self.reader_generation = self.reader_generation.wrapping_add(1);
         for task in std::mem::take(&mut self.reader_tasks).into_keys() {
             context.cancel(task);
@@ -2772,6 +2828,108 @@ impl Bomtoon {
         self.page = self.page.min(last_page);
     }
 
+
+    fn owns_public_cover_url(&self, url: &str) -> bool {
+        self.featured
+            .featured
+            .iter()
+            .chain(&self.featured.recommended)
+            .chain(
+                self.featured
+                    .staged
+                    .iter()
+                    .flat_map(|staged| staged.featured.iter().chain(&staged.recommended)),
+            )
+            .any(|comic| comic.cover_url.as_deref() == Some(url))
+    }
+
+    fn episode_thumbnail_urls(&self) -> BTreeSet<String> {
+        self.episodes
+            .iter()
+            .filter_map(|episode| episode.thumbnail_url.clone())
+            .collect()
+    }
+
+    fn evict_episode_thumbnails(
+        &mut self,
+        context: &mut Context,
+        retained: &BTreeSet<String>,
+        episode_urls: &BTreeSet<String>,
+        public_urls: &BTreeSet<String>,
+    ) {
+        let obsolete_tasks = self
+            .covers
+            .tasks
+            .iter()
+            .filter(|(_, task)| {
+                episode_urls.contains(&task.url)
+                    && !retained.contains(&task.url)
+                    && !public_urls.contains(&task.url)
+            })
+            .map(|(task, cover)| (*task, cover.url.clone()))
+            .collect::<Vec<_>>();
+        for (task, url) in obsolete_tasks {
+            context.cancel(task);
+            self.covers.tasks.remove(&task);
+            if self.covers.entries.get(&url) == Some(&CoverState::Loading(task)) {
+                self.covers.entries.remove(&url);
+            }
+        }
+
+        let obsolete_entries = self
+            .covers
+            .entries
+            .keys()
+            .filter(|url| {
+                episode_urls.contains(*url)
+                    && !retained.contains(*url)
+                    && !public_urls.contains(*url)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for url in obsolete_entries {
+            if let Some(CoverState::Ready(picture)) = self.covers.entries.remove(&url) {
+                context.drop_picture(picture.handle);
+            }
+        }
+
+        self.covers
+            .visible_urls
+            .retain(|url| !episode_urls.contains(url) || retained.contains(url));
+        for task in self.covers.tasks.values_mut() {
+            if episode_urls.contains(&task.url)
+                && !retained.contains(&task.url)
+                && public_urls.contains(&task.url)
+            {
+                task.source = CoverSource::Public;
+            }
+        }
+    }
+
+    fn clear_episode_thumbnail_cache(&mut self, context: &mut Context) {
+        let episode_urls = self.episode_thumbnail_urls();
+        if episode_urls.is_empty() {
+            return;
+        }
+        let public_urls = self.public_cover_urls();
+        self.covers.generation = self.covers.generation.wrapping_add(1);
+        let generation = self.covers.generation;
+        self.evict_episode_thumbnails(
+            context,
+            &BTreeSet::new(),
+            &episode_urls,
+            &public_urls,
+        );
+        for task in self.covers.tasks.values_mut() {
+            task.generation = generation;
+            if public_urls.contains(&task.url) {
+                task.source = CoverSource::Public;
+            }
+        }
+        if self.covers.visible_urls.is_empty() {
+            self.covers.visible_source = None;
+        }
+    }
     fn public_cover_urls(&self) -> BTreeSet<String> {
         self.featured
             .featured
@@ -3015,6 +3173,7 @@ impl Bomtoon {
                             self.selected_title = detail.title;
                             self.selected_creators = detail.creators.join(" | ");
                             self.selected_synopsis = detail.synopsis;
+                            self.clear_episode_thumbnail_cache(context);
                             self.episodes = detail.episodes;
                             self.prepare_episode_layout();
                             self.restore_episode_page(episode_anchor, episode_page);
@@ -3161,6 +3320,81 @@ impl Bomtoon {
             }
         }
     }
+    fn try_spawn_commerce_command(
+        &mut self,
+        context: &mut Context,
+        command: commerce::CommerceCommand,
+    ) -> Result<(), commerce::CommerceCommand> {
+        match command {
+            commerce::CommerceCommand::FetchQuote {
+                selection,
+                purchase,
+            } => {
+                let Some(account_scope) = self.current_commerce_scope() else {
+                    let effects = self.commerce.quote_failed();
+                    self.apply_commerce_effects(context, effects);
+                    return Ok(());
+                };
+                let work = api::quote(
+                    &selection.title_alias,
+                    &selection.episode_alias,
+                    purchase,
+                );
+                let Some(id) = context.spawn(work) else {
+                    return Err(commerce::CommerceCommand::FetchQuote {
+                        selection,
+                        purchase,
+                    });
+                };
+                self.commerce_generation = self.commerce_generation.wrapping_add(1);
+                self.commerce_task = Some(CommerceTask {
+                    id,
+                    purpose: CommerceTaskPurpose::Quote {
+                        generation: self.commerce_generation,
+                        account_scope,
+                        selection,
+                        purchase,
+                    },
+                });
+                Ok(())
+            }
+            commerce::CommerceCommand::Post(marker) => {
+                let work =
+                    api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
+                let Some(id) = context.spawn(work) else {
+                    return Err(commerce::CommerceCommand::Post(marker));
+                };
+                self.commerce_generation = self.commerce_generation.wrapping_add(1);
+                self.commerce_task = Some(CommerceTask {
+                    id,
+                    purpose: CommerceTaskPurpose::Post {
+                        generation: self.commerce_generation,
+                        account_scope: marker.account_scope,
+                        marker,
+                    },
+                });
+                Ok(())
+            }
+            commerce::CommerceCommand::SaveMarker(_)
+            | commerce::CommerceCommand::ForgetMarker
+            | commerce::CommerceCommand::RefreshContent(_) => {
+                unreachable!("only network commerce commands can be deferred")
+            }
+        }
+    }
+
+    fn resume_queued_commerce(&mut self, context: &mut Context) {
+        if self.commerce_task.is_some() {
+            return;
+        }
+        let Some(command) = self.queued_commerce_command.take() else {
+            return;
+        };
+        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+            self.queued_commerce_command = Some(command);
+        }
+    }
+
 
     fn apply_commerce_effects(
         &mut self,
@@ -3168,6 +3402,7 @@ impl Bomtoon {
         effects: commerce::CommerceEffects,
     ) {
         if self.commerce.state() == commerce::CommerceState::Idle {
+            self.queued_commerce_command = None;
             self.retained_quote = None;
             self.commerce_episode = None;
         }
@@ -3184,56 +3419,31 @@ impl Bomtoon {
                     self.marker_store = Some(MarkerStoreOperation::Forget);
                     context.store().forget(commerce::MARKER_KEY);
                 }
-                Some(commerce::CommerceCommand::FetchQuote {
-                    selection,
-                    purchase,
-                }) => {
-                    let Some(account_scope) = self.current_commerce_scope() else {
-                        let effects = self.commerce.quote_failed();
-                        self.apply_commerce_effects(context, effects);
-                        return;
-                    };
-                    self.commerce_generation = self.commerce_generation.wrapping_add(1);
-                    let generation = self.commerce_generation;
-                    let work =
-                        api::quote(&selection.title_alias, &selection.episode_alias, purchase);
-                    if let Some(id) = context.spawn(work) {
-                        self.commerce_task = Some(CommerceTask {
-                            id,
-                            purpose: CommerceTaskPurpose::Quote {
-                                generation,
-                                account_scope,
-                                selection,
-                                purchase,
-                            },
-                        });
+                Some(command @ commerce::CommerceCommand::FetchQuote { .. })
+                | Some(command @ commerce::CommerceCommand::Post(_)) => {
+                    if self.covers.tasks.is_empty() {
+                        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+                            let effects = match command {
+                                commerce::CommerceCommand::FetchQuote { .. } => {
+                                    self.commerce.quote_failed()
+                                }
+                                commerce::CommerceCommand::Post(_) => self
+                                    .commerce
+                                    .mutation_finished(commerce::PostOutcome::Ambiguous),
+                                commerce::CommerceCommand::SaveMarker(_)
+                                | commerce::CommerceCommand::ForgetMarker
+                                | commerce::CommerceCommand::RefreshContent(_) => {
+                                    unreachable!("only network commands reach the task scheduler")
+                                }
+                            };
+                            self.apply_commerce_effects(context, effects);
+                            return;
+                        }
                     } else {
-                        let effects = self.commerce.quote_failed();
-                        self.apply_commerce_effects(context, effects);
-                        return;
-                    }
-                }
-                Some(commerce::CommerceCommand::Post(marker)) => {
-                    self.commerce_generation = self.commerce_generation.wrapping_add(1);
-                    let generation = self.commerce_generation;
-                    let account_scope = marker.account_scope;
-                    let work =
-                        api::purchase(&marker.title_alias, marker.episode_id, marker.purchase_type);
-                    if let Some(id) = context.spawn(work) {
-                        self.commerce_task = Some(CommerceTask {
-                            id,
-                            purpose: CommerceTaskPurpose::Post {
-                                generation,
-                                account_scope,
-                                marker,
-                            },
-                        });
-                    } else {
-                        let effects = self
-                            .commerce
-                            .mutation_finished(commerce::PostOutcome::Ambiguous);
-                        self.apply_commerce_effects(context, effects);
-                        return;
+                        self.preempt_cover_tasks(context);
+                        if let Err(command) = self.try_spawn_commerce_command(context, command) {
+                            self.queued_commerce_command = Some(command);
+                        }
                     }
                 }
                 Some(commerce::CommerceCommand::RefreshContent(selection)) => {
@@ -3392,6 +3602,7 @@ impl Bomtoon {
             context.cancel(task.id);
         }
         self.commerce_generation = self.commerce_generation.wrapping_add(1);
+        self.queued_commerce_command = None;
         self.reconciliation = None;
         self.scope_refresh_pending = false;
         self.account_scope = None;
@@ -3501,6 +3712,7 @@ impl Bomtoon {
         self.cancel_reader(context);
         self.cancel_wallet(context);
         self.clear_title_gifts(context);
+        self.clear_episode_thumbnail_cache(context);
         self.retain_public_cover_cache(context);
         self.wallet.summary = None;
         self.wallet.summary_error = false;
@@ -4031,6 +4243,18 @@ impl Bomtoon {
         }
         self.resume_queued_foreground(context);
         if self.queued_foreground.is_none() {
+            if self.reader_manifest_pending {
+                self.start_manifest(context);
+            }
+            if self.reader_manifest_pending {
+                return;
+            }
+            if self.queued_commerce_command.is_some() {
+                self.resume_queued_commerce(context);
+            }
+            if self.queued_commerce_command.is_some() {
+                return;
+            }
             self.resume_deferred_wallet(context);
             self.spawn_visible_covers(context);
         }
@@ -4065,6 +4289,7 @@ impl Bomtoon {
     }
 
     fn start_manifest(&mut self, context: &mut Context) {
+        self.reader_manifest_pending = false;
         let Some((content_alias, episode_alias)) =
             self.reader_selection.as_ref().map(|selection| {
                 (
@@ -4096,7 +4321,7 @@ impl Bomtoon {
             )
             .is_none()
         {
-            self.fail_reader(Retry::Manifest, "Another reader request is still active.");
+            self.reader_manifest_pending = true;
         }
     }
 
@@ -4757,6 +4982,7 @@ impl Bomtoon {
                         self.selected_title = detail.title;
                         self.selected_creators = detail.creators.join(" | ");
                         self.selected_synopsis = detail.synopsis;
+                        self.clear_episode_thumbnail_cache(context);
                         self.episodes = detail.episodes;
                         self.prepare_episode_layout();
                         self.restore_episode_page(
@@ -4821,6 +5047,7 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
+        self.clear_episode_thumbnail_cache(context);
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
         self.page = 0;
@@ -4852,6 +5079,7 @@ impl Bomtoon {
         }) else {
             return;
         };
+        self.clear_episode_thumbnail_cache(context);
         self.synopsis.open_page = None;
         self.cancel_title_gift_task(context);
         self.clear_comment_state(context);
@@ -5981,6 +6209,14 @@ impl Bomtoon {
     ) -> bool {
         if cover.generation != self.covers.generation
             || self.covers.entries.get(&cover.url) != Some(&CoverState::Loading(task))
+            || match cover.source {
+                CoverSource::Public => !self.owns_public_cover_url(&cover.url),
+                CoverSource::Protected => {
+                    self.account != AccountState::Active
+                        || self.covers.visible_source != Some(CoverSource::Protected)
+                        || !self.covers.visible_urls.contains(&cover.url)
+                }
+            }
         {
             return false;
         }
@@ -6057,6 +6293,7 @@ impl KoboApp for Bomtoon {
 
     fn on_suspend(&mut self, context: &mut Context) {
         self.synopsis.open_page = None;
+        self.clear_episode_thumbnail_cache(context);
         self.clear_commerce_access(context);
         if self.view.is_reader_flow()
             || self.reader_selection.is_some()
@@ -16602,6 +16839,495 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn episode_thumbnail_url(index: usize) -> String {
+        format!("https://image.balcony.studio/tw/ep_thumbnail/episode-{index}.webp")
+    }
+
+    fn thumbnail_episode(index: usize, thumbnail_url: String) -> Episode {
+        Episode {
+            id: 1_000 + index,
+            alias: format!("thumbnail-{index}"),
+            title: format!("Thumbnail episode {index}"),
+            opened_at: 1_709_136_000_000 + i64::try_from(index).expect("small index") * 1_000,
+            thumbnail_url: Some(thumbnail_url),
+            purchase: model::PurchaseState::Owned,
+            rent_expires_at: None,
+            rent_coin: None,
+            purchase_coin: None,
+            gift_eligible: false,
+        }
+    }
+
+    fn episode_thumbnail_app(count: usize) -> Bomtoon {
+        let mut app = episode_metadata_app("Synopsis".to_owned());
+        app.episodes = (0..count)
+            .map(|index| thumbnail_episode(index, episode_thumbnail_url(index)))
+            .collect();
+        app.episode_items_per_page = None;
+        app.prepare_episode_layout();
+        app
+    }
+
+    fn episode_thumbnail_runner(count: usize) -> AppRunner<Bomtoon> {
+        AppRunner::with_metrics(episode_thumbnail_app(count), CLARA_BW_METRICS)
+    }
+
+    fn first_episode_lead(screen: &Screen) -> RowLead {
+        screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => rows.first().map(|row| row.lead),
+                _ => None,
+            })
+            .expect("episode row")
+    }
+
+    fn put_picture_handles(commands: &[Command]) -> BTreeSet<PictureHandle> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::PutPicture { handle, .. } => Some(*handle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn episode_thumbnails_request_only_the_visible_page() {
+        let mut runner = episode_thumbnail_runner(12);
+        let rows = runner.app().episode_rows_per_page();
+        assert!(runner.app().episodes.len() > rows);
+        let first_page = (0..rows).map(episode_thumbnail_url).collect::<BTreeSet<_>>();
+        let second_page = (rows..rows.saturating_mul(2).min(12))
+            .map(episode_thumbnail_url)
+            .collect::<BTreeSet<_>>();
+
+        let commands = runner.action(action_id("refresh-layout"));
+        let fetches = cover_fetches(&commands);
+        let requested = fetches
+            .iter()
+            .map(|(_, url)| url.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(!requested.is_empty());
+        assert!(requested.is_subset(&first_page));
+        assert!(requested.is_disjoint(&second_page));
+        assert!(fetches.len() <= 4);
+        assert_eq!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Icon(Glyph::Book)
+        );
+
+        let (ready_task, ready_url) = fetches[0].clone();
+        let commands =
+            runner.task_outcome(ready_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert_eq!(put_picture_handles(&commands).len(), 1);
+        assert!(matches!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Picture(_, Glyph::Book)
+        ));
+        let ready_picture = ready_cover(&runner.app().covers, Some(&ready_url))
+            .expect("visible thumbnail picture");
+        let stale = runner
+            .app()
+            .covers
+            .tasks
+            .iter()
+            .filter(|(_, cover)| first_page.contains(&cover.url))
+            .map(|(task, cover)| (*task, cover.url.clone()))
+            .collect::<Vec<_>>();
+        assert!(stale.len() >= 2, "two stale outcomes must be exercised");
+
+        let commands = runner.action(action_id(NEXT_PAGE));
+        let cancelled = cancelled_tasks(&commands);
+        assert_eq!(runner.app().page, 1);
+        assert!(stale.iter().all(|(task, _)| cancelled.contains(task)));
+        assert!(commands.contains(&Command::DropPicture(ready_picture.handle)));
+        assert!(cover_fetches(&commands)
+            .iter()
+            .all(|(_, url)| second_page.contains(url)));
+
+        for (index, (task, url)) in stale.into_iter().take(2).enumerate() {
+            let outcome = if index == 0 {
+                TaskOutcome::Completed(TINY_WEBP.to_vec())
+            } else {
+                TaskOutcome::Failed(TaskError::TimedOut)
+            };
+            let commands = runner.task_outcome(task, outcome);
+            assert!(put_picture_handles(&commands).is_empty());
+            assert!(runner.app().problem.is_none());
+            assert!(!runner.app().covers.entries.contains_key(&url));
+            assert!(cover_fetches(&commands)
+                .iter()
+                .all(|(_, url)| second_page.contains(url)));
+        }
+        assert!(!runner.app().covers.entries.contains_key(&ready_url));
+    }
+
+    #[test]
+    fn repeated_episode_thumbnail_url_remains_owned_across_pages() {
+        let mut app = episode_thumbnail_app(12);
+        let rows = app.episode_rows_per_page();
+        let shared = episode_thumbnail_url(0);
+        app.episodes[rows].thumbnail_url = Some(shared.clone());
+        app.episode_items_per_page = None;
+        app.prepare_episode_layout();
+        let rows = app.episode_rows_per_page();
+        app.episodes[rows].thumbnail_url = Some(shared.clone());
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id("refresh-layout"));
+        let shared_task = cover_fetches(&commands)
+            .into_iter()
+            .find_map(|(task, url)| (url == shared).then_some(task))
+            .expect("shared visible thumbnail task");
+        let commands = runner.action(action_id(NEXT_PAGE));
+        assert!(!cancelled_tasks(&commands).contains(&shared_task));
+
+        let commands =
+            runner.task_outcome(shared_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
+        assert_eq!(put_picture_handles(&commands).len(), 1);
+        assert!(matches!(
+            first_episode_lead(&last_screen(&commands)),
+            RowLead::Picture(_, Glyph::Book)
+        ));
+    }
+
+    #[test]
+    fn episode_thumbnail_failure_keeps_glyph_without_page_error() {
+        let mut runner = episode_thumbnail_runner(1);
+        let commands = runner.action(action_id("refresh-layout"));
+        let thumbnail = cover_fetches(&commands)[0].0;
+
+        let commands = runner.task_outcome(thumbnail, TaskOutcome::Failed(TaskError::Offline));
+
+        assert!(put_picture_handles(&commands).is_empty());
+        assert!(runner.app().problem.is_none());
+        assert_eq!(
+            first_episode_lead(&runner.app().screen()),
+            RowLead::Icon(Glyph::Book)
+        );
+        assert!(cover_fetches(&runner.action(action_id("refresh-layout"))).is_empty());
+    }
+
+    fn cached_episode_thumbnail_runner() -> (
+        AppRunner<Bomtoon>,
+        String,
+        TilePicture,
+        String,
+        TilePicture,
+    ) {
+        let shared = episode_thumbnail_url(0);
+        let episode_only = episode_thumbnail_url(1);
+        let shared_picture = TilePicture::new(PictureHandle(301), 1, 1);
+        let episode_picture = TilePicture::new(PictureHandle(302), 1, 1);
+        let mut app = episode_thumbnail_app(2);
+        app.episodes[0].thumbnail_url = Some(shared.clone());
+        app.episodes[1].thumbnail_url = Some(episode_only.clone());
+        app.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: vec![ShelfComic {
+                title: "Shared shelf comic".to_owned(),
+                alias: "shared-shelf".to_owned(),
+                cover_url: Some(shared.clone()),
+            }],
+            ..FeaturedState::default()
+        };
+        app.covers.entries = BTreeMap::from([
+            (shared.clone(), CoverState::Ready(shared_picture)),
+            (
+                episode_only.clone(),
+                CoverState::Ready(episode_picture),
+            ),
+        ]);
+        app.covers.visible_urls = vec![shared.clone(), episode_only.clone()];
+        app.covers.visible_source = Some(CoverSource::Protected);
+        (
+            AppRunner::with_metrics(app, CLARA_BW_METRICS),
+            shared,
+            shared_picture,
+            episode_only,
+            episode_picture,
+        )
+    }
+
+    #[test]
+    fn leaving_episode_view_drops_episode_only_pictures_but_preserves_public_shelf_covers() {
+        let (mut reader, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(reader.app().view, View::Reader);
+        assert_eq!(
+            reader.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!reader.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let (mut main, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        let commands = main.action(ActionId::BACK);
+        assert_eq!(main.app().view, View::Main);
+        assert_eq!(
+            main.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!main.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let (mut replacement, shared, shared_picture, episode_only, episode_picture) =
+            cached_episode_thumbnail_runner();
+        replacement.app_mut().view = View::Main;
+        let commands = replacement.action(action_id("comic-0"));
+        assert_eq!(replacement.app().pending, Some(Pending::Content(0)));
+        assert_eq!(
+            replacement.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!replacement.app().covers.entries.contains_key(&episode_only));
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+        assert!(commands.contains(&Command::DropPicture(episode_picture.handle)));
+
+        let mut eviction = episode_thumbnail_app(12);
+        let shared = episode_thumbnail_url(0);
+        let shared_picture = TilePicture::new(PictureHandle(303), 1, 1);
+        eviction.featured = FeaturedState {
+            status: FeaturedStatus::Ready,
+            featured: vec![ShelfComic {
+                title: "Shared shelf comic".to_owned(),
+                alias: "shared-shelf".to_owned(),
+                cover_url: Some(shared.clone()),
+            }],
+            ..FeaturedState::default()
+        };
+        eviction.covers.entries =
+            BTreeMap::from([(shared.clone(), CoverState::Ready(shared_picture))]);
+        eviction.covers.visible_urls = eviction.visible_cover_urls();
+        eviction.covers.visible_source = Some(CoverSource::Protected);
+        let mut eviction = AppRunner::with_metrics(eviction, CLARA_BW_METRICS);
+        let commands = eviction.action(action_id(NEXT_PAGE));
+        assert_eq!(
+            eviction.app().covers.entries.get(&shared),
+            Some(&CoverState::Ready(shared_picture))
+        );
+        assert!(!commands.contains(&Command::DropPicture(shared_picture.handle)));
+    }
+
+    fn seed_episode_thumbnail_cache(
+        app: &mut Bomtoon,
+        loading_task: TaskId,
+        ready_picture: TilePicture,
+    ) -> (String, String) {
+        let loading_url = episode_thumbnail_url(0);
+        let ready_url = episode_thumbnail_url(1);
+        app.covers.generation = 17;
+        app.covers.visible_urls = vec![loading_url.clone(), ready_url.clone()];
+        app.covers.visible_source = Some(CoverSource::Protected);
+        app.covers.entries = BTreeMap::from([
+            (loading_url.clone(), CoverState::Loading(loading_task)),
+            (ready_url.clone(), CoverState::Ready(ready_picture)),
+        ]);
+        app.covers.tasks = BTreeMap::from([(
+            loading_task,
+            CoverTask {
+                generation: 17,
+                url: loading_url.clone(),
+                source: CoverSource::Protected,
+            },
+        )]);
+        (loading_url, ready_url)
+    }
+
+    fn assert_episode_thumbnail_cache_cleared(
+        app: &Bomtoon,
+        loading_url: &str,
+        ready_url: &str,
+    ) {
+        assert!(!app.covers.entries.contains_key(loading_url));
+        assert!(!app.covers.entries.contains_key(ready_url));
+        assert!(app.covers.tasks.is_empty());
+        assert!(!app.covers.visible_urls.contains(&loading_url.to_owned()));
+        assert!(!app.covers.visible_urls.contains(&ready_url.to_owned()));
+    }
+
+    #[test]
+    fn protected_episode_thumbnails_clear_on_suspend_credential_loss_sign_out_and_exit() {
+        let loading = TaskId(801);
+        let picture = TilePicture::new(PictureHandle(401), 1, 1);
+        let mut suspend = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(suspend.app_mut(), loading, picture);
+        let commands = suspend.suspend();
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(suspend.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(802);
+        let picture = TilePicture::new(PictureHandle(402), 1, 1);
+        let mut credential = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(credential.app_mut(), loading, picture);
+        let scope = TaskId(803);
+        credential.app_mut().scope_task = Some(scope);
+        let commands = credential.task_outcome(scope, TaskOutcome::Failed(TaskError::NoCredential));
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(credential.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(804);
+        let picture = TilePicture::new(PictureHandle(404), 1, 1);
+        let mut sign_out = episode_thumbnail_runner(2);
+        sign_out.app_mut().view = View::Account;
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(sign_out.app_mut(), loading, picture);
+        let commands = sign_out.action(action_id(SIGN_OUT));
+        let (logout, work) = only_spawn(&commands);
+        assert_eq!(work, api::logout());
+        let commands = sign_out.task_outcome(logout, TaskOutcome::Completed(Vec::new()));
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(sign_out.app(), &loading_url, &ready_url);
+
+        let loading = TaskId(805);
+        let picture = TilePicture::new(PictureHandle(405), 1, 1);
+        let mut exit = episode_thumbnail_runner(2);
+        let (loading_url, ready_url) =
+            seed_episode_thumbnail_cache(exit.app_mut(), loading, picture);
+        let commands = exit.exit();
+        assert!(commands.contains(&Command::Cancel(loading)));
+        assert!(commands.contains(&Command::DropPicture(picture.handle)));
+        assert_episode_thumbnail_cache_cleared(exit.app(), &loading_url, &ready_url);
+    }
+
+    #[test]
+    fn reader_and_content_foreground_work_preempt_episode_thumbnails() {
+        let mut reader = episode_thumbnail_runner(12);
+        let commands = reader.action(action_id("refresh-layout"));
+        let reader_covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert!(!reader_covers.is_empty());
+        assert_eq!(reader_covers.len(), 4);
+        let commands = reader.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), reader_covers);
+        assert!(cover_fetches(&commands).is_empty());
+        let mut manifest = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072));
+        for task in reader_covers.iter().copied() {
+            if manifest.is_some() {
+                break;
+            }
+            let commands = reader.task_outcome(task, TaskOutcome::Cancelled);
+            assert!(cover_fetches(&commands).is_empty());
+            manifest = spawns(&commands)
+                .into_iter()
+                .find(|(_, work)| *work == api::images("hunter_q", "thumbnail-0", 1072));
+        }
+        assert!(manifest.is_some(), "reader manifest did not resume first");
+
+        let mut content = episode_thumbnail_runner(12);
+        content.app_mut().episodes[0].purchase = model::PurchaseState::Rented;
+        content.app_mut().episodes[0].rent_expires_at = Some(1);
+        let commands = content.action(action_id("refresh-layout"));
+        let content_covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(content_covers.len(), 4);
+
+        let commands = content.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), content_covers);
+        assert!(cover_fetches(&commands).is_empty());
+        let mut detail = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == api::detail("hunter_q"));
+        for task in content_covers.iter().copied() {
+            if detail.is_none() {
+                let commands = content.task_outcome(task, TaskOutcome::Cancelled);
+                assert!(cover_fetches(&commands).is_empty());
+                detail = spawns(&commands)
+                    .into_iter()
+                    .find(|(_, work)| *work == api::detail("hunter_q"));
+            } else {
+                let commands = content.task_outcome(task, TaskOutcome::Cancelled);
+                assert!(cover_fetches(&commands).is_empty());
+            }
+        }
+        let (detail, _) = detail.expect("content refresh did not resume first");
+        let refreshed_thumbnail = episode_thumbnail_url(50);
+        let refreshed_episode = format!(
+            concat!(
+                "{{\"id\":105,\"alias\":\"thumbnail-0\",\"title\":\"Thumbnail episode 0\",",
+                "\"openedAt\":1709136000000,\"isSample\":false,",
+                "\"purchaseStatus\":\"POSSESSION\",",
+                "\"thumbnails\":[{{\"type\":\"COMMON\",\"imagePath\":\"{}\"}}]}}"
+            ),
+            refreshed_thumbnail
+        );
+        let commands = content.task_outcome(
+            detail,
+            TaskOutcome::Completed(detail_response(
+                41,
+                "hunter_q",
+                "Hunter Q",
+                &refreshed_episode,
+            )),
+        );
+        assert!(cover_fetches(&commands)
+            .iter()
+            .any(|(_, url)| url == &refreshed_thumbnail));
+    }
+
+    #[test]
+    fn commerce_foreground_preempts_episode_thumbnails_and_resumes_after_cancellation() {
+        let mut app = episode_thumbnail_app(12);
+        app.episodes[0].purchase = model::PurchaseState::NotOwned;
+        app.episodes[0].purchase_coin = Some(7);
+        let account_scope = app.account_scope.expect("account scope");
+        let _ = app.commerce.marker_loaded(None);
+        let _ = app.commerce.safety_changed(
+            commerce::Authentication::Authenticated(account_scope),
+            commerce::Connectivity::Online,
+        );
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id("refresh-layout"));
+        let covers = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covers.len(), 4);
+
+        let commands = runner.action(action_id("episode-0"));
+        assert_eq!(cancelled_tasks(&commands), covers);
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Quoting
+        );
+        assert!(cover_fetches(&commands).is_empty());
+        let quote_work = api::quote(
+            "hunter_q",
+            "thumbnail-0",
+            model::PurchaseType::Possession,
+        );
+        let mut quote = spawns(&commands)
+            .into_iter()
+            .find(|(_, work)| *work == quote_work);
+        for task in covers {
+            let commands = runner.task_outcome(task, TaskOutcome::Cancelled);
+            assert!(cover_fetches(&commands).is_empty());
+            if quote.is_none() {
+                quote = spawns(&commands)
+                    .into_iter()
+                    .find(|(_, work)| *work == quote_work);
+            }
+        }
+        assert!(quote.is_some(), "quote did not resume before thumbnails");
     }
 
     #[test]
