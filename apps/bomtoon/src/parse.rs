@@ -211,14 +211,14 @@ pub fn themes(bytes: &[u8]) -> Result<Vec<ThemeCollection>, ParseError> {
         let Some(label) = value.get("title").and_then(Value::as_str).map(str::trim) else {
             continue;
         };
-        if label.is_empty() || label.len() > MAX_TITLE_BYTES || !seen.insert(id) {
+        if label.is_empty() || label.len() > MAX_TITLE_BYTES {
             continue;
         }
         let comics = contents
             .iter()
             .filter_map(|comic| feature_comic(comic, "badgeAdult"))
             .collect::<Vec<_>>();
-        if comics.is_empty() {
+        if comics.is_empty() || !seen.insert(id) {
             continue;
         }
         collections.push(ThemeCollection {
@@ -850,13 +850,12 @@ fn feature_comic(value: &Value, adult_key: &str) -> Option<FeatureComic> {
     if creators.len() > MAX_CREATORS_BYTES {
         return None;
     }
-    let view_count = match value.get("viewCount") {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let count = value.as_integer_str()?.parse::<u64>().ok()?;
-            (count > 0).then_some(count)
-        }
-    };
+    let view_count = value
+        .get("viewCount")
+        .filter(|value| !matches!(value, Value::Null))
+        .and_then(Value::as_integer_str)
+        .and_then(|count| count.parse::<u64>().ok())
+        .filter(|count| *count > 0);
     let (vertical_url, square_url) =
         if matches!(value.get(adult_key), Some(Value::Bool(false))) {
             let vertical_url = public_thumbnail(
@@ -3225,6 +3224,37 @@ mod tests {
     }
 
     #[test]
+    fn public_collection_normalizes_invalid_view_counts_without_dropping_comics() {
+        let body = br#"{
+          "result":"SUCCESS",
+          "data":[
+            {"alias":"negative","title":"Negative","creators":"Creator","isAdult":false,"viewCount":-1,"thumbnails":[]},
+            {"alias":"overflow","title":"Overflow","creators":"Creator","isAdult":false,"viewCount":18446744073709551616,"thumbnails":[]},
+            {"alias":"fraction","title":"Fraction","creators":"Creator","isAdult":false,"viewCount":1.5,"thumbnails":[]},
+            {"alias":"text","title":"Text","creators":"Creator","isAdult":false,"viewCount":"many","thumbnails":[]},
+            {"alias":"positive","title":"Positive","creators":"Creator","isAdult":false,"viewCount":9,"thumbnails":[]}
+          ]
+        }"#;
+
+        let comics = public_collection(body).expect("invalid counts are optional metadata");
+
+        assert_eq!(
+            comics
+                .iter()
+                .map(|comic| comic.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["negative", "overflow", "fraction", "text", "positive"]
+        );
+        assert_eq!(
+            comics
+                .iter()
+                .map(|comic| comic.view_count)
+                .collect::<Vec<_>>(),
+            [None, None, None, None, Some(9)]
+        );
+    }
+
+    #[test]
     fn public_collection_rejects_non_success_and_oversized_arrays() {
         assert!(public_collection(br#"{"result":"ERROR","data":[]}"#).is_err());
         let comic = feature_comic_json("safe", "\"isAdult\":false,");
@@ -3276,6 +3306,29 @@ mod tests {
         );
         assert_eq!(themes[0].label, "給我一次重來的機會🕙");
         assert_eq!(themes[0].comics.len(), 6);
+    }
+
+    #[test]
+    fn themes_allow_a_valid_group_after_empty_or_all_invalid_same_id() {
+        let valid = feature_comic_json("valid", "\"badgeAdult\":false,");
+        let invalid = feature_comic_json("bad/slash", "\"badgeAdult\":false,");
+        let body = format!(
+            r#"{{"result":"SUCCESS","data":[{},{},{},{}]}}"#,
+            theme_json(10, "Empty", ""),
+            theme_json(10, "Valid ten", &valid),
+            theme_json(11, "Invalid", &invalid),
+            theme_json(11, "Valid eleven", &valid)
+        );
+
+        let themes = themes(body.as_bytes()).expect("later valid groups");
+
+        assert_eq!(
+            themes
+                .iter()
+                .map(|theme| (theme.id, theme.label.as_str()))
+                .collect::<Vec<_>>(),
+            [(10, "Valid ten"), (11, "Valid eleven")]
+        );
     }
 
     #[test]
