@@ -21,7 +21,6 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 kobo-protocol = { path = "../kobo-protocol" }
-kobo-policy = { path = "../kobo-policy" }
 kobo-json = { path = "../kobo-json" }
 
 [lints]
