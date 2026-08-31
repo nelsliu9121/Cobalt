@@ -78,6 +78,46 @@ impl FeatureSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedBlock {
+    Banners,
+    Collection(usize),
+    ThemeWithHeading(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedPage {
+    pub blocks: Vec<FeedBlock>,
+}
+
+pub fn feed_blocks(snapshot: &FeatureSnapshot) -> Vec<FeedBlock> {
+    let mut indices = snapshot
+        .collections
+        .iter()
+        .enumerate()
+        .filter_map(|(index, collection)| (!collection.comics.is_empty()).then_some(index))
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|index| {
+        let collection = &snapshot.collections[*index];
+        (collection.priority, collection.order, *index)
+    });
+    let first_theme = indices
+        .iter()
+        .position(|index| snapshot.collections[*index].priority == 9);
+    let mut blocks = Vec::with_capacity(indices.len() + usize::from(!snapshot.banners.is_empty()));
+    if !snapshot.banners.is_empty() {
+        blocks.push(FeedBlock::Banners);
+    }
+    blocks.extend(indices.into_iter().enumerate().map(|(position, index)| {
+        if Some(position) == first_theme {
+            FeedBlock::ThemeWithHeading(index)
+        } else {
+            FeedBlock::Collection(index)
+        }
+    }));
+    blocks
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceStatus {
     Queued,
     Pending,
@@ -117,6 +157,8 @@ pub struct FeaturedState {
     pub batch: Option<FeatureBatch>,
     pub feed_page: usize,
     pub loaded_day: Option<LocalDay>,
+    pub collection_id: Option<String>,
+    pub origin_feed_page: usize,
     pub desired_day: Option<LocalDay>,
     pub local_day_pending: bool,
 }
@@ -206,7 +248,6 @@ impl FeaturedState {
         }
 
         self.generation = self.generation.wrapping_add(1);
-        self.feed_page = 0;
         let queued = FEATURE_SOURCES
             .into_iter()
             .filter(|source| failed_sources.contains(source))
@@ -1094,5 +1135,100 @@ mod tests {
         let banner = &state.snapshot().expect("snapshot").banners[0];
         assert_eq!(banner.alias, "rank-0");
         assert!(banner.vertical_url.is_some());
+    }
+
+    fn feed_snapshot_fixture() -> FeatureSnapshot {
+        let collection = |id: &str, label: &str, priority: u8, order: usize| {
+            FeatureCollection {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                priority,
+                order,
+                comics: comics(id, 8),
+            }
+        };
+        FeatureSnapshot {
+            banners: comics("banner", 4),
+            collections: vec![
+                collection("freetime", "免費看", 10, 0),
+                collection("theme-20", "First", 9, 0),
+                collection("only-in-bomtoon", "只在 Bomtoon", 8, 0),
+                collection("theme-10", "Second", 9, 1),
+                collection("newest", "人氣新作", 2, 0),
+            ],
+            sources: BTreeMap::new(),
+            failed_sources: BTreeSet::new(),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn failed_retry_keeps_the_visible_feed_page() {
+        let mut state = state_with_partial_snapshot();
+        state.feed_page = 3;
+        assert_eq!(state.begin_failed_retry(), vec![FeatureSource::Ranking]);
+        assert_eq!(state.feed_page, 3);
+        assert!(state.snapshot().is_some());
+    }
+
+    #[test]
+    fn feed_blocks_keep_editorial_heading_with_the_first_theme() {
+        let blocks = feed_blocks(&feed_snapshot_fixture());
+        let themed = blocks
+            .iter()
+            .filter(|block| matches!(block, FeedBlock::ThemeWithHeading(_)))
+            .count();
+        assert_eq!(themed, 1);
+    }
+
+    #[test]
+    fn feed_blocks_use_sorted_fixed_theme_and_freetime_order() {
+        let snapshot = feed_snapshot_fixture();
+        let blocks = feed_blocks(&snapshot);
+        let ids = blocks
+            .iter()
+            .filter_map(|block| match block {
+                FeedBlock::Banners => None,
+                FeedBlock::Collection(index) | FeedBlock::ThemeWithHeading(index) => {
+                    Some(snapshot.collections[*index].id.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "newest",
+                "only-in-bomtoon",
+                "theme-20",
+                "theme-10",
+                "freetime"
+            ]
+        );
+        assert!(matches!(blocks.first(), Some(FeedBlock::Banners)));
+        assert!(matches!(blocks[3], FeedBlock::ThemeWithHeading(_)));
+    }
+
+    #[test]
+    fn feed_blocks_omit_empty_collections_and_empty_banner_strip() {
+        let mut snapshot = feed_snapshot_fixture();
+        snapshot.banners.clear();
+        snapshot.collections[1].comics.clear();
+        let blocks = feed_blocks(&snapshot);
+        assert!(!blocks
+            .iter()
+            .any(|block| matches!(block, FeedBlock::Banners)));
+        assert!(!blocks.iter().any(|block| {
+            matches!(
+                block,
+                FeedBlock::Collection(1) | FeedBlock::ThemeWithHeading(1)
+            )
+        }));
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, FeedBlock::ThemeWithHeading(_)))
+                .count(),
+            1
+        );
     }
 }

@@ -3,21 +3,24 @@ mod commerce;
 mod feature;
 mod model;
 mod parse;
-use feature::{FeatureSnapshot, FeatureSource, FeaturedState, SourceResult};
+use feature::{
+    feed_blocks, FeedBlock, FeedPage, FeatureSnapshot, FeatureSource, FeaturedState, SourceResult,
+};
 #[cfg(test)]
 use feature::FEATURE_SOURCES;
 
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Chrome, Context, ControlState, DeviceRequest, DeviceResult,
-    Failure, Glyph, KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen,
-    ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, TileShape,
-    CLARA_BW_METRICS,
+    DisplayMetrics, Failure, Glyph, KoboApp, LocalDay, PictureHandle, ReadingChrome, RowLead, Screen,
+    ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, CLARA_BW_METRICS,
 };
 use model::{
     display_text, AssetKind, AssetSubtype, Comic, Comment, Episode, EpisodeImage, ExpirationRow,
-    FeatureComic, RecentEntry, WalletSummary,
+    RecentEntry, WalletSummary,
 };
+#[cfg(test)]
+use model::FeatureComic;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -298,85 +301,12 @@ struct CoverCache {
     visible_source: Option<CoverSource>,
 }
 
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FeaturedPage {
-    featured: std::ops::Range<usize>,
-    recommended: std::ops::Range<usize>,
+fn collection_action(id: &str) -> String {
+    format!("feature-collection-{id}")
 }
 
-
-fn featured_page(featured: &FeaturedState, page: usize, first_page_rows: usize) -> FeaturedPage {
-    let first_page_rows = first_page_rows.max(1);
-    let banner_count = featured
-        .snapshot()
-        .map_or(0, |snapshot| snapshot.banners.len().min(3));
-    let recommended_len = featured.snapshot().map_or(0, |snapshot| {
-        snapshot
-            .collections
-            .iter()
-            .map(|collection| collection.comics.len())
-            .sum()
-    });
-    if page == 0 {
-        return FeaturedPage {
-            featured: 0..banner_count,
-            recommended: 0..recommended_len.min(first_page_rows),
-        };
-    }
-    let continuation_rows = 6;
-    let start = first_page_rows
-        .saturating_add(page.saturating_sub(1).saturating_mul(continuation_rows))
-        .min(recommended_len);
-    FeaturedPage {
-        featured: 0..0,
-        recommended: start
-            ..start
-                .saturating_add(continuation_rows)
-                .min(recommended_len),
-    }
-}
-
-fn featured_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
-    let first_page_rows = first_page_rows.max(1);
-    let continuation_rows = 6;
-    let recommended_len = featured.snapshot().map_or(0, |snapshot| {
-        snapshot
-            .collections
-            .iter()
-            .map(|collection| collection.comics.len())
-            .sum()
-    });
-    if recommended_len <= first_page_rows {
-        1
-    } else {
-        1 + recommended_len
-            .saturating_sub(first_page_rows)
-            .div_ceil(continuation_rows)
-    }
-}
-
-fn featured_content_page(featured: &FeaturedState) -> Option<usize> {
-    if featured.warning().is_some() {
-        featured.feed_page.checked_sub(1)
-    } else {
-        Some(featured.feed_page)
-    }
-}
-
-fn featured_display_page_count(featured: &FeaturedState, first_page_rows: usize) -> usize {
-    featured_page_count(featured, first_page_rows)
-        .saturating_add(usize::from(featured.warning().is_some()))
-}
-
-fn recommended_comic(snapshot: &FeatureSnapshot, mut index: usize) -> Option<&FeatureComic> {
-    for collection in &snapshot.collections {
-        if index < collection.comics.len() {
-            return collection.comics.get(index);
-        }
-        index = index.saturating_sub(collection.comics.len());
-    }
-    None
+fn comic_action(collection: &str, index: usize) -> String {
+    format!("feature-comic-{collection}-{index}")
 }
 fn ready_cover(covers: &CoverCache, url: Option<&str>) -> Option<TilePicture> {
     match url.and_then(|url| covers.entries.get(url)) {
@@ -391,121 +321,186 @@ fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
     })
 }
 
-fn add_featured_feed(
+fn add_feed_blocks(
     mut screen: ScreenBuilder,
-    featured: &FeaturedState,
+    snapshot: &FeatureSnapshot,
     covers: &CoverCache,
-    content_page: usize,
-    first_page_rows: usize,
+    blocks: &[FeedBlock],
 ) -> ScreenBuilder {
-    let Some(snapshot) = featured.snapshot() else {
-        return screen;
-    };
-    let page = featured_page(featured, content_page, first_page_rows);
-    if !page.featured.is_empty() {
-        screen = screen.picture_tiles(
-            TileShape::Portrait,
-            page.featured.map(|index| {
-                let comic = &snapshot.banners[index];
-                (
-                    format!("comic-{index}"),
-                    display_text(&comic.title, &comic.alias),
-                    Glyph::Book,
-                    ready_cover(
-                        covers,
-                        comic
-                            .vertical_url
-                            .as_ref()
-                            .or(comic.square_url.as_ref())
-                            .map(String::as_str),
-                    ),
-                )
-            }),
-        );
+    for block in blocks {
+        match *block {
+            FeedBlock::Banners => {
+                screen = screen.image_strip(snapshot.banners.iter().take(3).enumerate().map(
+                    |(index, comic)| {
+                        (
+                            format!("feature-banner-{index}"),
+                            Glyph::Book,
+                            ready_cover(
+                                covers,
+                                comic
+                                    .vertical_url
+                                    .as_ref()
+                                    .or(comic.square_url.as_ref())
+                                    .map(String::as_str),
+                            ),
+                        )
+                    },
+                ));
+            }
+            FeedBlock::Collection(index) | FeedBlock::ThemeWithHeading(index) => {
+                let collection = &snapshot.collections[index];
+                if matches!(block, FeedBlock::ThemeWithHeading(_)) {
+                    screen = screen.section("編輯精選");
+                }
+                screen = screen
+                    .tappable_section(
+                        collection_action(&collection.id),
+                        collection.label.clone(),
+                    )
+                    .media_grid(collection.comics.iter().take(6).enumerate().map(
+                        |(index, comic)| {
+                            (
+                                comic_action(&collection.id, index),
+                                display_text(
+                                    &comic.title,
+                                    &format!("BOMTOON {}", comic.alias),
+                                ),
+                                display_text(&comic.creators, ""),
+                                Glyph::Book,
+                                ready_cover(covers, comic.vertical_url.as_deref()),
+                            )
+                        },
+                    ));
+            }
+        }
     }
-    let recommended_offset = snapshot.banners.len();
-    screen = screen
-        .section("Recommended")
-        .rows(page.recommended.filter_map(|index| {
-            let comic = recommended_comic(snapshot, index)?;
-            Some((
-                format!("comic-{}", recommended_offset.saturating_add(index)),
-                display_text(&comic.title, &comic.alias),
-                "",
-                cover_lead(
-                    covers,
-                    comic
-                        .vertical_url
-                        .as_ref()
-                        .or(comic.square_url.as_ref())
-                        .map(String::as_str),
-                ),
-            ))
-        }));
-    let pages = featured_page_count(featured, first_page_rows);
-    screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
-        u16::try_from(content_page.saturating_add(1)).unwrap_or(u16::MAX),
-        u16::try_from(pages).unwrap_or(u16::MAX),
-    )
+    screen
+}
+
+fn add_feed_warning(
+    screen: ScreenBuilder,
+    warning: Option<&str>,
+) -> ScreenBuilder {
+    match warning {
+        Some(warning) => screen
+            .banner(BannerLevel::Attention, warning)
+            .primary_button(RETRY, "Try again"),
+        None => screen,
+    }
+}
+
+fn measured_feed_screen(
+    page: &FeedPage,
+    snapshot: &FeatureSnapshot,
+    warning: Option<&str>,
+) -> Screen {
+    let screen = ScreenBuilder::new("bomtoon-featured-measure")
+        .top_bar("Featured")
+        .top_bar_action(ACCOUNT, "Coins 18446744073709551615");
+    let screen = add_feed_warning(screen, warning);
+    add_feed_blocks(screen, snapshot, &CoverCache::default(), &page.blocks)
+        .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
+        .page_position(u16::MAX, u16::MAX)
+        .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
+        .build()
+}
+
+fn page_fits_with_warning(
+    page: &FeedPage,
+    snapshot: &FeatureSnapshot,
+    warning: Option<&str>,
+    metrics: &DisplayMetrics,
+) -> bool {
+    !measured_feed_screen(page, snapshot, warning)
+        .diagnostics(metrics, &Chrome::measuring(true))
+        .has_errors()
+}
+
+#[cfg(test)]
+fn page_fits(
+    page: &FeedPage,
+    snapshot: &FeatureSnapshot,
+    metrics: &DisplayMetrics,
+) -> bool {
+    page_fits_with_warning(page, snapshot, snapshot.warning.as_deref(), metrics)
+}
+
+fn feed_pages_with_warning(
+    snapshot: &FeatureSnapshot,
+    warning: Option<&str>,
+    metrics: &DisplayMetrics,
+) -> Vec<FeedPage> {
+    let blocks = feed_blocks(snapshot);
+    if blocks.is_empty() {
+        return vec![FeedPage { blocks }];
+    }
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    for block in blocks {
+        let mut candidate = current.clone();
+        candidate.push(block);
+        let candidate = FeedPage { blocks: candidate };
+        if page_fits_with_warning(&candidate, snapshot, warning, metrics) {
+            current = candidate.blocks;
+            continue;
+        }
+        assert!(
+            !current.is_empty(),
+            "Feature feed block {block:?} does not fit an empty page"
+        );
+        pages.push(FeedPage { blocks: current });
+        let fresh = FeedPage {
+            blocks: vec![block],
+        };
+        assert!(
+            page_fits_with_warning(&fresh, snapshot, warning, metrics),
+            "Feature feed block {block:?} does not fit an empty page"
+        );
+        current = fresh.blocks;
+    }
+    pages.push(FeedPage { blocks: current });
+    pages
+}
+
+fn feed_pages(snapshot: &FeatureSnapshot, metrics: &DisplayMetrics) -> Vec<FeedPage> {
+    feed_pages_with_warning(snapshot, snapshot.warning.as_deref(), metrics)
+}
+
+fn featured_feed_pages(featured: &FeaturedState, metrics: &DisplayMetrics) -> Vec<FeedPage> {
+    featured.snapshot().map_or_else(Vec::new, |snapshot| {
+        if featured.warning() == snapshot.warning.as_deref() {
+            feed_pages(snapshot, metrics)
+        } else {
+            feed_pages_with_warning(snapshot, featured.warning(), metrics)
+        }
+    })
 }
 
 fn add_featured_content(
     screen: ScreenBuilder,
     featured: &FeaturedState,
     covers: &CoverCache,
-    first_page_rows: usize,
 ) -> ScreenBuilder {
     if featured.is_failed() {
         return screen
             .banner(BannerLevel::Attention, "Featured could not be loaded.")
             .primary_button(RETRY, "Try again");
     }
-    if featured.feed_page == 0 {
-        if let Some(warning) = featured.warning() {
-            let pages = featured_display_page_count(featured, first_page_rows);
-            return screen
-                .banner(BannerLevel::Attention, warning)
-                .primary_button(RETRY, "Try again")
-                .page_turns(PREVIOUS_PAGE, NEXT_PAGE)
-                .page_position(1, u16::try_from(pages).unwrap_or(u16::MAX));
-        }
-    }
-    if featured.snapshot().is_some() {
-        let content_page = featured_content_page(featured).unwrap_or(0);
-        let pages = featured_display_page_count(featured, first_page_rows);
-        return add_featured_feed(screen, featured, covers, content_page, first_page_rows)
-            .page_position(
-                u16::try_from(featured.feed_page.saturating_add(1)).unwrap_or(u16::MAX),
-                u16::try_from(pages).unwrap_or(u16::MAX),
-            );
+    if let Some(snapshot) = featured.snapshot() {
+        let pages = featured_feed_pages(featured, &CLARA_BW_METRICS);
+        let page_index = featured.feed_page.min(pages.len().saturating_sub(1));
+        let screen = add_feed_warning(screen, featured.warning());
+        let screen = add_feed_blocks(screen, snapshot, covers, &pages[page_index].blocks);
+        return screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
+            u16::try_from(page_index.saturating_add(1)).unwrap_or(u16::MAX),
+            u16::try_from(pages.len()).unwrap_or(u16::MAX),
+        );
     }
     if featured.is_loading() {
         screen.activity("Loading Featured", None)
     } else {
         screen.text("Featured has not loaded yet.")
     }
-}
-
-fn featured_page_zero_rows(featured: &FeaturedState) -> usize {
-    featured_page_zero_rows_with_covers(featured, &CoverCache::default())
-}
-
-fn featured_page_zero_rows_with_covers(featured: &FeaturedState, covers: &CoverCache) -> usize {
-    for rows in (1..=6).rev() {
-        let builder = ScreenBuilder::new("bomtoon-featured-measure")
-            .top_bar("Featured")
-            .top_bar_action(ACCOUNT, "Coins 18446744073709551615");
-        let screen = add_featured_feed(builder, featured, covers, 0, rows)
-            .nav_bar(MainDestination::Featured.index(), MAIN_DESTINATIONS)
-            .build();
-        if !screen
-            .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-            .has_errors()
-        {
-            return rows;
-        }
-    }
-    1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1004,30 +999,26 @@ impl Bomtoon {
         match self.destination {
             MainDestination::Featured if self.featured.snapshot().is_some() => {
                 let snapshot = self.featured.snapshot().expect("checked Feature snapshot");
-                let first_page_rows = featured_page_zero_rows(&self.featured);
-                let Some(content_page) = featured_content_page(&self.featured) else {
-                    return visible;
-                };
-                let page = featured_page(&self.featured, content_page, first_page_rows);
-                for index in page.featured {
-                    let comic = &snapshot.banners[index];
-                    push(
-                        comic
-                            .vertical_url
-                            .as_ref()
-                            .or(comic.square_url.as_ref()),
-                    );
-                }
-                for index in page.recommended {
-                    let Some(comic) = recommended_comic(snapshot, index) else {
-                        continue;
-                    };
-                    push(
-                        comic
-                            .vertical_url
-                            .as_ref()
-                            .or(comic.square_url.as_ref()),
-                    );
+                let pages = featured_feed_pages(&self.featured, &CLARA_BW_METRICS);
+                let page = &pages[self.featured.feed_page.min(pages.len().saturating_sub(1))];
+                for block in &page.blocks {
+                    match *block {
+                        FeedBlock::Banners => {
+                            for comic in snapshot.banners.iter().take(3) {
+                                push(
+                                    comic
+                                        .vertical_url
+                                        .as_ref()
+                                        .or(comic.square_url.as_ref()),
+                                );
+                            }
+                        }
+                        FeedBlock::Collection(index) | FeedBlock::ThemeWithHeading(index) => {
+                            for comic in snapshot.collections[index].comics.iter().take(6) {
+                                push(comic.vertical_url.as_ref());
+                            }
+                        }
+                    }
                 }
             }
             MainDestination::Recent if self.recent_load.loaded => {
@@ -1382,12 +1373,7 @@ impl Bomtoon {
 
         match self.destination {
             MainDestination::Featured => {
-                screen = add_featured_content(
-                    screen,
-                    &self.featured,
-                    &self.covers,
-                    featured_page_zero_rows(&self.featured),
-                );
+                screen = add_featured_content(screen, &self.featured, &self.covers);
             }
             MainDestination::Recent => {
                 if self.recent_load.pending_page.is_some() {
@@ -1615,15 +1601,7 @@ impl Bomtoon {
 
     fn destination_len(&self) -> usize {
         match self.destination {
-            MainDestination::Featured => self.featured.snapshot().map_or(0, |snapshot| {
-                snapshot.banners.len().saturating_add(
-                    snapshot
-                        .collections
-                        .iter()
-                        .map(|collection| collection.comics.len())
-                        .sum::<usize>(),
-                )
-            }),
+            MainDestination::Featured => 0,
             MainDestination::Recent => self.recent.len(),
             MainDestination::Library => self.comics.len(),
         }
@@ -1631,7 +1609,7 @@ impl Bomtoon {
 
     fn destination_total(&self) -> usize {
         match self.destination {
-            MainDestination::Featured => self.destination_len(),
+            MainDestination::Featured => 0,
             MainDestination::Recent => self.total_recent_titles,
             MainDestination::Library => self.total_library_titles,
         }
@@ -4121,7 +4099,13 @@ impl Bomtoon {
         false
     }
 
-    fn open_comic(&mut self, context: &mut Context, index: usize) {
+    fn open_selected_comic(
+        &mut self,
+        context: &mut Context,
+        alias: String,
+        title: String,
+        pending_index: usize,
+    ) {
         if self.account != AccountState::Active {
             self.destination = MainDestination::Featured;
             self.view = View::Status;
@@ -4130,18 +4114,22 @@ impl Bomtoon {
             self.show(context);
             return;
         }
+        self.pending_purchase_rejection = None;
+        self.purchase_rejection_notice = None;
+        self.page = 0;
+        self.clear_title_gifts(context);
+        self.selected_content_id = None;
+        self.selected_content_alias.clone_from(&alias);
+        self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
+        self.problem = None;
+        self.retry = Retry::Restart;
+        self.request_foreground(context, Pending::Content(pending_index));
+        self.show(context);
+    }
+
+    fn open_comic(&mut self, context: &mut Context, index: usize) {
         let selected = match self.destination {
-            MainDestination::Featured => self.featured.snapshot().and_then(|snapshot| {
-                snapshot
-                    .banners
-                    .get(index)
-                    .or_else(|| {
-                        index
-                            .checked_sub(snapshot.banners.len())
-                            .and_then(|index| recommended_comic(snapshot, index))
-                    })
-                    .map(|comic| (comic.alias.clone(), comic.title.clone()))
-            }),
+            MainDestination::Featured => None,
             MainDestination::Library => self
                 .comics
                 .get(index)
@@ -4154,16 +4142,20 @@ impl Bomtoon {
         let Some((alias, title)) = selected else {
             return;
         };
-        self.pending_purchase_rejection = None;
-        self.purchase_rejection_notice = None;
-        self.page = 0;
-        self.clear_title_gifts(context);
-        self.selected_content_id = None;
-        self.selected_content_alias.clone_from(&alias);
-        self.selected_title = display_text(&title, &format!("BOMTOON {alias}"));
-        self.problem = None;
-        self.retry = Retry::Restart;
-        self.request_foreground(context, Pending::Content(index));
+        self.open_selected_comic(context, alias, title, index);
+    }
+
+    fn open_collection(&mut self, context: &mut Context, id: &str) {
+        if self
+            .featured
+            .snapshot()
+            .and_then(|snapshot| snapshot.collection(id))
+            .is_none()
+        {
+            return;
+        }
+        self.featured.collection_id = Some(id.to_owned());
+        self.featured.origin_feed_page = self.featured.feed_page;
         self.show(context);
     }
 
@@ -5646,24 +5638,61 @@ impl KoboApp for Bomtoon {
             && featured_content_ready
         {
             if action == action_id(PREVIOUS_PAGE) {
-                self.featured.feed_page = self.featured.feed_page.saturating_sub(1);
+                let last_page = featured_feed_pages(&self.featured, &CLARA_BW_METRICS)
+                    .len()
+                    .saturating_sub(1);
+                self.featured.feed_page =
+                    self.featured.feed_page.min(last_page).saturating_sub(1);
                 self.show(context);
                 return;
             }
             if action == action_id(NEXT_PAGE) {
-                let first_page_rows = featured_page_zero_rows(&self.featured);
-                let pages = featured_display_page_count(&self.featured, first_page_rows);
-                if self.featured.feed_page.saturating_add(1) < pages {
-                    self.featured.feed_page = self.featured.feed_page.saturating_add(1);
-                }
+                let pages = featured_feed_pages(&self.featured, &CLARA_BW_METRICS);
+                self.featured.feed_page = self
+                    .featured
+                    .feed_page
+                    .saturating_add(1)
+                    .min(pages.len().saturating_sub(1));
                 self.show(context);
                 return;
             }
-            for index in 0..self.destination_len() {
-                if action == action_id(&format!("comic-{index}")) {
-                    self.open_comic(context, index);
-                    return;
-                }
+            let selected = self.featured.snapshot().and_then(|snapshot| {
+                snapshot
+                    .banners
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                    .find(|(index, _)| action == action_id(&format!("feature-banner-{index}")))
+                    .map(|(index, comic)| {
+                        (comic.alias.clone(), comic.title.clone(), index)
+                    })
+                    .or_else(|| {
+                        snapshot.collections.iter().find_map(|collection| {
+                            collection.comics.iter().take(6).enumerate().find_map(
+                                |(index, comic)| {
+                                    (action
+                                        == action_id(&comic_action(&collection.id, index)))
+                                    .then(|| {
+                                        (comic.alias.clone(), comic.title.clone(), index)
+                                    })
+                                },
+                            )
+                        })
+                    })
+            });
+            if let Some((alias, title, index)) = selected {
+                self.open_selected_comic(context, alias, title, index);
+                return;
+            }
+            let collection_id = self.featured.snapshot().and_then(|snapshot| {
+                snapshot.collections.iter().find_map(|collection| {
+                    (action == action_id(&collection_action(&collection.id)))
+                        .then(|| collection.id.clone())
+                })
+            });
+            if let Some(collection_id) = collection_id {
+                self.open_collection(context, &collection_id);
+                return;
             }
         }
 
@@ -5732,7 +5761,7 @@ impl KoboApp for Bomtoon {
                 };
                 self.request_foreground(context, pending);
             }
-        } else if self.view == View::Main {
+        } else if self.view == View::Main && self.destination != MainDestination::Featured {
             for index in 0..self.destination_len() {
                 if action == action_id(&format!("comic-{index}")) {
                     self.open_comic(context, index);
@@ -13814,6 +13843,395 @@ mod tests {
         }
     }
 
+    fn grouped_feature_state(warning: Option<&str>) -> FeaturedState {
+        let collection = |id: &str, label: &str, priority: u8, order: usize| {
+            model::FeatureCollection {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                priority,
+                order,
+                comics: (0..8)
+                    .map(|index| {
+                        shelf(
+                            &format!("{id}-{index}"),
+                            &format!("{label} title {index}"),
+                        )
+                    })
+                    .collect(),
+            }
+        };
+        let collections = vec![
+            collection("freetime", "免費看", 10, 0),
+            collection("theme-20", "Theme First", 9, 0),
+            collection("only-in-bomtoon", "只在 Bomtoon", 8, 0),
+            collection("theme-10", "Theme Second", 9, 1),
+            collection("newest", "人氣新作", 2, 0),
+        ];
+        FeaturedState {
+            generation: 1,
+            snapshot: Some(FeatureSnapshot {
+                banners: (0..4)
+                    .map(|index| shelf(&format!("banner-{index}"), "unused banner label"))
+                    .collect(),
+                collections,
+                sources: BTreeMap::new(),
+                failed_sources: BTreeSet::new(),
+                warning: warning.map(str::to_owned),
+            }),
+            ..FeaturedState::default()
+        }
+    }
+
+    fn grouped_feature_app(warning: Option<&str>) -> Bomtoon {
+        Bomtoon {
+            account: AccountState::Active,
+            view: View::Main,
+            destination: MainDestination::Featured,
+            featured: grouped_feature_state(warning),
+            page: 7,
+            ..Bomtoon::default()
+        }
+    }
+
+    #[test]
+    fn feature_feed_pages_never_split_duplicate_or_strand_warning() {
+        for warning in [None, Some("Some Featured collections could not be loaded.")] {
+            let featured = grouped_feature_state(warning);
+            let snapshot = featured.snapshot().expect("grouped snapshot");
+            let pages = feed_pages(snapshot, &CLARA_BW_METRICS);
+            assert!(!pages.is_empty());
+            assert!(pages.iter().all(|page| !page.blocks.is_empty()));
+            let collection_blocks = pages
+                .iter()
+                .flat_map(|page| &page.blocks)
+                .filter(|block| {
+                    matches!(
+                        block,
+                        feature::FeedBlock::Collection(_)
+                            | feature::FeedBlock::ThemeWithHeading(_)
+                    )
+                })
+                .count();
+            assert_eq!(collection_blocks, snapshot.collections.len());
+            assert!(pages
+                .iter()
+                .all(|page| page_fits(page, snapshot, &CLARA_BW_METRICS)));
+        }
+    }
+
+    #[test]
+    fn grouped_feature_feed_renders_exact_banners_collections_and_theme_group() {
+        let mut app = grouped_feature_app(None);
+        let snapshot = app.featured.snapshot().expect("snapshot").clone();
+        let pages = feed_pages(&snapshot, &CLARA_BW_METRICS);
+        let mut sections = Vec::new();
+        let mut grids = Vec::new();
+        for (page_index, page) in pages.iter().enumerate() {
+            app.featured.feed_page = page_index;
+            let screen = app.main_screen();
+            let diagnostics =
+                screen.diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true));
+            assert!(
+                !diagnostics.has_errors(),
+                "page {page_index}: {:?}",
+                diagnostics.issues
+            );
+            let turns = screen.page_turns.as_ref().expect("Feature page turns");
+            assert_eq!(
+                turns.position,
+                Some((
+                    u16::try_from(page_index + 1).expect("small page"),
+                    u16::try_from(pages.len()).expect("small page count")
+                ))
+            );
+            for node in &screen.nodes {
+                match node {
+                    Node::ImageStrip { tiles, .. } => {
+                        assert_eq!(page_index, 0);
+                        assert_eq!(tiles.len(), 3);
+                        assert!(tiles.iter().enumerate().all(|(index, tile)| {
+                            tile.label.is_empty()
+                                && tile.action
+                                    == action_id(&format!("feature-banner-{index}"))
+                        }));
+                    }
+                    Node::Section { title, action, .. } => {
+                        sections.push((title.clone(), *action));
+                    }
+                    Node::MediaGrid { tiles, .. } => grids.push(tiles.clone()),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                page.blocks
+                    .iter()
+                    .filter(|block| matches!(block, feature::FeedBlock::Banners))
+                    .count(),
+                screen
+                    .nodes
+                    .iter()
+                    .filter(|node| matches!(node, Node::ImageStrip { .. }))
+                    .count()
+            );
+        }
+        let titles = sections
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            [
+                "人氣新作",
+                "只在 Bomtoon",
+                "編輯精選",
+                "Theme First",
+                "Theme Second",
+                "免費看"
+            ]
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .filter(|(title, action)| title == "編輯精選" && action.is_none())
+                .count(),
+            1
+        );
+        for (title, action) in sections.iter().filter(|(title, _)| title != "編輯精選") {
+            let collection = snapshot
+                .collections
+                .iter()
+                .find(|collection| collection.label == *title)
+                .expect("section collection");
+            assert_eq!(
+                *action,
+                Some(action_id(&collection_action(&collection.id)))
+            );
+        }
+        assert_eq!(grids.len(), snapshot.collections.len());
+        for (grid, collection) in grids.iter().zip(
+            ["newest", "only-in-bomtoon", "theme-20", "theme-10", "freetime"]
+                .into_iter()
+                .map(|id| snapshot.collection(id).expect(id)),
+        ) {
+            assert_eq!(grid.len(), 6);
+            assert!(grid.iter().enumerate().all(|(index, tile)| {
+                tile.action == action_id(&comic_action(&collection.id, index))
+                    && tile.label
+                        == display_text(
+                            &collection.comics[index].title,
+                            &format!("BOMTOON {}", collection.comics[index].alias),
+                        )
+            }));
+        }
+    }
+
+    #[test]
+    fn grouped_feature_feed_routes_exact_placement_and_collection_origin() {
+        let mut app = grouped_feature_app(None);
+        let urls = app
+            .featured
+            .snapshot()
+            .expect("snapshot")
+            .banners
+            .iter()
+            .chain(
+                app.featured
+                    .snapshot()
+                    .expect("snapshot")
+                    .collections
+                    .iter()
+                    .flat_map(|collection| collection.comics.iter()),
+            )
+            .filter_map(|comic| comic.vertical_url.clone())
+            .collect::<Vec<_>>();
+        for url in urls {
+            app.covers.entries.insert(
+                url,
+                CoverState::Ready(TilePicture::new(PictureHandle(41), 60, 80)),
+            );
+        }
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let pages = feed_pages(
+            runner.app().featured.snapshot().expect("snapshot"),
+            &CLARA_BW_METRICS,
+        );
+        runner.app_mut().featured.feed_page = pages.len().saturating_sub(1);
+        let origin = runner.app().featured.feed_page;
+
+        let commands = runner.action(action_id(&collection_action("theme-10")));
+        assert!(spawns(&commands).is_empty());
+        assert_eq!(
+            runner.app().featured.collection_id.as_deref(),
+            Some("theme-10")
+        );
+        assert_eq!(runner.app().featured.origin_feed_page, origin);
+
+        let commands = runner.action(action_id(&comic_action("theme-10", 4)));
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, task)| *task == api::content("theme-10-4")));
+        assert_eq!(runner.app().pending, Some(Pending::Content(4)));
+        assert_eq!(runner.app().selected_content_alias, "theme-10-4");
+        assert_eq!(runner.app().featured.feed_page, origin);
+    }
+
+    #[test]
+    fn grouped_feature_feed_banner_action_opens_exact_banner_placement() {
+        let mut runner =
+            AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
+
+        let commands = runner.action(action_id("feature-banner-1"));
+
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, task)| *task == api::content("banner-1")));
+        assert_eq!(runner.app().pending, Some(Pending::Content(1)));
+        assert_eq!(runner.app().selected_content_alias, "banner-1");
+    }
+
+    #[test]
+    fn grouped_feature_feed_warning_shares_content_page_and_retry_keeps_position() {
+        let mut app = grouped_feature_app(Some(
+            "Some Featured collections could not be loaded.",
+        ));
+        let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
+        snapshot.failed_sources.insert(FeatureSource::Ranking);
+        app.featured.feed_page = 1;
+        let screen = app.main_screen();
+        assert_eq!(retry_button_count(&screen), 1);
+        assert!(screen
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Banner { .. })));
+        assert!(screen.nodes.iter().any(|node| {
+            matches!(
+                node,
+                Node::ImageStrip { .. } | Node::MediaGrid { .. }
+            )
+        }));
+        assert_fits(&screen);
+
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+        let commands = runner.action(action_id(RETRY));
+        assert!(spawns(&commands)
+            .iter()
+            .any(|(_, task)| *task == api::ranking()));
+        assert_eq!(runner.app().featured.feed_page, 1);
+        assert!(runner.app().featured.snapshot().is_some());
+        let screen = last_screen(&commands);
+        assert_eq!(retry_button_count(&screen), 1);
+        assert!(screen.nodes.iter().any(|node| {
+            matches!(
+                node,
+                Node::ImageStrip { .. } | Node::MediaGrid { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn grouped_feature_feed_signed_out_card_preserves_feed_origin_state() {
+        let mut app = grouped_feature_app(None);
+        app.account = AccountState::SignedOut;
+        app.featured.feed_page = 2;
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        runner.action(action_id(&comic_action("theme-20", 1)));
+
+        assert_eq!(runner.app().view, View::Status);
+        assert_eq!(runner.app().destination, MainDestination::Featured);
+        assert_eq!(runner.app().featured.feed_page, 2);
+        assert_eq!(runner.app().page, 0);
+        assert!(runner.app().pending.is_none());
+    }
+
+    #[test]
+    fn visible_feature_covers_cancel_obsolete_page_tasks() {
+        let mut runner =
+            AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
+        let commands = runner.action(action_id("refresh-layout"));
+        let first_tasks = cover_fetches(&commands)
+            .into_iter()
+            .map(|(task, _)| task)
+            .collect::<BTreeSet<_>>();
+        assert!(!first_tasks.is_empty());
+
+        let commands = runner.action(action_id(NEXT_PAGE));
+
+        let cancelled = cancelled_tasks(&commands);
+        assert!(!cancelled.is_empty());
+        assert!(cancelled.is_subset(&first_tasks));
+        let expected = runner.app().visible_cover_urls();
+        assert_eq!(runner.app().covers.visible_urls, expected);
+    }
+    #[test]
+    fn feature_feed_pages_turn_without_mutating_shelf_page() {
+        let mut runner = AppRunner::with_metrics(grouped_feature_app(None), CLARA_BW_METRICS);
+        let page_count = feed_pages(
+            runner.app().featured.snapshot().expect("snapshot"),
+            &CLARA_BW_METRICS,
+        )
+        .len();
+        assert!(page_count > 1);
+        runner.action(action_id(NEXT_PAGE));
+        assert_eq!(runner.app().featured.feed_page, 1);
+        assert_eq!(runner.app().page, 7);
+        runner.app_mut().featured.feed_page = page_count - 1;
+        runner.action(action_id(NEXT_PAGE));
+        assert_eq!(runner.app().featured.feed_page, page_count - 1);
+        assert_eq!(runner.app().page, 7);
+        runner.action(action_id(PREVIOUS_PAGE));
+        assert_eq!(runner.app().featured.feed_page, page_count - 2);
+        assert_eq!(runner.app().page, 7);
+        runner.app_mut().featured.feed_page = usize::MAX;
+        runner.action(action_id(PREVIOUS_PAGE));
+        assert_eq!(runner.app().featured.feed_page, page_count - 2);
+        assert_eq!(runner.app().page, 7);
+    }
+
+    #[test]
+    fn visible_feature_covers_follow_current_blocks_and_deduplicate_only_urls() {
+        let mut app = grouped_feature_app(None);
+        let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
+        let shared = snapshot.banners[0].vertical_url.clone();
+        snapshot.collections[0].comics[0].vertical_url.clone_from(&shared);
+        snapshot.collections[4].comics[0].vertical_url.clone_from(&shared);
+        let snapshot = snapshot.clone();
+        let pages = feed_pages(&snapshot, &CLARA_BW_METRICS);
+        let first_blocks = pages[0].blocks.clone();
+        let mut expected = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut add = |url: Option<&String>| {
+            if let Some(url) = url {
+                if seen.insert(url.clone()) {
+                    expected.push(url.clone());
+                }
+            }
+        };
+        for block in first_blocks {
+            match block {
+                feature::FeedBlock::Banners => {
+                    for comic in snapshot.banners.iter().take(3) {
+                        add(comic.vertical_url.as_ref().or(comic.square_url.as_ref()));
+                    }
+                }
+                feature::FeedBlock::Collection(index)
+                | feature::FeedBlock::ThemeWithHeading(index) => {
+                    for comic in snapshot.collections[index].comics.iter().take(6) {
+                        add(comic.vertical_url.as_ref());
+                    }
+                }
+            }
+        }
+        assert_eq!(app.visible_cover_urls(), expected);
+        let placements = snapshot
+            .collections
+            .iter()
+            .flat_map(|collection| collection.comics.iter())
+            .filter(|comic| comic.vertical_url == shared)
+            .count();
+        assert_eq!(placements, 2);
+    }
+
     fn local_day(day: u8) -> LocalDay {
         LocalDay::new(2026, 8, day).expect("valid local day")
     }
@@ -14163,8 +14581,14 @@ mod tests {
                 .page_turns
                 .as_ref()
                 .and_then(|turns| turns.position),
-            Some((1, 2))
+            Some((1, 1))
         );
+        assert!(screen.nodes.iter().any(|node| {
+            matches!(
+                node,
+                Node::ImageStrip { .. } | Node::MediaGrid { .. }
+            )
+        }));
     }
 
     #[test]
@@ -14754,7 +15178,7 @@ mod tests {
     }
 
     #[test]
-    fn cover_cached_picture_is_reused_across_featured_and_recommended() {
+    fn cover_cached_picture_is_reused_across_feature_banner_and_collection() {
         let shared = shelf("shared-cover", "Shared cover");
         let mut runner = AppRunner::with_metrics(
             Bomtoon {
@@ -14767,7 +15191,7 @@ mod tests {
                         label: "人氣新作".to_owned(),
                         priority: 2,
                         order: 0,
-                        comics: vec![shared.clone()],
+                        comics: vec![shared.clone(); 6],
                     };
                     FeaturedState {
                         generation: 1,
@@ -14795,26 +15219,40 @@ mod tests {
         let commands =
             runner.task_outcome(fetches[0].0, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let screen = last_screen(&commands);
-        let tile_picture = screen
+        let banner_picture = screen
             .nodes
             .iter()
             .find_map(|node| match node {
-                Node::TileGrid { tiles, .. } => tiles.first().and_then(|tile| tile.picture),
+                Node::ImageStrip { tiles, .. } => {
+                    tiles.first().and_then(|tile| tile.picture)
+                }
                 _ => None,
             })
-            .expect("Featured tile picture");
-        let row_picture = screen
+            .expect("Feature banner picture");
+        let collection_picture = screen
             .nodes
             .iter()
             .find_map(|node| match node {
-                Node::Rows { rows, .. } => rows.first().and_then(|row| match row.lead {
-                    kobo_sdk::RowLead::Picture(picture, Glyph::Book) => Some(picture),
-                    _ => None,
-                }),
+                Node::MediaGrid { tiles, .. } => {
+                    tiles.first().and_then(|tile| tile.picture)
+                }
                 _ => None,
             })
-            .expect("Recommended row picture");
-        assert_eq!(tile_picture, row_picture);
+            .or_else(|| {
+                let commands = runner.action(action_id(NEXT_PAGE));
+                assert!(cover_fetches(&commands).is_empty());
+                last_screen(&commands)
+                    .nodes
+                    .iter()
+                    .find_map(|node| match node {
+                        Node::MediaGrid { tiles, .. } => {
+                            tiles.first().and_then(|tile| tile.picture)
+                        }
+                        _ => None,
+                    })
+            })
+            .expect("Feature collection picture");
+        assert_eq!(banner_picture, collection_picture);
     }
 
     #[test]
