@@ -11494,6 +11494,33 @@ fn draw_fitted_picture(
     draw_picture_window(surface, fitted.target, source, pixels, clip, fitted.source);
 }
 
+/// Draws into a target whose geometry was already settled by layout.
+fn draw_placed_picture(
+    surface: &mut Surface,
+    target: Rect,
+    source: (u32, u32),
+    pixels: PicturePixelsRef<'_>,
+    clip: Rect,
+    fit: PictureFit,
+) {
+    match fit {
+        PictureFit::Contain => draw_picture_window(
+            surface,
+            target,
+            source,
+            pixels,
+            clip,
+            SourceWindow {
+                x: 0,
+                y: 0,
+                width: usize::try_from(source.0).unwrap_or(0),
+                height: usize::try_from(source.1).unwrap_or(0),
+            },
+        ),
+        PictureFit::Cover => draw_fitted_picture(surface, target, source, pixels, clip, fit),
+    }
+}
+
 /// Rasterizes a retained screen for a specific panel and runtime chrome.
 ///
 /// The arms stay in layout-kind order rather than being merged whenever two
@@ -12326,7 +12353,7 @@ fn render_all_with_selected_font(
             LayoutKind::Picture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_fitted_picture(surface, node.rect, source, pixels, clip, fit);
+                        draw_placed_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
             }
@@ -12336,7 +12363,7 @@ fn render_all_with_selected_font(
             LayoutKind::FramedPicture(handle, fit) => {
                 if let Some(source) = pictures.dimensions(handle) {
                     if let Some(pixels) = pictures.get(handle) {
-                        draw_fitted_picture(surface, node.rect, source, pixels, clip, fit);
+                        draw_placed_picture(surface, node.rect, source, pixels, clip, fit);
                     }
                 }
                 stroke_clipped(
@@ -12860,7 +12887,7 @@ fn draw_row_lead(
                     }
                     PictureFit::Cover => rect,
                 };
-                draw_fitted_picture(surface, fitted, source, pixels, clip, picture.fit);
+                draw_placed_picture(surface, fitted, source, pixels, clip, picture.fit);
                 stroke_clipped(surface, fitted, tone::RULE, 1, clip);
             }
             None => draw_glyph_icon(surface, glyph, rect, clip),
