@@ -464,6 +464,15 @@ fn cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
     })
 }
 
+fn shelf_cover_lead(covers: &CoverCache, url: Option<&str>) -> RowLead {
+    let Some(url) = url else {
+        return RowLead::Icon(Glyph::Book);
+    };
+    ready_cover(covers, Some(url)).map_or(RowLead::CoverSlot(Glyph::Book), |picture| {
+        RowLead::Picture(picture, Glyph::Book)
+    })
+}
+
 fn episode_status(episode: &Episode, now_ms: Option<i64>) -> String {
     match episode.purchase {
         model::PurchaseState::Owned => "Owned".to_owned(),
@@ -1737,7 +1746,7 @@ impl Bomtoon {
                             format!("comic-{index}"),
                             recent.content_title.clone(),
                             recent.creators.clone(),
-                            cover_lead(&self.covers, recent.cover_url.as_deref()),
+                            shelf_cover_lead(&self.covers, recent.cover_url.as_deref()),
                             display_text(&recent.episode_title, &episode_fallback),
                         )
                     }));
@@ -1768,7 +1777,7 @@ impl Bomtoon {
                             format!("comic-{index}"),
                             comic.title.clone(),
                             comic.creators.clone(),
-                            cover_lead(&self.covers, comic.cover_url.as_deref()),
+                            shelf_cover_lead(&self.covers, comic.cover_url.as_deref()),
                             format!("{} / {}", comic.owned_episodes, comic.total_episodes),
                         )
                     }));
@@ -17463,6 +17472,134 @@ mod tests {
     }
 
     #[test]
+    fn shelf_cover_lead_reserves_a_square_only_for_declared_artwork() {
+        let covers = CoverCache::default();
+        let url = "https://image.balcony.studio/tw/contents/shelf.webp";
+
+        assert_eq!(shelf_cover_lead(&covers, None), RowLead::Icon(Glyph::Book));
+        assert_eq!(
+            shelf_cover_lead(&covers, Some(url)),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+    }
+
+    #[test]
+    fn shelf_cover_lead_keeps_the_slot_through_loading_and_failure() {
+        let url = "https://image.balcony.studio/tw/contents/shelf.webp";
+        let picture = TilePicture::new(PictureHandle(91), 289, 345);
+        let mut covers = CoverCache::default();
+        covers
+            .entries
+            .insert(url.to_owned(), CoverState::Loading(TaskId(90)));
+        assert_eq!(
+            shelf_cover_lead(&covers, Some(url)),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+
+        covers.entries.insert(url.to_owned(), CoverState::Failed);
+        assert_eq!(
+            shelf_cover_lead(&covers, Some(url)),
+            RowLead::CoverSlot(Glyph::Book)
+        );
+
+        covers
+            .entries
+            .insert(url.to_owned(), CoverState::Ready(picture));
+        assert_eq!(
+            shelf_cover_lead(&covers, Some(url)),
+            RowLead::Picture(picture, Glyph::Book)
+        );
+    }
+
+    #[test]
+    fn recent_and_library_title_geometry_stays_fixed_when_cover_becomes_ready() {
+        let url = shelf_cover_url(0);
+        let geometry = |screen: &Screen, title: &str| {
+            let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+            let title = layout
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.text_lines.len() == 1
+                        && node.text_lines.first().map(String::as_str) == Some(title)
+                })
+                .expect("shelf title");
+            let side = CLARA_BW_METRICS.touch_target_default();
+            let lead = layout
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.text_lines.is_empty()
+                        && node.rect.x < title.rect.x
+                        && node.rect.width == side
+                        && node.rect.height == side
+                        && node.rect.y <= title.rect.y
+                        && node.rect.y.saturating_add(node.rect.height)
+                            >= title.rect.y.saturating_add(title.rect.height)
+                })
+                .expect("square shelf lead");
+            (
+                (lead.rect.x, lead.rect.y, lead.rect.width, lead.rect.height),
+                (
+                    title.rect.x,
+                    title.rect.y,
+                    title.rect.width,
+                    title.rect.height,
+                ),
+            )
+        };
+
+        for (destination, title) in [
+            (MainDestination::Recent, "Recent 0"),
+            (MainDestination::Library, "Library 0"),
+        ] {
+            let mut app = Bomtoon {
+                account: AccountState::Active,
+                view: View::Main,
+                destination,
+                recent: vec![recent_shelf_entry(0, Some(url.clone()))],
+                comics: vec![library_shelf_comic(0, Some(url.clone()))],
+                recent_load: loaded_shelf(),
+                library_load: loaded_shelf(),
+                total_recent_titles: 1,
+                total_library_titles: 1,
+                ..Bomtoon::default()
+            };
+
+            let placeholder = app.main_screen();
+            let placeholder_row = placeholder
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => rows.first(),
+                    _ => None,
+                })
+                .expect("placeholder shelf row");
+            assert_eq!(placeholder_row.lead, RowLead::CoverSlot(Glyph::Book));
+            let before = geometry(&placeholder, title);
+
+            let picture = TilePicture::new(PictureHandle(92), 289, 345);
+            app.covers
+                .entries
+                .insert(url.clone(), CoverState::Ready(picture));
+            let ready = app.main_screen();
+            let ready_row = ready
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    Node::Rows { rows, .. } => rows.first(),
+                    _ => None,
+                })
+                .expect("ready shelf row");
+            assert_eq!(ready_row.lead, RowLead::Picture(picture, Glyph::Book));
+
+            assert_eq!(geometry(&ready, title), before);
+            assert_fits(&placeholder);
+            assert_fits(&ready);
+        }
+    }
+
+    #[test]
     fn recent_row_shows_cover_title_creators_and_episode() {
         let url = shelf_cover_url(0);
         let picture = TilePicture::new(PictureHandle(7), 60, 60);
@@ -18329,7 +18466,7 @@ mod tests {
             row.title == format!("Recent {index}")
                 && row.summary == format!("Creators {index}")
                 && row.trailing.as_deref() == Some(format!("Episode title {index}").as_str())
-                && row.lead == kobo_sdk::RowLead::Icon(Glyph::Book)
+                && row.lead == kobo_sdk::RowLead::CoverSlot(Glyph::Book)
         }));
         assert!(first_screen.nav_bar.is_some());
         assert_fits(&first_screen);
@@ -18357,7 +18494,7 @@ mod tests {
         ));
         assert!(ready_rows[1..]
             .iter()
-            .all(|row| row.lead == kobo_sdk::RowLead::Icon(Glyph::Book)));
+            .all(|row| row.lead == kobo_sdk::RowLead::CoverSlot(Glyph::Book)));
         assert!(ready_screen.nav_bar.is_some());
         assert_fits(&ready_screen);
     }
