@@ -2,16 +2,16 @@
 
 ## Status
 
-Implementation complete. Page 1 retains title, creators, synopsis preview, and conditional `More`; later pages retain only the title and use separately measured episode ranges. Transient warnings render as modals without reserving row space, and the opt-in episode pager reaches the panel bottom while retaining full-height targets. Focused format, test, Clippy, browser simulator, and layout-diagnostics gates pass. The authenticated browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
+The episode layout implementation is complete and its format, test, Clippy, browser simulator, and layout-diagnostics gates passed. A production API regression is confirmed: authenticated detail HTML now reports `ssrPersonalized == false` for every selected title, so the fail-closed parser rejects the response. The approved correction replaces that obsolete HTML boundary with the bearer-authenticated content JSON endpoint described below. The correction is pending implementation and repeat simulator proof. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction remains a browser-simulator gate.
 
 ## Goal
 
-Redesign the signed-in comic episode view so it presents the comic's title, creators, and synopsis, then a paginated rich-row episode list. Each episode row shows its thumbnail, title, published date, and truthful readable-access status. Possession state comes from the personalized title detail embedded in the comic detail HTML.
+Redesign the signed-in comic episode view so it presents the comic's title, creators, and synopsis, then a paginated rich-row episode list. Each episode row shows its thumbnail, title, published date, and truthful readable-access status. Possession state comes from the bearer-authenticated title content response.
 
 ## Requirements
 
-- Load the selected comic from `https://www.bomtoon.tw/detail/{alias}` with the managed BOMTOON credential.
-- Parse `script#__NEXT_DATA__`, require `props.pageProps.ssrPersonalized == true`, and read only `props.pageProps.ssrDetail`.
+- Load the selected comic from `https://www.bomtoon.tw/api/balcony-api-v2/contents/{alias}?isNotLoginAdult=false&isPorch=false` with the managed BOMTOON access token.
+- Require the JSON envelope's `result == "SUCCESS"`, require `data.alias` to equal the requested alias, and parse only allowlisted fields from `data`.
 - Show the comic title, ordered creator names, and synopsis preview above the episode list on page 1.
 - On pages after page 1, show only the comic title above the balances and episode rows.
 - Show a `More` action on page 1 only, and only when the synopsis is longer than its preview.
@@ -36,23 +36,25 @@ Redesign the signed-in comic episode view so it presents the comic's title, crea
 - A tile grid, large episode cards, or a new `kobo-ui` control.
 - Background thumbnail prefetch beyond the visible episode page.
 - Persisting comic metadata or thumbnails across app launches.
-- Parsing, storing, exposing, or logging `pageProps.userData`.
+- Parsing, storing, exposing, or logging account fields, access tokens, session cookies, or credentials.
 - Changing app capabilities, network origins, workspace dependencies, protocol types, or Store metadata.
 
 ## Evidence
 
 The design uses local captures as schema evidence. Raw HARs can contain account and credential material; implementation and tests must use only allowlisted business fields and sanitized synthetic fixtures.
 
-`evidences/detail-365-html.har` records a successful `GET https://www.bomtoon.tw/detail/365`. Its 131,807-byte HTML response contains `script#__NEXT_DATA__` with:
+The original implementation used `evidences/detail-365-html.har`. That historical response contained `script#__NEXT_DATA__`, `props.pageProps.ssrPersonalized == true`, and a personalized `ssrDetail`. The current authenticated route no longer preserves that contract: a live non-spending simulator trace returned `ssrPersonalized == false` while the response still contained `userData`, one episode, and a `purchaseStatus` field. The strict parser therefore produced the reported error for every title.
 
-- `props.pageProps.ssrPersonalized == true`;
-- `props.pageProps.ssrDetail.alias == "365"`;
-- comic `title`, `creators`, and `synopsis`;
-- 26 episodes with numeric `openedAt`, `COMMON` thumbnails, and `purchaseStatus` values `NONE` and `POSSESSION`.
+A live non-spending probe of the existing bearer endpoint returned:
 
-`evidences/title-json.har` records the corresponding Next.js title JSON shape. It confirms the same `pageProps.ssrDetail` business fields and episode ownership values. The HTML capture is the selected runtime source because it avoids a dynamic `buildId` dependency.
+- root keys `result` and `data`;
+- `result == "SUCCESS"`;
+- allowlisted `data` fields including `id`, `alias`, `title`, `synopsis`, `creators`, and `episodes`;
+- nine episodes for the selected title, with `purchaseStatus` present on all nine.
 
-The older `evidences/hunter_q-html.har` does not contain `__NEXT_DATA__`, `ssrDetail`, or `ssrPersonalized`. The implementation must therefore fail closed when the expected personalized payload is absent. It must not fall back to Open Graph data or interpret missing ownership as `NONE`.
+The probe logged only field names, counts, and the public result code. It did not log response values, account data, headers, cookies, or credentials. Raw authenticated responses remain local evidence and must not enter fixtures or source control.
+
+The bearer endpoint is the new trust boundary because the runtime injects the managed access token and the server returns an explicit success envelope. The parser remains fail-closed on a missing or non-success result, an alias mismatch, malformed or oversized fields, and unknown access states. It must not fall back to public HTML or infer ownership from missing data.
 
 ## Screen design
 
@@ -133,30 +135,31 @@ Remote collections and strings remain explicitly bounded. The implementation pla
 
 ## Request and parsing flow
 
-Opening a comic keeps the existing foreground-task ownership and selected-alias state, but replaces the current authenticated JSON content request with an authenticated HTML detail request.
+Opening a comic keeps the existing foreground-task ownership and selected-alias state, but replaces the obsolete authenticated HTML detail request with the bearer-authenticated JSON content request.
 
 The request contract is:
 
 ```text
-GET https://www.bomtoon.tw/detail/{validated alias}
-Credential: managed session `bomtoon-session` in the `Cookie` header
+GET https://www.bomtoon.tw/api/balcony-api-v2/contents/{validated alias}?isNotLoginAdult=false&isPorch=false
+Credential: managed bearer `bomtoon-access-token`
 Maximum response: 512 KiB
-Accept: HTML
+Accept: application/json
 Accept-Language: existing zh-TW preference
+x-balcony-id: BOMTOON_TW
+x-balcony-timezone: Asia/Taipei
+x-platform: MOBILE_IOS
 ```
 
 The detail parser:
 
 1. validates the expected alias before parsing;
-2. decodes the response as UTF-8 HTML;
-3. locates the active `script#__NEXT_DATA__` element using the existing inert-content-aware HTML scanning rules;
-4. parses its JSON payload;
-5. requires `props.pageProps.ssrPersonalized == true`;
-6. requires `ssrDetail.alias` to equal the expected alias;
-7. parses only the allowlisted comic and episode fields;
-8. ignores every sibling field, including all of `userData`.
+2. decodes and parses the bounded JSON response;
+3. requires root `result == "SUCCESS"`;
+4. requires `data.alias` to equal the expected alias;
+5. parses only the allowlisted comic and episode fields from `data`;
+6. rejects missing, malformed, oversized, ambiguous, or hostile values through the existing typed parser boundary.
 
-The old content API constructor and old `result/data` content-detail envelope parser are removed after every caller and test migrates. Initial detail loading and post-purchase reconciliation use the same HTML request and parser. No compatibility alias or fallback parser remains.
+The authenticated HTML detail constructor and `__NEXT_DATA__` parser are removed after every caller and test migrates. Initial detail loading and post-purchase reconciliation use the same bearer JSON request and parser. No compatibility parser, public fallback, cookie request, or `ssrPersonalized` exception remains.
 
 ## Access status mapping
 
@@ -190,7 +193,7 @@ The SDK-wide task cap remains authoritative. Foreground detail or commerce work 
 
 ## Failure behavior
 
-- Missing `__NEXT_DATA__`, unpersonalized HTML, alias mismatch, malformed JSON, wrong required types, invalid dates, and oversized required values fail the foreground detail load and use the existing problem/retry surface.
+- Missing or non-success result, alias mismatch, malformed JSON, wrong required types, invalid dates, and oversized required values fail the foreground detail load and use the existing problem/retry surface.
 - Unknown purchase status remains explicit through `PurchaseState::Other`; it is never converted to unowned access.
 - Missing or unsafe thumbnail data degrades to the book glyph without failing otherwise valid detail.
 - A failed thumbnail can retry only through the existing visible-image scheduling behavior; it does not create a page-level retry action.
@@ -202,8 +205,8 @@ The SDK-wide task cap remains authoritative. Foreground detail or commerce work 
 ```text
 Main shelf
   -> open comic
-  -> authenticated detail HTML pending
-  -> personalized detail parsed
+  -> bearer-authenticated detail JSON pending
+  -> content detail parsed
   -> Episodes page 1
 
 Episodes
@@ -220,7 +223,7 @@ Episodes
 Episodes unowned row
   -> existing quote and purchase flow
   -> existing reconciliation
-  -> authenticated detail HTML refresh
+  -> bearer-authenticated detail JSON refresh
   -> same episode page with refreshed access label
 ```
 
@@ -228,25 +231,24 @@ All stale-result identity and generation checks continue to bind results to the 
 
 ## Files
 
-The implementation is limited to five existing source files:
+The regression correction is limited to four existing files:
 
 1. `apps/bomtoon/src/api.rs`
-2. `apps/bomtoon/src/model.rs`
-3. `apps/bomtoon/src/parse.rs`
-4. `apps/bomtoon/src/main.rs`
-5. `crates/kobo-policy/src/credentials.rs`
+2. `apps/bomtoon/src/parse.rs`
+3. `apps/bomtoon/src/main.rs`
+4. this design specification
 
-No new source module, dependency, capability, origin, or SDK change is required. The network policy change permits the session cookie only for an exact `GET` to the BOMTOON detail route and continues to reject the access bearer on HTML detail requests.
+No new source module, dependency, capability, origin, credential, protocol type, Store metadata, or SDK change is required. The existing BOMTOON bearer policy already permits the exact content API origin and path.
 
 ## Verification
 
 ### API and parser contracts
 
-- Exact authenticated detail URL, managed session cookie, HTML acceptance, language header, byte ceiling, and least-privilege credential policy.
-- Minimal sanitized HTML fixture matching the observed `__NEXT_DATA__` envelope.
-- Personalized response parses title, ordered creators, synopsis, episode identity, title, `openedAt`, `COMMON` thumbnail, and `purchaseStatus`.
-- Missing payload, inactive/inert script, `ssrPersonalized == false`, wrong alias, wrong types, invalid timestamp, oversized fields, duplicate ambiguous thumbnail, hostile image host/path, and unknown purchase status.
-- Tests contain no copied `userData`, email address, access token, cookie, or other account material.
+- Exact authenticated content URL, managed bearer credential, JSON acceptance, existing balcony headers, and 512 KiB ceiling.
+- Minimal sanitized JSON fixture matching the observed `result/data` envelope.
+- Successful response parses title, ordered creators, synopsis, episode identity, title, `openedAt`, `COMMON` thumbnail, and `purchaseStatus`.
+- Missing or non-success result, wrong alias, wrong types, invalid timestamp, oversized fields, duplicate ambiguous thumbnail, hostile image host/path, and unknown purchase status remain fail-closed.
+- HTML and `__NEXT_DATA__` input are rejected; tests contain no copied account data, email address, access token, cookie, or other credential material.
 
 ### Screen and behavior contracts
 
@@ -260,7 +262,7 @@ No new source module, dependency, capability, origin, or SDK change is required.
 - Episode pagination uses separately measured first-page and later-page capacities, explicit non-overlapping ranges, and stops at the final page.
 - Bomtoon uses the opt-in edge pager; its touch targets retain the shared minimum height while the band sits flush with the panel bottom.
 - Only visible episode thumbnails request work; stale completions do not install; leaving the view cancels and drops resources.
-- Post-purchase reconciliation updates the row through the personalized HTML parser while preserving commerce safety state.
+- Post-purchase reconciliation updates the row through the bearer JSON parser while preserving commerce safety state.
 
 ### Gates and smoke checks
 
