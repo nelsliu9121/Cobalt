@@ -18649,7 +18649,7 @@ mod tests {
                 _ => None,
             })
             .expect("Recent row");
-        assert_eq!(row.lead, kobo_sdk::RowLead::Icon(Glyph::Book));
+        assert_eq!(row.lead, RowLead::CoverSlot(Glyph::Book));
 
         let commands = runner.action(action_id("refresh-layout"));
         assert!(cover_fetches(&commands).is_empty());
@@ -18723,7 +18723,10 @@ mod tests {
                     })
             })
             .expect("Feature collection picture");
-        assert_eq!(banner_picture, collection_picture);
+        assert_eq!(banner_picture.handle, collection_picture.handle);
+        assert_eq!(banner_picture.source, collection_picture.source);
+        assert_eq!(banner_picture.fit, PictureFit::Contain);
+        assert_eq!(collection_picture.fit, PictureFit::Cover);
     }
 
     #[test]
