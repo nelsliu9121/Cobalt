@@ -6667,19 +6667,21 @@ impl KoboApp for Bomtoon {
             && (action == action_id(EPISODE_WARNING_CLOSE) || action == ActionId::BACK)
         {
             if let Some(warning) = self.episode_warning() {
-                match warning {
-                    EpisodeWarning::CrossAccount => {
-                        self.episode_warnings.cross_account_dismissed = true;
+                if self.quote_screen().is_none() {
+                    match warning {
+                        EpisodeWarning::CrossAccount => {
+                            self.episode_warnings.cross_account_dismissed = true;
+                        }
+                        EpisodeWarning::PurchaseRejected(_) => {
+                            self.purchase_rejection_notice = None;
+                        }
+                        EpisodeWarning::GiftFailure => {
+                            self.episode_warnings.gift_dismissed = true;
+                        }
                     }
-                    EpisodeWarning::PurchaseRejected(_) => {
-                        self.purchase_rejection_notice = None;
-                    }
-                    EpisodeWarning::GiftFailure => {
-                        self.episode_warnings.gift_dismissed = true;
-                    }
+                    self.show(context);
+                    return;
                 }
-                self.show(context);
-                return;
             }
         }
         if self.view == View::FeatureCollection && action == ActionId::BACK {
@@ -8943,6 +8945,16 @@ mod tests {
             .all(|command| !matches!(command, Command::Store(_))));
         assert_no_post_or_marker_forget(&commands);
         assert_eq!(runner.app().view, View::Episodes);
+
+        let commands = runner.action(ActionId::BACK);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert_no_post_or_marker_forget(&commands);
+        let screen = runner.app().screen();
+        assert!(screen.overlay.is_none());
+        assert!(episode_rows(&screen).iter().any(|row| {
+            row.title == "Paid Episode" && row.action == action_id("episode-disabled-1")
+        }));
 
         let commands = runner.action(ActionId::BACK);
         assert_eq!(runner.app().view, View::Main);
@@ -19323,6 +19335,44 @@ mod tests {
             .all(|(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/gift/"))));
         assert_eq!(runner.app().view, View::Reader);
     }
+    #[test]
+    fn back_closes_visible_quote_before_dismissing_hidden_gift_warning() {
+        const QUOTE_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let (gift, _) = only_spawn(&commands);
+        let (quote, _) = only_spawn(&runner.action(action_id("episode-4")));
+        runner.task_outcome(quote, TaskOutcome::Completed(QUOTE_RESPONSE.to_vec()));
+        assert_eq!(
+            runner.app().commerce.state(),
+            commerce::CommerceState::Choosing
+        );
+
+        runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+
+        assert!(runner.app().quote_screen().is_some());
+        assert_eq!(
+            runner.app().episode_warning(),
+            Some(EpisodeWarning::GiftFailure)
+        );
+
+        runner.action(ActionId::BACK);
+
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
+        assert_eq!(runner.app().view, View::Episodes);
+        assert_eq!(
+            runner.app().episode_warning(),
+            Some(EpisodeWarning::GiftFailure)
+        );
+        assert!(runner.app().quote_screen().is_none());
+    }
+
     #[test]
     fn back_cancels_requote_before_save_and_is_consumed_after_save() {
         const QUOTE: &[u8] = br#"{"result":"SUCCESS","data":{"contentsId":41,"episodeId":105,"contentsAlias":"hunter_q","episodeAlias":"paid","isAvailable":false,"coinKind":"COIN","rentCoin":1,"possessionCoin":2,"permanentCoin":2,"isRentGift":true,"isPossessionGift":false}}"#;
