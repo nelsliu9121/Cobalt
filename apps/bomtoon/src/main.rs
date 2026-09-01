@@ -5707,7 +5707,6 @@ impl Bomtoon {
 
     fn request_reader_viewport(&mut self, context: &mut Context, offset_rows: u64) {
         if let Some(picture) = self.take_ready_viewport(offset_rows) {
-            context.set_screen(self.reader_screen_with_chrome(ReadingChrome::OverlayBusy));
             if let Err(error) = self.install_viewport(context, offset_rows, picture) {
                 self.fail_reader(Retry::Viewport(offset_rows), error);
                 self.show(context);
@@ -12280,7 +12279,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_page_turn_shows_busy_footer_before_replacing_handle() {
+    fn prepared_page_turn_skips_busy_footer_before_replacing_handle() {
         let mut runner = seeded_reader(2, 0, true);
         let commands = runner.action(action_id(READER_NEXT));
         let reader = runner.app().reader.as_ref().expect("reader");
@@ -12294,18 +12293,17 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(screens.len(), 2, "busy screen followed by the new page");
-        let busy = screens[0].1.reading_surface.expect("busy reading surface");
-        assert_eq!(busy.picture.handle, PictureHandle(7));
-        assert_eq!(busy.chrome, ReadingChrome::OverlayBusy);
-        let busy_progress = screens[0]
+        assert_eq!(
+            screens.len(),
+            1,
+            "prepared turn only installs its new viewport"
+        );
+        let installed = screens[0]
             .1
-            .page_turns
-            .expect("busy page turns")
-            .progress
-            .expect("busy progress");
-        assert_eq!(busy_progress.percent, 50);
-        let installed_progress = screens[1]
+            .reading_surface
+            .expect("installed reading surface");
+        assert_eq!(installed.chrome, ReadingChrome::Hidden);
+        let installed_progress = screens[0]
             .1
             .page_turns
             .expect("installed page turns")
@@ -12328,7 +12326,16 @@ mod tests {
             .iter()
             .position(|command| matches!(command, Command::DropPicture(_)))
             .expect("DropPicture");
-        assert!(screens[0].0 < put && put < screens[1].0 && screens[1].0 < drop);
+        assert!(put < screens[0].0 && screens[0].0 < drop);
+        assert!(!commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::SetScreen(screen)
+                    if screen.reading_surface.is_some_and(|surface| {
+                        surface.chrome == ReadingChrome::OverlayBusy
+                    })
+            )
+        }));
     }
 
     fn assert_prepared_turn_commands(
@@ -12358,12 +12365,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(put_indices.len(), 1);
-        assert_eq!(set_indices.len(), 2);
+        assert_eq!(set_indices.len(), 1);
         assert_eq!(drop_indices.len(), 1);
         assert!(
-            set_indices[0] < put_indices[0]
-                && put_indices[0] < set_indices[1]
-                && set_indices[1] < drop_indices[0]
+            put_indices[0] < set_indices[0] && set_indices[0] < drop_indices[0],
+            "prepared turn uploads and installs without an intermediate loading screen"
         );
         match (&commands[put_indices[0]], format) {
             (
@@ -12382,15 +12388,7 @@ mod tests {
             ) => {}
             (command, _) => panic!("wrong typed page upload: {command:?}"),
         }
-        let Command::SetScreen(busy_screen) = &commands[set_indices[0]] else {
-            unreachable!();
-        };
-        let busy = busy_screen
-            .reading_surface
-            .expect("prepared turn busy reading surface");
-        assert_eq!(busy.picture.handle, old_handle);
-        assert_eq!(busy.chrome, ReadingChrome::OverlayBusy);
-        let Command::SetScreen(page_screen) = &commands[set_indices[1]] else {
+        let Command::SetScreen(page_screen) = &commands[set_indices[0]] else {
             unreachable!();
         };
         let page = page_screen
