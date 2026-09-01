@@ -47,6 +47,15 @@ const MANAGED_BUILTINS: &[BuiltinApp] = &[
         capabilities: &["network", "audio", "bluetooth-audio", "bluetooth-control"],
     },
     BuiltinApp {
+        id: "bomtoon",
+        title: "BOMTOON",
+        label: "BOMTOON",
+        summary: "Read owned and free BOMTOON episodes on your Kobo.",
+        version: "0.6.0",
+        glyph: Glyph::Book,
+        capabilities: &["network"],
+    },
+    BuiltinApp {
         id: "brief",
         title: "Daily Brief",
         label: "Daily Brief",
@@ -1059,6 +1068,36 @@ mod tests {
     }
 
     #[test]
+    fn private_bomtoon_binary_is_listed_and_resolved_as_a_builtin() {
+        let root = root();
+        fs::create_dir_all(root.join("bin")).expect("built-in directory");
+        fs::write(builtin_binary(&root, "bomtoon"), b"private BOMTOON binary")
+            .expect("built-in BOMTOON");
+
+        let entries = installed(&root).expect("installed built-ins");
+        let bomtoon = entries
+            .iter()
+            .find(|entry| entry.id == "bomtoon")
+            .expect("BOMTOON launcher entry");
+        assert_eq!(bomtoon.title, "BOMTOON");
+        assert_eq!(bomtoon.label, "BOMTOON");
+        assert_eq!(
+            bomtoon.summary,
+            "Read owned and free BOMTOON episodes on your Kobo."
+        );
+        assert_eq!(bomtoon.version, "0.6.0");
+        assert_eq!(bomtoon.installed_version.as_deref(), Some("0.6.0"));
+        assert_eq!(bomtoon.glyph, Glyph::Book);
+        assert_eq!(bomtoon.capabilities, vec!["network".to_owned()]);
+        assert_eq!(
+            resolve(&root, "bomtoon").expect("resolve built-in BOMTOON"),
+            builtin_binary(&root, "bomtoon")
+        );
+
+        let _ignored = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn bundled_apps_use_the_same_capabilities_as_their_store_manifests() {
         assert!(builtin_declared("todo")
             .expect("Todo declaration")
@@ -1074,6 +1113,11 @@ mod tests {
         // Play button that is refused for every reader who has not already
         // paired something -- which is every reader, once.
         assert!(audiobook.holds(kobo_policy::Capability::BluetoothControl));
+        let bomtoon = builtin_declared("bomtoon").expect("BOMTOON declaration");
+        assert_eq!(
+            bomtoon.iter().collect::<Vec<_>>(),
+            vec![kobo_policy::Capability::Network]
+        );
         assert!(builtin_declared("terminal").is_none());
     }
 
@@ -1524,11 +1568,15 @@ mod tests {
             .and_then(kobo_json::Value::as_array)
             .expect("capabilities");
 
-        assert_eq!(version, "0.5.0");
-        assert_eq!(minimum, "0.4.0");
+        assert_eq!(version, "0.6.0");
+        assert_eq!(minimum, "0.5.0");
         assert_eq!(capabilities.len(), 1);
         assert_eq!(capabilities[0].as_str(), Some("network"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
+
+        let builtin = managed_builtin("bomtoon").expect("BOMTOON built-in entry");
+        assert_eq!(builtin.version, version);
+        assert_eq!(builtin.capabilities, &["network"]);
         assert!(kobo_app_store::cobalt_version_at_least(
             env!("CARGO_PKG_VERSION"),
             minimum
