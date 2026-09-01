@@ -1445,6 +1445,7 @@ pub struct PageTurns {
     /// to fifty-four shelves and never told the reader which one they were on,
     /// so turning the page was indistinguishable from the list not moving.
     pub position: Option<(u16, u16)>,
+    edge_position: bool,
 }
 
 impl PageTurns {
@@ -1455,6 +1456,7 @@ impl PageTurns {
             next,
             menu: None,
             position: None,
+            edge_position: false,
         }
     }
 
@@ -1466,6 +1468,14 @@ impl PageTurns {
     #[must_use]
     pub const fn with_position(mut self, page: u16, of: u16) -> Self {
         self.position = Some((page, of));
+        self
+    }
+
+    /// Draws the page-position band against the panel bottom when no bar or
+    /// overlay owns that edge.
+    #[must_use]
+    pub const fn with_edge_position(mut self) -> Self {
+        self.edge_position = true;
         self
     }
 
@@ -1705,8 +1715,16 @@ impl Screen {
         // lets a tab switch repaint the content area and two bars instead of
         // the whole screen, which is the difference between one refresh and
         // one refresh plus visible chrome flicker.
+        let edge_position = self.nav_bar.is_none()
+            && self.bottom_action.is_none()
+            && self.overlay.is_none()
+            && self.page_turns.is_some_and(|turns| {
+                turns.edge_position && turns.drawable_position().is_some()
+            });
         let content_bottom = if self.nav_bar.is_some() || self.bottom_action.is_some() {
             metrics.height - metrics.nav_bar_height()
+        } else if edge_position {
+            metrics.height
         } else {
             // A screen margin, the same one the sides get. Without a bar to
             // provide it the last control sat on the bezel: a button whose
@@ -19206,6 +19224,63 @@ mod prose_tests {
             shown.rect.y >= with.content.y + with.content.height,
             "the position was drawn inside the page-turn zone it describes"
         );
+    }
+
+    #[test]
+    fn edge_page_position_uses_the_panel_bottom_without_shrinking_targets() {
+        let screen = |edge| {
+            let mut screen =
+                Screen::new(1, Vec::new()).with_page_turns(ActionId(7), ActionId(9));
+            screen.page_turns = screen.page_turns.map(|turns| {
+                let turns = turns.with_position(2, 3);
+                if edge {
+                    turns.with_edge_position()
+                } else {
+                    turns
+                }
+            });
+            screen.layout_with(&CLARA_BW_METRICS, &Chrome::default())
+        };
+
+        let inset = screen(false);
+        let edge = screen(true);
+        let inset_position = inset
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::PagePosition)
+            .expect("inset page position");
+        let edge_position = edge
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::PagePosition)
+            .expect("edge page position");
+
+        assert_eq!(
+            inset_position.rect.y + inset_position.rect.height,
+            CLARA_BW_METRICS.height - CLARA_BW_METRICS.screen_margin()
+        );
+        assert_eq!(
+            edge_position.rect.y + edge_position.rect.height,
+            CLARA_BW_METRICS.height
+        );
+        assert_eq!(
+            edge_position.rect.height,
+            CLARA_BW_METRICS.page_position_band()
+        );
+        assert_eq!(
+            edge.content.height - inset.content.height,
+            CLARA_BW_METRICS.screen_margin()
+        );
+        assert!(edge
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    LayoutKind::PagePrevious(_) | LayoutKind::PageNext(_)
+                )
+            })
+            .all(|node| node.rect.height >= CLARA_BW_METRICS.touch_target_minimum()));
     }
 
     #[test]

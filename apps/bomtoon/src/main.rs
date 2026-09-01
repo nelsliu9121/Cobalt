@@ -39,6 +39,7 @@ const LIBRARY: &str = "library";
 const ACCOUNT: &str = "account";
 const RETRY_BALANCES: &str = "retry-balances";
 const RETRY_GIFTS: &str = "retry-gifts";
+const EPISODE_WARNING_CLOSE: &str = "episode-warning-close";
 const USE_GIFT: &str = "commerce-use-gift";
 const RENT: &str = "commerce-rent";
 const BUY: &str = "commerce-buy";
@@ -890,7 +891,15 @@ impl WalletState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GiftTaskPurpose {
     Display,
+    Quote { episode: usize },
     Reconcile { generation: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EpisodeWarning {
+    CrossAccount,
+    PurchaseRejected(&'static str),
+    GiftFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1108,6 +1117,9 @@ struct Bomtoon {
     commerce_episode: Option<usize>,
     pending_purchase_rejection: Option<&'static str>,
     purchase_rejection_notice: Option<&'static str>,
+    gift_warning_dismissed: bool,
+    cross_account_warning_dismissed: bool,
+    pending_gift_quote: Option<usize>,
     retained_quote: Option<commerce::QuotePresentation>,
     reconciliation: Option<ReconciliationState>,
     reconciliation_post_accepted: bool,
@@ -1369,6 +1381,20 @@ impl Bomtoon {
                     source,
                 },
             );
+        }
+    }
+
+    fn episode_warning(&self) -> Option<EpisodeWarning> {
+        if self.commerce.marker_belongs_to_another_account()
+            && !self.cross_account_warning_dismissed
+        {
+            Some(EpisodeWarning::CrossAccount)
+        } else if let Some(result) = self.purchase_rejection_notice {
+            Some(EpisodeWarning::PurchaseRejected(result))
+        } else if self.gifts.error && !self.gift_warning_dismissed {
+            Some(EpisodeWarning::GiftFailure)
+        } else {
+            None
         }
     }
 
@@ -1995,9 +2021,12 @@ impl Bomtoon {
             preview,
             truncated,
         );
-        let screen = self
-            .add_episode_body(header, 0..self.episodes.len().min(1), 0, 1, true)
+        let mut screen = self
+            .add_episode_body(header, 0..self.episodes.len().min(1), 0, 1)
             .build();
+        screen.page_turns = screen
+            .page_turns
+            .map(|turns| turns.with_edge_position());
         !screen
             .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
             .has_errors()
@@ -2060,19 +2089,8 @@ impl Bomtoon {
     }
 
     fn episode_ranges_fit(&self, ranges: &[std::ops::Range<usize>]) -> bool {
-        ranges.iter().enumerate().all(|(page, range)| {
-            let actual = self.episode_screen_for(page, ranges, false);
-            if !episode_screen_layout_fits(&actual) {
-                return false;
-            }
-            let header = self.add_episode_header(
-                ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
-                page,
-            );
-            let reserved = self
-                .add_episode_body(header, range.clone(), page, ranges.len().max(1), true)
-                .build();
-            episode_screen_layout_fits(&reserved)
+        ranges.iter().enumerate().all(|(page, _)| {
+            episode_screen_layout_fits(&self.episode_screen_for(page, ranges, false))
         })
     }
 
@@ -2192,27 +2210,9 @@ impl Bomtoon {
         range: std::ops::Range<usize>,
         page: usize,
         page_count: usize,
-        reserve_transient_space: bool,
     ) -> ScreenBuilder {
-        let mut screen = if reserve_transient_space || self.gifts.error {
-            screen.button(
-                RETRY_GIFTS,
-                format!("{} · Retry Gift", self.episode_balance_label()),
-            )
-        } else {
-            screen.text(self.episode_balance_label())
-        };
-        if reserve_transient_space {
-            screen = screen.text("Purchase rejected: FAIL");
-        } else if let Some(result) = self.purchase_rejection_notice {
-            screen = screen.text(format!("Purchase rejected: {result}"));
-        }
+        let mut screen = screen.text(self.episode_balance_label());
         let marker_belongs_to_another_account = self.commerce.marker_belongs_to_another_account();
-        if reserve_transient_space || marker_belongs_to_another_account {
-            screen = screen.text(
-                "A purchase is unresolved for another account. Restore the original account to refresh its status.",
-            );
-        }
         let now_ms = unix_time_ms();
         screen = screen.rows_with_trailing(range.map(|index| {
             let episode = &self.episodes[index];
@@ -2251,7 +2251,7 @@ impl Bomtoon {
             page,
         );
         let range = ranges.get(page).cloned().unwrap_or(0..0);
-        let mut screen = self.add_episode_body(header, range, page, ranges.len().max(1), false);
+        let mut screen = self.add_episode_body(header, range, page, ranges.len().max(1));
         if modal {
             if let Some((synopsis_page, range)) =
                 self.synopsis.open_page.and_then(|synopsis_page| {
@@ -2274,7 +2274,35 @@ impl Bomtoon {
                 });
             }
         }
-        screen.build()
+        if modal && self.synopsis.open_page.is_none() {
+            if let Some(warning) = self.episode_warning() {
+                screen = match warning {
+                    EpisodeWarning::CrossAccount => screen.modal("Account warning", |modal| {
+                        modal
+                            .text("A purchase is unresolved for another account. Restore the original account to refresh its status.")
+                            .button(EPISODE_WARNING_CLOSE, "Close")
+                    }),
+                    EpisodeWarning::PurchaseRejected(result) => {
+                        screen.modal("Purchase rejected", |modal| {
+                            modal
+                                .text(result)
+                                .button(EPISODE_WARNING_CLOSE, "Close")
+                        })
+                    }
+                    EpisodeWarning::GiftFailure => screen.modal("Gift unavailable", |modal| {
+                        modal
+                            .text("BOMTOON Gift status could not be loaded.")
+                            .button(RETRY_GIFTS, "Retry")
+                            .button(EPISODE_WARNING_CLOSE, "Close")
+                    }),
+                };
+            }
+        }
+        let mut screen = screen.build();
+        screen.page_turns = screen
+            .page_turns
+            .map(|turns| turns.with_edge_position());
+        screen
     }
 
     fn episode_screen(&self) -> Screen {
@@ -2548,16 +2576,29 @@ impl Bomtoon {
         }
     }
 
+    fn mark_title_gift_error(&mut self, purpose: GiftTaskPurpose) {
+        self.gifts.error = true;
+        if matches!(
+            purpose,
+            GiftTaskPurpose::Display | GiftTaskPurpose::Quote { .. }
+        ) {
+            self.gift_warning_dismissed = false;
+        }
+    }
+
     fn clear_title_gifts(&mut self, context: &mut Context) {
         self.cancel_title_gift_task(context);
         self.gifts.title_id = None;
         self.gifts.available = None;
         self.gifts.error = false;
+        self.gift_warning_dismissed = false;
+        self.cross_account_warning_dismissed = false;
+        self.pending_gift_quote = None;
     }
 
     fn refresh_title_gifts(&mut self, context: &mut Context, purpose: GiftTaskPurpose) {
         let Some(title_id) = self.selected_content_id else {
-            self.gifts.error = true;
+            self.mark_title_gift_error(purpose);
             return;
         };
         self.refresh_title_gifts_for(context, title_id, purpose);
@@ -2570,7 +2611,7 @@ impl Bomtoon {
         purpose: GiftTaskPurpose,
     ) -> Option<u64> {
         let Some(account_scope) = self.current_commerce_scope() else {
-            self.gifts.error = true;
+            self.mark_title_gift_error(purpose);
             return None;
         };
         self.cancel_title_gift_task(context);
@@ -2581,7 +2622,7 @@ impl Bomtoon {
         self.gifts.error = false;
         let generation = self.gifts.generation;
         let Some(id) = context.spawn(api::title_gifts(title_id)) else {
-            self.gifts.error = true;
+            self.mark_title_gift_error(purpose);
             return None;
         };
         self.gifts.task = Some(GiftTask {
@@ -2623,18 +2664,28 @@ impl Bomtoon {
                     self.gifts.error = false;
                     Ok(balance.available)
                 } else {
-                    self.gifts.error = true;
+                    self.mark_title_gift_error(task.purpose);
                     Err(())
                 }
             }
             TaskOutcome::Completed(_) | TaskOutcome::Failed(_) => {
-                self.gifts.error = true;
+                self.mark_title_gift_error(task.purpose);
                 Err(())
             }
             TaskOutcome::Cancelled => Err(()),
         };
         match task.purpose {
             GiftTaskPurpose::Display => {}
+            GiftTaskPurpose::Quote { episode } => {
+                if observed.is_ok() && self.pending_gift_quote == Some(episode) {
+                    self.pending_gift_quote = None;
+                    if self.episodes.get(episode).is_some_and(|episode| {
+                        episode.purchase == model::PurchaseState::NotOwned
+                    }) {
+                        self.open_episode(context, episode);
+                    }
+                }
+            }
             GiftTaskPurpose::Reconcile { generation } => {
                 if let Some(reconciliation) = self.reconciliation.as_mut() {
                     if reconciliation.generation == generation
@@ -3622,10 +3673,18 @@ impl Bomtoon {
         self.commerce.mutation_finished(outcome)
     }
 
+    fn observe_cross_account_transition(&mut self, was_foreign: bool) {
+        if !was_foreign && self.commerce.marker_belongs_to_another_account() {
+            self.cross_account_warning_dismissed = false;
+        }
+    }
+
     fn update_commerce_safety(&mut self, context: &mut Context) {
+        let was_foreign = self.commerce.marker_belongs_to_another_account();
         let effects = self
             .commerce
             .safety_changed(self.authentication(), self.connectivity());
+        self.observe_cross_account_transition(was_foreign);
         self.apply_commerce_effects(context, effects);
     }
     fn clear_commerce_access(&mut self, context: &mut Context) {
@@ -5318,6 +5377,12 @@ impl Bomtoon {
         self.synopsis.open_page = None;
         self.pending_purchase_rejection = None;
         self.purchase_rejection_notice = None;
+        if episode.purchase == model::PurchaseState::NotOwned && self.gifts.error {
+            self.pending_gift_quote = Some(index);
+            self.refresh_title_gifts(context, GiftTaskPurpose::Quote { episode: index });
+            return;
+        }
+        self.pending_gift_quote = None;
         if episode.purchase == model::PurchaseState::NotOwned {
             let Some(title_id) = self.selected_content_id else {
                 return;
@@ -6575,6 +6640,22 @@ impl KoboApp for Bomtoon {
             self.show(context);
             return;
         }
+        if self.view == View::Episodes && action == action_id(EPISODE_WARNING_CLOSE) {
+            match self.episode_warning() {
+                Some(EpisodeWarning::CrossAccount) => {
+                    self.cross_account_warning_dismissed = true;
+                }
+                Some(EpisodeWarning::PurchaseRejected(_)) => {
+                    self.purchase_rejection_notice = None;
+                }
+                Some(EpisodeWarning::GiftFailure) => {
+                    self.gift_warning_dismissed = true;
+                }
+                None => {}
+            }
+            self.show(context);
+            return;
+        }
         if self.view == View::FeatureCollection && action == ActionId::BACK {
             self.cancel_collection_details(context);
             let origin = self
@@ -6589,6 +6670,7 @@ impl KoboApp for Bomtoon {
             return;
         }
         if self.view == View::Episodes && action == action_id(RETRY_GIFTS) {
+            self.gift_warning_dismissed = false;
             self.refresh_title_gifts(context, GiftTaskPurpose::Display);
             self.show(context);
             return;
@@ -7094,6 +7176,7 @@ impl KoboApp for Bomtoon {
     }
 
     fn on_store(&mut self, context: &mut Context, result: StoreResult) {
+        let was_foreign = self.commerce.marker_belongs_to_another_account();
         let effects = match (&self.marker_store, result) {
             (Some(MarkerStoreOperation::Load), StoreResult::Loaded { key, value })
                 if key == commerce::MARKER_KEY =>
@@ -7124,6 +7207,7 @@ impl KoboApp for Bomtoon {
             }
             _ => None,
         };
+        self.observe_cross_account_transition(was_foreign);
         if let Some(effects) = effects {
             self.apply_commerce_effects(context, effects);
         }
@@ -10864,6 +10948,78 @@ mod tests {
         );
         assert!(runner.app().commerce.marker_belongs_to_another_account());
         assert_eq!(snapshot(runner.app()), baseline);
+    }
+
+    #[test]
+    fn purchase_and_cross_account_warnings_are_modal_and_do_not_reserve_rows() {
+        const OWNER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
+        const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
+
+        let mut app = episode_metadata_app("Short synopsis.".to_owned());
+        app.episodes = (0..18)
+            .map(|index| Episode {
+                id: 100 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: if index == 0 {
+                    model::PurchaseState::NotOwned
+                } else {
+                    model::PurchaseState::Owned
+                },
+                rent_expires_at: None,
+                rent_coin: Some(1),
+                purchase_coin: Some(2),
+                gift_eligible: true,
+            })
+            .collect();
+        app.prepare_episode_layout();
+        let ranges = app.episode_pages.clone();
+        let baseline_rows = episode_rows(&app.episode_screen()).len();
+        app.gifts.error = true;
+        app.purchase_rejection_notice = Some("FAIL");
+        let marker = marker_for(test_scope(OWNER));
+        let _ = app.commerce.marker_loaded(Some(&marker));
+        let _ = app.commerce.safety_changed(
+            commerce::Authentication::Authenticated(test_scope(READER)),
+            commerce::Connectivity::Online,
+        );
+        let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
+
+        let cross_account = runner.app().episode_screen();
+        assert!(overlay_text(
+            cross_account.overlay.as_ref().expect("cross-account warning")
+        )
+        .contains("another account"));
+        assert_eq!(episode_rows(&cross_account).len(), baseline_rows);
+        assert_eq!(runner.app().episode_pages, ranges);
+
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+        let purchase = runner.app().episode_screen();
+        assert!(overlay_text(purchase.overlay.as_ref().expect("purchase warning")).contains("FAIL"));
+        assert_eq!(episode_rows(&purchase).len(), baseline_rows);
+        assert_eq!(runner.app().episode_pages, ranges);
+        assert_eq!(
+            episode_rows(&purchase)[0].action,
+            action_id("episode-disabled-0"),
+            "cross-account dismissal must not enable affected rows"
+        );
+
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+        let gift = runner.app().episode_screen();
+        assert!(
+            overlay_text(gift.overlay.as_ref().expect("Gift warning")).contains("Gift")
+        );
+        assert!(screen_button_actions(&gift).contains(&action_id(RETRY_GIFTS)));
+        assert_eq!(episode_rows(&gift).len(), baseline_rows);
+        assert_eq!(runner.app().episode_pages, ranges);
+
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+        assert!(runner.app().episode_screen().overlay.is_none());
+        assert!(runner.app().gifts.error);
+        assert!(runner.app().commerce.marker_belongs_to_another_account());
+        assert_eq!(runner.app().episode_pages, ranges);
     }
 
     #[test]
@@ -18469,33 +18625,71 @@ mod tests {
         assert_fits(&screen);
     }
     #[test]
-    fn gift_failure_exposes_only_a_gift_retry_and_preserves_episode_actions() {
+    fn gift_failure_uses_a_modal_without_changing_episode_ranges() {
+        const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
         let (mut runner, _) = loaded_library();
         complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
         let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
         let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
         let (gift, _) = only_spawn(&commands);
+        let ranges = runner.app().episode_pages.clone();
 
         let commands = runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
         let screen = last_screen(&commands);
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Button { action, label, .. }
-                if *action == action_id(RETRY_GIFTS) && label.contains("Retry Gift")
-        )));
-        assert!(screen.nodes.iter().any(|node| matches!(
-            node,
-            Node::Rows { rows, .. }
-                if rows.iter().any(|row| row.action == action_id("episode-0"))
-        )));
+        let overlay = screen.overlay.as_ref().expect("Gift warning modal");
+        assert!(overlay_text(overlay).contains("Gift"));
+        assert!(screen_button_actions(&screen).contains(&action_id(RETRY_GIFTS)));
+        assert!(screen_button_actions(&screen).contains(&action_id(EPISODE_WARNING_CLOSE)));
+        assert_eq!(runner.app().episode_pages, ranges);
         assert_fits(&screen);
 
-        let commands = runner.action(action_id(RETRY_GIFTS));
-        let (_, work) = only_spawn(&commands);
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+        assert!(runner.app().screen().overlay.is_none());
+        assert!(runner.app().gifts.error);
+        let commands = runner.action(action_id("episode-4"));
+        let (gift, work) = only_spawn(&commands);
         assert_eq!(work, api::title_gifts(41));
-        assert!(spawns(&commands).iter().all(
-            |(_, work)| !matches!(work, Task::Fetch { url, .. } if url.contains("/asset/user"))
-        ));
+        assert_eq!(runner.app().pending_gift_quote, Some(4));
+
+        let commands =
+            runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::quote("hunter_q", "paid", model::PurchaseType::Possession)
+        );
+        assert_eq!(runner.app().pending_gift_quote, None);
+    }
+
+    #[test]
+    fn gift_quote_continuation_failure_reopens_warning_without_quoting() {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+
+        let commands = runner.action(action_id("episode-4"));
+        let (gift, work) = only_spawn(&commands);
+        assert_eq!(work, api::title_gifts(41));
+        let commands = runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert_eq!(runner.app().pending_gift_quote, Some(4));
+        let screen = last_screen(&commands);
+        let overlay = screen.overlay.as_ref().expect("Gift warning reopened");
+        assert!(overlay_text(overlay).contains("Gift"));
+        assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
     }
     #[test]
     fn quote_requote_and_marker_acknowledgement_order_the_purchase_post() {
@@ -18783,9 +18977,16 @@ mod tests {
         assert_eq!(runner.app().commerce.state(), commerce::CommerceState::Idle);
         assert_eq!(runner.app().pending_purchase_rejection, None);
         assert_eq!(runner.app().purchase_rejection_notice, Some("FAIL"));
-        let drawn = format!("{:?}", last_screen(&commands));
-        assert!(drawn.contains("Purchase rejected: FAIL"), "{drawn}");
-        assert!(!drawn.contains("not accepted"), "{drawn}");
+        let screen = last_screen(&commands);
+        let overlay = screen.overlay.as_ref().expect("purchase rejection modal");
+        assert!(overlay_text(overlay).contains("FAIL"));
+        assert!(!overlay_text(overlay).contains("not accepted"));
+        assert!(screen_button_actions(&screen).contains(&action_id(EPISODE_WARNING_CLOSE)));
+
+        runner.action(action_id(EPISODE_WARNING_CLOSE));
+        assert_eq!(runner.app().pending_purchase_rejection, None);
+        assert_eq!(runner.app().purchase_rejection_notice, None);
+        assert!(runner.app().screen().overlay.is_none());
 
         let commands = runner.action(action_id("episode-4"));
         let (_, work) = only_spawn(&commands);
