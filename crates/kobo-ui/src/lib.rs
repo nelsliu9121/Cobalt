@@ -1718,9 +1718,9 @@ impl Screen {
         let edge_position = self.nav_bar.is_none()
             && self.bottom_action.is_none()
             && self.overlay.is_none()
-            && self.page_turns.is_some_and(|turns| {
-                turns.edge_position && turns.drawable_position().is_some()
-            });
+            && self
+                .page_turns
+                .is_some_and(|turns| turns.edge_position && turns.drawable_position().is_some());
         let content_bottom = if self.nav_bar.is_some() || self.bottom_action.is_some() {
             metrics.height - metrics.nav_bar_height()
         } else if edge_position {
@@ -19229,8 +19229,7 @@ mod prose_tests {
     #[test]
     fn edge_page_position_uses_the_panel_bottom_without_shrinking_targets() {
         let screen = |edge| {
-            let mut screen =
-                Screen::new(1, Vec::new()).with_page_turns(ActionId(7), ActionId(9));
+            let mut screen = Screen::new(1, Vec::new()).with_page_turns(ActionId(7), ActionId(9));
             screen.page_turns = screen.page_turns.map(|turns| {
                 let turns = turns.with_position(2, 3);
                 if edge {
