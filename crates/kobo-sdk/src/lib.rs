@@ -1614,6 +1614,17 @@ impl ScreenBuilder {
         self
     }
 
+    /// Shows whole-strip progress and which footer turns remain available.
+    ///
+    /// Has no effect unless [`Self::page_turns`] was asked for as well.
+    #[must_use]
+    pub fn reading_progress(mut self, percent: u8, previous: bool, next: bool) -> Self {
+        self.page_turns = self
+            .page_turns
+            .map(|turns| turns.with_progress(percent, previous, next));
+        self
+    }
+
     /// Adds a middle column that asks for this screen's own controls.
     ///
     /// For a screen that carries nothing at the foot, which is every reading
@@ -6090,6 +6101,23 @@ mod tests {
         assert_eq!(surface.chrome, ReadingChrome::Overlay);
         assert!(surface.id.0 > 0);
         assert!(screen.nodes.is_empty());
+    }
+
+    #[test]
+    fn builder_declares_reading_progress_and_available_turns() {
+        let screen = ScreenBuilder::new("comic")
+            .page_turns("previous", "next")
+            .reading_progress(37, true, false)
+            .build();
+
+        let progress = screen
+            .page_turns
+            .expect("page turns")
+            .progress
+            .expect("reading progress");
+        assert_eq!(progress.percent, 37);
+        assert!(progress.previous);
+        assert!(!progress.next);
     }
 
     #[test]

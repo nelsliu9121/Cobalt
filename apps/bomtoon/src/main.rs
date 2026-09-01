@@ -699,7 +699,7 @@ fn add_featured_content(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PageSegment {
+struct ViewportSegment {
     source: usize,
     source_row: u32,
     rows: u32,
@@ -707,31 +707,46 @@ struct PageSegment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PagePlan {
-    segments: Vec<PageSegment>,
+struct ViewportPlan {
+    segments: Vec<ViewportSegment>,
     content_rows: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StripSource {
+    start_row: u64,
+    end_row: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EpisodeStrip {
+    sources: Vec<StripSource>,
+    total_rows: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
-struct PageBuild {
-    page: usize,
+struct ViewportBuild {
+    offset_rows: u64,
+    plan: ViewportPlan,
     format: PictureFormat,
     bytes: Vec<u8>,
     next_segment: usize,
 }
 
-impl PageBuild {
+impl ViewportBuild {
     fn new(
-        page: usize,
+        offset_rows: u64,
+        plan: ViewportPlan,
         format: PictureFormat,
         panel_width: u32,
         panel_height: u32,
     ) -> Result<Self, String> {
         let byte_len = format
             .byte_len(panel_width, panel_height)
-            .ok_or_else(|| "The comic page byte length is not supported.".to_owned())?;
+            .ok_or_else(|| "The comic viewport byte length is not supported.".to_owned())?;
         Ok(Self {
-            page,
+            offset_rows,
+            plan,
             format,
             bytes: vec![255; byte_len],
             next_segment: 0,
@@ -790,7 +805,7 @@ fn reader_limits(format: PictureFormat) -> ReaderLimits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FetchIntent {
-    Foreground { page: usize },
+    Foreground { offset_rows: u64 },
     Prefetch,
 }
 
@@ -803,7 +818,7 @@ struct SourceFailure {
 enum ReaderTaskPurpose {
     Manifest,
     ManifestRefresh,
-    ForegroundSource { source: usize, page: usize },
+    ForegroundSource { source: usize, offset_rows: u64 },
     PrefetchSource { source: usize },
     Maintenance,
 }
@@ -994,9 +1009,9 @@ struct ReconciliationState {
     gift_generation: Option<u64>,
 }
 
-enum PageEntry {
-    Building(PageBuild),
-    Ready { page: usize, picture: Picture },
+enum ViewportEntry {
+    Building(ViewportBuild),
+    Ready { offset_rows: u64, picture: Picture },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1004,7 +1019,7 @@ enum Retry {
     #[default]
     Restart,
     Manifest,
-    Page(usize),
+    Viewport(u64),
 }
 
 struct EpisodeSelection {
@@ -1020,10 +1035,9 @@ struct ReaderState {
     panel_width: u32,
     panel_height: u32,
     images: Vec<EpisodeImage>,
-    plans: Vec<PagePlan>,
-    page: usize,
-    total_pages: u16,
-    window: VecDeque<PageEntry>,
+    strip: EpisodeStrip,
+    offset_rows: u64,
+    window: VecDeque<ViewportEntry>,
     source_cache: BTreeMap<usize, Picture>,
     source_fetches: BTreeMap<usize, TaskId>,
     maintenance_task: Option<TaskId>,
@@ -1107,13 +1121,13 @@ struct PlannedReaderSpawn {
 #[derive(Default)]
 struct ReaderMaintenancePlan {
     spawns: Vec<PlannedReaderSpawn>,
-    promotion: Option<(TaskId, usize, usize)>,
+    promotion: Option<(TaskId, usize, u64)>,
     refresh_promotion: Option<TaskId>,
-    ready: Option<(usize, Picture)>,
+    ready: Option<(u64, Picture)>,
 }
 
 struct RebasedReaderWindow {
-    build: PageBuild,
+    build: ViewportBuild,
     cached_sources: BTreeSet<usize>,
     fetches: BTreeMap<usize, TaskId>,
 }
@@ -2409,9 +2423,19 @@ impl Bomtoon {
             .reading_surface(picture, chrome)
             .page_turns(READER_PREVIOUS, READER_NEXT)
             .reading_menu(READER_CHROME)
-            .page_position(
-                u16::try_from(reader.page.saturating_add(1)).unwrap_or(reader.total_pages),
-                reader.total_pages,
+            .reading_progress(
+                reader_progress_percent(
+                    reader.offset_rows,
+                    reader.panel_height,
+                    reader.strip.total_rows,
+                ),
+                previous_viewport_offset(reader.offset_rows, reader.panel_height).is_some(),
+                next_viewport_offset(
+                    reader.offset_rows,
+                    reader.panel_height,
+                    reader.strip.total_rows,
+                )
+                .is_some(),
             )
             .build()
     }
@@ -4673,24 +4697,11 @@ impl Bomtoon {
             return false;
         };
         match intent {
-            FetchIntent::Foreground { page } => {
-                self.retry == Retry::Page(page)
-                    && reader.plans.get(page).is_some_and(|plan| {
-                        plan.segments.iter().any(|segment| segment.source == source)
-                    })
+            FetchIntent::Foreground { offset_rows } => {
+                self.retry == Retry::Viewport(offset_rows)
+                    && source_relevant_to_offset(source, offset_rows, &reader.window)
             }
-            FetchIntent::Prefetch => {
-                source_relevant_to_window(source, &reader.plans, &reader.window)
-                    || match self.retry {
-                        Retry::Page(page) => source_relevant_to_page_window(
-                            source,
-                            &reader.plans,
-                            page,
-                            reader.limits.pages,
-                        ),
-                        Retry::Restart | Retry::Manifest => false,
-                    }
-            }
+            FetchIntent::Prefetch => source_relevant_to_window(source, &reader.window),
         }
     }
 
@@ -4705,7 +4716,9 @@ impl Bomtoon {
         }
         let advice = advice.into();
         match intent {
-            FetchIntent::Foreground { page } => self.fail_reader(Retry::Page(page), advice),
+            FetchIntent::Foreground { offset_rows } => {
+                self.fail_reader(Retry::Viewport(offset_rows), advice);
+            }
             FetchIntent::Prefetch => {
                 if let Some(reader) = self.reader.as_mut() {
                     reader
@@ -4728,16 +4741,16 @@ impl Bomtoon {
         let mut foreground = None;
         for (source, intent) in waiters {
             match intent {
-                FetchIntent::Foreground { page } if foreground.is_none() => {
-                    foreground = Some(page);
+                FetchIntent::Foreground { offset_rows } if foreground.is_none() => {
+                    foreground = Some(offset_rows);
                 }
                 FetchIntent::Foreground { .. } | FetchIntent::Prefetch => {
                     self.record_source_failure(source, FetchIntent::Prefetch, advice.clone());
                 }
             }
         }
-        if let Some(page) = foreground {
-            self.fail_reader(Retry::Page(page), advice);
+        if let Some(offset_rows) = foreground {
+            self.fail_reader(Retry::Viewport(offset_rows), advice);
         }
     }
 
@@ -4754,7 +4767,11 @@ impl Bomtoon {
         if let Some(original) = attempted {
             let terminal = match original {
                 FetchIntent::Prefetch => FetchIntent::Prefetch,
-                FetchIntent::Foreground { page } if self.retry == Retry::Page(page) => original,
+                FetchIntent::Foreground { offset_rows }
+                    if self.retry == Retry::Viewport(offset_rows) =>
+                {
+                    original
+                }
                 FetchIntent::Foreground { .. } => intent,
             };
             self.record_source_failure(
@@ -4810,8 +4827,8 @@ impl Bomtoon {
     }
 
     fn drain_refresh_waiters(&mut self, context: &mut Context) -> Result<(), String> {
-        let desired_page = match self.retry {
-            Retry::Page(page) => Some(page),
+        let desired_offset = match self.retry {
+            Retry::Viewport(offset_rows) => Some(offset_rows),
             Retry::Restart | Retry::Manifest => None,
         };
         let foreground_available = self.foreground_reader_task.is_none();
@@ -4825,13 +4842,19 @@ impl Bomtoon {
             if reader.refresh_task.is_some() {
                 return Ok(());
             }
-            refreshed_source_candidates(reader, desired_page, foreground_available, available_tasks)
+            refreshed_source_candidates(
+                reader,
+                desired_offset,
+                foreground_available,
+                available_tasks,
+            )
         };
         for (source, intent) in candidates {
             let purpose = match intent {
-                FetchIntent::Foreground { page } => {
-                    ReaderTaskPurpose::ForegroundSource { source, page }
-                }
+                FetchIntent::Foreground { offset_rows } => ReaderTaskPurpose::ForegroundSource {
+                    source,
+                    offset_rows,
+                },
                 FetchIntent::Prefetch => ReaderTaskPurpose::PrefetchSource { source },
             };
             let foreground = matches!(intent, FetchIntent::Foreground { .. });
@@ -4943,10 +4966,10 @@ impl Bomtoon {
         Ok(handle)
     }
 
-    fn install_page(
+    fn install_viewport(
         &mut self,
         context: &mut Context,
-        page: usize,
+        offset_rows: u64,
         picture: Picture,
     ) -> Result<(), String> {
         let handle = self.next_handle()?;
@@ -4954,18 +4977,18 @@ impl Bomtoon {
         let height = picture.height();
         let uploaded = context
             .put_picture(handle, width, height, picture.into_pixels())
-            .ok_or_else(|| "The comic page could not be uploaded.".to_owned())?;
+            .ok_or_else(|| "The comic viewport could not be uploaded.".to_owned())?;
         let old = {
             let reader = self
                 .reader
                 .as_mut()
                 .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-            reader.page = page;
+            reader.offset_rows = offset_rows;
             reader.chrome_visible = false;
             reader.picture.replace(uploaded)
         };
         self.problem = None;
-        self.retry = Retry::Page(page);
+        self.retry = Retry::Viewport(offset_rows);
         self.show(context);
         if let Some(old) = old {
             context.drop_picture(old.handle);
@@ -5009,31 +5032,36 @@ impl Bomtoon {
             (Ok(width), Ok(height)) => parse::images(bytes)
                 .map_err(|error| error.to_string())
                 .and_then(|images| {
-                    page_plan(&images, width, height)
-                        .map(|(plans, total_pages)| (images, plans, total_pages, width, height))
+                    episode_strip(&images, width, height)
+                        .map(|strip| (images, strip, width, height))
                 }),
             _ => Err("The panel dimensions are not supported.".to_owned()),
         };
         match planned {
-            Ok((images, plans, total_pages, panel_width, panel_height)) => {
-                let first = plans
-                    .first()
-                    .and_then(|plan| plan.segments.first())
-                    .map(|segment| segment.source);
-                let Some(first_source) = first else {
-                    self.fail_reader(Retry::Manifest, "The comic has no readable pages.");
-                    return;
-                };
-                let format = metrics.picture_format;
-                let first_build = match PageBuild::new(0, format, panel_width, panel_height) {
-                    Ok(build) => build,
+            Ok((images, strip, panel_width, panel_height)) => {
+                let first_plan = match viewport_plan(&strip, 0, panel_height) {
+                    Ok(plan) => plan,
                     Err(error) => {
                         self.fail_reader(Retry::Manifest, error);
                         return;
                     }
                 };
+                let first_source = first_plan.segments.first().map(|segment| segment.source);
+                let Some(first_source) = first_source else {
+                    self.fail_reader(Retry::Manifest, "The comic has no readable content.");
+                    return;
+                };
+                let format = metrics.picture_format;
+                let first_build =
+                    match ViewportBuild::new(0, first_plan, format, panel_width, panel_height) {
+                        Ok(build) => build,
+                        Err(error) => {
+                            self.fail_reader(Retry::Manifest, error);
+                            return;
+                        }
+                    };
                 let mut window = VecDeque::new();
-                window.push_back(PageEntry::Building(first_build));
+                window.push_back(ViewportEntry::Building(first_build));
                 self.reader = Some(ReaderState {
                     generation: self.reader_generation,
                     format,
@@ -5041,9 +5069,8 @@ impl Bomtoon {
                     panel_width,
                     panel_height,
                     images,
-                    plans,
-                    page: 0,
-                    total_pages,
+                    strip,
+                    offset_rows: 0,
                     window,
                     source_cache: BTreeMap::new(),
                     source_fetches: BTreeMap::new(),
@@ -5055,21 +5082,21 @@ impl Bomtoon {
                     picture: None,
                     chrome_visible: false,
                 });
-                self.retry = Retry::Page(0);
+                self.retry = Retry::Viewport(0);
                 if self
                     .start_reader_source(
                         context,
                         first_source,
                         ReaderTaskPurpose::ForegroundSource {
                             source: first_source,
-                            page: 0,
+                            offset_rows: 0,
                         },
                         true,
                     )
                     .is_none()
                 {
                     self.fail_reader(
-                        Retry::Page(0),
+                        Retry::Viewport(0),
                         "The first comic image could not be requested.",
                     );
                 }
@@ -5082,7 +5109,7 @@ impl Bomtoon {
         &mut self,
         context: &mut Context,
         extend_window: bool,
-        install_target: Option<usize>,
+        install_target: Option<u64>,
     ) -> Result<bool, String> {
         self.drain_refresh_waiters(context)?;
         let available_tasks = self
@@ -5090,10 +5117,6 @@ impl Bomtoon {
             .as_ref()
             .map_or(0, |reader| reader.limits.tasks)
             .saturating_sub(self.reader_tasks.len());
-        let desired_page = match self.retry {
-            Retry::Page(page) => Some(page),
-            Retry::Restart | Retry::Manifest => None,
-        };
         let ReaderMaintenancePlan {
             spawns,
             promotion,
@@ -5104,22 +5127,19 @@ impl Bomtoon {
                 .reader
                 .as_mut()
                 .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-            plan_reader_maintenance(
-                reader,
-                available_tasks,
-                extend_window,
-                install_target,
-                desired_page,
-            )?
+            plan_reader_maintenance(reader, available_tasks, extend_window, install_target)?
         };
-        if let Some((task, source, page)) = promotion {
+        if let Some((task, source, offset_rows)) = promotion {
             let entry = self.reader_tasks.get_mut(&task).ok_or_else(|| {
                 "The comic image request registry changed unexpectedly.".to_owned()
             })?;
             if entry.generation != self.reader_generation {
                 return Err("The comic image request generation changed unexpectedly.".to_owned());
             }
-            entry.purpose = ReaderTaskPurpose::ForegroundSource { source, page };
+            entry.purpose = ReaderTaskPurpose::ForegroundSource {
+                source,
+                offset_rows,
+            };
             self.foreground_reader_task = Some(task);
         }
         if let Some(task) = refresh_promotion {
@@ -5135,8 +5155,8 @@ impl Bomtoon {
             }
             self.foreground_reader_task = Some(task);
         }
-        if let Some((page, picture)) = ready {
-            self.install_page(context, page, picture)?;
+        if let Some((offset_rows, picture)) = ready {
+            self.install_viewport(context, offset_rows, picture)?;
             return Ok(true);
         }
         for spawn in spawns {
@@ -5166,12 +5186,12 @@ impl Bomtoon {
         intent: FetchIntent,
         bytes: &[u8],
     ) -> bool {
-        let desired_page = match self.retry {
-            Retry::Page(page) => Some(page),
+        let desired_offset = match self.retry {
+            Retry::Viewport(offset_rows) => Some(offset_rows),
             Retry::Restart | Retry::Manifest => None,
         };
         let install_target = match intent {
-            FetchIntent::Foreground { page } => Some(page),
+            FetchIntent::Foreground { offset_rows } => Some(offset_rows),
             FetchIntent::Prefetch => None,
         };
         let foreground_active = self.foreground_reader_task.is_some();
@@ -5183,11 +5203,9 @@ impl Bomtoon {
                 return false;
             }
             reader.source_fetches.remove(&source);
-            let relevant_to_window =
-                source_relevant_to_window(source, &reader.plans, &reader.window);
-            let relevant_to_desired = desired_page.is_some_and(|target| {
-                source_relevant_to_page_window(source, &reader.plans, target, reader.limits.pages)
-            });
+            let relevant_to_window = source_relevant_to_window(source, &reader.window);
+            let relevant_to_desired = desired_offset
+                .is_some_and(|target| source_relevant_to_offset(source, target, &reader.window));
             (
                 relevant_to_window || relevant_to_desired,
                 matches!(intent, FetchIntent::Prefetch)
@@ -5527,38 +5545,36 @@ impl Bomtoon {
         self.resume_deferred_summary(context);
     }
 
-    fn take_ready_page(&mut self, page: usize) -> Option<Picture> {
+    fn take_ready_viewport(&mut self, offset_rows: u64) -> Option<Picture> {
         let reader = self.reader.as_mut()?;
         if !matches!(
             reader.window.front(),
-            Some(PageEntry::Ready {
-                page: ready_page,
+            Some(ViewportEntry::Ready {
+                offset_rows: ready_offset,
                 ..
-            }) if *ready_page == page
+            }) if *ready_offset == offset_rows
         ) {
             return None;
         }
         match reader.window.pop_front() {
-            Some(PageEntry::Ready { picture, .. }) => Some(picture),
-            Some(PageEntry::Building(_)) | None => None,
+            Some(ViewportEntry::Ready { picture, .. }) => Some(picture),
+            Some(ViewportEntry::Building(_)) | None => None,
         }
     }
 
-    fn prepare_rebased_window(&self, page: usize) -> Result<RebasedReaderWindow, String> {
+    fn prepare_rebased_window(&self, offset_rows: u64) -> Result<RebasedReaderWindow, String> {
         let reader = self
             .reader
             .as_ref()
             .ok_or_else(|| "The selected episode is no longer available.".to_owned())?;
-        let plan = reader
-            .plans
-            .get(page)
-            .ok_or_else(|| "The selected comic page is no longer available.".to_owned())?;
+        let plan = viewport_plan(&reader.strip, offset_rows, reader.panel_height)?;
         let required_source = plan
             .segments
             .first()
-            .ok_or_else(|| "The selected comic page is empty.".to_owned())?
+            .ok_or_else(|| "The selected comic viewport is empty.".to_owned())?
             .source;
-        let build = PageBuild::new(page, reader.format, reader.panel_width, reader.panel_height)?;
+        let source_relevant =
+            |source: usize| plan.segments.iter().any(|segment| segment.source == source);
         let is_active_source = |source: usize, task: TaskId| {
             self.reader_tasks.get(&task).is_some_and(|entry| {
                 entry.generation == self.reader_generation
@@ -5597,9 +5613,7 @@ impl Bomtoon {
             if kept_sources.len() == retained_capacity {
                 break;
             }
-            if source_relevant_to_page_window(source, &reader.plans, page, reader.limits.pages)
-                && kept_sources.insert(source)
-            {
+            if source_relevant(source) && kept_sources.insert(source) {
                 kept_cache_sources.insert(source);
             }
         }
@@ -5609,13 +5623,20 @@ impl Bomtoon {
             {
                 break;
             }
-            if source_relevant_to_page_window(source, &reader.plans, page, reader.limits.pages)
+            if source_relevant(source)
                 && is_active_source(source, task)
                 && kept_sources.insert(source)
             {
                 kept_fetches.insert(source, task);
             }
         }
+        let build = ViewportBuild::new(
+            offset_rows,
+            plan,
+            reader.format,
+            reader.panel_width,
+            reader.panel_height,
+        )?;
         Ok(RebasedReaderWindow {
             build,
             cached_sources: kept_cache_sources,
@@ -5623,15 +5644,15 @@ impl Bomtoon {
         })
     }
 
-    fn rebase_window(&mut self, context: &mut Context, page: usize) {
+    fn rebase_window(&mut self, context: &mut Context, offset_rows: u64) {
         let RebasedReaderWindow {
             build,
             cached_sources: kept_cache_sources,
             fetches: kept_fetches,
-        } = match self.prepare_rebased_window(page) {
+        } = match self.prepare_rebased_window(offset_rows) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.fail_reader(Retry::Page(page), error);
+                self.fail_reader(Retry::Viewport(offset_rows), error);
                 return;
             }
         };
@@ -5653,7 +5674,7 @@ impl Bomtoon {
         for (&source, &task) in &kept_fetches {
             let Some(entry) = self.reader_tasks.get_mut(&task) else {
                 self.fail_reader(
-                    Retry::Page(page),
+                    Retry::Viewport(offset_rows),
                     "The comic image request registry changed unexpectedly.",
                 );
                 return;
@@ -5663,37 +5684,37 @@ impl Bomtoon {
         self.foreground_reader_task = None;
         let Some(reader) = self.reader.as_mut() else {
             self.fail_reader(
-                Retry::Page(page),
+                Retry::Viewport(offset_rows),
                 "The selected episode is no longer available.",
             );
             return;
         };
         reader.window.clear();
-        reader.window.push_back(PageEntry::Building(build));
+        reader.window.push_back(ViewportEntry::Building(build));
         reader
             .source_cache
             .retain(|source, _| kept_cache_sources.contains(source));
         reader.source_fetches = kept_fetches;
         reader.maintenance_task = None;
         self.problem = None;
-        self.retry = Retry::Page(page);
+        self.retry = Retry::Viewport(offset_rows);
 
-        match self.maintain_reader(context, false, Some(page)) {
+        match self.maintain_reader(context, false, Some(offset_rows)) {
             Ok(_) => {}
-            Err(error) => self.fail_reader(Retry::Page(page), error),
+            Err(error) => self.fail_reader(Retry::Viewport(offset_rows), error),
         }
     }
 
-    fn request_reader_page(&mut self, context: &mut Context, page: usize) {
-        if let Some(picture) = self.take_ready_page(page) {
+    fn request_reader_viewport(&mut self, context: &mut Context, offset_rows: u64) {
+        if let Some(picture) = self.take_ready_viewport(offset_rows) {
             context.set_screen(self.reader_screen_with_chrome(ReadingChrome::OverlayBusy));
-            if let Err(error) = self.install_page(context, page, picture) {
-                self.fail_reader(Retry::Page(page), error);
+            if let Err(error) = self.install_viewport(context, offset_rows, picture) {
+                self.fail_reader(Retry::Viewport(offset_rows), error);
                 self.show(context);
             }
             return;
         }
-        self.rebase_window(context, page);
+        self.rebase_window(context, offset_rows);
         self.show(context);
     }
 
@@ -5703,20 +5724,23 @@ impl Bomtoon {
         match retry {
             Retry::Restart => self.restart(context),
             Retry::Manifest => self.start_manifest(context),
-            Retry::Page(page) => {
+            Retry::Viewport(offset_rows) => {
+                let failed = self
+                    .reader
+                    .as_ref()
+                    .and_then(|reader| {
+                        viewport_plan(&reader.strip, offset_rows, reader.panel_height).ok()
+                    })
+                    .into_iter()
+                    .flat_map(|plan| plan.segments)
+                    .map(|segment| segment.source)
+                    .collect::<BTreeSet<_>>();
                 if let Some(reader) = self.reader.as_mut() {
-                    let failed = reader
-                        .plans
-                        .get(page)
-                        .into_iter()
-                        .flat_map(|plan| &plan.segments)
-                        .map(|segment| segment.source)
-                        .collect::<BTreeSet<_>>();
                     reader
                         .source_failures
                         .retain(|source, _| !failed.contains(source));
                 }
-                self.rebase_window(context, page);
+                self.rebase_window(context, offset_rows);
             }
         }
         false
@@ -6381,30 +6405,31 @@ impl Bomtoon {
             self.show(context);
             return;
         }
-        let target = self.reader.as_ref().and_then(|reader| {
-            if action == action_id(READER_PREVIOUS) {
-                reader.page.checked_sub(1)
-            } else if action == action_id(READER_NEXT) {
-                reader
-                    .page
-                    .checked_add(1)
-                    .filter(|page| *page < reader.plans.len())
-            } else {
-                None
+        if action == action_id(READER_PREVIOUS) {
+            let target = self.reader.as_ref().and_then(|reader| {
+                previous_viewport_offset(reader.offset_rows, reader.panel_height)
+            });
+            if let Some(offset_rows) = target {
+                self.request_reader_viewport(context, offset_rows);
             }
-        });
-        if let Some(target) = target {
-            self.request_reader_page(context, target);
-        } else if action == action_id(READER_NEXT)
-            && self
-                .reader
-                .as_ref()
-                .is_some_and(|reader| reader.page.saturating_add(1) == reader.plans.len())
-        {
-            self.start_comment_appendix(context);
-        } else if action != action_id(READER_PREVIOUS) && action != action_id(READER_NEXT) {
-            self.show(context);
+            return;
         }
+        if action == action_id(READER_NEXT) {
+            let target = self.reader.as_ref().and_then(|reader| {
+                next_viewport_offset(
+                    reader.offset_rows,
+                    reader.panel_height,
+                    reader.strip.total_rows,
+                )
+            });
+            if let Some(offset_rows) = target {
+                self.request_reader_viewport(context, offset_rows);
+            } else if self.reader.is_some() {
+                self.start_comment_appendix(context);
+            }
+            return;
+        }
+        self.show(context);
     }
 
     fn handle_manifest_outcome(&mut self, context: &mut Context, outcome: TaskOutcome) -> bool {
@@ -6491,7 +6516,7 @@ impl Bomtoon {
         task: TaskId,
         outcome: &TaskOutcome,
     ) -> bool {
-        let page = self.reader.as_ref().map_or(0, |reader| reader.page);
+        let offset_rows = self.reader.as_ref().map_or(0, |reader| reader.offset_rows);
         if let Some(reader) = self.reader.as_mut() {
             if reader.maintenance_task == Some(task) {
                 reader.maintenance_task = None;
@@ -6500,14 +6525,14 @@ impl Bomtoon {
         match outcome {
             TaskOutcome::Completed(_) => {
                 if let Err(error) = self.maintain_reader(context, true, None) {
-                    self.fail_reader(Retry::Page(page), error);
+                    self.fail_reader(Retry::Viewport(offset_rows), error);
                 }
             }
             TaskOutcome::Failed(error) => {
-                self.fail_reader(Retry::Page(page), Failure::of(*error).advice);
+                self.fail_reader(Retry::Viewport(offset_rows), Failure::of(*error).advice);
             }
             TaskOutcome::Cancelled => {
-                self.fail_reader(Retry::Page(page), "The request was cancelled.");
+                self.fail_reader(Retry::Viewport(offset_rows), "The request was cancelled.");
             }
         }
         false
@@ -6540,14 +6565,16 @@ impl Bomtoon {
             ReaderTaskPurpose::ManifestRefresh => {
                 self.handle_manifest_refresh_outcome(context, task, outcome)
             }
-            ReaderTaskPurpose::ForegroundSource { source, page } => self
-                .handle_reader_source_outcome(
-                    context,
-                    task,
-                    source,
-                    FetchIntent::Foreground { page },
-                    outcome,
-                ),
+            ReaderTaskPurpose::ForegroundSource {
+                source,
+                offset_rows,
+            } => self.handle_reader_source_outcome(
+                context,
+                task,
+                source,
+                FetchIntent::Foreground { offset_rows },
+                outcome,
+            ),
             ReaderTaskPurpose::PrefetchSource { source } => self.handle_reader_source_outcome(
                 context,
                 task,
@@ -7321,46 +7348,83 @@ impl KoboApp for Bomtoon {
     }
 }
 
+fn viewport_build(reader: &ReaderState, offset_rows: u64) -> Result<ViewportBuild, String> {
+    let plan = viewport_plan(&reader.strip, offset_rows, reader.panel_height)?;
+    ViewportBuild::new(
+        offset_rows,
+        plan,
+        reader.format,
+        reader.panel_width,
+        reader.panel_height,
+    )
+}
+
+fn entry_offset(entry: &ViewportEntry) -> u64 {
+    match entry {
+        ViewportEntry::Building(build) => build.offset_rows,
+        ViewportEntry::Ready { offset_rows, .. } => *offset_rows,
+    }
+}
+
+fn source_relevant_to_window(source: usize, window: &VecDeque<ViewportEntry>) -> bool {
+    window.iter().any(|entry| {
+        let ViewportEntry::Building(build) = entry else {
+            return false;
+        };
+        build.plan.segments[build.next_segment..]
+            .iter()
+            .any(|segment| segment.source == source)
+    })
+}
+
+fn source_relevant_to_offset(
+    source: usize,
+    offset_rows: u64,
+    window: &VecDeque<ViewportEntry>,
+) -> bool {
+    window.iter().any(|entry| {
+        let ViewportEntry::Building(build) = entry else {
+            return false;
+        };
+        build.offset_rows == offset_rows
+            && build.plan.segments[build.next_segment..]
+                .iter()
+                .any(|segment| segment.source == source)
+    })
+}
+
 fn extend_reader_window(reader: &mut ReaderState) -> Result<(), String> {
     while reader.window.len() < reader.limits.pages {
-        let next_page = reader.window.back().map(entry_page).map_or_else(
-            || reader.page.saturating_add(1),
-            |page| page.saturating_add(1),
-        );
-        if next_page >= reader.plans.len() {
-            break;
-        }
-        reader.window.push_back(PageEntry::Building(PageBuild::new(
-            next_page,
-            reader.format,
-            reader.panel_width,
+        let previous_offset = reader
+            .window
+            .back()
+            .map_or(reader.offset_rows, entry_offset);
+        let Some(next_offset) = next_viewport_offset(
+            previous_offset,
             reader.panel_height,
-        )?));
+            reader.strip.total_rows,
+        ) else {
+            break;
+        };
+        let build = viewport_build(reader, next_offset)?;
+        reader.window.push_back(ViewportEntry::Building(build));
     }
     Ok(())
 }
 
-fn discard_stale_reader_failures(reader: &mut ReaderState, desired_page: Option<usize>) {
+fn discard_stale_reader_failures(reader: &mut ReaderState) {
     let ReaderState {
         source_failures,
-        plans,
         window,
-        limits,
         ..
     } = reader;
-    source_failures.retain(|source, _| {
-        source_relevant_to_window(*source, plans, window)
-            || desired_page.is_some_and(|page| {
-                source_relevant_to_page_window(*source, plans, page, limits.pages)
-            })
-    });
+    source_failures.retain(|source, _| source_relevant_to_window(*source, window));
 }
 
 fn update_reader_builds(reader: &mut ReaderState) -> Result<(), String> {
     {
         let ReaderState {
             source_cache,
-            plans,
             window,
             panel_width,
             panel_height,
@@ -7368,11 +7432,10 @@ fn update_reader_builds(reader: &mut ReaderState) -> Result<(), String> {
         } = reader;
         for (&source, picture) in source_cache.iter() {
             for entry in window.iter_mut() {
-                if let PageEntry::Building(build) = entry {
+                if let ViewportEntry::Building(build) = entry {
                     copy_source_into_builds(
                         source,
                         picture,
-                        plans,
                         std::slice::from_mut(build),
                         *panel_width,
                         *panel_height,
@@ -7385,85 +7448,76 @@ fn update_reader_builds(reader: &mut ReaderState) -> Result<(), String> {
     let mut index = 0;
     while index < reader.window.len() {
         let complete = match reader.window.get(index) {
-            Some(PageEntry::Ready { .. }) => {
+            Some(ViewportEntry::Ready { .. }) => {
                 index += 1;
                 continue;
             }
-            Some(PageEntry::Building(build)) => {
-                let plan = reader
-                    .plans
-                    .get(build.page)
-                    .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-                build.next_segment == plan.segments.len()
-            }
+            Some(ViewportEntry::Building(build)) => build.next_segment == build.plan.segments.len(),
             None => break,
         };
         if !complete {
             break;
         }
-        let Some(PageEntry::Building(build)) = reader.window.remove(index) else {
-            return Err("The comic page window changed unexpectedly.".to_owned());
+        let Some(ViewportEntry::Building(build)) = reader.window.remove(index) else {
+            return Err("The comic viewport window changed unexpectedly.".to_owned());
         };
-        let page = build.page;
-        let plan = reader
-            .plans
-            .get(page)
-            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-        let picture = finish_build(build, plan, reader.panel_width, reader.panel_height)?;
-        reader
-            .window
-            .insert(index, PageEntry::Ready { page, picture });
+        let offset_rows = build.offset_rows;
+        let picture = finish_build(build, reader.panel_width, reader.panel_height)?;
+        reader.window.insert(
+            index,
+            ViewportEntry::Ready {
+                offset_rows,
+                picture,
+            },
+        );
         index += 1;
     }
     Ok(())
 }
 
-fn retain_reader_sources(reader: &mut ReaderState, install_target: Option<usize>) {
+fn retain_reader_sources(reader: &mut ReaderState) {
     let ReaderState {
         source_cache,
-        plans,
         window,
-        limits,
         ..
     } = reader;
-    source_cache.retain(|source, _| {
-        source_relevant_to_window(*source, plans, window)
-            || install_target.is_some_and(|target| {
-                source_relevant_to_following_page_window(*source, plans, target, limits.pages)
-            })
-    });
+    source_cache.retain(|source, _| source_relevant_to_window(*source, window));
 }
 
-fn take_installable_reader_page(
+fn take_installable_reader_viewport(
     reader: &mut ReaderState,
-    target: usize,
-) -> Result<Option<(usize, Picture)>, String> {
+    target: u64,
+) -> Result<Option<(u64, Picture)>, String> {
     let installable = matches!(
         reader.window.front(),
-        Some(PageEntry::Ready { page, .. }) if *page == target
+        Some(ViewportEntry::Ready { offset_rows, .. }) if *offset_rows == target
     );
     if !installable {
         return Ok(None);
     }
-    let Some(PageEntry::Ready { page, picture }) = reader.window.pop_front() else {
-        return Err("The ready comic page changed unexpectedly.".to_owned());
+    let Some(ViewportEntry::Ready {
+        offset_rows,
+        picture,
+    }) = reader.window.pop_front()
+    else {
+        return Err("The ready comic viewport changed unexpectedly.".to_owned());
     };
-    Ok(Some((page, picture)))
+    Ok(Some((offset_rows, picture)))
 }
 
 fn plan_foreground_reader_source(
     reader: &mut ReaderState,
-    page: usize,
+    offset_rows: u64,
     spawn_limit: usize,
     plan: &mut ReaderMaintenancePlan,
 ) -> Result<(), String> {
     let missing = reader.window.iter().find_map(|entry| match entry {
-        PageEntry::Building(build) if build.page == page => reader
-            .plans
-            .get(build.page)
-            .and_then(|page_plan| page_plan.segments.get(build.next_segment))
+        ViewportEntry::Building(build) if build.offset_rows == offset_rows => build
+            .plan
+            .segments
+            .get(build.next_segment)
             .map(|segment| segment.source),
-        PageEntry::Building(_) | PageEntry::Ready { .. } => None,
+        ViewportEntry::Building(_) | ViewportEntry::Ready { .. } => None,
     });
     let Some(source) = missing else {
         return Ok(());
@@ -7472,10 +7526,10 @@ fn plan_foreground_reader_source(
         return Err(failure.advice.clone());
     }
     if let Some(intent) = reader.refresh_waiters.get_mut(&source) {
-        *intent = FetchIntent::Foreground { page };
+        *intent = FetchIntent::Foreground { offset_rows };
         plan.refresh_promotion = reader.refresh_task;
     } else if let Some(&task) = reader.source_fetches.get(&source) {
-        plan.promotion = Some((task, source, page));
+        plan.promotion = Some((task, source, offset_rows));
     } else if !reader.source_cache.contains_key(&source) && spawn_limit > 0 {
         let url = reader
             .images
@@ -7485,7 +7539,10 @@ fn plan_foreground_reader_source(
             .clone();
         plan.spawns.push(PlannedReaderSpawn {
             source,
-            purpose: ReaderTaskPurpose::ForegroundSource { source, page },
+            purpose: ReaderTaskPurpose::ForegroundSource {
+                source,
+                offset_rows,
+            },
             foreground: true,
             url,
         });
@@ -7498,18 +7555,14 @@ fn plan_prefetch_reader_sources(
     spawn_limit: usize,
     plan: &mut ReaderMaintenancePlan,
 ) -> Result<(), String> {
-    'pages: for entry in &reader.window {
-        let PageEntry::Building(build) = entry else {
+    'viewports: for entry in &reader.window {
+        let ViewportEntry::Building(build) = entry else {
             continue;
         };
-        let page_plan = reader
-            .plans
-            .get(build.page)
-            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-        for segment in &page_plan.segments[build.next_segment..] {
+        for segment in &build.plan.segments[build.next_segment..] {
             let source = segment.source;
             if reader.source_failures.contains_key(&source) {
-                break 'pages;
+                break 'viewports;
             }
             if reader.refresh_waiters.contains_key(&source) {
                 continue;
@@ -7533,7 +7586,7 @@ fn plan_prefetch_reader_sources(
                 url,
             });
             if plan.spawns.len() == spawn_limit {
-                break 'pages;
+                break 'viewports;
             }
         }
     }
@@ -7544,17 +7597,16 @@ fn plan_reader_maintenance(
     reader: &mut ReaderState,
     available_tasks: usize,
     extend_window: bool,
-    install_target: Option<usize>,
-    desired_page: Option<usize>,
+    install_target: Option<u64>,
 ) -> Result<ReaderMaintenancePlan, String> {
     if extend_window {
         extend_reader_window(reader)?;
     }
-    discard_stale_reader_failures(reader, desired_page);
+    discard_stale_reader_failures(reader);
     update_reader_builds(reader)?;
-    retain_reader_sources(reader, install_target);
+    retain_reader_sources(reader);
     let ready = match install_target {
-        Some(target) => take_installable_reader_page(reader, target)?,
+        Some(target) => take_installable_reader_viewport(reader, target)?,
         None => None,
     };
     let mut plan = ReaderMaintenancePlan {
@@ -7575,8 +7627,8 @@ fn plan_reader_maintenance(
         .fetches
         .saturating_sub(reader.source_fetches.len());
     let spawn_limit = available_tasks.min(available_slots).min(available_fetches);
-    if let Some(page) = install_target {
-        plan_foreground_reader_source(reader, page, spawn_limit, &mut plan)?;
+    if let Some(offset_rows) = install_target {
+        plan_foreground_reader_source(reader, offset_rows, spawn_limit, &mut plan)?;
     } else if spawn_limit > 0
         && (reader.refresh_task.is_some() || reader.refresh_waiters.is_empty())
     {
@@ -7587,7 +7639,7 @@ fn plan_reader_maintenance(
 
 fn refreshed_source_candidates(
     reader: &mut ReaderState,
-    desired_page: Option<usize>,
+    desired_offset: Option<u64>,
     foreground_available: bool,
     available_tasks: usize,
 ) -> Vec<(usize, FetchIntent)> {
@@ -7596,23 +7648,11 @@ fn refreshed_source_candidates(
         .iter()
         .filter_map(|(&source, &intent)| {
             let relevant = match intent {
-                FetchIntent::Foreground { page } => {
-                    desired_page == Some(page)
-                        && reader.plans.get(page).is_some_and(|plan| {
-                            plan.segments.iter().any(|segment| segment.source == source)
-                        })
+                FetchIntent::Foreground { offset_rows } => {
+                    desired_offset == Some(offset_rows)
+                        && source_relevant_to_offset(source, offset_rows, &reader.window)
                 }
-                FetchIntent::Prefetch => {
-                    source_relevant_to_window(source, &reader.plans, &reader.window)
-                        || desired_page.is_some_and(|page| {
-                            source_relevant_to_page_window(
-                                source,
-                                &reader.plans,
-                                page,
-                                reader.limits.pages,
-                            )
-                        })
-                }
+                FetchIntent::Prefetch => source_relevant_to_window(source, &reader.window),
             };
             (!relevant
                 || reader.source_cache.contains_key(&source)
@@ -7668,67 +7708,7 @@ fn refreshed_source_candidates(
     candidates
 }
 
-fn entry_page(entry: &PageEntry) -> usize {
-    match entry {
-        PageEntry::Building(build) => build.page,
-        PageEntry::Ready { page, .. } => *page,
-    }
-}
-
-fn source_relevant_to_window(
-    source: usize,
-    plans: &[PagePlan],
-    window: &VecDeque<PageEntry>,
-) -> bool {
-    window.iter().any(|entry| {
-        let PageEntry::Building(build) = entry else {
-            return false;
-        };
-        plans
-            .get(build.page)
-            .and_then(|plan| plan.segments.get(build.next_segment..))
-            .is_some_and(|segments| segments.iter().any(|segment| segment.source == source))
-    })
-}
-
-fn source_relevant_to_page_window(
-    source: usize,
-    plans: &[PagePlan],
-    page: usize,
-    following_pages: usize,
-) -> bool {
-    if page >= plans.len() {
-        return false;
-    }
-    let end = page
-        .checked_add(following_pages)
-        .and_then(|last| last.checked_add(1))
-        .unwrap_or(plans.len())
-        .min(plans.len());
-    plans[page..end]
-        .iter()
-        .flat_map(|plan| &plan.segments)
-        .any(|segment| segment.source == source)
-}
-
-fn source_relevant_to_following_page_window(
-    source: usize,
-    plans: &[PagePlan],
-    page: usize,
-    following_pages: usize,
-) -> bool {
-    let Some(first_following) = page.checked_add(1) else {
-        return false;
-    };
-    source_relevant_to_page_window(
-        source,
-        plans,
-        first_following,
-        following_pages.saturating_sub(1),
-    )
-}
-
-fn validate_continuous_page(plan: &PagePlan) -> Result<(), String> {
+fn validate_continuous_viewport(plan: &ViewportPlan) -> Result<(), String> {
     let mut next_destination = 0_u32;
     let mut previous_source = None;
     for segment in &plan.segments {
@@ -7758,105 +7738,118 @@ fn validate_continuous_page(plan: &PagePlan) -> Result<(), String> {
     Ok(())
 }
 
-fn page_plan(
+fn viewport_stride(panel_height: u32, percent: u64) -> u64 {
+    (u64::from(panel_height) * percent + 50) / 100
+}
+
+fn next_viewport_offset(offset_rows: u64, panel_height: u32, total_rows: u64) -> Option<u64> {
+    let visible_end = offset_rows.checked_add(u64::from(panel_height))?;
+    if visible_end >= total_rows {
+        return None;
+    }
+    offset_rows.checked_add(viewport_stride(panel_height, 90))
+}
+
+fn previous_viewport_offset(offset_rows: u64, panel_height: u32) -> Option<u64> {
+    (offset_rows > 0).then(|| offset_rows.saturating_sub(viewport_stride(panel_height, 50)))
+}
+
+fn reader_progress_percent(offset_rows: u64, panel_height: u32, total_rows: u64) -> u8 {
+    if total_rows == 0 {
+        return 0;
+    }
+    let visible_end = offset_rows
+        .saturating_add(u64::from(panel_height))
+        .min(total_rows);
+    u8::try_from(visible_end.saturating_mul(100) / total_rows).unwrap_or(100)
+}
+
+fn episode_strip(
     images: &[EpisodeImage],
     panel_width: u32,
     panel_height: u32,
-) -> Result<(Vec<PagePlan>, u16), String> {
+) -> Result<EpisodeStrip, String> {
     if panel_width == 0 || panel_height == 0 {
         return Err("The comic page dimensions are not supported.".to_owned());
     }
 
-    let panel_rows = u64::from(panel_height);
     let mut total_rows = 0_u64;
+    let mut sources = Vec::with_capacity(images.len());
     for image in images {
         let (_, scaled_height) =
             kobo_image::width_scaled_size((image.width, image.height), panel_width)
                 .map_err(|error| error.to_string())?;
+        let start_row = total_rows;
         total_rows = total_rows
             .checked_add(u64::from(scaled_height))
             .ok_or_else(|| "The comic height is not supported.".to_owned())?;
-    }
-
-    let page_count = total_rows.div_ceil(panel_rows);
-    let total_pages =
-        u16::try_from(page_count).map_err(|_| "The comic has too many pages.".to_owned())?;
-    let mut plans = Vec::with_capacity(usize::from(total_pages));
-    for page in 0..page_count {
-        let page_start = page
-            .checked_mul(panel_rows)
-            .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
-        let remaining = total_rows
-            .checked_sub(page_start)
-            .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
-        let content_rows = u32::try_from(remaining.min(panel_rows))
-            .map_err(|_| "The comic page height is not supported.".to_owned())?;
-        plans.push(PagePlan {
-            segments: Vec::new(),
-            content_rows,
+        sources.push(StripSource {
+            start_row,
+            end_row: total_rows,
         });
     }
 
-    let mut source_start = 0_u64;
-    for (source, image) in images.iter().enumerate() {
-        let (_, scaled_height) =
-            kobo_image::width_scaled_size((image.width, image.height), panel_width)
-                .map_err(|error| error.to_string())?;
-        let source_end = source_start
-            .checked_add(u64::from(scaled_height))
-            .ok_or_else(|| "The comic source interval is not supported.".to_owned())?;
-        let mut page = source_start / panel_rows;
-        loop {
-            let page_start = page
-                .checked_mul(panel_rows)
-                .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
-            if page_start >= source_end {
-                break;
-            }
-            let plan_index = usize::try_from(page)
-                .map_err(|_| "The comic page index is not supported.".to_owned())?;
-            let plan = plans
-                .get_mut(plan_index)
-                .ok_or_else(|| "The comic page index is not supported.".to_owned())?;
-            let page_end = page_start
-                .checked_add(u64::from(plan.content_rows))
-                .ok_or_else(|| "The comic page interval is not supported.".to_owned())?;
-            let overlap_start = page_start.max(source_start);
-            let overlap_end = page_end.min(source_end);
-            if overlap_start < overlap_end {
-                let source_row = overlap_start
-                    .checked_sub(source_start)
-                    .ok_or_else(|| "The comic source row is not supported.".to_owned())?;
-                let rows = overlap_end
-                    .checked_sub(overlap_start)
-                    .ok_or_else(|| "The comic segment height is not supported.".to_owned())?;
-                let destination_row = overlap_start
-                    .checked_sub(page_start)
-                    .ok_or_else(|| "The comic destination row is not supported.".to_owned())?;
-                plan.segments.push(PageSegment {
-                    source,
-                    source_row: u32::try_from(source_row)
-                        .map_err(|_| "The comic source row is not supported.".to_owned())?,
-                    rows: u32::try_from(rows)
-                        .map_err(|_| "The comic segment height is not supported.".to_owned())?,
-                    destination_row: u32::try_from(destination_row)
-                        .map_err(|_| "The comic destination row is not supported.".to_owned())?,
-                });
-            }
-            page = page
-                .checked_add(1)
-                .ok_or_else(|| "The comic page index is not supported.".to_owned())?;
-        }
-        source_start = source_end;
-    }
+    let page_count = total_rows.div_ceil(u64::from(panel_height));
+    u16::try_from(page_count).map_err(|_| "The comic has too many pages.".to_owned())?;
+    Ok(EpisodeStrip {
+        sources,
+        total_rows,
+    })
+}
 
-    if source_start != total_rows {
-        return Err("The comic source intervals are not contiguous.".to_owned());
+fn viewport_plan(
+    strip: &EpisodeStrip,
+    offset_rows: u64,
+    panel_height: u32,
+) -> Result<ViewportPlan, String> {
+    if panel_height == 0 || offset_rows >= strip.total_rows {
+        return Err("The comic viewport is outside the episode.".to_owned());
     }
-    for plan in &plans {
-        validate_continuous_page(plan)?;
+    let viewport_end = offset_rows
+        .checked_add(u64::from(panel_height))
+        .ok_or_else(|| "The comic viewport interval is not supported.".to_owned())?
+        .min(strip.total_rows);
+    let content_rows = u32::try_from(
+        viewport_end
+            .checked_sub(offset_rows)
+            .ok_or_else(|| "The comic viewport interval is not supported.".to_owned())?,
+    )
+    .map_err(|_| "The comic page height is not supported.".to_owned())?;
+    let mut segments = Vec::new();
+    for (source, interval) in strip
+        .sources
+        .iter()
+        .enumerate()
+        .skip_while(|(_, interval)| interval.end_row <= offset_rows)
+        .take_while(|(_, interval)| interval.start_row < viewport_end)
+    {
+        let overlap_start = offset_rows.max(interval.start_row);
+        let overlap_end = viewport_end.min(interval.end_row);
+        let source_row = overlap_start
+            .checked_sub(interval.start_row)
+            .ok_or_else(|| "The comic source row is not supported.".to_owned())?;
+        let rows = overlap_end
+            .checked_sub(overlap_start)
+            .ok_or_else(|| "The comic segment height is not supported.".to_owned())?;
+        let destination_row = overlap_start
+            .checked_sub(offset_rows)
+            .ok_or_else(|| "The comic destination row is not supported.".to_owned())?;
+        segments.push(ViewportSegment {
+            source,
+            source_row: u32::try_from(source_row)
+                .map_err(|_| "The comic source row is not supported.".to_owned())?,
+            rows: u32::try_from(rows)
+                .map_err(|_| "The comic segment height is not supported.".to_owned())?,
+            destination_row: u32::try_from(destination_row)
+                .map_err(|_| "The comic destination row is not supported.".to_owned())?,
+        });
     }
-    Ok((plans, total_pages))
+    let plan = ViewportPlan {
+        segments,
+        content_rows,
+    };
+    validate_continuous_viewport(&plan)?;
+    Ok(plan)
 }
 
 fn row_byte_offset(row: u32, width: u32, format: PictureFormat) -> Option<usize> {
@@ -7869,23 +7862,19 @@ fn row_byte_offset(row: u32, width: u32, format: PictureFormat) -> Option<usize>
 fn copy_source_into_builds(
     source_index: usize,
     source: &Picture,
-    plans: &[PagePlan],
-    builds: &mut [PageBuild],
+    builds: &mut [ViewportBuild],
     panel_width: u32,
     panel_height: u32,
 ) -> Result<(), String> {
     for build in builds {
-        let plan = plans
-            .get(build.page)
-            .ok_or_else(|| "The comic page build has no plan.".to_owned())?;
-        let Some(segment) = plan.segments.get(build.next_segment) else {
+        let Some(segment) = build.plan.segments.get(build.next_segment) else {
             continue;
         };
         if segment.source != source_index {
             continue;
         }
         if source.format() != build.format {
-            return Err("The comic source format does not match the page build.".to_owned());
+            return Err("The comic source format does not match the viewport build.".to_owned());
         }
         if source.width() != panel_width {
             return Err("The scaled comic image width does not match the panel.".to_owned());
@@ -7893,16 +7882,16 @@ fn copy_source_into_builds(
         let expected_build_len = build
             .format
             .byte_len(panel_width, panel_height)
-            .ok_or_else(|| "The comic page byte length is not supported.".to_owned())?;
+            .ok_or_else(|| "The comic viewport byte length is not supported.".to_owned())?;
         if build.bytes.len() != expected_build_len {
-            return Err("The comic page pixels do not match their dimensions.".to_owned());
+            return Err("The comic viewport pixels do not match their dimensions.".to_owned());
         }
 
         let source_bytes = match source.pixels() {
             PicturePixelsRef::Gray8(bytes) if build.format == PictureFormat::Gray8 => bytes,
             PicturePixelsRef::Rgb8(bytes) if build.format == PictureFormat::Rgb8 => bytes,
             _ => {
-                return Err("The comic source format does not match the page build.".to_owned());
+                return Err("The comic source format does not match the viewport build.".to_owned());
             }
         };
         let expected_source_len = build
@@ -7921,34 +7910,35 @@ fn copy_source_into_builds(
             .checked_add(copied_len)
             .ok_or_else(|| "The comic source byte interval is not supported.".to_owned())?;
         let destination_start = row_byte_offset(segment.destination_row, panel_width, build.format)
-            .ok_or_else(|| "The comic page byte offset is not supported.".to_owned())?;
+            .ok_or_else(|| "The comic viewport byte offset is not supported.".to_owned())?;
         let destination_end = destination_start
             .checked_add(copied_len)
-            .ok_or_else(|| "The comic page byte interval is not supported.".to_owned())?;
+            .ok_or_else(|| "The comic viewport byte interval is not supported.".to_owned())?;
         let source_rows = source_bytes.get(source_start..source_end).ok_or_else(|| {
             "The comic source pixels do not cover the planned segment.".to_owned()
         })?;
         let destination = build
             .bytes
             .get_mut(destination_start..destination_end)
-            .ok_or_else(|| "The comic page pixels do not cover the planned segment.".to_owned())?;
+            .ok_or_else(|| {
+                "The comic viewport pixels do not cover the planned segment.".to_owned()
+            })?;
         destination.copy_from_slice(source_rows);
         build.next_segment = build
             .next_segment
             .checked_add(1)
-            .ok_or_else(|| "The comic page has too many segments.".to_owned())?;
+            .ok_or_else(|| "The comic viewport has too many segments.".to_owned())?;
     }
     Ok(())
 }
 
 fn finish_build(
-    build: PageBuild,
-    plan: &PagePlan,
+    build: ViewportBuild,
     panel_width: u32,
     panel_height: u32,
 ) -> Result<Picture, String> {
-    if build.next_segment != plan.segments.len() {
-        return Err("The comic page build is incomplete.".to_owned());
+    if build.next_segment != build.plan.segments.len() {
+        return Err("The comic viewport build is incomplete.".to_owned());
     }
     let pixels = match build.format {
         PictureFormat::Gray8 => PicturePixels::Gray8(build.bytes),
@@ -8317,30 +8307,23 @@ mod tests {
         }
     }
 
-    fn plan_for_heights(heights: &[u32]) -> (Vec<PagePlan>, u16) {
-        let images = heights
-            .iter()
-            .enumerate()
-            .map(|(source, height)| episode_image(source, 2, *height))
-            .collect::<Vec<_>>();
-        page_plan(&images, 2, 4).expect("continuous page plan")
-    }
-
     #[test]
-    fn short_sources_share_a_page_without_seam_padding() {
-        let (plans, total_pages) = plan_for_heights(&[2, 2]);
-        assert_eq!(total_pages, 1);
+    fn viewport_plan_starts_at_an_arbitrary_strip_row_across_a_seam() {
+        let images = [episode_image(0, 2, 5), episode_image(1, 2, 5)];
+        let strip = episode_strip(&images, 2, 4).expect("episode strip");
+
+        assert_eq!(strip.total_rows, 10);
         assert_eq!(
-            plans,
-            vec![PagePlan {
+            viewport_plan(&strip, 3, 4).expect("viewport plan"),
+            ViewportPlan {
                 segments: vec![
-                    PageSegment {
+                    ViewportSegment {
                         source: 0,
-                        source_row: 0,
+                        source_row: 3,
                         rows: 2,
                         destination_row: 0,
                     },
-                    PageSegment {
+                    ViewportSegment {
                         source: 1,
                         source_row: 0,
                         rows: 2,
@@ -8348,160 +8331,64 @@ mod tests {
                     },
                 ],
                 content_rows: 4,
-            }]
+            }
         );
     }
 
     #[test]
-    fn page_plan_handles_seams_at_global_rows_3_4_and_5() {
-        let (row_3, _) = plan_for_heights(&[3, 2]);
-        assert_eq!(
-            row_3,
-            vec![
-                PagePlan {
-                    segments: vec![
-                        PageSegment {
-                            source: 0,
-                            source_row: 0,
-                            rows: 3,
-                            destination_row: 0,
-                        },
-                        PageSegment {
-                            source: 1,
-                            source_row: 0,
-                            rows: 1,
-                            destination_row: 3,
-                        },
-                    ],
-                    content_rows: 4,
-                },
-                PagePlan {
-                    segments: vec![PageSegment {
-                        source: 1,
-                        source_row: 1,
-                        rows: 1,
-                        destination_row: 0,
-                    }],
-                    content_rows: 1,
-                },
-            ]
-        );
+    fn asymmetric_viewport_turns_are_relative_to_the_current_offset() {
+        let first_next = next_viewport_offset(0, 100, 1_000).expect("first next offset");
+        let previous = previous_viewport_offset(first_next, 100).expect("previous viewport offset");
+        let second_next = next_viewport_offset(previous, 100, 1_000).expect("second next offset");
 
-        let (row_4, _) = plan_for_heights(&[4, 2]);
+        assert_eq!((first_next, previous, second_next), (90, 40, 130));
+        assert_eq!(previous_viewport_offset(previous, 100), Some(0));
+        assert_eq!(previous_viewport_offset(0, 100), None);
+        assert_eq!(next_viewport_offset(900, 100, 1_000), None);
+    }
+
+    #[test]
+    fn reading_progress_uses_the_installed_viewports_visible_end() {
+        assert_eq!(reader_progress_percent(0, 100, 1_000), 10);
+        assert_eq!(reader_progress_percent(279, 100, 1_000), 37);
+        assert_eq!(reader_progress_percent(899, 100, 1_000), 99);
+        assert_eq!(reader_progress_percent(900, 100, 1_000), 100);
+    }
+
+    #[test]
+    fn short_sources_share_a_viewport_without_seam_padding() {
+        let images = [episode_image(0, 2, 2), episode_image(1, 2, 2)];
+        let strip = episode_strip(&images, 2, 4).expect("episode strip");
+
         assert_eq!(
-            row_4,
-            vec![
-                PagePlan {
-                    segments: vec![PageSegment {
+            viewport_plan(&strip, 0, 4).expect("viewport plan"),
+            ViewportPlan {
+                segments: vec![
+                    ViewportSegment {
                         source: 0,
-                        source_row: 0,
-                        rows: 4,
-                        destination_row: 0,
-                    }],
-                    content_rows: 4,
-                },
-                PagePlan {
-                    segments: vec![PageSegment {
-                        source: 1,
                         source_row: 0,
                         rows: 2,
                         destination_row: 0,
-                    }],
-                    content_rows: 2,
-                },
-            ]
-        );
-
-        let (row_5, _) = plan_for_heights(&[5, 2]);
-        assert_eq!(
-            row_5,
-            vec![
-                PagePlan {
-                    segments: vec![PageSegment {
-                        source: 0,
+                    },
+                    ViewportSegment {
+                        source: 1,
                         source_row: 0,
-                        rows: 4,
-                        destination_row: 0,
-                    }],
-                    content_rows: 4,
-                },
-                PagePlan {
-                    segments: vec![
-                        PageSegment {
-                            source: 0,
-                            source_row: 4,
-                            rows: 1,
-                            destination_row: 0,
-                        },
-                        PageSegment {
-                            source: 1,
-                            source_row: 0,
-                            rows: 2,
-                            destination_row: 1,
-                        },
-                    ],
-                    content_rows: 3,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn page_plan_packs_one_row_sources_in_source_order() {
-        let (plans, total_pages) = plan_for_heights(&[1, 1, 1, 1]);
-        assert_eq!(total_pages, 1);
-        assert_eq!(
-            plans,
-            vec![PagePlan {
-                segments: (0..4)
-                    .map(|source| PageSegment {
-                        source,
-                        source_row: 0,
-                        rows: 1,
-                        destination_row: u32::try_from(source).expect("destination row"),
-                    })
-                    .collect(),
+                        rows: 2,
+                        destination_row: 2,
+                    },
+                ],
                 content_rows: 4,
-            }]
+            }
         );
     }
 
     #[test]
-    fn page_plan_keeps_the_final_partial_page() {
-        let (plans, total_pages) = plan_for_heights(&[5]);
-        assert_eq!(total_pages, 2);
-        assert_eq!(
-            plans,
-            vec![
-                PagePlan {
-                    segments: vec![PageSegment {
-                        source: 0,
-                        source_row: 0,
-                        rows: 4,
-                        destination_row: 0,
-                    }],
-                    content_rows: 4,
-                },
-                PagePlan {
-                    segments: vec![PageSegment {
-                        source: 0,
-                        source_row: 4,
-                        rows: 1,
-                        destination_row: 0,
-                    }],
-                    content_rows: 1,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn page_plan_rejects_zero_dimensions() {
+    fn episode_strip_rejects_zero_dimensions() {
         let valid = episode_image(0, 2, 2);
-        assert!(page_plan(std::slice::from_ref(&valid), 0, 4).is_err());
-        assert!(page_plan(std::slice::from_ref(&valid), 2, 0).is_err());
-        assert!(page_plan(&[episode_image(0, 0, 2)], 2, 4).is_err());
-        assert!(page_plan(&[episode_image(0, 2, 0)], 2, 4).is_err());
+        assert!(episode_strip(std::slice::from_ref(&valid), 0, 4).is_err());
+        assert!(episode_strip(std::slice::from_ref(&valid), 2, 0).is_err());
+        assert!(episode_strip(&[episode_image(0, 0, 2)], 2, 4).is_err());
+        assert!(episode_strip(&[episode_image(0, 2, 0)], 2, 4).is_err());
     }
 
     #[test]
@@ -8513,15 +8400,12 @@ mod tests {
             .map(|source| episode_image(source, 1, source_height))
             .collect::<Vec<_>>();
 
-        let (plans, total_pages) = page_plan(&images, 1, u32::MAX).expect("u64 global plan");
-
-        assert_eq!(total_pages, 2);
-        assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].content_rows, u32::MAX);
+        let strip = episode_strip(&images, 1, u32::MAX).expect("u64 episode strip");
+        assert_eq!(strip.total_rows, u64::from(u32::MAX) + 1);
         assert_eq!(
-            plans[1],
-            PagePlan {
-                segments: vec![PageSegment {
+            viewport_plan(&strip, u64::from(u32::MAX), u32::MAX).expect("final viewport"),
+            ViewportPlan {
+                segments: vec![ViewportSegment {
                     source: source_count - 1,
                     source_row: source_height - 1,
                     rows: 1,
@@ -8530,33 +8414,26 @@ mod tests {
                 content_rows: 1,
             }
         );
-        assert_eq!(
-            plans
-                .iter()
-                .map(|plan| u64::from(plan.content_rows))
-                .sum::<u64>(),
-            u64::from(u32::MAX) + 1
-        );
     }
 
     #[test]
-    fn page_plan_rejects_more_than_u16_pages() {
+    fn episode_strip_rejects_more_than_u16_virtual_pages() {
         let height = u32::from(u16::MAX) + 1;
-        let error = page_plan(&[episode_image(0, 1, height)], 1, 1)
-            .expect_err("page count above u16 must fail");
+        let error = episode_strip(&[episode_image(0, 1, height)], 1, 1)
+            .expect_err("virtual page count above u16 must fail");
         assert_eq!(error, "The comic has too many pages.");
     }
 
-    fn seam_plan() -> PagePlan {
-        PagePlan {
+    fn seam_plan() -> ViewportPlan {
+        ViewportPlan {
             segments: vec![
-                PageSegment {
+                ViewportSegment {
                     source: 0,
                     source_row: 0,
                     rows: 1,
                     destination_row: 0,
                 },
-                PageSegment {
+                ViewportSegment {
                     source: 1,
                     source_row: 0,
                     rows: 1,
@@ -8568,42 +8445,44 @@ mod tests {
     }
 
     #[test]
-    fn typed_page_assembly_gray8_dithers_once_after_the_source_seam() {
-        let plans = vec![seam_plan()];
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
+    fn typed_viewport_assembly_gray8_dithers_once_after_the_source_seam() {
+        let mut builds = vec![
+            ViewportBuild::new(0, seam_plan(), PictureFormat::Gray8, 2, 2).expect("Gray8 build"),
+        ];
         let first = Picture::from_grey(2, 1, vec![10, 10]).expect("first source");
         let second = Picture::from_grey(2, 1, vec![20, 20]).expect("second source");
 
-        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2).expect("first segment");
+        copy_source_into_builds(0, &first, &mut builds, 2, 2).expect("first segment");
         assert_eq!(builds[0].bytes, [10, 10, 255, 255]);
         assert_eq!(builds[0].next_segment, 1);
-        copy_source_into_builds(0, &first, &plans, &mut builds, 2, 2)
-            .expect("duplicate source is ignored");
+        copy_source_into_builds(0, &first, &mut builds, 2, 2).expect("duplicate source is ignored");
         assert_eq!(builds[0].next_segment, 1);
-        copy_source_into_builds(1, &second, &plans, &mut builds, 2, 2).expect("second segment");
+        copy_source_into_builds(1, &second, &mut builds, 2, 2).expect("second segment");
         assert_eq!(builds[0].bytes, [10, 10, 20, 20]);
 
-        let mut expected = Picture::from_grey(2, 2, vec![10, 10, 20, 20]).expect("undithered page");
-        expected.dither(PANEL_GREYS).expect("whole-page dither");
-        let picture = finish_build(builds.pop().expect("build"), &plans[0], 2, 2)
-            .expect("finished Gray8 page");
+        let mut expected =
+            Picture::from_grey(2, 2, vec![10, 10, 20, 20]).expect("undithered viewport");
+        expected.dither(PANEL_GREYS).expect("whole-viewport dither");
+        let picture =
+            finish_build(builds.pop().expect("build"), 2, 2).expect("finished Gray8 viewport");
 
         assert_eq!(picture.pixels(), expected.pixels());
     }
 
     #[test]
-    fn typed_page_assembly_rgb8_preserves_exact_colors_across_the_source_seam() {
-        let plans = vec![seam_plan()];
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
+    fn typed_viewport_assembly_rgb8_preserves_exact_colors_across_the_source_seam() {
+        let mut builds = vec![
+            ViewportBuild::new(0, seam_plan(), PictureFormat::Rgb8, 2, 2).expect("RGB8 build"),
+        ];
         let red = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![255, 0, 0, 255, 0, 0]))
             .expect("red source");
         let blue = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![0, 0, 255, 0, 0, 255]))
             .expect("blue source");
 
-        copy_source_into_builds(0, &red, &plans, &mut builds, 2, 2).expect("red segment");
-        copy_source_into_builds(1, &blue, &plans, &mut builds, 2, 2).expect("blue segment");
-        let picture = finish_build(builds.pop().expect("build"), &plans[0], 2, 2)
-            .expect("finished RGB8 page");
+        copy_source_into_builds(0, &red, &mut builds, 2, 2).expect("red segment");
+        copy_source_into_builds(1, &blue, &mut builds, 2, 2).expect("blue segment");
+        let picture =
+            finish_build(builds.pop().expect("build"), 2, 2).expect("finished RGB8 viewport");
 
         assert_eq!(
             picture.pixels(),
@@ -8612,9 +8491,9 @@ mod tests {
     }
 
     #[test]
-    fn page_assembly_final_padding_is_white_and_bytes_per_pixel_correct() {
-        let plan = PagePlan {
-            segments: vec![PageSegment {
+    fn viewport_assembly_final_padding_is_white_and_bytes_per_pixel_correct() {
+        let plan = ViewportPlan {
+            segments: vec![ViewportSegment {
                 source: 0,
                 source_row: 0,
                 rows: 1,
@@ -8622,100 +8501,104 @@ mod tests {
             }],
             content_rows: 1,
         };
-        let plans = vec![plan.clone()];
 
         let grey = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
-        let mut grey_builds =
-            vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("Gray8 build")];
-        copy_source_into_builds(0, &grey, &plans, &mut grey_builds, 2, 2).expect("Gray8 segment");
-        let grey_page =
-            finish_build(grey_builds.pop().expect("Gray8 build"), &plan, 2, 2).expect("Gray8 page");
+        let mut grey_builds = vec![
+            ViewportBuild::new(0, plan.clone(), PictureFormat::Gray8, 2, 2).expect("Gray8 build"),
+        ];
+        copy_source_into_builds(0, &grey, &mut grey_builds, 2, 2).expect("Gray8 segment");
+        let grey_viewport =
+            finish_build(grey_builds.pop().expect("Gray8 build"), 2, 2).expect("Gray8 viewport");
         assert_eq!(
-            grey_page.pixels(),
+            grey_viewport.pixels(),
             PicturePixelsRef::Gray8(&[0, 0, 255, 255])
         );
 
         let rgb = Picture::from_pixels(2, 1, PicturePixels::Rgb8(vec![1, 2, 3, 4, 5, 6]))
             .expect("RGB8 source");
         let mut rgb_builds =
-            vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
-        copy_source_into_builds(0, &rgb, &plans, &mut rgb_builds, 2, 2).expect("RGB8 segment");
-        let rgb_page =
-            finish_build(rgb_builds.pop().expect("RGB8 build"), &plan, 2, 2).expect("RGB8 page");
+            vec![ViewportBuild::new(0, plan, PictureFormat::Rgb8, 2, 2).expect("RGB8 build")];
+        copy_source_into_builds(0, &rgb, &mut rgb_builds, 2, 2).expect("RGB8 segment");
+        let rgb_viewport =
+            finish_build(rgb_builds.pop().expect("RGB8 build"), 2, 2).expect("RGB8 viewport");
         assert_eq!(
-            rgb_page.pixels(),
+            rgb_viewport.pixels(),
             PicturePixelsRef::Rgb8(&[1, 2, 3, 4, 5, 6, 255, 255, 255, 255, 255, 255])
         );
     }
 
     #[test]
-    fn page_assembly_format_mismatch_is_refused() {
-        let plans = vec![PagePlan {
-            segments: vec![PageSegment {
+    fn viewport_assembly_format_mismatch_is_refused() {
+        let plan = ViewportPlan {
+            segments: vec![ViewportSegment {
                 source: 0,
                 source_row: 0,
                 rows: 1,
                 destination_row: 0,
             }],
             content_rows: 1,
-        }];
+        };
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("Gray8 source");
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Rgb8, 2, 1).expect("RGB8 build")];
+        let mut builds =
+            vec![ViewportBuild::new(0, plan, PictureFormat::Rgb8, 2, 1).expect("RGB8 build")];
 
         assert!(
-            copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err(),
+            copy_source_into_builds(0, &source, &mut builds, 2, 1).is_err(),
             "a Gray8 source must not enter an RGB8 build"
         );
     }
 
     #[test]
-    fn page_assembly_wrong_scaled_width_is_refused() {
-        let plans = vec![PagePlan {
-            segments: vec![PageSegment {
+    fn viewport_assembly_wrong_scaled_width_is_refused() {
+        let plan = ViewportPlan {
+            segments: vec![ViewportSegment {
                 source: 0,
                 source_row: 0,
                 rows: 1,
                 destination_row: 0,
             }],
             content_rows: 1,
-        }];
+        };
         let source = Picture::from_grey(1, 1, vec![0]).expect("narrow source");
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 1).expect("build")];
+        let mut builds =
+            vec![ViewportBuild::new(0, plan, PictureFormat::Gray8, 2, 1).expect("build")];
 
-        assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 1).is_err());
+        assert!(copy_source_into_builds(0, &source, &mut builds, 2, 1).is_err());
     }
 
     #[test]
-    fn page_assembly_truncated_source_rows_are_refused() {
-        let plans = vec![PagePlan {
-            segments: vec![PageSegment {
+    fn viewport_assembly_truncated_source_rows_are_refused() {
+        let plan = ViewportPlan {
+            segments: vec![ViewportSegment {
                 source: 0,
                 source_row: 0,
                 rows: 2,
                 destination_row: 0,
             }],
             content_rows: 2,
-        }];
+        };
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("one-row source");
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+        let mut builds =
+            vec![ViewportBuild::new(0, plan, PictureFormat::Gray8, 2, 2).expect("build")];
 
-        assert!(copy_source_into_builds(0, &source, &plans, &mut builds, 2, 2).is_err());
+        assert!(copy_source_into_builds(0, &source, &mut builds, 2, 2).is_err());
     }
 
     #[test]
-    fn page_assembly_incomplete_build_is_refused() {
-        let plan = seam_plan();
-        let mut builds = vec![PageBuild::new(0, PictureFormat::Gray8, 2, 2).expect("build")];
+    fn viewport_assembly_incomplete_build_is_refused() {
+        let mut builds =
+            vec![ViewportBuild::new(0, seam_plan(), PictureFormat::Gray8, 2, 2).expect("build")];
         let source = Picture::from_grey(2, 1, vec![0, 0]).expect("first source");
-        copy_source_into_builds(0, &source, std::slice::from_ref(&plan), &mut builds, 2, 2)
-            .expect("first segment");
+        copy_source_into_builds(0, &source, &mut builds, 2, 2).expect("first segment");
 
-        assert!(finish_build(builds.pop().expect("build"), &plan, 2, 2).is_err());
+        assert!(finish_build(builds.pop().expect("build"), 2, 2).is_err());
     }
 
     #[test]
-    fn page_assembly_rejects_unrepresentable_page_buffer() {
-        assert!(PageBuild::new(0, PictureFormat::Rgb8, u32::MAX, u32::MAX).is_err());
+    fn viewport_assembly_rejects_unrepresentable_buffer() {
+        assert!(
+            ViewportBuild::new(0, seam_plan(), PictureFormat::Rgb8, u32::MAX, u32::MAX,).is_err()
+        );
     }
 
     #[test]
@@ -9660,33 +9543,41 @@ mod tests {
 
     fn seeded_reader_with_metrics(
         metrics: DisplayMetrics,
-        page_count: usize,
-        current_page: usize,
+        source_count: usize,
+        current_viewport: usize,
         chrome_visible: bool,
     ) -> AppRunner<Bomtoon> {
         let width = u32::try_from(metrics.width).expect("positive panel width");
         let panel_height = u32::try_from(metrics.height).expect("positive panel height");
         let format = metrics.picture_format;
-        let images = (0..page_count)
+        let images = (0..source_count)
             .map(|source| episode_image(source, width, panel_height))
             .collect::<Vec<_>>();
-        let (plans, total_pages) =
-            page_plan(&images, width, panel_height).expect("seeded reader plans");
+        let strip = episode_strip(&images, width, panel_height).expect("seeded episode strip");
+        let offset_rows = u64::try_from(current_viewport)
+            .expect("viewport index")
+            .saturating_mul(u64::from(panel_height));
         let limits = reader_limits(format);
         let mut window = VecDeque::new();
-        for page in current_page.saturating_add(1)..page_count {
+        let mut next_offset = next_viewport_offset(offset_rows, panel_height, strip.total_rows);
+        while let Some(offset_rows) = next_offset {
             if window.len() == limits.pages {
                 break;
             }
             let byte_len = format
                 .byte_len(width, panel_height)
-                .expect("seeded page byte length");
+                .expect("seeded viewport byte length");
             let pixels = match format {
                 PictureFormat::Gray8 => PicturePixels::Gray8(vec![127; byte_len]),
                 PictureFormat::Rgb8 => PicturePixels::Rgb8(vec![127; byte_len]),
             };
-            let picture = Picture::from_pixels(width, panel_height, pixels).expect("ready page");
-            window.push_back(PageEntry::Ready { page, picture });
+            let picture =
+                Picture::from_pixels(width, panel_height, pixels).expect("ready viewport");
+            window.push_back(ViewportEntry::Ready {
+                offset_rows,
+                picture,
+            });
+            next_offset = next_viewport_offset(offset_rows, panel_height, strip.total_rows);
         }
         AppRunner::with_metrics(
             Bomtoon {
@@ -9705,9 +9596,8 @@ mod tests {
                     panel_width: width,
                     panel_height,
                     images,
-                    plans,
-                    page: current_page,
-                    total_pages,
+                    strip,
+                    offset_rows,
                     window,
                     source_cache: BTreeMap::new(),
                     source_fetches: BTreeMap::new(),
@@ -9747,13 +9637,16 @@ mod tests {
             app.pending = Some(Pending::Content(99));
             app.task = Some(TaskId(99));
             app.problem = Some("reader failure".to_owned());
-            app.retry = Retry::Page(0);
+            app.retry = Retry::Viewport(0);
             app.reader_tasks = BTreeMap::from([
                 (
                     foreground,
                     ReaderTaskEntry {
                         generation: 1,
-                        purpose: ReaderTaskPurpose::ForegroundSource { source: 0, page: 0 },
+                        purpose: ReaderTaskPurpose::ForegroundSource {
+                            source: 0,
+                            offset_rows: 0,
+                        },
                     },
                 ),
                 (
@@ -9785,7 +9678,7 @@ mod tests {
             reader.refresh_task = Some(refresh);
             reader
                 .refresh_waiters
-                .insert(3, FetchIntent::Foreground { page: 3 });
+                .insert(3, FetchIntent::Foreground { offset_rows: 3 });
             reader.refresh_attempted.insert(3, FetchIntent::Prefetch);
             reader.source_failures.insert(
                 4,
@@ -9805,12 +9698,15 @@ mod tests {
                 PictureFormat::Gray8 => PicturePixels::Gray8(vec![127; 2]),
                 PictureFormat::Rgb8 => PicturePixels::Rgb8(vec![127; 6]),
             };
+            let plan = viewport_plan(&reader.strip, 2, 2).expect("building viewport plan");
             reader.window = VecDeque::from([
-                PageEntry::Ready {
-                    page: 1,
-                    picture: Picture::from_pixels(1, 2, ready_pixels).expect("ready page"),
+                ViewportEntry::Ready {
+                    offset_rows: 1,
+                    picture: Picture::from_pixels(1, 2, ready_pixels).expect("ready viewport"),
                 },
-                PageEntry::Building(PageBuild::new(2, format, 1, 2).expect("building page")),
+                ViewportEntry::Building(
+                    ViewportBuild::new(2, plan, format, 1, 2).expect("building viewport"),
+                ),
             ]);
         }
         (runner, tasks)
@@ -9894,7 +9790,7 @@ mod tests {
                     && reader
                         .window
                         .iter()
-                        .all(|entry| matches!(entry, PageEntry::Ready { .. }))
+                        .all(|entry| matches!(entry, ViewportEntry::Ready { .. }))
                     && runner.app().reader_tasks.is_empty()
             };
             if settled {
@@ -9971,8 +9867,8 @@ mod tests {
     ) -> (AppRunner<Bomtoon>, TaskId, Option<TaskId>, TaskId) {
         let metrics = reader_metrics(format, 2);
         let images = vec![episode_image(0, 1, 3), episode_image(1, 1, 2)];
-        let (plans, total_pages) = page_plan(&images, 1, 2).expect("seam plans");
-        assert_eq!(total_pages, 3);
+        let strip = episode_strip(&images, 1, 2).expect("episode strip");
+        assert_eq!(strip.total_rows, 5);
         let first_task = TaskId(41);
         let second_task = TaskId(42);
         let maintenance_task = TaskId(43);
@@ -10008,8 +9904,8 @@ mod tests {
         };
         let backward_picture =
             Picture::from_pixels(1, 2, backward_pixels).expect("backward cached page");
-        let window = VecDeque::from([PageEntry::Ready {
-            page: 0,
+        let window = VecDeque::from([ViewportEntry::Ready {
+            offset_rows: 4,
             picture: backward_picture,
         }]);
         let picture = TilePicture::new(PictureHandle(7), 1, 2);
@@ -10030,9 +9926,8 @@ mod tests {
                     panel_width: 1,
                     panel_height: 2,
                     images,
-                    plans,
-                    page: 2,
-                    total_pages,
+                    strip,
+                    offset_rows: 3,
                     window,
                     source_cache: BTreeMap::new(),
                     source_fetches,
@@ -11885,6 +11780,11 @@ mod tests {
         assert_eq!(turns.previous, action_id(READER_PREVIOUS));
         assert_eq!(turns.next, action_id(READER_NEXT));
         assert_eq!(turns.menu, Some(action_id(READER_CHROME)));
+        let progress = turns.progress.expect("reader progress");
+        assert_eq!(progress.percent, 100);
+        assert!(!progress.previous);
+        assert!(!progress.next);
+        assert!(turns.position.is_none());
         assert!(
             screen.nodes.is_empty(),
             "reader must not expose scrolling controls"
@@ -12029,7 +11929,7 @@ mod tests {
         assert_eq!(runner.app().view, View::CommentAppendix);
         runner.action(ActionId::BACK);
         assert_eq!(runner.app().view, View::Reader);
-        assert_eq!(runner.app().reader.as_ref().expect("reader").page, 0);
+        assert_eq!(runner.app().reader.as_ref().expect("reader").offset_rows, 0);
     }
 
     #[test]
@@ -12384,7 +12284,7 @@ mod tests {
         let mut runner = seeded_reader(2, 0, true);
         let commands = runner.action(action_id(READER_NEXT));
         let reader = runner.app().reader.as_ref().expect("reader");
-        assert_eq!(reader.page, 1);
+        assert_eq!(reader.offset_rows, viewport_stride(reader.panel_height, 90));
         assert!(!reader.chrome_visible);
         let screens = commands
             .iter()
@@ -12398,6 +12298,28 @@ mod tests {
         let busy = screens[0].1.reading_surface.expect("busy reading surface");
         assert_eq!(busy.picture.handle, PictureHandle(7));
         assert_eq!(busy.chrome, ReadingChrome::OverlayBusy);
+        let busy_progress = screens[0]
+            .1
+            .page_turns
+            .expect("busy page turns")
+            .progress
+            .expect("busy progress");
+        assert_eq!(busy_progress.percent, 50);
+        let installed_progress = screens[1]
+            .1
+            .page_turns
+            .expect("installed page turns")
+            .progress
+            .expect("installed progress");
+        assert_eq!(
+            installed_progress.percent,
+            reader_progress_percent(
+                reader.offset_rows,
+                reader.panel_height,
+                reader.strip.total_rows,
+            )
+        );
+        assert!(installed_progress.previous);
         let put = commands
             .iter()
             .position(|command| matches!(command, Command::PutPicture { .. }))
@@ -12510,9 +12432,12 @@ mod tests {
                 .expect("reader")
                 .window
                 .iter()
-                .map(entry_page)
+                .map(entry_offset)
                 .collect::<Vec<_>>();
-            assert_eq!(initial_pages, (1..=limits.pages).collect::<Vec<_>>());
+            assert_eq!(
+                initial_pages,
+                (1..=u64::try_from(limits.pages).expect("viewport limit")).collect::<Vec<_>>()
+            );
             let old_handle = runner
                 .app()
                 .reader
@@ -12525,15 +12450,15 @@ mod tests {
             assert_prepared_turn_commands(&commands, format, old_handle);
 
             let reader = runner.app().reader.as_ref().expect("reader");
-            assert_eq!(reader.page, 1);
+            assert_eq!(reader.offset_rows, 1);
             assert_eq!(
-                reader.window.iter().map(entry_page).collect::<Vec<_>>(),
-                (2..=limits.pages).collect::<Vec<_>>()
+                reader.window.iter().map(entry_offset).collect::<Vec<_>>(),
+                (2..=u64::try_from(limits.pages).expect("viewport limit")).collect::<Vec<_>>()
             );
             assert!(reader
                 .window
                 .iter()
-                .all(|entry| matches!(entry, PageEntry::Ready { .. })));
+                .all(|entry| matches!(entry, ViewportEntry::Ready { .. })));
             let maintenance = reader.maintenance_task.expect("turn maintenance");
 
             let commands = runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
@@ -12544,6 +12469,7 @@ mod tests {
             let (far_edge_task, work) = only_spawn(&commands);
             assert!(matches!(work, Task::Fetch { .. }));
             let far_edge = limits.pages + 1;
+            let far_edge_offset = u64::try_from(far_edge).expect("far edge offset");
             assert_eq!(
                 runner
                     .app()
@@ -12554,12 +12480,12 @@ mod tests {
             );
             let reader = runner.app().reader.as_ref().expect("reader");
             assert_eq!(
-                reader.window.iter().map(entry_page).collect::<Vec<_>>(),
-                (2..=far_edge).collect::<Vec<_>>()
+                reader.window.iter().map(entry_offset).collect::<Vec<_>>(),
+                (2..=far_edge_offset).collect::<Vec<_>>()
             );
             assert!(matches!(
                 reader.window.back(),
-                Some(PageEntry::Building(build)) if build.page == far_edge
+                Some(ViewportEntry::Building(build)) if build.offset_rows == far_edge_offset
             ));
             assert_reader_bounds(runner.app());
         }
@@ -12642,7 +12568,7 @@ mod tests {
             .expect("first maintenance");
         assert!(first_put < first_screen && first_screen < first_maintenance);
         let reader = runner.app().reader.as_ref().expect("first page reader");
-        assert_eq!(reader.page, 0);
+        assert_eq!(reader.offset_rows, 0);
         assert!(
             reader.window.is_empty(),
             "maintenance ran before first paint"
@@ -12665,12 +12591,12 @@ mod tests {
             let settled = {
                 let app = runner.app();
                 let reader = app.reader.as_ref().expect("lookahead reader");
-                let expected = limits.pages.min(reader.plans.len().saturating_sub(1));
+                let expected = limits.pages;
                 reader.window.len() == expected
                     && reader
                         .window
                         .iter()
-                        .all(|entry| matches!(entry, PageEntry::Ready { .. }))
+                        .all(|entry| matches!(entry, ViewportEntry::Ready { .. }))
                     && app.reader_tasks.is_empty()
             };
             if settled {
@@ -12693,7 +12619,7 @@ mod tests {
         assert!(reader
             .window
             .iter()
-            .all(|entry| matches!(entry, PageEntry::Ready { .. })));
+            .all(|entry| matches!(entry, ViewportEntry::Ready { .. })));
         assert!(runner.app().reader_tasks.is_empty());
     }
 
@@ -12704,7 +12630,15 @@ mod tests {
         page_height: u32,
     ) -> Vec<u8> {
         let next_commands = runner.action(action_id(READER_NEXT));
-        assert_eq!(runner.app().reader.as_ref().expect("next reader").page, 1);
+        assert_eq!(
+            runner
+                .app()
+                .reader
+                .as_ref()
+                .expect("next reader")
+                .offset_rows,
+            viewport_stride(page_height, 90)
+        );
         assert!(next_commands.iter().any(|command| {
             matches!(
                 command,
@@ -12762,7 +12696,15 @@ mod tests {
                 .chrome,
             ReadingChrome::Overlay
         );
-        assert_eq!(runner.app().reader.as_ref().expect("chrome reader").page, 1);
+        assert_eq!(
+            runner
+                .app()
+                .reader
+                .as_ref()
+                .expect("chrome reader")
+                .offset_rows,
+            viewport_stride(page_height, 90)
+        );
         next_png
     }
 
@@ -12791,7 +12733,12 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::Spawn { .. })));
         assert!(runner.app().problem.is_some());
-        assert_eq!(runner.app().retry, Retry::Page(0));
+        let failed_offset = previous_viewport_offset(
+            runner.app().reader.as_ref().expect("reader").offset_rows,
+            page_height,
+        )
+        .expect("previous offset");
+        assert_eq!(runner.app().retry, Retry::Viewport(failed_offset));
 
         let mut retry_commands = runner.action(action_id(RETRY));
         assert!(retry_commands.iter().any(|command| {
@@ -12834,8 +12781,13 @@ mod tests {
         assert_eq!(previous_upload.1, page_height);
         assert_eq!(&previous_upload.2, first_pixels);
         assert_eq!(
-            runner.app().reader.as_ref().expect("Previous reader").page,
-            0
+            runner
+                .app()
+                .reader
+                .as_ref()
+                .expect("Previous reader")
+                .offset_rows,
+            failed_offset
         );
         strict_picture_png(previous_upload.0, previous_upload.1, &previous_upload.2)
     }
@@ -12918,8 +12870,9 @@ mod tests {
                 let app = runner.app_mut();
                 let reader = app.reader.as_mut().expect("reader");
                 reader.window.clear();
-                reader.window.push_back(PageEntry::Building(
-                    PageBuild::new(1, format, 1, 1).expect("page one build"),
+                let plan = viewport_plan(&reader.strip, 1, 1).expect("viewport-one plan");
+                reader.window.push_back(ViewportEntry::Building(
+                    ViewportBuild::new(1, plan, format, 1, 1).expect("viewport-one build"),
                 ));
                 reader.source_fetches.insert(1, prefetch);
                 app.reader_tasks.insert(
@@ -12947,16 +12900,19 @@ mod tests {
             assert_eq!(surface.chrome, ReadingChrome::OverlayBusy);
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
-            assert_eq!(reader.page, 0);
+            assert_eq!(reader.offset_rows, 0);
             assert_eq!(
                 reader.picture.map(|picture| picture.handle),
                 Some(PictureHandle(7))
             );
-            assert_eq!(app.retry, Retry::Page(1));
+            assert_eq!(app.retry, Retry::Viewport(1));
             assert_eq!(app.foreground_reader_task, Some(prefetch));
             assert_eq!(
                 app.reader_tasks.get(&prefetch).map(|entry| entry.purpose),
-                Some(ReaderTaskPurpose::ForegroundSource { source: 1, page: 1 })
+                Some(ReaderTaskPurpose::ForegroundSource {
+                    source: 1,
+                    offset_rows: 1,
+                })
             );
             assert_eq!(reader.source_fetches.get(&1), Some(&prefetch));
             assert_reader_bounds(app);
@@ -12964,7 +12920,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_rebase_caches_retained_future_prefetch_until_maintenance_uses_it() {
+    fn previous_rebase_cancels_prefetch_outside_the_target_viewport() {
         let format = PictureFormat::Gray8;
         let mut runner = seeded_reader_with_metrics(reader_metrics(format, 1), 6, 3, false);
         let target_task = TaskId(51);
@@ -12992,85 +12948,22 @@ mod tests {
         }
 
         let commands = runner.action(action_id(READER_PREVIOUS));
-        assert!(!commands
-            .iter()
-            .any(|command| matches!(command, Command::Spawn { .. } | Command::Cancel(_))));
+        assert!(commands.contains(&Command::Cancel(future_task)));
+        assert!(!commands.contains(&Command::Cancel(target_task)));
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(
-            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            reader.window.iter().map(entry_offset).collect::<Vec<_>>(),
             vec![2]
         );
         assert_eq!(runner.app().foreground_reader_task, Some(target_task));
-        assert_eq!(
-            runner
-                .app()
-                .reader_tasks
-                .get(&future_task)
-                .map(|entry| entry.purpose),
-            Some(ReaderTaskPurpose::PrefetchSource { source: 4 })
-        );
+        assert!(!reader.source_fetches.contains_key(&4));
+        assert!(!runner.app().reader_tasks.contains_key(&future_task));
 
         let commands = runner.task_outcome(future_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
-        assert!(!commands
-            .iter()
-            .any(|command| matches!(command, Command::Spawn { .. })));
+        assert!(commands.is_empty());
         let reader = runner.app().reader.as_ref().expect("reader");
-        assert!(reader.source_cache.contains_key(&4));
-        assert!(!reader.source_fetches.contains_key(&4));
-        assert_eq!(
-            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
-            vec![2]
-        );
+        assert!(!reader.source_cache.contains_key(&4));
         assert_reader_bounds(runner.app());
-
-        runner.task_outcome(target_task, TaskOutcome::Failed(TaskError::TimedOut));
-        let reader = runner.app().reader.as_ref().expect("reader");
-        assert!(runner.app().problem.is_some());
-        assert!(reader.source_cache.contains_key(&4));
-        assert_reader_bounds(runner.app());
-
-        let commands = runner.action(action_id(RETRY));
-        let (retry_task, retry_work) = only_spawn(&commands);
-        assert!(matches!(retry_work, Task::Fetch { .. }));
-        let reader = runner.app().reader.as_ref().expect("reader");
-        assert!(runner.app().problem.is_none());
-        assert_eq!(runner.app().foreground_reader_task, Some(retry_task));
-        assert!(reader.source_cache.contains_key(&4));
-        assert_eq!(
-            runner
-                .app()
-                .reader_tasks
-                .get(&retry_task)
-                .map(|entry| entry.purpose),
-            Some(ReaderTaskPurpose::ForegroundSource { source: 2, page: 2 })
-        );
-        assert_reader_bounds(runner.app());
-
-        runner.task_outcome(retry_task, TaskOutcome::Completed(TINY_WEBP.to_vec()));
-        let reader = runner.app().reader.as_ref().expect("reader");
-        assert_eq!(reader.page, 2);
-        assert!(reader.source_cache.contains_key(&4));
-        let maintenance = reader.maintenance_task.expect("rebase maintenance");
-        assert_reader_bounds(runner.app());
-
-        runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
-        let app = runner.app();
-        let reader = app.reader.as_ref().expect("reader");
-        assert_eq!(
-            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
-            vec![3, 4, 5]
-        );
-        assert!(matches!(
-            reader.window.get(1),
-            Some(PageEntry::Building(build)) if build.page == 4 && build.next_segment == 1
-        ));
-        assert!(!reader.source_fetches.contains_key(&4));
-        assert!(!app.reader_tasks.values().any(|entry| matches!(
-            entry.purpose,
-            ReaderTaskPurpose::PrefetchSource { source: 4 }
-                | ReaderTaskPurpose::ForegroundSource { source: 4, .. }
-        )));
-        assert_reader_bounds(app);
     }
 
     #[test]
@@ -13094,7 +12987,7 @@ mod tests {
         let reader = runner.app().reader.as_ref().expect("reader");
         assert!(!reader.source_cache.contains_key(&0));
         assert_eq!(
-            reader.window.iter().map(entry_page).collect::<Vec<_>>(),
+            reader.window.iter().map(entry_offset).collect::<Vec<_>>(),
             vec![4]
         );
         assert_reader_bounds(runner.app());
@@ -13138,8 +13031,8 @@ mod tests {
             .expect("old DropPicture");
         assert!(put < set && set < drop);
         let reader = runner.app().reader.as_ref().expect("reader");
-        assert_eq!(reader.page, 1);
-        assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
+        assert_eq!(reader.offset_rows, 2);
+        assert!(reader.window.iter().all(|entry| entry_offset(entry) >= 2));
         reader.maintenance_task.expect("seam maintenance")
     }
 
@@ -13176,14 +13069,17 @@ mod tests {
                     .reader_tasks
                     .get(&first_task)
                     .map(|entry| entry.purpose),
-                Some(ReaderTaskPurpose::ForegroundSource { source: 0, page: 1 })
+                Some(ReaderTaskPurpose::ForegroundSource {
+                    source: 0,
+                    offset_rows: 2,
+                })
             );
             let reader = runner.app().reader.as_ref().expect("reader");
             assert_eq!(
-                reader.window.iter().map(entry_page).collect::<Vec<_>>(),
-                vec![1]
+                reader.window.iter().map(entry_offset).collect::<Vec<_>>(),
+                vec![2]
             );
-            assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
+            assert!(reader.window.iter().all(|entry| entry_offset(entry) >= 2));
 
             let commands =
                 runner.task_outcome(first_task, TaskOutcome::Completed(BLACK_1X3_WEBP.to_vec()));
@@ -13219,7 +13115,10 @@ mod tests {
                     .reader_tasks
                     .get(&second_task)
                     .map(|entry| entry.purpose),
-                Some(ReaderTaskPurpose::ForegroundSource { source: 1, page: 1 })
+                Some(ReaderTaskPurpose::ForegroundSource {
+                    source: 1,
+                    offset_rows: 2,
+                })
             );
 
             let commands =
@@ -13228,7 +13127,7 @@ mod tests {
 
             runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
             let reader = runner.app().reader.as_ref().expect("reader");
-            assert!(reader.window.iter().all(|entry| entry_page(entry) >= 1));
+            assert!(reader.window.iter().all(|entry| entry_offset(entry) >= 2));
             assert_reader_bounds(runner.app());
         }
     }
@@ -13273,7 +13172,7 @@ mod tests {
         assert!(commands.is_empty());
         let reader = runner.app().reader.as_ref().expect("reader");
         assert_eq!(reader.generation, 1);
-        assert_eq!(reader.page, 0);
+        assert_eq!(reader.offset_rows, 0);
         assert_eq!(
             reader.picture.map(|picture| picture.handle),
             Some(PictureHandle(7))
@@ -15516,8 +15415,12 @@ mod tests {
                 .iter()
                 .next_back()
                 .expect("one source task");
-            let ReaderTaskPurpose::ForegroundSource { source, page: 0 } = entry.purpose else {
-                panic!("expected foreground page-zero source");
+            let ReaderTaskPurpose::ForegroundSource {
+                source,
+                offset_rows: 0,
+            } = entry.purpose
+            else {
+                panic!("expected foreground offset-zero source");
             };
             assert_eq!(source, expected_source);
             observed_sources.push(source);
@@ -15595,7 +15498,7 @@ mod tests {
             .expect("page two source");
 
         runner.action(action_id(READER_NEXT));
-        assert_eq!(runner.app().reader.as_ref().expect("reader").page, 1);
+        assert_eq!(runner.app().reader.as_ref().expect("reader").offset_rows, 1);
         runner.task_outcome(page_two_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
         let existing_maintenance = runner
             .app()
@@ -15609,7 +15512,7 @@ mod tests {
         runner.action(action_id(READER_NEXT));
         let app = runner.app();
         let reader = app.reader.as_ref().expect("reader");
-        assert_eq!(reader.page, 2);
+        assert_eq!(reader.offset_rows, 2);
         assert!(app.problem.is_none());
         assert_eq!(reader.maintenance_task, Some(existing_maintenance));
         assert_eq!(
@@ -15625,7 +15528,7 @@ mod tests {
         let app = runner.app();
         let reader = app.reader.as_ref().expect("reader");
         assert!(app.problem.is_none());
-        assert_eq!(reader.page, 2);
+        assert_eq!(reader.offset_rows, 2);
         assert_eq!(reader.maintenance_task, None);
         assert_eq!(reader.window.len(), reader.limits.pages);
         assert_reader_bounds(app);
@@ -15640,9 +15543,12 @@ mod tests {
             let app = runner.app_mut();
             let reader = app.reader.as_mut().expect("reader");
             reader.window.clear();
-            for page in 1..=reader.limits.pages {
-                reader.window.push_back(PageEntry::Building(
-                    PageBuild::new(page, format, 1, 1).expect("source page build"),
+            for offset_rows in 1..=u64::try_from(reader.limits.pages).expect("viewport limit") {
+                let plan =
+                    viewport_plan(&reader.strip, offset_rows, 1).expect("source viewport plan");
+                reader.window.push_back(ViewportEntry::Building(
+                    ViewportBuild::new(offset_rows, plan, format, 1, 1)
+                        .expect("source viewport build"),
                 ));
             }
             reader.source_fetches.insert(1, source_task);
@@ -15651,8 +15557,11 @@ mod tests {
                 ReaderTaskEntry {
                     generation: 1,
                     purpose: match intent {
-                        FetchIntent::Foreground { page } => {
-                            ReaderTaskPurpose::ForegroundSource { source: 1, page }
+                        FetchIntent::Foreground { offset_rows } => {
+                            ReaderTaskPurpose::ForegroundSource {
+                                source: 1,
+                                offset_rows,
+                            }
                         }
                         FetchIntent::Prefetch => ReaderTaskPurpose::PrefetchSource { source: 1 },
                     },
@@ -15670,21 +15579,24 @@ mod tests {
         let source_task = TaskId(41);
         {
             let app = runner.app_mut();
-            app.retry = Retry::Page(1);
+            app.retry = Retry::Viewport(1);
             app.foreground_reader_task = Some(source_task);
             app.reader_tasks.insert(
                 source_task,
                 ReaderTaskEntry {
                     generation: 1,
-                    purpose: ReaderTaskPurpose::ForegroundSource { source: 0, page: 1 },
+                    purpose: ReaderTaskPurpose::ForegroundSource {
+                        source: 0,
+                        offset_rows: 1,
+                    },
                 },
             );
             let reader = app.reader.as_mut().expect("reader");
             reader.images = vec![episode_image(0, 1, 3)];
-            (reader.plans, reader.total_pages) =
-                page_plan(&reader.images, 1, 1).expect("reused source plan");
-            reader.window = VecDeque::from([PageEntry::Building(
-                PageBuild::new(1, format, 1, 1).expect("page-one build"),
+            reader.strip = episode_strip(&reader.images, 1, 1).expect("reused source strip");
+            let plan = viewport_plan(&reader.strip, 1, 1).expect("reused viewport plan");
+            reader.window = VecDeque::from([ViewportEntry::Building(
+                ViewportBuild::new(1, plan, format, 1, 1).expect("offset-one build"),
             )]);
             reader.source_fetches = BTreeMap::from([(0, source_task)]);
         }
@@ -15710,7 +15622,7 @@ mod tests {
         runner.task_outcome(refresh, TaskOutcome::Completed(manifest));
         let refreshed_source = active_reader_source(runner.app(), 0)
             .map(|(task, intent)| {
-                assert_eq!(intent, FetchIntent::Foreground { page: 1 });
+                assert_eq!(intent, FetchIntent::Foreground { offset_rows: 1 });
                 task
             })
             .expect("refreshed reused source");
@@ -15726,11 +15638,11 @@ mod tests {
             .expect("reused source maintenance");
         runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
         let reader = runner.app().reader.as_ref().expect("reader");
-        assert_eq!(reader.page, 1);
+        assert_eq!(reader.offset_rows, 1);
         assert!(reader.source_cache.is_empty());
         assert_eq!(
             reader.refresh_attempted.get(&0),
-            Some(&FetchIntent::Foreground { page: 1 })
+            Some(&FetchIntent::Foreground { offset_rows: 1 })
         );
         assert_reader_bounds(runner.app());
     }
@@ -15740,8 +15652,8 @@ mod tests {
             let intent = match entry.purpose {
                 ReaderTaskPurpose::ForegroundSource {
                     source: task_source,
-                    page,
-                } if task_source == source => FetchIntent::Foreground { page },
+                    offset_rows,
+                } if task_source == source => FetchIntent::Foreground { offset_rows },
                 ReaderTaskPurpose::PrefetchSource {
                     source: task_source,
                 } if task_source == source => FetchIntent::Prefetch,
@@ -15768,7 +15680,7 @@ mod tests {
                 "{format:?} exposed a background error"
             );
             assert!(app.foreground_reader_task.is_none());
-            assert_eq!(reader.page, 0);
+            assert_eq!(reader.offset_rows, 0);
             assert_eq!(
                 reader.picture.map(|picture| picture.handle),
                 Some(PictureHandle(7))
@@ -15780,7 +15692,7 @@ mod tests {
             let commands = runner.action(action_id(READER_NEXT));
             let app = runner.app();
             assert!(app.problem.is_some());
-            assert_eq!(app.retry, Retry::Page(1));
+            assert_eq!(app.retry, Retry::Viewport(1));
             assert_eq!(
                 app.reader
                     .as_ref()
@@ -15802,10 +15714,13 @@ mod tests {
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
             assert!(app.problem.is_none());
-            assert_eq!(app.retry, Retry::Page(1));
+            assert_eq!(app.retry, Retry::Viewport(1));
             assert_eq!(
                 app.reader_tasks.get(&retry_task).map(|entry| entry.purpose),
-                Some(ReaderTaskPurpose::ForegroundSource { source: 1, page: 1 })
+                Some(ReaderTaskPurpose::ForegroundSource {
+                    source: 1,
+                    offset_rows: 1,
+                })
             );
             assert!(!reader.source_failures.contains_key(&1));
             assert_reader_bounds(app);
@@ -15924,7 +15839,7 @@ mod tests {
 
             runner.action(action_id(READER_NEXT));
             assert!(runner.app().problem.is_some());
-            assert_eq!(runner.app().retry, Retry::Page(1));
+            assert_eq!(runner.app().retry, Retry::Viewport(1));
             runner.action(action_id(RETRY));
             let reader = runner.app().reader.as_ref().expect("reader");
             assert_eq!(
@@ -15933,7 +15848,7 @@ mod tests {
             );
             assert_eq!(
                 active_reader_source(runner.app(), 1).map(|(_, intent)| intent),
-                Some(FetchIntent::Foreground { page: 1 })
+                Some(FetchIntent::Foreground { offset_rows: 1 })
             );
             assert!(reader.refresh_task.is_none());
             assert_reader_bounds(runner.app());
@@ -15954,10 +15869,10 @@ mod tests {
 
             runner.action(action_id(READER_NEXT));
             let reader = runner.app().reader.as_ref().expect("reader");
-            assert_eq!(runner.app().retry, Retry::Page(1));
+            assert_eq!(runner.app().retry, Retry::Viewport(1));
             assert_eq!(
                 reader.refresh_waiters.get(&1),
-                Some(&FetchIntent::Foreground { page: 1 })
+                Some(&FetchIntent::Foreground { offset_rows: 1 })
             );
             assert_eq!(
                 reader.refresh_attempted.get(&1),
@@ -15970,7 +15885,7 @@ mod tests {
             );
             let retried = active_reader_source(runner.app(), 1)
                 .map(|(task, intent)| {
-                    assert_eq!(intent, FetchIntent::Foreground { page: 1 });
+                    assert_eq!(intent, FetchIntent::Foreground { offset_rows: 1 });
                     task
                 })
                 .expect("promoted refreshed source");
@@ -16000,7 +15915,7 @@ mod tests {
             runner.action(action_id(READER_PREVIOUS));
             let second_fetch = active_reader_source(runner.app(), 0)
                 .map(|(task, intent)| {
-                    assert_eq!(intent, FetchIntent::Foreground { page: 0 });
+                    assert_eq!(intent, FetchIntent::Foreground { offset_rows: 0 });
                     task
                 })
                 .expect("page-zero reused source");
@@ -16010,11 +15925,11 @@ mod tests {
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
             assert!(app.problem.is_some());
-            assert_eq!(app.retry, Retry::Page(0));
+            assert_eq!(app.retry, Retry::Viewport(0));
             assert!(reader.refresh_task.is_none());
             assert_eq!(
                 reader.refresh_attempted.get(&0),
-                Some(&FetchIntent::Foreground { page: 1 })
+                Some(&FetchIntent::Foreground { offset_rows: 1 })
             );
             assert!(!commands
                 .iter()
@@ -16031,7 +15946,7 @@ mod tests {
             let prefetch = TaskId(90);
             {
                 let app = runner.app_mut();
-                app.retry = Retry::Page(2);
+                app.retry = Retry::Viewport(2);
                 app.foreground_reader_task = None;
                 app.reader_tasks.clear();
                 app.reader_tasks.insert(
@@ -16042,8 +15957,15 @@ mod tests {
                     },
                 );
                 let reader = app.reader.as_mut().expect("reader");
-                reader.window = VecDeque::from([PageEntry::Building(
-                    PageBuild::new(2, format, 1, 1).expect("page-two build"),
+                reader.window = VecDeque::from([ViewportEntry::Building(
+                    ViewportBuild::new(
+                        2,
+                        viewport_plan(&reader.strip, 2, 1).expect("offset-two plan"),
+                        format,
+                        1,
+                        1,
+                    )
+                    .expect("offset-two build"),
                 )]);
                 reader.source_fetches = BTreeMap::from([(0, prefetch)]);
                 reader.maintenance_task = None;
@@ -16059,7 +15981,7 @@ mod tests {
             assert!(reader.source_failures.contains_key(&0));
             assert_eq!(
                 reader.refresh_attempted.get(&0),
-                Some(&FetchIntent::Foreground { page: 1 })
+                Some(&FetchIntent::Foreground { offset_rows: 1 })
             );
             assert!(!commands
                 .iter()
@@ -16079,7 +16001,7 @@ mod tests {
                 let app = runner.app_mut();
                 app.reader_tasks.clear();
                 app.foreground_reader_task = Some(refresh);
-                app.retry = Retry::Page(2);
+                app.retry = Retry::Viewport(2);
                 app.reader_tasks.insert(
                     refresh,
                     ReaderTaskEntry {
@@ -16111,10 +16033,10 @@ mod tests {
                 reader.refresh_task = Some(refresh);
                 reader
                     .refresh_waiters
-                    .insert(2, FetchIntent::Foreground { page: 2 });
+                    .insert(2, FetchIntent::Foreground { offset_rows: 2 });
                 reader
                     .refresh_attempted
-                    .insert(2, FetchIntent::Foreground { page: 2 });
+                    .insert(2, FetchIntent::Foreground { offset_rows: 2 });
             }
 
             runner.task_outcome(
@@ -16131,11 +16053,11 @@ mod tests {
 
             runner.action(action_id(READER_NEXT));
             let reader = runner.app().reader.as_ref().expect("reader");
-            assert_eq!(runner.app().retry, Retry::Page(1));
+            assert_eq!(runner.app().retry, Retry::Viewport(1));
             assert!(!reader.refresh_waiters.contains_key(&2));
             assert_eq!(
                 active_reader_source(runner.app(), 1).map(|(_, intent)| intent),
-                Some(FetchIntent::Foreground { page: 1 })
+                Some(FetchIntent::Foreground { offset_rows: 1 })
             );
 
             runner.task_outcome(first_source, TaskOutcome::Completed(TINY_WEBP.to_vec()));
@@ -16148,11 +16070,11 @@ mod tests {
             runner.task_outcome(maintenance, TaskOutcome::Completed(Vec::new()));
             let app = runner.app();
             let reader = app.reader.as_ref().expect("reader");
-            assert_eq!(reader.page, 1);
+            assert_eq!(reader.offset_rows, 1);
             assert!(app.problem.is_none());
             assert_ne!(
                 active_reader_source(app, 2).map(|(_, intent)| intent),
-                Some(FetchIntent::Foreground { page: 2 })
+                Some(FetchIntent::Foreground { offset_rows: 2 })
             );
             assert!(app.foreground_reader_task.is_none());
             assert!(!reader.refresh_waiters.contains_key(&2));
@@ -16169,7 +16091,7 @@ mod tests {
                 let app = runner.app_mut();
                 app.reader_tasks.clear();
                 app.foreground_reader_task = Some(refresh);
-                app.retry = Retry::Page(2);
+                app.retry = Retry::Viewport(2);
                 app.reader_tasks.insert(
                     refresh,
                     ReaderTaskEntry {
@@ -16182,7 +16104,7 @@ mod tests {
                 reader.refresh_task = Some(refresh);
                 reader.refresh_waiters = BTreeMap::from([
                     (1, FetchIntent::Prefetch),
-                    (2, FetchIntent::Foreground { page: 2 }),
+                    (2, FetchIntent::Foreground { offset_rows: 2 }),
                 ]);
                 reader.refresh_attempted = reader.refresh_waiters.clone();
             }
@@ -16195,7 +16117,7 @@ mod tests {
             let reader = app.reader.as_ref().expect("reader");
             assert_eq!(
                 active_reader_source(app, 2).map(|(_, intent)| intent),
-                Some(FetchIntent::Foreground { page: 2 })
+                Some(FetchIntent::Foreground { offset_rows: 2 })
             );
             if format == PictureFormat::Gray8 {
                 assert_eq!(
@@ -16223,7 +16145,7 @@ mod tests {
             let app = runner.app_mut();
             app.reader_tasks.clear();
             app.foreground_reader_task = Some(active_foreground);
-            app.retry = Retry::Page(2);
+            app.retry = Retry::Viewport(2);
             app.reader_tasks.insert(
                 refresh,
                 ReaderTaskEntry {
@@ -16235,7 +16157,10 @@ mod tests {
                 active_foreground,
                 ReaderTaskEntry {
                     generation: 1,
-                    purpose: ReaderTaskPurpose::ForegroundSource { source: 3, page: 3 },
+                    purpose: ReaderTaskPurpose::ForegroundSource {
+                        source: 3,
+                        offset_rows: 3,
+                    },
                 },
             );
             let reader = app.reader.as_mut().expect("reader");
@@ -16243,7 +16168,7 @@ mod tests {
             reader.refresh_task = Some(refresh);
             reader.refresh_waiters = BTreeMap::from([
                 (1, FetchIntent::Prefetch),
-                (2, FetchIntent::Foreground { page: 2 }),
+                (2, FetchIntent::Foreground { offset_rows: 2 }),
             ]);
             reader.refresh_attempted = reader.refresh_waiters.clone();
         }
@@ -16272,7 +16197,7 @@ mod tests {
             let app = runner.app_mut();
             app.reader_tasks.clear();
             app.foreground_reader_task = Some(refresh);
-            app.retry = Retry::Page(2);
+            app.retry = Retry::Viewport(2);
             app.reader_tasks.insert(
                 refresh,
                 ReaderTaskEntry {
@@ -16293,10 +16218,10 @@ mod tests {
             reader.refresh_task = Some(refresh);
             reader
                 .refresh_waiters
-                .insert(2, FetchIntent::Foreground { page: 2 });
+                .insert(2, FetchIntent::Foreground { offset_rows: 2 });
             reader
                 .refresh_attempted
-                .insert(2, FetchIntent::Foreground { page: 2 });
+                .insert(2, FetchIntent::Foreground { offset_rows: 2 });
         }
 
         runner.task_outcome(
@@ -16308,7 +16233,7 @@ mod tests {
         assert!(active_reader_source(app, 2).is_none());
         assert_eq!(
             reader.refresh_waiters.get(&2),
-            Some(&FetchIntent::Foreground { page: 2 })
+            Some(&FetchIntent::Foreground { offset_rows: 2 })
         );
         assert_reader_bounds(app);
     }
@@ -16338,8 +16263,10 @@ mod tests {
             .iter()
             .any(|command| matches!(command, Command::SetScreen(_))));
 
-        let (mut foreground, source_task) =
-            reader_with_source_task(PictureFormat::Gray8, FetchIntent::Foreground { page: 1 });
+        let (mut foreground, source_task) = reader_with_source_task(
+            PictureFormat::Gray8,
+            FetchIntent::Foreground { offset_rows: 1 },
+        );
         foreground.task_outcome(source_task, TaskOutcome::Failed(TaskError::Unauthorized));
         let refresh = foreground
             .app()
@@ -16349,7 +16276,7 @@ mod tests {
             .expect("foreground refresh");
         let commands = foreground.task_outcome(refresh, TaskOutcome::Failed(TaskError::TimedOut));
         assert!(foreground.app().problem.is_some());
-        assert_eq!(foreground.app().retry, Retry::Page(1));
+        assert_eq!(foreground.app().retry, Retry::Viewport(1));
         assert!(last_screen(&commands).reading_surface.is_none());
     }
 

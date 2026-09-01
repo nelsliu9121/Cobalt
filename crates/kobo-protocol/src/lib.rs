@@ -3538,10 +3538,20 @@ fn encoded_screen_len(
         if turns.menu.is_some() {
             add_encoded_len(&mut length, 4)?;
         }
-        // A flag, plus the page and the total when there is one.
+        // A flag, then either page/total or progress/available-turn bits.
         add_encoded_len(&mut length, 1)?;
-        if turns.position.is_some() {
-            add_encoded_len(&mut length, 4)?;
+        match (turns.position, turns.progress) {
+            (Some(_), Some(_)) => {
+                return Err(ProtocolError::InvalidValue("reading position"));
+            }
+            (Some(_), None) => add_encoded_len(&mut length, 4)?,
+            (None, Some(progress)) => {
+                if progress.percent > 100 {
+                    return Err(ProtocolError::InvalidValue("reading progress"));
+                }
+                add_encoded_len(&mut length, 2)?;
+            }
+            (None, None) => {}
         }
     }
     // One flag byte, plus an action identifier when the screen asked to hear
@@ -4551,13 +4561,24 @@ fn encode_screen(
             if let Some(menu) = turns.menu {
                 push_u32(output, menu.0);
             }
-            match turns.position {
-                Some((page, of)) => {
+            match (turns.position, turns.progress) {
+                (Some(_), Some(_)) => {
+                    return Err(ProtocolError::InvalidValue("reading position"));
+                }
+                (Some((page, of)), None) => {
                     output.push(1);
                     push_u16(output, page);
                     push_u16(output, of);
                 }
-                None => output.push(0),
+                (None, Some(progress)) => {
+                    if progress.percent > 100 {
+                        return Err(ProtocolError::InvalidValue("reading progress"));
+                    }
+                    output.push(2);
+                    output.push(progress.percent);
+                    output.push(u8::from(progress.previous) | (u8::from(progress.next) << 1));
+                }
+                (None, None) => output.push(0),
             }
         }
     }
@@ -5711,6 +5732,14 @@ fn decode_screen(
         Some(turns) => Some(match reader.u8()? {
             0 => turns,
             1 => turns.with_position(reader.u16()?, reader.u16()?),
+            2 => {
+                let percent = reader.u8()?;
+                let available = reader.u8()?;
+                if percent > 100 || available > 0b11 {
+                    return Err(ProtocolError::InvalidValue("reading progress"));
+                }
+                turns.with_progress(percent, available & 0b01 != 0, available & 0b10 != 0)
+            }
             _ => return Err(ProtocolError::InvalidValue("page position flag")),
         }),
     };
@@ -7401,7 +7430,14 @@ mod tests {
                 .map(|turns| turns.with_menu(ActionId(13)).with_position(4, 12));
             screen
         };
-        for screen in [plain, with_menu] {
+        let with_progress = {
+            let mut screen = plain.clone();
+            screen.page_turns = screen
+                .page_turns
+                .map(|turns| turns.with_progress(37, true, false));
+            screen
+        };
+        for screen in [plain, with_menu, with_progress] {
             let expected = screen.page_turns;
             let frame = Frame {
                 request_id: 4,
