@@ -2223,10 +2223,10 @@ impl Bomtoon {
         screen = screen.rows_with_trailing(range.map(|index| {
             let episode = &self.episodes[index];
             let title = display_text(&episode.title, &format!("Episode {}", episode.alias));
-            let action = if episode.purchase.is_readable()
-                || (episode.purchase == model::PurchaseState::NotOwned
-                    && !marker_belongs_to_another_account
-                    && !gift_quote_in_flight)
+            let action = if !gift_quote_in_flight
+                && (episode.purchase.is_readable()
+                    || (episode.purchase == model::PurchaseState::NotOwned
+                        && !marker_belongs_to_another_account))
             {
                 format!("episode-{index}")
             } else {
@@ -2606,6 +2606,14 @@ impl Bomtoon {
         }
     }
 
+    fn abort_deferred_gift_quote(&mut self, purpose: GiftTaskPurpose) {
+        if matches!(purpose, GiftTaskPurpose::Quote { .. }) {
+            self.episode_warnings.pending_gift_quote = None;
+            self.gifts.available = None;
+            self.mark_title_gift_error(purpose);
+        }
+    }
+
     fn clear_title_gifts(&mut self, context: &mut Context) {
         self.cancel_title_gift_task(context);
         self.gifts.title_id = None;
@@ -2665,6 +2673,10 @@ impl Bomtoon {
             || self.gifts.title_id != Some(task.title_id)
             || self.account_scope != Some(task.account_scope)
         {
+            if matches!(task.purpose, GiftTaskPurpose::Quote { .. }) {
+                self.abort_deferred_gift_quote(task.purpose);
+                self.show(context);
+            }
             return;
         }
         if matches!(outcome, TaskOutcome::Failed(TaskError::NoCredential)) {
@@ -2697,16 +2709,19 @@ impl Bomtoon {
         match task.purpose {
             GiftTaskPurpose::Display => {}
             GiftTaskPurpose::Quote { episode } => {
-                if observed.is_ok() && self.episode_warnings.pending_gift_quote == Some(episode) {
+                let can_continue = observed.is_ok()
+                    && self.episode_warnings.pending_gift_quote == Some(episode)
+                    && self.view == View::Episodes
+                    && self.selected_content_id == Some(task.title_id)
+                    && self
+                        .episodes
+                        .get(episode)
+                        .is_some_and(|episode| episode.purchase == model::PurchaseState::NotOwned);
+                if can_continue {
                     self.episode_warnings.pending_gift_quote = None;
-                    if self.view == View::Episodes
-                        && self.selected_content_id == Some(task.title_id)
-                        && self.episodes.get(episode).is_some_and(|episode| {
-                            episode.purchase == model::PurchaseState::NotOwned
-                        })
-                    {
-                        self.open_episode(context, episode);
-                    }
+                    self.open_episode(context, episode);
+                } else {
+                    self.abort_deferred_gift_quote(task.purpose);
                 }
             }
             GiftTaskPurpose::Reconcile { generation } => {
@@ -5380,6 +5395,9 @@ impl Bomtoon {
         let Some(episode) = self.episodes.get(index) else {
             return;
         };
+        if self.gift_quote_in_flight() {
+            return;
+        }
         let commerce_state = self.commerce.state();
         let active_transaction = matches!(
             commerce_state,
@@ -5393,7 +5411,7 @@ impl Bomtoon {
         );
         if active_transaction
             || (episode.purchase == model::PurchaseState::NotOwned
-                && (commerce_state != commerce::CommerceState::Idle || self.gift_quote_in_flight()))
+                && commerce_state != commerce::CommerceState::Idle)
         {
             return;
         }
@@ -18697,6 +18715,23 @@ mod tests {
         assert!(drawn.contains("Coins 10 · Gifts 2"), "{drawn}");
         assert_fits(&screen);
     }
+    fn runner_waiting_for_deferred_gift_quote() -> (AppRunner<Bomtoon>, TaskId) {
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(content_response()));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+        runner.action(ActionId::BACK);
+        let (gift, work) = only_spawn(&runner.action(action_id("episode-4")));
+        assert_eq!(work, api::title_gifts(41));
+        (runner, gift)
+    }
+
     #[test]
     fn gift_failure_uses_a_modal_without_changing_episode_ranges() {
         const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
@@ -18757,7 +18792,7 @@ mod tests {
         let commands = runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
 
         assert!(spawns(&commands).is_empty(), "{commands:?}");
-        assert_eq!(runner.app().episode_warnings.pending_gift_quote, Some(4));
+        assert_eq!(runner.app().episode_warnings.pending_gift_quote, None);
         let screen = last_screen(&commands);
         let overlay = screen.overlay.as_ref().expect("Gift warning reopened");
         assert!(overlay_text(overlay).contains("Gift"));
@@ -18845,6 +18880,92 @@ mod tests {
             work,
             api::quote("hunter_q", "paid", model::PurchaseType::Possession)
         );
+    }
+
+    #[test]
+    fn deferred_gift_quote_blocks_every_episode_action() {
+        const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        let details = detail_response(
+            41,
+            "hunter_q",
+            "Localized Title",
+            concat!(
+                "{\"id\":104,\"alias\":\"rented\",\"title\":\"Expired Rental\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"RENT\",\"rentExpiredAt\":1,\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2,\"isRentGift\":true},",
+                "{\"id\":105,\"alias\":\"paid\",\"title\":\"Paid Episode\",\"openedAt\":1709136000000,\"isSample\":false,\"purchaseStatus\":\"NONE\",\"paid\":true,\"coinKind\":\"COIN\",\"rentCoin\":1,\"possessionCoin\":2}"
+            ),
+        );
+        let (mut runner, _) = loaded_library();
+        complete_initial_summary(&mut runner);
+        runner.store_result(StoreResult::Loaded {
+            key: commerce::MARKER_KEY.to_owned(),
+            value: None,
+        });
+        let (content, _) = only_spawn(&runner.action(action_id("comic-0")));
+        let commands = runner.task_outcome(content, TaskOutcome::Completed(details));
+        let (gift, _) = only_spawn(&commands);
+        runner.task_outcome(gift, TaskOutcome::Failed(TaskError::TimedOut));
+        runner.action(ActionId::BACK);
+        let (gift, work) = only_spawn(&runner.action(action_id("episode-1")));
+        assert_eq!(work, api::title_gifts(41));
+        let screen = runner.app().episode_screen();
+        assert_eq!(
+            episode_rows(&screen)[0].action,
+            action_id("episode-disabled-0")
+        );
+        assert_eq!(
+            episode_rows(&screen)[1].action,
+            action_id("episode-disabled-1")
+        );
+
+        let commands = runner.action(action_id("episode-0"));
+
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert_eq!(runner.app().view, View::Episodes);
+        assert!(runner.app().pending.is_none());
+        assert_eq!(
+            runner.app().gifts.task.as_ref().map(|task| task.id),
+            Some(gift)
+        );
+        assert_eq!(runner.app().episode_warnings.pending_gift_quote, Some(1));
+
+        let commands = runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
+        let (_, work) = only_spawn(&commands);
+        assert_eq!(
+            work,
+            api::quote("hunter_q", "paid", model::PurchaseType::Possession)
+        );
+    }
+
+    #[test]
+    fn cancelled_deferred_gift_quote_reloads_before_quoting() {
+        let (mut runner, gift) = runner_waiting_for_deferred_gift_quote();
+
+        let commands = runner.task_outcome(gift, TaskOutcome::Cancelled);
+
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert!(runner.app().gifts.error);
+        assert_eq!(runner.app().episode_warnings.pending_gift_quote, None);
+        runner.action(ActionId::BACK);
+        let (_, work) = only_spawn(&runner.action(action_id("episode-4")));
+        assert_eq!(work, api::title_gifts(41));
+    }
+
+    #[test]
+    fn stale_scope_deferred_gift_quote_reloads_before_quoting() {
+        const GIFT_RESPONSE: &[u8] = br#"{"result":"SUCCESS","data":{"receivedGifts":[{"giftType":"RENT","isReceived":true,"issuedCount":1,"usedCount":0}],"receivableGifts":[]}}"#;
+        let (mut runner, gift) = runner_waiting_for_deferred_gift_quote();
+        let scope = runner.app().account_scope.expect("account scope");
+        runner.app_mut().account_scope = None;
+
+        let commands = runner.task_outcome(gift, TaskOutcome::Completed(GIFT_RESPONSE.to_vec()));
+
+        assert!(spawns(&commands).is_empty(), "{commands:?}");
+        assert!(runner.app().gifts.error);
+        assert_eq!(runner.app().episode_warnings.pending_gift_quote, None);
+        runner.app_mut().account_scope = Some(scope);
+        runner.action(ActionId::BACK);
+        let (_, work) = only_spawn(&runner.action(action_id("episode-4")));
+        assert_eq!(work, api::title_gifts(41));
     }
     #[test]
     fn quote_requote_and_marker_acknowledgement_order_the_purchase_post() {
