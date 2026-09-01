@@ -12,10 +12,11 @@ use feature::{
 
 use kobo_image::{Picture, PictureFormat, PicturePixels, PicturePixelsRef, PANEL_GREYS};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Chrome, Context, ControlState, DeviceRequest, DeviceResult,
-    DiagnosticSeverity, DisplayMetrics, Failure, Glyph, KoboApp, LayoutIssueKind, LocalDay,
-    PictureFit, PictureHandle, ReadingChrome, RowLead, RowLineLimits, Screen, ScreenBuilder,
-    StoreResult, TaskError, TaskId, TaskOutcome, TilePicture, CLARA_BW_METRICS,
+    action_id, drawable_text_in, ActionId, BannerLevel, Chrome, Context, ControlState,
+    DeviceRequest, DeviceResult, DiagnosticSeverity, DisplayMetrics, Face, Failure, Glyph, KoboApp,
+    LayoutIssueKind, LocalDay, PictureFit, PictureHandle, ReadingChrome, RowLead, RowLineLimits,
+    Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture,
+    CLARA_BW_METRICS,
 };
 #[cfg(test)]
 use model::FeatureComic;
@@ -519,6 +520,15 @@ fn synopsis_for(cache: &BTreeMap<String, DetailState>, alias: &str) -> String {
     }
 }
 
+fn display_content_title(title: &str, alias: &str) -> String {
+    let drawable = drawable_text_in(title, Face::Text);
+    if !title.is_empty() && drawable == title {
+        drawable
+    } else {
+        format!("BOMTOON {alias}")
+    }
+}
+
 fn add_feed_blocks(
     mut screen: ScreenBuilder,
     snapshot: &FeatureSnapshot,
@@ -556,7 +566,7 @@ fn add_feed_blocks(
                         |(index, comic)| {
                             (
                                 comic_action(&collection.id, index),
-                                display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
+                                display_content_title(&comic.title, &comic.alias),
                                 display_text(&comic.creators, ""),
                                 Glyph::Book,
                                 ready_cover(covers, comic.vertical_url.as_deref()),
@@ -1722,7 +1732,7 @@ impl Bomtoon {
                     let comic = &collection.comics[index];
                     (
                         comic_action(&collection.id, index),
-                        display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
+                        display_content_title(&comic.title, &comic.alias),
                         display_text(&comic.creators, ""),
                         synopsis_for(&self.featured.detail_cache, &comic.alias),
                         collection_cover_lead(
@@ -4130,7 +4140,7 @@ impl Bomtoon {
             .iter()
             .map(|comic| {
                 (
-                    display_text(&comic.title, &format!("BOMTOON {}", comic.alias)),
+                    display_content_title(&comic.title, &comic.alias),
                     display_text(&comic.creators, ""),
                     synopsis_for(&self.featured.detail_cache, &comic.alias),
                     compact_count(comic.view_count),
@@ -5219,7 +5229,7 @@ impl Bomtoon {
         self.selected_content_id = None;
         self.selected_content_alias.clear();
         self.selected_content_alias.push_str(alias);
-        self.selected_title = display_text(title, &format!("BOMTOON {alias}"));
+        self.selected_title = display_content_title(title, alias);
         self.selected_creators.clear();
         self.selected_synopsis.clear();
         self.synopsis = SynopsisState::default();
@@ -16176,12 +16186,36 @@ mod tests {
             assert!(grid.iter().enumerate().all(|(index, tile)| {
                 tile.action == action_id(&comic_action(&collection.id, index))
                     && tile.label
-                        == display_text(
+                        == display_content_title(
                             &collection.comics[index].title,
-                            &format!("BOMTOON {}", collection.comics[index].alias),
+                            &collection.comics[index].alias,
                         )
             }));
         }
+    }
+
+    #[test]
+    fn grouped_feature_feed_keeps_drawable_traditional_chinese_title() {
+        let mut app = grouped_feature_app(None);
+        let snapshot = app.featured.snapshot.as_mut().expect("snapshot");
+        let comic = &mut snapshot.collections[0].comics[0];
+        comic.alias = "365".to_owned();
+        comic.title = "36.5度的晚餐".to_owned();
+        let collection_id = snapshot.collections[0].id.clone();
+        let snapshot = snapshot.clone();
+        let pages = feed_pages(&snapshot, &CLARA_BW_METRICS);
+        let action = action_id(&comic_action(&collection_id, 0));
+
+        let label = (0..pages.len()).find_map(|page_index| {
+            let (_, grids) = grouped_feature_page_evidence(&mut app, &pages, page_index);
+            grids
+                .into_iter()
+                .flatten()
+                .find(|tile| tile.action == action)
+                .map(|tile| tile.label)
+        });
+
+        assert_eq!(label.as_deref(), Some("36.5度的晚餐"));
     }
 
     #[test]
