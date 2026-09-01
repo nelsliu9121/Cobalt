@@ -15110,9 +15110,8 @@ mod tests {
         else {
             panic!("opening a comic did not request content");
         };
-        assert!(url.contains(
-            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
-        ));
+        assert!(url
+            .contains("/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"));
         assert!(matches!(
             credential,
             Some(value)

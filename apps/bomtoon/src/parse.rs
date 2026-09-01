@@ -552,12 +552,7 @@ pub fn content_detail(bytes: &[u8], expected_alias: &str) -> Result<ContentDetai
     if title.trim().is_empty() {
         return Err(ParseError::InvalidValue("data.title"));
     }
-    let creator_values = bounded_array(
-        detail,
-        "creators",
-        "data.creators",
-        MAX_DETAIL_CREATORS,
-    )?;
+    let creator_values = bounded_array(detail, "creators", "data.creators", MAX_DETAIL_CREATORS)?;
     let mut creators = Vec::with_capacity(creator_values.len());
     for creator in creator_values {
         let name = bounded_string(creator, "name", "creator.name", MAX_CREATOR_NAME_BYTES)?;
@@ -2548,8 +2543,12 @@ mod tests {
 
     #[test]
     fn detail_bounds_creator_names_and_synopsis() {
-        let valid = String::from_utf8(content_detail_response("SUCCESS", "hunter_q", OWNED_EPISODE))
-            .expect("synthetic JSON");
+        let valid = String::from_utf8(content_detail_response(
+            "SUCCESS",
+            "hunter_q",
+            OWNED_EPISODE,
+        ))
+        .expect("synthetic JSON");
         for (from, to, expected) in [
             (
                 "\"name\":\"Writer\"".to_owned(),
