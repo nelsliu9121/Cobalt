@@ -45,6 +45,7 @@ const INSTALLED_PACKAGES: &[(&str, Option<&str>)] = &[
     ("kobod", Some("device-write")),
     ("kobo-launcher", None),
     ("kobo-audiobook", None),
+    ("kobo-bomtoon", None),
     ("kobo-terminal", None),
     ("kobo-todo", None),
     ("kobo-brief", None),
@@ -5895,13 +5896,28 @@ mod tests {
             let directory = if *name == "kobod" {
                 "crates/kobod".to_owned()
             } else {
-                format!("examples/{}", name.trim_start_matches("kobo-"))
+                let package = name.trim_start_matches("kobo-");
+                let app_directory = format!("apps/{package}");
+                if manifest.contains(&format!("\"{app_directory}\"")) {
+                    app_directory
+                } else {
+                    format!("examples/{package}")
+                }
             };
             assert!(
                 manifest.contains(&format!("\"{directory}\"")),
                 "{name} is packaged but {directory} is not a workspace member"
             );
         }
+    }
+
+    #[test]
+    fn private_device_package_includes_bomtoon() {
+        let (_, features) = super::INSTALLED_PACKAGES
+            .iter()
+            .find(|(name, _)| *name == "kobo-bomtoon")
+            .expect("private device payload must include BOMTOON");
+        assert_eq!(*features, None, "BOMTOON needs no package-only Cargo feature");
     }
 
     /// The daemon shipped in the package was built without `device-write` for
