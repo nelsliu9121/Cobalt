@@ -96,7 +96,7 @@ impl Store {
             without_controls
         };
         let pages = page_indices.len();
-        self.page = self.page.min(pages - 1);
+        self.page = self.page.min(pages.saturating_sub(1));
         let mut screen = ScreenBuilder::new("store-catalog")
             .top_bar("App Store")
             .top_bar_glyph(REFRESH, "Refresh", Glyph::Refresh)
