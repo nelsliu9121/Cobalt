@@ -8079,16 +8079,12 @@ mod tests {
     fn detail_response(id: usize, alias: &str, title: &str, episodes: &str) -> Vec<u8> {
         format!(
             concat!(
-                "<script id=\"__NEXT_DATA__\">",
-                "{{\"props\":{{\"pageProps\":{{",
-                "\"ssrPersonalized\":true,",
-                "\"ssrDetail\":{{\"id\":{id},\"alias\":\"{alias}\",",
-                "\"title\":\"{title}\",",
+                "{{\"result\":\"SUCCESS\",\"data\":{{",
+                "\"id\":{id},\"alias\":\"{alias}\",\"title\":\"{title}\",",
                 "\"creators\":[{{\"name\":\"Writer\"}}],",
                 "\"synopsis\":\"Synopsis\",",
-                "\"episodes\":[{episodes}]}}",
-                "}}}}}}",
-                "</script>"
+                "\"episodes\":[{episodes}]",
+                "}}}}"
             ),
             id = id,
             alias = alias,
@@ -11671,7 +11667,9 @@ mod tests {
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. }
-                if url.contains("/detail/hunter_q")
+                if url.contains(
+                    "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
+                )
         ));
         let commands =
             runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
@@ -15102,7 +15100,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_session_returns_to_login_instructions() {
+    fn expired_access_token_returns_to_login_instructions() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (task, work) = only_spawn(&commands);
@@ -15112,12 +15110,14 @@ mod tests {
         else {
             panic!("opening a comic did not request content");
         };
-        assert!(url.contains("/detail/hunter_q"));
+        assert!(url.contains(
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
+        ));
         assert!(matches!(
             credential,
             Some(value)
-                if value.secret == "bomtoon-session"
-                    && value.header == SecretHeader::Named("Cookie".to_owned())
+                if value.secret == "bomtoon-access-token"
+                    && value.header == SecretHeader::Bearer
         ));
 
         let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Unauthorized));
@@ -15163,14 +15163,16 @@ mod tests {
     }
 
     #[test]
-    fn comic_selection_uses_personalized_detail_and_back_returns_to_the_library() {
+    fn comic_selection_uses_bearer_detail_and_back_returns_to_the_library() {
         let (mut runner, _) = loaded_library();
         let commands = runner.action(action_id("comic-0"));
         let (task, work) = only_spawn(&commands);
         assert!(matches!(
             work,
             Task::Fetch { ref url, .. }
-                if url.contains("/detail/hunter_q")
+                if url.contains(
+                    "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false"
+                )
         ));
 
         let commands = runner.task_outcome(task, TaskOutcome::Completed(content_response()));
@@ -19174,7 +19176,10 @@ mod tests {
         let page = runner.app().page;
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
         assert!(!commands
@@ -19227,7 +19232,10 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_gift_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 2, "{commands:?}");
 
@@ -19323,7 +19331,10 @@ mod tests {
             ),
         );
 
-        fetch_task_with(&commands, "/detail/hunter_q");
+        fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         assert_eq!(
             runner.app().commerce.state(),
             commerce::CommerceState::Reconciling
@@ -19355,7 +19366,10 @@ mod tests {
         ] {
             let (mut runner, scope) = startup_with_marker(Some(marker_for(test_scope(SCOPE))));
             let commands = runner.task_outcome(scope, TaskOutcome::Completed(SCOPE.to_vec()));
-            let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+            let (content, _) = fetch_task_with(
+                &commands,
+                "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+            );
             seed_all_account_data(&mut runner);
             runner.app_mut().pending_purchase_rejection = Some("FAIL");
             runner.app_mut().purchase_rejection_notice = Some("FAIL");
@@ -19382,7 +19396,10 @@ mod tests {
         const NINE_COINS: &[u8] = br#"{"result":"SUCCESS","data":{"coinBalance":{"coin":6,"bonusCoin":2,"freeCoin":1},"ticketBalance":{"ticket":3,"bonusTicket":1,"freeTicket":0}}}"#;
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
 
         runner.task_outcome(content, TaskOutcome::Failed(TaskError::TimedOut));
@@ -19424,7 +19441,10 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
@@ -19585,7 +19605,10 @@ mod tests {
         };
         let (mut runner, post) = runner_waiting_for_paid_rent_post();
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let commands = runner.action(ActionId::BACK);
         assert_eq!(
@@ -19823,7 +19846,10 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(RECEIPT.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         assert_eq!(spawns(&commands).len(), 2);
         let commands = runner.task_outcome(content, TaskOutcome::Completed(owned_content()));
@@ -19860,7 +19886,10 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Failed(TaskError::TimedOut));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);
@@ -19888,7 +19917,10 @@ mod tests {
         let (mut runner, post) = runner_waiting_for_buy_post();
 
         let commands = runner.task_outcome(post, TaskOutcome::Completed(MISMATCHED.to_vec()));
-        let (content, _) = fetch_task_with(&commands, "/detail/hunter_q");
+        let (content, _) = fetch_task_with(
+            &commands,
+            "/api/balcony-api-v2/contents/hunter_q?isNotLoginAdult=false&isPorch=false",
+        );
         let (wallet, _) = fetch_task_with(&commands, "/asset/user");
         let (gift, _) = fetch_task_with(&commands, "/gift/contents/detail?");
         assert_eq!(spawns(&commands).len(), 3);

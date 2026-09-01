@@ -4,6 +4,7 @@ use kobo_sdk::{Credential, Header, Task};
 
 const HOMEPAGE_URL: &str = "https://www.bomtoon.tw/comic/main";
 const DETAIL_URL: &str = "https://www.bomtoon.tw/detail/";
+const CONTENT_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/";
 const MAIN_API: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/main/";
 const THEME_API: &str = "https://www.bomtoon.tw/api/balcony-api-v2/theme";
 const IMAGES_URL: &str = "https://www.bomtoon.tw/api/balcony-api-v2/contents/images/";
@@ -17,6 +18,7 @@ const PURCHASE_URL: &str = "https://www.bomtoon.tw/api/balcony-api/purchase";
 const COMMENTS_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/contents/";
 const REPLIES_URL: &str = "https://www.bomtoon.tw/api/balcony-api/comment/reply/CONTENTS/";
 const PUBLIC_HTML_BYTES: u32 = 512 * 1024;
+const CONTENT_BYTES: u32 = 512 * 1024;
 const PUBLIC_COLLECTION_BYTES: u32 = 512 * 1024;
 const IMAGE_MANIFEST_BYTES: u32 = 512 * 1024;
 const LIBRARY_BYTES: u32 = 2 * 1024 * 1024;
@@ -115,10 +117,10 @@ pub fn recent(page: usize) -> Task {
 
 pub fn detail(alias: &str) -> Task {
     fetch(
-        format!("{DETAIL_URL}{alias}"),
-        PUBLIC_HTML_BYTES,
-        Credential::in_header("bomtoon-session", "Cookie"),
-        response_headers("text/html"),
+        format!("{CONTENT_URL}{alias}?isNotLoginAdult=false&isPorch=false"),
+        CONTENT_BYTES,
+        Credential::bearer("bomtoon-access-token"),
+        balcony_headers(),
     )
 }
 
@@ -289,9 +291,10 @@ fn fetch(url: String, max_bytes: u32, credential: Credential, headers: Vec<Heade
 #[cfg(test)]
 mod tests {
     use super::{
-        account_scope, asset_summary, comments, detail, expiration_history, freetime, homepage,
-        image, images, library, most_favorited, public_detail, purchase, quote, ranking, recent,
-        replies, themes, title_gifts, CommentOrder, ACCEPT_LANGUAGE, PUBLIC_COLLECTION_BYTES,
+        account_scope, asset_summary, balcony_headers, comments, detail, expiration_history,
+        freetime, homepage, image, images, library, most_favorited, public_detail, purchase, quote,
+        ranking, recent, replies, themes, title_gifts, CommentOrder, ACCEPT_LANGUAGE,
+        PUBLIC_COLLECTION_BYTES,
     };
     use crate::model::{AssetKind, PurchaseType};
     use kobo_sdk::{Credential, Header, SecretHeader, Task};
@@ -410,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_uses_managed_session_cookie_html_endpoint() {
+    fn detail_uses_bearer_content_json_endpoint() {
         let Task::Fetch {
             url,
             offset,
@@ -421,23 +424,23 @@ mod tests {
         else {
             panic!("detail must be a fetch");
         };
-        assert_eq!(url, "https://www.bomtoon.tw/detail/365");
+        assert_eq!(
+            url,
+            "https://www.bomtoon.tw/api/balcony-api-v2/contents/365?isNotLoginAdult=false&isPorch=false"
+        );
         assert_eq!(offset, 0);
         assert_eq!(max_bytes, 512 * 1024);
-        assert_eq!(
+        assert!(matches!(
             credential,
-            Some(Credential::in_header("bomtoon-session", "Cookie"))
-        );
-        assert_eq!(
-            headers,
-            vec![
-                Header::new("Accept", "text/html"),
-                Header::new("Accept-Language", ACCEPT_LANGUAGE),
-            ]
-        );
+            Some(value)
+                if value.secret == "bomtoon-access-token"
+                    && value.header == SecretHeader::Bearer
+        ));
+        assert_eq!(headers, balcony_headers());
         assert!(headers.iter().all(|header| {
             !header.name.eq_ignore_ascii_case("cookie")
                 && !header.name.eq_ignore_ascii_case("authorization")
+                && !header.value.to_ascii_lowercase().contains("text/html")
         }));
     }
 

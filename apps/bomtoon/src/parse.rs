@@ -539,31 +539,23 @@ pub fn content_detail(bytes: &[u8], expected_alias: &str) -> Result<ContentDetai
     if !valid_alias(expected_alias) {
         return Err(ParseError::InvalidValue("detail alias"));
     }
-    let html = str::from_utf8(bytes).map_err(ParseError::Utf8)?;
-    let payload = next_data_payload(html).ok_or(ParseError::Missing("__NEXT_DATA__"))?;
-    let root = kobo_json::parse(payload).map_err(ParseError::Json)?;
-    let props = field(&root, "props", "props")?;
-    let page_props = field(props, "pageProps", "props.pageProps")?;
-    if !boolean(
-        page_props,
-        "ssrPersonalized",
-        "props.pageProps.ssrPersonalized",
-    )? {
-        return Err(ParseError::InvalidValue("props.pageProps.ssrPersonalized"));
+    let root = parse_json(bytes)?;
+    if bounded_string(&root, "result", "result", MAX_REMOTE_CODE_BYTES)? != "SUCCESS" {
+        return Err(ParseError::InvalidValue("result"));
     }
-    let detail = field(page_props, "ssrDetail", "props.pageProps.ssrDetail")?;
-    let alias = bounded_string(detail, "alias", "ssrDetail.alias", MAX_ALIAS_BYTES)?;
+    let detail = field(&root, "data", "data")?;
+    let alias = bounded_string(detail, "alias", "data.alias", MAX_ALIAS_BYTES)?;
     if alias != expected_alias {
-        return Err(ParseError::InvalidValue("ssrDetail.alias"));
+        return Err(ParseError::InvalidValue("data.alias"));
     }
-    let title = bounded_string(detail, "title", "ssrDetail.title", MAX_TITLE_BYTES)?;
+    let title = bounded_string(detail, "title", "data.title", MAX_TITLE_BYTES)?;
     if title.trim().is_empty() {
-        return Err(ParseError::InvalidValue("ssrDetail.title"));
+        return Err(ParseError::InvalidValue("data.title"));
     }
     let creator_values = bounded_array(
         detail,
         "creators",
-        "ssrDetail.creators",
+        "data.creators",
         MAX_DETAIL_CREATORS,
     )?;
     let mut creators = Vec::with_capacity(creator_values.len());
@@ -574,16 +566,16 @@ pub fn content_detail(bytes: &[u8], expected_alias: &str) -> Result<ContentDetai
         }
         creators.push(name.to_owned());
     }
-    let synopsis = bounded_string(detail, "synopsis", "ssrDetail.synopsis", MAX_SYNOPSIS_BYTES)?;
+    let synopsis = bounded_string(detail, "synopsis", "data.synopsis", MAX_SYNOPSIS_BYTES)?;
     if synopsis.trim().is_empty() {
-        return Err(ParseError::InvalidValue("ssrDetail.synopsis"));
+        return Err(ParseError::InvalidValue("data.synopsis"));
     }
-    let episodes = bounded_array(detail, "episodes", "ssrDetail.episodes", MAX_EPISODES)?
+    let episodes = bounded_array(detail, "episodes", "data.episodes", MAX_EPISODES)?
         .iter()
         .map(parse_episode)
         .collect::<Result<Vec<_>, ParseError>>()?;
     Ok(ContentDetail {
-        id: unsigned(detail, "id", "ssrDetail.id")?,
+        id: unsigned(detail, "id", "data.id")?,
         title: title.to_owned(),
         creators,
         synopsis: synopsis.to_owned(),
@@ -1619,24 +1611,18 @@ mod tests {
     };
     use crate::model::{AssetKind, AssetSubtype, BannerComic, PurchaseState, PurchaseType};
 
-    fn personalized_detail_html(personalized: bool, alias: &str, episodes: &str) -> Vec<u8> {
+    fn content_detail_response(result: &str, alias: &str, episodes: &str) -> Vec<u8> {
         format!(
             concat!(
-                "<!doctype html><html><head>",
-                "<script id=\"__NEXT_DATA__\" type=\"application/json\">",
-                "{{\"props\":{{\"pageProps\":{{",
-                "\"ssrPersonalized\":{personalized},",
-                "\"userData\":{{\"ignored\":true}},",
-                "\"ssrDetail\":{{",
+                "{{\"result\":\"{result}\",\"data\":{{",
                 "\"id\":41,\"alias\":\"{alias}\",\"title\":\"Hunter Q\",",
                 "\"creators\":[{{\"creatorId\":1,\"name\":\"Writer\",\"type\":\"WRITER\"}},",
                 "{{\"creatorId\":2,\"name\":\"Artist\",\"type\":\"ARTIST\"}}],",
                 "\"synopsis\":\"A complete synopsis.\",",
                 "\"episodes\":[{episodes}]",
-                "}}}}}}}}",
-                "</script></head></html>"
+                "}}}}"
             ),
-            personalized = personalized,
+            result = result,
             alias = alias,
             episodes = episodes,
         )
@@ -2502,12 +2488,12 @@ mod tests {
     }
 
     #[test]
-    fn personalized_detail_html_retains_metadata_episode_date_thumbnail_and_access() {
+    fn bearer_content_detail_retains_metadata_episode_date_thumbnail_and_access() {
         let parsed = content_detail(
-            &personalized_detail_html(true, "hunter_q", OWNED_EPISODE),
+            &content_detail_response("SUCCESS", "hunter_q", OWNED_EPISODE),
             "hunter_q",
         )
-        .expect("personalized detail");
+        .expect("bearer content detail");
         assert_eq!(parsed.id, 41);
         assert_eq!(parsed.title, "Hunter Q");
         assert_eq!(
@@ -2524,50 +2510,46 @@ mod tests {
     }
 
     #[test]
-    fn detail_rejects_unpersonalized_or_wrong_alias_without_reading_user_data() {
+    fn detail_rejects_non_success_wrong_alias_and_html() {
         assert!(matches!(
             content_detail(
-                &personalized_detail_html(false, "hunter_q", OWNED_EPISODE),
+                &content_detail_response("FAIL", "hunter_q", OWNED_EPISODE),
                 "hunter_q"
             ),
-            Err(ParseError::InvalidValue("props.pageProps.ssrPersonalized"))
+            Err(ParseError::InvalidValue("result"))
         ));
         assert!(matches!(
             content_detail(
-                &personalized_detail_html(true, "another", OWNED_EPISODE),
+                &content_detail_response("SUCCESS", "another", OWNED_EPISODE),
                 "hunter_q"
             ),
-            Err(ParseError::InvalidValue("ssrDetail.alias"))
+            Err(ParseError::InvalidValue("data.alias"))
+        ));
+        assert!(matches!(
+            content_detail(
+                br#"<script id="__NEXT_DATA__">{"props":{}}</script>"#,
+                "hunter_q"
+            ),
+            Err(ParseError::Json(_))
         ));
     }
 
     #[test]
-    fn detail_requires_active_next_data_and_boolean_personalization() {
-        assert!(matches!(
-            content_detail(b"<!doctype html><p>No detail</p>", "hunter_q"),
-            Err(ParseError::Missing("__NEXT_DATA__"))
-        ));
-        assert!(matches!(
-            content_detail(
-                br#"<!--<script id="__NEXT_DATA__">{"props":{}}</script>-->"#,
-                "hunter_q"
-            ),
-            Err(ParseError::Missing("__NEXT_DATA__"))
-        ));
-        let wrong_type =
-            String::from_utf8(personalized_detail_html(true, "hunter_q", OWNED_EPISODE))
-                .expect("synthetic HTML")
-                .replace("\"ssrPersonalized\":true", "\"ssrPersonalized\":\"true\"");
+    fn detail_requires_string_result() {
+        let body = content_detail_response("SUCCESS", "hunter_q", OWNED_EPISODE);
+        let wrong_type = String::from_utf8(body)
+            .expect("synthetic JSON")
+            .replace("\"result\":\"SUCCESS\"", "\"result\":true");
         assert!(matches!(
             content_detail(wrong_type.as_bytes(), "hunter_q"),
-            Err(ParseError::WrongType("props.pageProps.ssrPersonalized"))
+            Err(ParseError::WrongType("result"))
         ));
     }
 
     #[test]
     fn detail_bounds_creator_names_and_synopsis() {
-        let valid = String::from_utf8(personalized_detail_html(true, "hunter_q", OWNED_EPISODE))
-            .expect("synthetic HTML");
+        let valid = String::from_utf8(content_detail_response("SUCCESS", "hunter_q", OWNED_EPISODE))
+            .expect("synthetic JSON");
         for (from, to, expected) in [
             (
                 "\"name\":\"Writer\"".to_owned(),
@@ -2587,12 +2569,12 @@ mod tests {
             (
                 "\"synopsis\":\"A complete synopsis.\"".to_owned(),
                 "\"synopsis\":\"\"".to_owned(),
-                "ssrDetail.synopsis",
+                "data.synopsis",
             ),
             (
                 "\"synopsis\":\"A complete synopsis.\"".to_owned(),
                 format!("\"synopsis\":\"{}\"", "S".repeat(16 * 1024 + 1)),
-                "ssrDetail.synopsis",
+                "data.synopsis",
             ),
         ] {
             let body = valid.replace(&from, &to);
@@ -2619,7 +2601,7 @@ mod tests {
         );
         assert!(matches!(
             content_detail(too_many.as_bytes(), "hunter_q"),
-            Err(ParseError::InvalidValue("ssrDetail.creators"))
+            Err(ParseError::InvalidValue("data.creators"))
         ));
     }
 
@@ -2636,17 +2618,17 @@ mod tests {
             .join(",");
         assert!(matches!(
             content_detail(
-                &personalized_detail_html(true, "hunter_q", &episodes),
+                &content_detail_response("SUCCESS", "hunter_q", &episodes),
                 "hunter_q"
             ),
-            Err(ParseError::InvalidValue("ssrDetail.episodes"))
+            Err(ParseError::InvalidValue("data.episodes"))
         ));
 
         for opened_at in ["0", "-1"] {
             let episode = detail_episode(opened_at, "", "NONE");
             assert!(matches!(
                 content_detail(
-                    &personalized_detail_html(true, "hunter_q", &episode),
+                    &content_detail_response("SUCCESS", "hunter_q", &episode),
                     "hunter_q"
                 ),
                 Err(ParseError::InvalidValue("episode.openedAt"))
@@ -2655,7 +2637,7 @@ mod tests {
         let episode = detail_episode("\"1709136000000\"", "", "NONE");
         assert!(matches!(
             content_detail(
-                &personalized_detail_html(true, "hunter_q", &episode),
+                &content_detail_response("SUCCESS", "hunter_q", &episode),
                 "hunter_q"
             ),
             Err(ParseError::WrongType("episode.openedAt"))
@@ -2670,7 +2652,7 @@ mod tests {
             "NONE",
         );
         let parsed = content_detail(
-            &personalized_detail_html(true, "hunter_q", &non_common),
+            &content_detail_response("SUCCESS", "hunter_q", &non_common),
             "hunter_q",
         )
         .expect("non-COMMON thumbnail is ignored");
@@ -2678,7 +2660,7 @@ mod tests {
 
         let missing = detail_episode("1709136000000", "", "NONE");
         let parsed = content_detail(
-            &personalized_detail_html(true, "hunter_q", &missing),
+            &content_detail_response("SUCCESS", "hunter_q", &missing),
             "hunter_q",
         )
         .expect("missing thumbnail falls back to glyph");
@@ -2695,7 +2677,7 @@ mod tests {
                 format!(",\"thumbnails\":[{{\"type\":\"COMMON\",\"imagePath\":\"{url}\"}}]");
             let episode = detail_episode("1709136000000", &thumbnails, "NONE");
             let parsed = content_detail(
-                &personalized_detail_html(true, "hunter_q", &episode),
+                &content_detail_response("SUCCESS", "hunter_q", &episode),
                 "hunter_q",
             )
             .expect("hostile thumbnail degrades to glyph");
@@ -2713,7 +2695,7 @@ mod tests {
         );
         assert!(matches!(
             content_detail(
-                &personalized_detail_html(true, "hunter_q", &duplicate),
+                &content_detail_response("SUCCESS", "hunter_q", &duplicate),
                 "hunter_q"
             ),
             Err(ParseError::InvalidValue("episode.thumbnails"))
@@ -2737,7 +2719,7 @@ mod tests {
             let episode = detail_episode("1709136000000", &thumbnails, "NONE");
             assert!(
                 content_detail(
-                    &personalized_detail_html(true, "hunter_q", &episode),
+                    &content_detail_response("SUCCESS", "hunter_q", &episode),
                     "hunter_q"
                 )
                 .is_err(),
@@ -2749,7 +2731,7 @@ mod tests {
     #[test]
     fn content_detail_retains_pricing_rental_gift_and_unknown_status_logic() {
         let parsed = content_detail(
-            &personalized_detail_html(true, "hunter_q", CONTENT_EPISODES),
+            &content_detail_response("SUCCESS", "hunter_q", CONTENT_EPISODES),
             "hunter_q",
         )
         .expect("valid content response");
@@ -2806,7 +2788,7 @@ mod tests {
             );
             assert!(
                 content_detail(
-                    &personalized_detail_html(true, "hunter_q", &episode),
+                    &content_detail_response("SUCCESS", "hunter_q", &episode),
                     "hunter_q"
                 )
                 .is_err(),
@@ -2828,7 +2810,7 @@ mod tests {
                 title = title,
                 status = status,
             );
-            personalized_detail_html(true, "hunter_q", &episode)
+            content_detail_response("SUCCESS", "hunter_q", &episode)
         };
         let alias_128 = "a".repeat(128);
         let title_512 = "T".repeat(512);
