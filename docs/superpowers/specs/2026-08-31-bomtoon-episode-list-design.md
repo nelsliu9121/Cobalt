@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation complete for the original design. A follow-up pagination correction is approved and pending implementation: page 1 retains the full metadata preview, while later pages retain only the comic title and use the freed space for additional episode rows. Focused format, test, Clippy, workspace build, browser simulator, and one-shot runtime simulator gates passed for the original implementation. The browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
+Implementation complete. Page 1 retains title, creators, synopsis preview, and conditional `More`; later pages retain only the title and use separately measured episode ranges. Transient warnings render as modals without reserving row space, and the opt-in episode pager reaches the panel bottom while retaining full-height targets. Focused format, test, Clippy, browser simulator, and layout-diagnostics gates pass. The authenticated browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
 
 ## Goal
 
@@ -21,7 +21,10 @@ Redesign the signed-in comic episode view so it presents the comic's title, crea
 - Use `purchaseStatus` and the existing access rules as the authority for possession, rental, free, and sample state.
 - Show `Owned` for permanent possession, ceiling-rounded rental time for active rentals, `Free` for free episodes, and `Sample` for samples or previews.
 - Leave the trailing status empty for an unowned episode. Tapping it continues to open the existing purchase options.
-- Preserve existing title Gift and Coin balance presentation, purchase rejection notices, unresolved-commerce notices, purchase flow, reader flow, and episode navigation semantics.
+- Preserve existing title Gift and Coin balance presentation, purchase flow, reader flow, and episode navigation semantics.
+- Show Gift failure, purchase rejection, and unresolved cross-account warnings in dismissible modals rather than reserving episode-list space.
+- A Gift failure modal offers Retry and Close. After Close, tapping the episode re-enters the existing quote and Gift flow.
+- Keep the pager at the bottom with its existing minimum touch-target height, but place its band flush with the panel edge so it does not also reserve the bottom screen margin.
 - Fetch thumbnails only for the visible episode page and release or cancel episode thumbnail resources when they are no longer relevant.
 - Fall back to the existing book glyph when a thumbnail is absent, unsafe, loading, or failed.
 - Keep every screen and modal page within `CLARA_BW_METRICS`.
@@ -79,9 +82,11 @@ The episode screen uses existing `ScreenBuilder` primitives.
 +------------------------------------------------+
 ```
 
-The top bar says `Episodes`; the comic title appears once in the content header. On page 1, the content header also shows creators, the synopsis preview, and conditional `More`. On later pages, the content header contains only the comic title. Existing problem, purchase-rejection, cross-account marker, and Gift retry surfaces remain above the list in their current priority order. Their presence can reduce the number of episode rows, but must never cause overflow.
+The top bar says `Episodes`; the comic title appears once in the content header. On page 1, the content header also shows creators, the synopsis preview, and conditional `More`. On later pages, the content header contains only the comic title. Gift failure, purchase rejection, and unresolved cross-account warnings render as modal overlays and consume no episode-list space.
 
-The implementation measures page 1 and later pages separately using the existing layout-issue mechanism. It selects the largest episode-row capacity, up to the existing six-row ceiling, that fits each header shape and the reserved transient controls. Pagination stores explicit episode ranges because page 1 and later pages can have different capacities. Navigation, page count, visible-thumbnail scheduling, and refresh anchoring use those same ranges so every episode appears exactly once without gaps or duplicates.
+The implementation measures page 1 and later pages separately using the existing layout-issue mechanism. It selects the largest episode-row capacity, up to the existing six-row ceiling, that fits each header shape, balance line, rows, and pager. Pagination stores explicit episode ranges because page 1 and later pages can have different capacities. Navigation, page count, visible-thumbnail scheduling, and refresh anchoring use those same ranges so every episode appears exactly once without gaps or duplicates.
+
+Bomtoon opts into an edge-aligned page-position band. The band retains `DisplayMetrics::page_position_band()` height and the existing Previous/Next hit targets, but its bottom edge is the panel bottom instead of the top of `screen_margin()`. Content ends at the top of that band. Other applications retain the existing inset pager.
 
 Creator names retain remote order and are joined with ` | `. Empty creator names are rejected at the parser boundary. The page-1 synopsis preview preserves UTF-8 boundaries and indicates omitted text. `More` is absent when the full synopsis fits in the preview allocation and from every later page.
 
@@ -98,7 +103,17 @@ Modal controls are deterministic:
 - Close is always present;
 - Close clears only synopsis-modal state and returns to the same episode page.
 
-No modal action starts network work or changes commerce or reader state.
+No synopsis modal action starts network work or changes commerce or reader state.
+
+## Transient warning modals
+
+Episode warnings share the existing modal overlay mechanism and never alter stored episode ranges. Modal priority is unresolved cross-account warning, then purchase rejection, then Gift failure. Page turns are suppressed while a warning modal is open.
+
+- Closing the cross-account warning dismisses its presentation until the marker identity or selected comic changes. The unresolved marker remains authoritative and affected episode actions remain disabled.
+- Closing a purchase-rejection warning clears only that presentation notice. Commerce reconciliation state is unchanged.
+- A Gift failure modal offers `Retry` and `Close`. Retry invokes the existing title-Gift retry action. Close dismisses the warning without claiming the Gift state loaded. A later tap on the episode enters the existing quote/Gift flow and may present a new failure modal if loading fails again.
+
+No warning modal changes balances, ownership, account scope, purchase markers, or episode ranges.
 
 ## Data model
 
@@ -237,12 +252,13 @@ No new source module, dependency, capability, origin, or SDK change is required.
 
 - Page 1 shows title, creators, synopsis preview, and conditional `More`.
 - Pages after page 1 show only the comic title above balances and episode rows.
-- Existing balance, Gift retry, commerce notices, and purchase rejection remain visible and ordered.
+- Existing balances remain visible; Gift failure, purchase rejection, and cross-account warnings appear in the specified modal priority.
 - Rows show thumbnail or fallback, title, exact Taipei date, and the approved optional status.
-- Unowned rows have empty trailing status but remain actionable.
+- Unowned rows have empty trailing status but remain actionable unless the unresolved cross-account marker disables them.
 - Owned, rented, free, and sample rows retain existing reader behavior.
 - Modal pagination preserves the complete synopsis, fits every page, and closes to the same episode page.
 - Episode pagination uses separately measured first-page and later-page capacities, explicit non-overlapping ranges, and stops at the final page.
+- Bomtoon uses the opt-in edge pager; its touch targets retain the shared minimum height while the band sits flush with the panel bottom.
 - Only visible episode thumbnails request work; stale completions do not install; leaving the view cancels and drops resources.
 - Post-purchase reconciliation updates the row through the personalized HTML parser while preserving commerce safety state.
 
