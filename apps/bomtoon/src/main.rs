@@ -7818,7 +7818,8 @@ fn episode_page_ranges(
     let first_capacity = first_capacity.max(1);
     let later_capacity = later_capacity.max(1);
     let first_end = total.min(first_capacity);
-    let mut ranges = vec![0..first_end];
+    let mut ranges = Vec::new();
+    ranges.push(0..first_end);
     let mut start = first_end;
     while start < total {
         let end = start.saturating_add(later_capacity).min(total);
@@ -10622,7 +10623,8 @@ mod tests {
         let observed = app
             .episode_pages
             .iter()
-            .flat_map(|range| range.clone())
+            .cloned()
+            .flatten()
             .collect::<Vec<_>>();
         assert_eq!(observed, (0..app.episodes.len()).collect::<Vec<_>>());
         assert!(app
@@ -10929,7 +10931,8 @@ mod tests {
         app.covers
             .entries
             .insert(thumbnail_url, CoverState::Ready(picture));
-        app.episode_pages = vec![0..app.episodes.len()];
+        app.episode_pages.clear();
+        app.episode_pages.push(0..app.episodes.len());
         let account_scope = app.account_scope.expect("account scope");
         let _ = app.commerce.marker_loaded(None);
         let _ = app.commerce.safety_changed(
@@ -14987,7 +14990,8 @@ mod tests {
                 .app()
                 .episode_pages
                 .iter()
-                .flat_map(|range| range.clone())
+                .cloned()
+                .flatten()
                 .collect::<Vec<_>>(),
             (0..=EPISODE_ITEMS_PER_PAGE).collect::<Vec<_>>()
         );
