@@ -2082,26 +2082,19 @@ impl Bomtoon {
         } else {
             EPISODE_ITEMS_PER_PAGE
         };
-        let first_capacity_limit =
-            if self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES {
-                1
-            } else {
-                title_capacity_limit
-            };
-        (1..=first_capacity_limit)
-            .rev()
-            .find_map(|first_capacity| {
-                (1..=title_capacity_limit)
-                    .rev()
-                    .find_map(|later_capacity| {
-                        let ranges = episode_page_ranges(
-                            self.episodes.len(),
-                            first_capacity,
-                            later_capacity,
-                        );
-                        self.episode_ranges_fit(&ranges).then_some(ranges)
-                    })
+        let first_capacity_limit = if self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
+        {
+            1
+        } else {
+            title_capacity_limit
+        };
+        (1..=first_capacity_limit).rev().find_map(|first_capacity| {
+            (1..=title_capacity_limit).rev().find_map(|later_capacity| {
+                let ranges =
+                    episode_page_ranges(self.episodes.len(), first_capacity, later_capacity);
+                self.episode_ranges_fit(&ranges).then_some(ranges)
             })
+        })
     }
 
     fn prepare_episode_layout(&mut self) {
@@ -2190,9 +2183,7 @@ impl Bomtoon {
                     .iter()
                     .position(|range| range.contains(&index))
             })
-            .unwrap_or_else(|| {
-                fallback_page.min(self.episode_page_count().saturating_sub(1))
-            });
+            .unwrap_or_else(|| fallback_page.min(self.episode_page_count().saturating_sub(1)));
     }
 
     fn add_episode_body(
@@ -2260,8 +2251,7 @@ impl Bomtoon {
             page,
         );
         let range = ranges.get(page).cloned().unwrap_or(0..0);
-        let mut screen =
-            self.add_episode_body(header, range, page, ranges.len().max(1), false);
+        let mut screen = self.add_episode_body(header, range, page, ranges.len().max(1), false);
         if modal {
             if let Some((synopsis_page, range)) =
                 self.synopsis.open_page.and_then(|synopsis_page| {
@@ -10635,11 +10625,10 @@ mod tests {
             .flat_map(|range| range.clone())
             .collect::<Vec<_>>();
         assert_eq!(observed, (0..app.episodes.len()).collect::<Vec<_>>());
-        assert!(
-            app.episode_pages
-                .windows(2)
-                .all(|pages| pages[0].end == pages[1].start)
-        );
+        assert!(app
+            .episode_pages
+            .windows(2)
+            .all(|pages| pages[0].end == pages[1].start));
     }
     #[test]
     fn whitespace_collapsed_synopsis_pages_remain_protocol_encodable() {
@@ -10808,9 +10797,7 @@ mod tests {
         const OWNER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
         const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
 
-        fn snapshot(
-            app: &Bomtoon,
-        ) -> (std::ops::Range<usize>, (u16, u16), BTreeSet<usize>) {
+        fn snapshot(app: &Bomtoon) -> (std::ops::Range<usize>, (u16, u16), BTreeSet<usize>) {
             let range = app.episode_page_range(app.page);
             let screen = app.episode_screen();
             assert_fits(&screen);
@@ -11022,11 +11009,9 @@ mod tests {
             .collect();
         app.prepare_episode_layout();
         let ranges = app.episode_pages.clone();
-        assert!(
-            ranges
-                .iter()
-                .all(|range| (1..=EPISODE_ITEMS_PER_PAGE).contains(&range.len()))
-        );
+        assert!(ranges
+            .iter()
+            .all(|range| (1..=EPISODE_ITEMS_PER_PAGE).contains(&range.len())));
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
         let mut observed = BTreeSet::new();
 
@@ -11199,12 +11184,10 @@ mod tests {
             .position(|range| range.contains(&refreshed_index))
             .expect("page containing refreshed anchor");
         assert_eq!(runner.app().page, refreshed_page);
-        assert!(
-            runner
-                .app()
-                .episode_page_range(runner.app().page)
-                .contains(&refreshed_index)
-        );
+        assert!(runner
+            .app()
+            .episode_page_range(runner.app().page)
+            .contains(&refreshed_index));
     }
 
     #[test]
@@ -15008,13 +14991,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..=EPISODE_ITEMS_PER_PAGE).collect::<Vec<_>>()
         );
-        assert!(
-            runner
-                .app()
-                .episode_pages
-                .iter()
-                .all(|range| range.len() <= EPISODE_ITEMS_PER_PAGE)
-        );
+        assert!(runner
+            .app()
+            .episode_pages
+            .iter()
+            .all(|range| range.len() <= EPISODE_ITEMS_PER_PAGE));
 
         let commands = runner.action(action_id(NEXT_PAGE));
         assert_eq!(runner.app().page, 1);
