@@ -16,7 +16,7 @@ use kobo_sdk::{
     DeviceRequest, DeviceResult, DiagnosticSeverity, DisplayMetrics, Face, Failure, Glyph, KoboApp,
     LayoutIssueKind, LocalDay, PictureFit, PictureHandle, ReadingChrome, RowLead, RowLineLimits,
     Screen, ScreenBuilder, StoreResult, TaskError, TaskId, TaskOutcome, TilePicture,
-    CLARA_BW_METRICS,
+    CLARA_BW_METRICS, MAX_ROWS,
 };
 #[cfg(test)]
 use model::FeatureComic;
@@ -47,7 +47,6 @@ const BUY: &str = "commerce-buy";
 const CANCEL_COMMERCE: &str = "commerce-cancel";
 const REFRESH_COMMERCE: &str = "commerce-refresh";
 const LIBRARY_ITEMS_PER_PAGE: usize = 6;
-const EPISODE_ITEMS_PER_PAGE: usize = 6;
 const ACCOUNT_HISTORY_ITEMS_PER_PAGE: usize = 3;
 const HISTORY_WINDOW_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const READER_PREVIOUS: &str = "reader-previous";
@@ -1449,6 +1448,43 @@ impl Bomtoon {
         format!("{coins} · {gifts}")
     }
 
+    fn episode_balance_action_label(&self) -> String {
+        const MAX_DISPLAY_BALANCE: usize = 9_999;
+
+        let compact = |value: usize| {
+            if value > MAX_DISPLAY_BALANCE {
+                format!("{MAX_DISPLAY_BALANCE}+")
+            } else {
+                value.to_string()
+            }
+        };
+        let coins = self
+            .wallet
+            .summary
+            .and_then(|summary| summary.coins.total())
+            .map_or_else(
+                || {
+                    if self.wallet.summary_task.is_some() {
+                        "Coins…".to_owned()
+                    } else {
+                        "Coins -".to_owned()
+                    }
+                },
+                |total| format!("Coins {}", compact(total)),
+            );
+        let gifts = self.gifts.available.map_or_else(
+            || {
+                if self.gifts.task.is_some() {
+                    "Gifts…".to_owned()
+                } else {
+                    "Gifts -".to_owned()
+                }
+            },
+            |available| format!("Gifts {}", compact(available)),
+        );
+        format!("{coins} · {gifts}")
+    }
+
     fn quote_episode_title(&self) -> String {
         self.commerce_episode
             .and_then(|index| self.episodes.get(index))
@@ -2030,14 +2066,22 @@ impl Bomtoon {
         }
     }
 
-    fn episode_preview_fits(&self, preview: String, truncated: bool) -> bool {
+    fn episode_preview_fits(
+        &self,
+        preview: String,
+        truncated: bool,
+        first_capacity: usize,
+    ) -> bool {
         let header = self.add_episode_header_preview(
-            ScreenBuilder::new("bomtoon-episode-preview-measure").top_bar("Episodes"),
+            ScreenBuilder::new("bomtoon-episode-preview-measure")
+                .top_bar("Episodes")
+                .top_bar_action(ACCOUNT, self.episode_balance_action_label()),
             preview,
             truncated,
         );
+        let ranges = episode_page_ranges(self.episodes.len(), first_capacity, 1);
         let mut screen = self
-            .add_episode_body(header, 0..self.episodes.len().min(1), 0, 1)
+            .add_episode_body(header, ranges[0].clone(), 0, ranges.len())
             .build();
         if let Some(page_turns) = screen.page_turns.take() {
             screen.page_turns = Some(page_turns.with_edge_position());
@@ -2047,11 +2091,11 @@ impl Bomtoon {
             .has_errors()
     }
 
-    fn measure_episode_synopsis_preview(&self) -> (String, bool) {
+    fn measure_episode_synopsis_preview(&self, first_capacity: usize) -> (String, bool) {
         let text = &self.selected_synopsis;
         if text.len() <= SYNOPSIS_PREVIEW_BYTES {
             let full = text.clone();
-            if self.episode_preview_fits(full.clone(), false) {
+            if self.episode_preview_fits(full.clone(), false, first_capacity) {
                 return (full, false);
             }
         }
@@ -2074,14 +2118,14 @@ impl Bomtoon {
 
         let (smallest, smallest_truncated) = comment_preview(text, boundaries[0]);
         let mut best = self
-            .episode_preview_fits(smallest, smallest_truncated)
+            .episode_preview_fits(smallest, smallest_truncated, first_capacity)
             .then_some(0);
         let mut low = 1;
         let mut high = boundaries.len();
         while low < high {
             let middle = low + (high - low) / 2;
             let (candidate, truncated) = comment_preview(text, boundaries[middle]);
-            if self.episode_preview_fits(candidate, truncated) {
+            if self.episode_preview_fits(candidate, truncated, first_capacity) {
                 best = Some(middle);
                 low = middle.saturating_add(1);
             } else {
@@ -2109,24 +2153,20 @@ impl Bomtoon {
         })
     }
 
+    fn measure_first_episode_capacity(&self) -> Option<usize> {
+        let capacity_limit = self.episodes.len().clamp(1, MAX_ROWS);
+        (1..=capacity_limit).rev().find(|first_capacity| {
+            let ranges = episode_page_ranges(self.episodes.len(), *first_capacity, 1);
+            episode_screen_layout_fits(&self.episode_screen_for(0, &ranges, false))
+        })
+    }
+
     fn measure_episode_pages(&self) -> Option<Vec<std::ops::Range<usize>>> {
-        let title_capacity_limit = if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES {
-            1
-        } else {
-            EPISODE_ITEMS_PER_PAGE
-        };
-        let first_capacity_limit = if self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
-        {
-            1
-        } else {
-            title_capacity_limit
-        };
-        (1..=first_capacity_limit).rev().find_map(|first_capacity| {
-            (1..=title_capacity_limit).rev().find_map(|later_capacity| {
-                let ranges =
-                    episode_page_ranges(self.episodes.len(), first_capacity, later_capacity);
-                self.episode_ranges_fit(&ranges).then_some(ranges)
-            })
+        let first_capacity = self.measure_first_episode_capacity()?;
+        let capacity_limit = self.episodes.len().clamp(1, MAX_ROWS);
+        (1..=capacity_limit).rev().find_map(|later_capacity| {
+            let ranges = episode_page_ranges(self.episodes.len(), first_capacity, later_capacity);
+            self.episode_ranges_fit(&ranges).then_some(ranges)
         })
     }
 
@@ -2156,7 +2196,13 @@ impl Bomtoon {
                 normalized_header_preview(&self.selected_title, title_bytes, "Comic");
             self.episode_creators_preview =
                 normalized_header_preview(&self.selected_creators, creator_bytes, "Creators");
-            let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
+            self.synopsis.preview.clear();
+            self.synopsis.preview_truncated = !self.selected_synopsis.is_empty();
+            let Some(first_capacity) = self.measure_first_episode_capacity() else {
+                continue;
+            };
+            let (preview, preview_truncated) =
+                self.measure_episode_synopsis_preview(first_capacity);
             self.synopsis.preview = preview;
             self.synopsis.preview_truncated = preview_truncated;
             if let Some(ranges) = self.measure_episode_pages() {
@@ -2226,7 +2272,7 @@ impl Bomtoon {
         page: usize,
         page_count: usize,
     ) -> ScreenBuilder {
-        let mut screen = screen.text(self.episode_balance_label());
+        let mut screen = screen;
         let marker_belongs_to_another_account = self.commerce.marker_belongs_to_another_account();
         let gift_quote_in_flight = self.gift_quote_in_flight();
         let now_ms = unix_time_ms();
@@ -2264,7 +2310,9 @@ impl Bomtoon {
     ) -> Screen {
         let page = page.min(ranges.len().saturating_sub(1));
         let header = self.add_episode_header(
-            ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"),
+            ScreenBuilder::new("bomtoon-episodes")
+                .top_bar("Episodes")
+                .top_bar_action(ACCOUNT, self.episode_balance_action_label()),
             page,
         );
         let range = ranges.get(page).cloned().unwrap_or(0..0);
@@ -10637,6 +10685,56 @@ mod tests {
         app.prepare_episode_layout();
         app
     }
+
+    fn paginated_episode_app(synopsis: String) -> Bomtoon {
+        let mut app = episode_metadata_app(synopsis);
+        let template = app.episodes[0].clone();
+        app.episodes = (0..24)
+            .map(|index| Episode {
+                id: 1_000 + index,
+                alias: format!("episode-{index}"),
+                title: format!("Episode {index}"),
+                ..template.clone()
+            })
+            .collect();
+        app.prepare_episode_layout();
+        app
+    }
+
+    #[test]
+    fn later_episode_pages_use_all_measured_row_space() {
+        let app = paginated_episode_app(String::new());
+        let largest_later_page = app
+            .episode_pages
+            .iter()
+            .skip(1)
+            .map(std::ops::Range::len)
+            .max()
+            .expect("later episode page");
+
+        assert!(
+            largest_later_page > 6,
+            "legacy six-row ceiling remains: {:?}",
+            app.episode_pages
+        );
+    }
+
+    #[test]
+    fn synopsis_preview_preserves_empty_preview_row_capacity() {
+        let mut app = paginated_episode_app(long_synopsis());
+        let measured_with_synopsis = app.episode_page_range(0).len();
+        assert!(app.synopsis.preview_truncated);
+
+        app.synopsis.preview.clear();
+        app.synopsis.preview_truncated = true;
+        app.episode_pages = app.measure_episode_pages().expect("empty preview fits");
+
+        assert_eq!(
+            measured_with_synopsis,
+            app.episode_page_range(0).len(),
+            "synopsis preview consumed episode capacity"
+        );
+    }
     fn episode_metadata_runner(synopsis: String) -> AppRunner<Bomtoon> {
         let mut runner = AppRunner::with_metrics(episode_metadata_app(synopsis), CLARA_BW_METRICS);
         runner.app_mut().prepare_episode_layout();
@@ -10683,17 +10781,19 @@ mod tests {
     }
 
     #[test]
-    fn episode_header_shows_metadata_balance_and_more_without_duplicate_title() {
+    fn episode_header_moves_balances_to_account_action() {
         let app = episode_metadata_app(long_synopsis());
         let screen = app.episode_screen();
 
-        assert_eq!(screen.top_bar.as_ref().expect("top bar").title, "Episodes");
+        let top_bar = screen.top_bar.as_ref().expect("top bar");
+        assert_eq!(top_bar.title, "Episodes");
+        assert_eq!(top_bar.actions.len(), 1);
+        assert_eq!(top_bar.actions[0].action, action_id(ACCOUNT));
+        assert_eq!(top_bar.actions[0].label, "Coins 10 · Gifts 2");
         let drawn = format!("{screen:?}");
         assert!(drawn.contains("Hunter Q"));
         assert_eq!(drawn.matches("Hunter Q").count(), 1);
         assert!(drawn.contains("Writer | Artist"));
-        assert!(drawn.contains("Coins 10"));
-        assert!(drawn.contains("Gifts 2"));
         assert!(screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
         assert_fits(&screen);
     }
@@ -10746,7 +10846,7 @@ mod tests {
         assert!(!later_drawn.contains("Writer | Artist"));
         assert!(!later_drawn.contains(synopsis));
         assert!(!screen_button_actions(&later).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
-        assert!(episode_rows(&later).len() > first_rows);
+        assert!(episode_rows(&later).len() >= first_rows);
         assert_fits(&later);
     }
 
@@ -10809,10 +10909,11 @@ mod tests {
 
     #[test]
     fn newline_heavy_preview_keeps_a_full_episode_page_visible() {
+        const EPISODE_COUNT: usize = 6;
         let synopsis = "Line\n".repeat(48);
         assert_eq!(synopsis.len(), SYNOPSIS_PREVIEW_BYTES);
         let mut app = episode_metadata_app(synopsis.clone());
-        app.episodes = (0..EPISODE_ITEMS_PER_PAGE)
+        app.episodes = (0..EPISODE_COUNT)
             .map(|index| Episode {
                 id: 100 + index,
                 alias: format!("ep-{index}"),
@@ -10844,7 +10945,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("episode rows");
-            for index in 0..EPISODE_ITEMS_PER_PAGE {
+            for index in 0..EPISODE_COUNT {
                 if rows
                     .iter()
                     .any(|row| row.action == action_id(&format!("episode-{index}")))
@@ -10864,10 +10965,7 @@ mod tests {
             }
             runner.action(action_id(NEXT_PAGE));
         }
-        assert_eq!(
-            observed,
-            (0..EPISODE_ITEMS_PER_PAGE).collect::<BTreeSet<_>>()
-        );
+        assert_eq!(observed, (0..EPISODE_COUNT).collect::<BTreeSet<_>>());
 
         runner.app_mut().page = 0;
 
@@ -10890,6 +10988,7 @@ mod tests {
     }
     #[test]
     fn episode_capacity_fits_later_button_pages_without_skips_or_duplicates() {
+        const LOCKED_EPISODES: usize = 6;
         let synopsis = "Line\n".repeat(48);
         let mut app = episode_metadata_app(synopsis);
         app.episodes = (0..12)
@@ -10899,7 +10998,7 @@ mod tests {
                 title: format!("Episode {index}"),
                 opened_at: 1_709_136_000_000,
                 thumbnail_url: None,
-                purchase: if index < EPISODE_ITEMS_PER_PAGE {
+                purchase: if index < LOCKED_EPISODES {
                     model::PurchaseState::Other("Locked".to_owned())
                 } else {
                     model::PurchaseState::Owned
@@ -11267,7 +11366,7 @@ mod tests {
         let ranges = app.episode_pages.clone();
         assert!(ranges
             .iter()
-            .all(|range| (1..=EPISODE_ITEMS_PER_PAGE).contains(&range.len())));
+            .all(|range| (1..=MAX_ROWS).contains(&range.len())));
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
         let mut observed = BTreeSet::new();
 
@@ -15220,9 +15319,10 @@ mod tests {
 
     #[test]
     fn episode_pagination_uses_explicit_ranges_and_stops_at_the_final_page() {
-        assert_eq!(EPISODE_ITEMS_PER_PAGE, 6);
+        const EPISODE_COUNT: usize = MAX_ROWS + 1;
+
         assert_eq!(episode_page_ranges(7, 2, 6), vec![0..2, 2..7]);
-        let episodes = (0..=EPISODE_ITEMS_PER_PAGE)
+        let episodes = (0..EPISODE_COUNT)
             .map(|index| Episode {
                 id: index,
                 alias: format!("ep-{index}"),
@@ -15251,14 +15351,17 @@ mod tests {
                 .cloned()
                 .flatten()
                 .collect::<Vec<_>>(),
-            (0..=EPISODE_ITEMS_PER_PAGE).collect::<Vec<_>>()
+            (0..EPISODE_COUNT).collect::<Vec<_>>()
         );
         assert!(runner
             .app()
             .episode_pages
             .iter()
-            .all(|range| range.len() <= EPISODE_ITEMS_PER_PAGE));
+            .all(|range| range.len() <= MAX_ROWS));
 
+        let page_count =
+            u16::try_from(runner.app().episode_pages.len()).expect("bounded page count");
+        assert!(page_count > 1);
         let commands = runner.action(action_id(NEXT_PAGE));
         assert_eq!(runner.app().page, 1);
         assert_eq!(
@@ -15266,11 +15369,14 @@ mod tests {
                 .page_turns
                 .as_ref()
                 .and_then(|turns| turns.position),
-            Some((2, 2))
+            Some((2, page_count))
         );
-
+        while runner.app().page.saturating_add(1) < usize::from(page_count) {
+            runner.action(action_id(NEXT_PAGE));
+        }
+        let final_page = runner.app().page;
         let commands = runner.action(action_id(NEXT_PAGE));
-        assert_eq!(runner.app().page, 1);
+        assert_eq!(runner.app().page, final_page);
         assert!(commands.is_empty());
     }
 
@@ -18649,11 +18755,11 @@ mod tests {
         app.prepare_episode_layout();
 
         let screen = app.episode_screen();
+        let top_bar = screen.top_bar.as_ref().expect("episode top bar");
+        assert_eq!(top_bar.actions.len(), 1);
+        assert_eq!(top_bar.actions[0].action, action_id(ACCOUNT));
+        assert_eq!(top_bar.actions[0].label, "Coins 9999+ · Gifts -");
         let drawn = format!("{screen:?}");
-        assert!(
-            drawn.contains(&format!("Coins {} · Gifts unavailable", usize::MAX)),
-            "missing independent balances: {drawn}"
-        );
         assert!(!drawn.contains("Tickets"));
         let rows = screen
             .nodes
