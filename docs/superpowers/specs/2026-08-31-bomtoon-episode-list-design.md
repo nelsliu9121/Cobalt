@@ -2,7 +2,7 @@
 
 ## Status
 
-The episode layout implementation is complete and its format, test, Clippy, browser simulator, and layout-diagnostics gates passed. A production API regression is confirmed: authenticated detail HTML now reports `ssrPersonalized == false` for every selected title, so the fail-closed parser rejects the response. The approved correction replaces that obsolete HTML boundary with the bearer-authenticated content JSON endpoint described below. The correction is pending implementation and repeat simulator proof. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction remains a browser-simulator gate.
+The bearer detail correction is complete. Authenticated title loading and post-purchase reconciliation use the bounded content JSON endpoint, require `result == "SUCCESS"` and exact alias identity, and retain the existing metadata and episode access limits. Focused parser/API tests, the full Bomtoon suite, formatting, Clippy, authenticated browser simulation across multiple titles, stable episode navigation, and clean layout diagnostics pass. The browser proof was non-spending; no episode, quote, purchase, Coin, or Gift action was used. The runtime simulator remains the host build, SDK IPC, daemon, device-result, and frame-render gate because it has no post-start action channel or browser credential reuse.
 
 ## Goal
 
