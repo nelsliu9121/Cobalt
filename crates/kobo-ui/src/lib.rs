@@ -7169,8 +7169,7 @@ fn layout_node(
                     text_lines: Vec::new(),
                 });
                 let fitted_picture = tile.picture.and_then(|picture| {
-                    let (width, height) =
-                        scale_within(picture.source, cell_width, cell_height);
+                    let (width, height) = scale_within(picture.source, cell_width, cell_height);
                     (width > 0 && height > 0).then_some((picture, width, height))
                 });
                 let (kind, mark_width, mark_height, mark_y) =
@@ -21588,9 +21587,8 @@ mod feature_feed_tests {
                 id: NodeId(1),
                 tiles: (0..3)
                     .map(|index| {
-                        Tile::new(ActionId(index + 1), "", Glyph::Book).with_picture(
-                            TilePicture::new(PictureHandle(index + 1), 2_890, 3_450),
-                        )
+                        Tile::new(ActionId(index + 1), "", Glyph::Book)
+                            .with_picture(TilePicture::new(PictureHandle(index + 1), 2_890, 3_450))
                     })
                     .collect(),
             }],
@@ -21630,18 +21628,22 @@ mod feature_feed_tests {
                 .saturating_add(targets[1].rect.width)
                 .saturating_add(gutter)
         );
-        let used = targets[0].rect.width.saturating_mul(3).saturating_add(gutter * 2);
+        let used = targets[0]
+            .rect
+            .width
+            .saturating_mul(3)
+            .saturating_add(gutter * 2);
         assert!((layout.content.width - margin * 2 - used).abs() < 3);
-        assert!(layout.nodes.iter().all(|node| node.kind != LayoutKind::TileLabel));
+        assert!(layout
+            .nodes
+            .iter()
+            .all(|node| node.kind != LayoutKind::TileLabel));
         assert_eq!(
             layout
                 .nodes
                 .iter()
                 .filter(|node| {
-                    matches!(
-                        node.kind,
-                        LayoutKind::FramedPicture(_, PictureFit::Contain)
-                    )
+                    matches!(node.kind, LayoutKind::FramedPicture(_, PictureFit::Contain))
                 })
                 .count(),
             3
@@ -21651,23 +21653,24 @@ mod feature_feed_tests {
     #[test]
     fn image_strip_contains_centers_and_bottom_aligns_each_source() {
         let sources = [(2_890, 3_450), (5_780, 3_450), (2_890, 6_900)];
-        let screen = Screen::new(
-            1,
-            vec![Node::ImageStrip {
-                id: NodeId(1),
-                tiles: sources
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (width, height))| {
-                        let handle =
-                            u32::try_from(index + 1).expect("three banner handles fit u32");
-                        Tile::new(ActionId(handle), "", Glyph::Book).with_picture(
-                            TilePicture::new(PictureHandle(handle), width, height),
-                        )
-                    })
-                    .collect(),
-            }],
-        );
+        let screen =
+            Screen::new(
+                1,
+                vec![Node::ImageStrip {
+                    id: NodeId(1),
+                    tiles: sources
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (width, height))| {
+                            let handle =
+                                u32::try_from(index + 1).expect("three banner handles fit u32");
+                            Tile::new(ActionId(handle), "", Glyph::Book).with_picture(
+                                TilePicture::new(PictureHandle(handle), width, height),
+                            )
+                        })
+                        .collect(),
+                }],
+            );
         let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
         let targets = layout
             .nodes
@@ -21681,9 +21684,7 @@ mod feature_feed_tests {
             let picture = layout
                 .nodes
                 .iter()
-                .find(|node| {
-                    node.kind == LayoutKind::FramedPicture(handle, PictureFit::Contain)
-                })
+                .find(|node| node.kind == LayoutKind::FramedPicture(handle, PictureFit::Contain))
                 .expect("contained banner picture");
             let slot = targets[index].rect;
             let expected = scale_within(source, slot.width, slot.height);
@@ -21707,10 +21708,8 @@ mod feature_feed_tests {
             1,
             vec![Node::ImageStrip {
                 id: NodeId(1),
-                tiles: vec![
-                    Tile::new(ActionId(1), "", Glyph::Book)
-                        .with_picture(TilePicture::new(PictureHandle(1), 0, 0)),
-                ],
+                tiles: vec![Tile::new(ActionId(1), "", Glyph::Book)
+                    .with_picture(TilePicture::new(PictureHandle(1), 0, 0))],
             }],
         );
         let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
