@@ -286,7 +286,7 @@ fn login(target: &LoginTarget) -> Result<(), String> {
     login_with(
         HostLock::acquire,
         Challenge::new,
-        open_normal_chrome,
+        open_default_browser,
         wait_for_payload,
         |selected| {
             kobo_policy::bomtoon::validate_session_cookie(selected)
@@ -300,12 +300,11 @@ fn login_url(challenge: &Challenge) -> String {
     format!("{LOGIN_URL}{}", challenge.fragment())
 }
 
-fn open_normal_chrome_with(
+fn open_default_browser_with(
     challenge: &Challenge,
     run: impl FnOnce(&mut Command) -> io::Result<ExitStatus>,
 ) -> Result<(), String> {
     let mut command = Command::new("open");
-    command.args(["-a", "Google Chrome"]);
     command.arg(login_url(challenge));
     match run(&mut command) {
         Ok(status) if status.success() => Ok(()),
@@ -314,8 +313,8 @@ fn open_normal_chrome_with(
 }
 
 #[cfg(target_os = "macos")]
-fn open_normal_chrome(challenge: &Challenge) -> Result<(), String> {
-    open_normal_chrome_with(challenge, Command::status)
+fn open_default_browser(challenge: &Challenge) -> Result<(), String> {
+    open_default_browser_with(challenge, Command::status)
 }
 
 trait LoginHandoff: Sized {
@@ -1583,12 +1582,12 @@ mod tests {
     }
 
     #[test]
-    fn normal_chrome_receives_only_the_exact_fragment_login_url() {
+    fn default_browser_receives_only_the_exact_fragment_login_url() {
         let challenge = test_challenge();
         let expected_url = format!("{LOGIN_URL}{}", challenge.fragment());
         let mut observed = Vec::new();
         assert_eq!(
-            open_normal_chrome_with(&challenge, |command| {
+            open_default_browser_with(&challenge, |command| {
                 observed.push(command.get_program().to_os_string());
                 observed.extend(command.get_args().map(ToOwned::to_owned));
                 Ok(std::process::ExitStatus::from_raw(0))
@@ -1597,7 +1596,7 @@ mod tests {
         );
         assert_eq!(
             observed,
-            ["open", "-a", "Google Chrome", expected_url.as_str()]
+            ["open", expected_url.as_str()]
                 .into_iter()
                 .map(Into::into)
                 .collect::<Vec<std::ffi::OsString>>()
@@ -1625,16 +1624,16 @@ mod tests {
     }
 
     #[test]
-    fn normal_chrome_launch_failures_use_the_fixed_error() {
+    fn default_browser_launch_failures_use_the_fixed_error() {
         let challenge = test_challenge();
         assert_eq!(
-            open_normal_chrome_with(&challenge, |_| {
+            open_default_browser_with(&challenge, |_| {
                 Ok(std::process::ExitStatus::from_raw(1 << 8))
             }),
             Err(BROWSER_LAUNCH_FAILED.to_owned())
         );
         assert_eq!(
-            open_normal_chrome_with(&challenge, |_| {
+            open_default_browser_with(&challenge, |_| {
                 Err(io::Error::other("injected launch failure"))
             }),
             Err(BROWSER_LAUNCH_FAILED.to_owned())
