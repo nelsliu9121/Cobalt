@@ -14,6 +14,14 @@ Add `kobo-bomtoon` to `INSTALLED_PACKAGES` in `crates/kobo-cli/src/main.rs` and 
 
 This is a private source-build decision, not a new distribution channel. The existing package builder remains responsible for compiling the static ARM hard-float executable, verifying its ELF shape, placing it at `.adds/cobalt/bin/kobo-bomtoon`, and refusing every archive path outside `.adds/cobalt`.
 
+Two device-only compatibility failures discovered during the attended install
+are part of the same private-install cut. Kobo firmware forces SSH through
+`initial_ssh_setup.sh`, so the BOMTOON credential installer sends both its
+program and base64 payload over stdin and uses BusyBox-compatible bounded
+`flock -n` retries. Sandboxed applications cannot see firmware or user font
+directories, so `kobo-text` selects one bounded, validated Traditional Chinese
+font and `kobod` copies it into each jail as read-only `/cjk.ttf`.
+
 ## Alternatives Rejected
 
 ### One-off binary copy
@@ -26,14 +34,25 @@ A private catalog would preserve Store-style app isolation, but it would require
 
 ## Source Changes
 
-The implementation changes only the local platform package membership, runtime built-in registration, and their focused regression coverage:
+The implementation changes the local package, credential transport, and
+sandbox font boundary:
 
-- Add `("kobo-bomtoon", None)` to `INSTALLED_PACKAGES` in the normal application order.
-- Add a BOMTOON entry to `MANAGED_BUILTINS` with ID `bomtoon`, display name and short label `BOMTOON`, catalog version `0.6.0`, book glyph, and exactly the `network` capability.
-- Extend the existing CLI package-membership tests to prove the generated Cobalt payload contains `.adds/cobalt/bin/kobo-bomtoon` as an executable.
-- Extend the existing runtime app-store tests to prove the present binary is listed as an included built-in, carries the expected metadata and capability, and launches by ID without a Store-installed manifest.
-- Preserve the existing invariant that the payload contains no path outside `.adds/cobalt`.
-- Leave `STORE_PACKAGES`, `apps/catalog.json`, BOMTOON application behavior, protocol, policy, networking, login implementation, and public release files unchanged.
+- Add `("kobo-bomtoon", None)` to `INSTALLED_PACKAGES` in normal application order.
+- Add BOMTOON to `MANAGED_BUILTINS` with ID `bomtoon`, version `0.6.0`, book glyph,
+  and exactly the `network` capability.
+- Send the device credential installer and base64 credential value through
+  stdin, never SSH arguments, and zero the owned input buffer on every exit.
+- Replace GNU-only `flock -w` with a five-second BusyBox `flock -n` retry loop.
+- Prefer Kobo's standard user-font directory for a regular, size-bounded face
+  that covers the representative zh-TW probe; retain firmware and host fallbacks.
+- Record the selected CJK source in the runtime, copy its resolved bytes into
+  each app jail, and force the jail copy to mode `0444`.
+- Cover package membership, managed built-in resolution, credential transport,
+  CJK discovery bounds/coverage, and read-only jail exposure with focused tests.
+- Preserve the existing invariant that the payload contains no path outside
+  `.adds/cobalt`.
+- Leave `STORE_PACKAGES`, `apps/catalog.json`, protocol, policy, public release
+  files, and BOMTOON's network/login protocol unchanged.
 
 No app version bump is required because no public package or catalog entry is being released.
 
@@ -54,9 +73,18 @@ A test failure, build failure, missing toolchain component, malformed archive, u
 
 ## Attended USB Installation
 
-The reader must be charged, awake, connected with a data-capable USB cable, and explicitly placed in USB connected mode. The mounted volume must identify as the supported Libra Colour profile before any write.
+The reader must be charged, awake, connected with a data-capable USB cable, and
+explicitly placed in USB connected mode. The mounted volume must identify as
+the supported Libra Colour profile before any write. This attended installation
+also verified that neither root authorized-key file contained a pre-existing
+key; `setup --enable-ssh` replaces both files and is not safe on a reader whose
+existing SSH access must be preserved.
 
-Run the existing USB setup with `--enable-ssh`. Setup builds before writing, installs the complete locally built Cobalt payload, reads every copied file back, stages the dedicated `kobo_cobalt` public key, and enables the firmware-provided SSH server for the next boot. It must not enable telnet, FTP, a password login, or any third-party SSH server.
+Run the existing USB setup with `--enable-ssh`. Setup builds before writing,
+installs the complete locally built Cobalt payload, reads every copied file
+back, stages the dedicated `kobo_cobalt` public key in both possible root-home
+locations, and enables the firmware-provided SSH server for the next boot. It
+must not enable telnet, FTP, or a third-party SSH server.
 
 After setup ejects the volume:
 
@@ -86,11 +114,16 @@ With temporary SSH still available, perform an owner-attended smoke check:
 
 1. Open the Cobalt launcher and confirm BOMTOON appears as an included local application.
 2. Launch BOMTOON and confirm it is signed in.
-3. Load the account library or recent list.
-4. Open one owned or free episode.
-5. Confirm the first page renders legibly on the 1264×1680 colour panel.
-6. Navigate forward and backward using touch; exercise the physical page buttons where the current reader flow supports them.
-7. Exit the episode, exit BOMTOON, and use Cobalt's return action to restore the stock Kobo reader.
+3. Confirm the runtime trace names `/mnt/onboard/fonts/jf-openhuninn-2.1.ttf`
+   as the selected CJK fallback.
+4. Confirm zh-TW collection and comic titles render rather than `BOMTOON <alias>`.
+5. Open one Chinese-titled collection or comic and wait for the next screen.
+6. Use Back once and confirm the feature feed returns without a runtime exit.
+7. Exit BOMTOON and use Cobalt's return action to restore the stock Kobo reader.
+
+The host regression test must also prove the jail receives an independent
+regular `/cjk.ttf` at mode `0444`; the app must not receive access to the source
+font directory.
 
 No purchase, rental, Gift redemption, coin spend, ticket spend, or other commerce mutation is part of this smoke check.
 
@@ -102,13 +135,24 @@ If display, touch, navigation, or exit behavior is wrong, stop. A long power-but
 
 While the authenticated SSH session is still active:
 
-1. Determine root's actual home directory from the device account database.
-2. Remove only the authorized-key line installed from `~/.ssh/kobo_cobalt.pub`, identified by its exact public key and `kobo-cobalt` comment.
-3. Preserve every unrelated authorized key and verify the dedicated line is absent.
+1. Verify `/etc/passwd-` retains an empty root password field and all nonsecret
+   root account fields match `/etc/passwd`.
+2. Atomically restore `/etc/passwd` from `/etc/passwd-` and remove
+   `/.login_pass_set`; the forced first-login script consumed upload bytes as a
+   password before the stdin transport fix.
+3. Remove the exact `~/.ssh/kobo_cobalt.pub` line from both
+   `/root/.ssh/authorized_keys` and `/.ssh/authorized_keys`, preserving any
+   unrelated lines.
+4. Verify the dedicated line is absent from both paths before ending the active session.
 
-Then reconnect the reader over USB and rename the firmware marker `.kobo/ssh-enabled` back to `.kobo/ssh-disabled`. Eject and restart the reader. The marker change disables the firmware SSH server at boot; it does not remove Cobalt or the managed BOMTOON credential.
+Then reconnect the reader over USB and rename the firmware marker
+`.kobo/ssh-enabled` back to `.kobo/ssh-disabled`. Eject and restart the reader.
+The marker change disables the firmware SSH server at boot; it does not remove
+Cobalt or the managed BOMTOON credential.
 
-If the dedicated key cannot be removed exactly, do not rewrite or replace the complete `authorized_keys` file. Stop and inspect the file while the current session remains available.
+If the password backup or dedicated key cannot be matched exactly, stop while
+the current session remains available. Do not use `passwd -d`, `passwd -l`,
+replace an entire key file, or run `kobo setup --undo`.
 
 ## Final Real-Device Acceptance
 

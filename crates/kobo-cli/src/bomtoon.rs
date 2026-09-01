@@ -160,13 +160,18 @@ chmod 700 "$secrets" "$state"
 command -v flock >/dev/null 2>&1 || exit 1
 exec 9>"$lock"
 chmod 600 "$lock"
-flock -w 5 9 || exit 1
+lock_wait=0
+while ! flock -n 9; do
+    [ "$lock_wait" -lt 5 ] || exit 1
+    lock_wait=$((lock_wait + 1))
+    sleep 1
+done
 recover
 set -C
 : > "$temporary"
 set +C
 chmod 600 "$temporary"
-cat > "$temporary"
+printf '%s' "$cookie_input" | base64 -d > "$temporary"
 durable
 [ -e "$cookie" ] && had_cookie=1
 [ -e "$managed" ] && had_state=1
@@ -570,20 +575,35 @@ fn install_target(target: &LoginTarget, cookie: &str) -> Result<(), String> {
 }
 
 fn device_install_command(host: &str) -> Command {
-    let mut command = super::remote_shell_command(&format!("root@{host}"));
-    command.arg(DEVICE_INSTALL_PROGRAM);
-    command
+    super::remote_shell_command(&format!("root@{host}"))
+}
+
+fn device_install_input(cookie: &[u8]) -> Vec<u8> {
+    let mut encoded = super::base64_encode(cookie).into_bytes();
+    encoded.retain(|byte| *byte != b'\n');
+    let mut input = Vec::with_capacity(
+        "cookie_input=''\n".len() + encoded.len() + DEVICE_INSTALL_PROGRAM.len(),
+    );
+    input.extend_from_slice(b"cookie_input='");
+    input.extend_from_slice(&encoded);
+    input.extend_from_slice(b"'\n");
+    input.extend_from_slice(DEVICE_INSTALL_PROGRAM.as_bytes());
+    encoded.fill(0);
+    input
 }
 
 fn install_device_with(
     host: &str,
     cookie: &str,
-    run: impl FnOnce(Command, &[u8]) -> Result<(), ()>,
+    run: impl FnOnce(Command, Vec<u8>) -> Result<(), ()>,
 ) -> Result<(), ()> {
     if !super::valid_device_host(host) {
         return Err(());
     }
-    run(device_install_command(host), cookie.as_bytes())
+    run(
+        device_install_command(host),
+        device_install_input(cookie.as_bytes()),
+    )
 }
 
 fn install_device(host: &str, cookie: &str) -> Result<(), ()> {
@@ -669,7 +689,16 @@ fn wait_for_device_install(
     }
 }
 
-fn run_device_install(mut command: Command, cookie: &[u8]) -> Result<(), ()> {
+struct DeviceInstallInput(Vec<u8>);
+
+impl Drop for DeviceInstallInput {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+fn run_device_install(mut command: Command, input_bytes: Vec<u8>) -> Result<(), ()> {
+    let input_bytes = DeviceInstallInput(input_bytes);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -680,12 +709,10 @@ fn run_device_install(mut command: Command, cookie: &[u8]) -> Result<(), ()> {
         super::terminate_remote_child(&mut child);
         return Err(());
     };
-    let mut secret = cookie.to_vec();
     let (sender, receiver) = mpsc::sync_channel(1);
     let _writer = thread::spawn(move || {
-        let result = input.write_all(&secret).map_err(|_| ());
+        let result = input.write_all(&input_bytes.0).map_err(|_| ());
         drop(input);
-        secret.fill(0);
         let _ = sender.send(result);
     });
     wait_for_device_install(
@@ -1988,20 +2015,30 @@ mod tests {
     }
 
     #[test]
-    fn device_install_keeps_the_cookie_out_of_process_arguments_and_errors() {
+    fn device_install_uses_stdin_for_the_program_and_cookie() {
         let cookie = format!("{SECURE_COOKIE}=stdin-only-material");
         let result = install_device_with("192.0.2.1", &cookie, |command, input| {
             let arguments = command
                 .get_args()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(input, cookie.as_bytes());
+            assert_eq!(arguments.last().map(String::as_str), Some("root@192.0.2.1"));
+            assert!(arguments
+                .iter()
+                .all(|argument| argument != DEVICE_INSTALL_PROGRAM));
+            let input = str::from_utf8(&input).expect("UTF-8 installer input");
+            let encoded = input
+                .strip_suffix(DEVICE_INSTALL_PROGRAM)
+                .and_then(|prefix| prefix.strip_prefix("cookie_input='"))
+                .and_then(|prefix| prefix.strip_suffix("'\n"))
+                .expect("encoded cookie assignment before installer");
             assert_eq!(
-                arguments.last().map(String::as_str),
-                Some(DEVICE_INSTALL_PROGRAM)
+                encoded,
+                "X19TZWN1cmUtbmV4dC1hdXRoLnNlc3Npb24tdG9rZW49c3RkaW4tb25seS1tYXRlcmlhbA=="
             );
-            assert!(arguments.iter().all(|argument| !argument.contains(&cookie)));
-            assert!(DEVICE_INSTALL_PROGRAM.contains("flock -w 5 9 || exit 1"));
+            assert!(!input.contains(&cookie));
+            assert!(DEVICE_INSTALL_PROGRAM.contains("flock -n 9"));
+            assert!(!DEVICE_INSTALL_PROGRAM.contains("flock -w"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("read_marker"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("recover"));
             assert!(DEVICE_INSTALL_PROGRAM.contains("marker=\"$state/.bomtoon-login.transaction\""));

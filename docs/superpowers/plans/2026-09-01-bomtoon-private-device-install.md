@@ -351,6 +351,11 @@ cargo run -p kobo-cli -- setup --enable-ssh
 
 Expected before physical interaction: build succeeds, every copied file reads back byte-for-byte, the volume ejects, and the command asks for the reader restart. Hold the power button to shut down, restart once, leave NickelMenu untouched for at least one minute, reconnect Wi-Fi, and open Cobalt once. This installs the staged dedicated public key and deletes its staged copy. Let setup/device discovery report the reader's exact IPv4 address and assign that value to the host shell variable `KOBO_IP` for the remaining commands.
 
+This reader was verified to have no pre-existing root SSH keys before setup.
+`setup --enable-ssh` replaces both `/root/.ssh/authorized_keys` and
+`/.ssh/authorized_keys`; do not reuse this procedure on a reader where existing
+SSH access must be preserved.
+
 - [ ] **Step 4: Confirm read-only identity over the temporary SSH path**
 
 Run:
@@ -379,51 +384,45 @@ On the reader:
 
 1. Open Launcher and confirm **BOMTOON** appears.
 2. Open BOMTOON and confirm the account is signed in.
-3. Load Library or Recent.
-4. Open one owned or free episode; do not trigger any commerce action.
-5. Confirm the first page is legible at the Libra Colour's 1264×1680 panel size.
-6. Navigate forward and backward by touch; exercise physical page buttons where the reader flow supports them.
-7. Exit the episode and BOMTOON, then select **Return to Kobo reader**.
+3. Confirm the runtime trace selects
+   `/mnt/onboard/fonts/jf-openhuninn-2.1.ttf` as its CJK fallback.
+4. Confirm zh-TW collection and comic titles render instead of
+   `BOMTOON <alias>`.
+5. Open one Chinese-titled collection or comic and wait for the next screen.
+6. Use Back once and confirm the feature feed returns without a runtime exit.
+7. Exit BOMTOON, then select **Return to Kobo reader**.
 
-Expected: no malformed layout, stuck input, unintended purchase/rental/Gift action, runtime exit, or profile refusal. If the panel or input is wrong, stop and recover with a long power-button reboot; never weaken the profile check.
+Expected: no malformed layout, unsupported-character panic, stuck input,
+unintended commerce action, runtime exit, or profile refusal. The focused
+`kobod` regression must also prove the sandbox receives an independent regular
+`/cjk.ttf` at mode `0444`. If the panel or input is wrong, stop and recover
+with a long power-button reboot; never weaken the profile check.
 
-- [ ] **Step 7: Identify and remove only the dedicated authorized key**
+- [ ] **Step 7: Restore root authentication and remove both dedicated keys**
 
-On the host, print the expected public line:
+The firmware's forced first-login script consumed upload bytes as `passwd`
+input before the stdin transport fix. Keep the current authenticated SSH
+session open. First require `/etc/passwd-` to contain the original empty root
+password and the same nonsecret root account fields as `/etc/passwd`.
 
-```sh
-cat "$HOME/.ssh/kobo_cobalt.pub"
-cargo run -p kobo-cli -- shell --device "$KOBO_IP"
-```
+Read the exact expected public key from `~/.ssh/kobo_cobalt.pub`. For each of
+`/root/.ssh/authorized_keys` and `/.ssh/authorized_keys`, remove only a line
+that matches those bytes exactly; preserve any unrelated lines and remove an
+empty file only after the exact line is gone.
 
-At the device shell, locate root's actual home and require exactly one dedicated key line:
+In the same remote transaction:
 
-```sh
-set -eu
-home=$(awk -F: '$1 == "root" { print $6 }' /etc/passwd)
-keys="$home/.ssh/authorized_keys"
-test -f "$keys"
-matches=$(grep -c ' kobo-cobalt$' "$keys")
-test "$matches" -eq 1
-grep ' kobo-cobalt$' "$keys"
-```
+1. copy `/etc/passwd-` to a root-owned mode-`0644` temporary file;
+2. atomically rename that file over `/etc/passwd`;
+3. remove `/.login_pass_set`;
+4. remove the exact dedicated key from both authorized-key paths;
+5. verify the root password field is empty, the sentinel is absent, and the
+   dedicated key is absent from both paths;
+6. run `sync` and exit the authenticated session.
 
-Compare the one printed device line byte-for-byte with the host's `~/.ssh/kobo_cobalt.pub` output. Do not continue if they differ. Once they match, remove exactly that line while preserving all others:
-
-```sh
-before=$(wc -l < "$keys")
-cp "$keys" "$keys.before-cobalt-removal"
-awk '!/ kobo-cobalt$/' "$keys" > "$keys.new"
-chmod 600 "$keys.new"
-mv "$keys.new" "$keys"
-after=$(wc -l < "$keys")
-test "$after" -eq "$((before - 1))"
-if grep -q ' kobo-cobalt$' "$keys"; then exit 1; fi
-rm "$keys.before-cobalt-removal"
-exit
-```
-
-Expected: exactly one line disappears, every unrelated key remains, and the active session exits normally. If any assertion fails, keep the current session available for inspection; never replace or clear the whole file.
+Do not use `passwd -d`, `passwd -l`, `setup --undo`, or a broad
+`authorized_keys` rewrite. If the backup fields or exact public key do not
+match, stop while the current session remains available.
 
 - [ ] **Step 8: Disable the firmware SSH server over USB**
 

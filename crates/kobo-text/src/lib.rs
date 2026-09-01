@@ -37,8 +37,9 @@
 //! column of question marks.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use fontdue::{Font, FontSettings};
 use kobo_ui::{BreakOpportunity, DisplayMetrics, Face, FontSize, Typesetter};
@@ -132,6 +133,9 @@ pub const READING_FONT_CANDIDATES: &[&str] = &[
 ///
 /// Latin text stays in Atkinson. These are consulted only for glyphs the
 /// interface, reading and grid fallback faces cannot draw.
+/// Read-only CJK face exposed inside an application jail by the runtime.
+pub const SANDBOX_CJK_FONT: &str = "/cjk.ttf";
+
 const CJK_FONT_CANDIDATES: &[&str] = &[
     "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/ub_arudjingxihei.ttf",
     "/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts/KBJ-UDKakugoPr6N-M.ttf",
@@ -140,6 +144,13 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 ];
+
+const CJK_FONT_DIRECTORIES: &[&str] = &["/mnt/onboard/fonts"];
+const MAX_CJK_FONT_FILES: usize = 64;
+const MAX_CJK_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const TRADITIONAL_CHINESE_PROBE: &str = "獵人只想安靜生活編輯精選";
+
+static INSTALLED_CJK_SOURCE: OnceLock<PathBuf> = OnceLock::new();
 
 /// The environment variable that overrides the prose face alone.
 pub const READING_FONT_OVERRIDE: &str = "KOBO_READING_FONT";
@@ -230,13 +241,51 @@ impl Typeface {
         Self::from_bytes(TEXT_FONT, "AtkinsonHyperlegible-Regular.ttf", metrics)
     }
 
-    /// Loads a CJK fallback when the device or simulator host provides one.
+    /// Loads a CJK fallback supplied by the runtime jail, Kobo's standard
+    /// user-font directory, firmware, or host, in that order.
     fn discover_cjk(metrics: DisplayMetrics) -> Option<Self> {
-        CJK_FONT_CANDIDATES.iter().find_map(|candidate| {
-            let path = Path::new(candidate);
-            path.exists()
-                .then(|| Self::load(path, metrics).ok())
-                .flatten()
+        Self::load_cjk(Path::new(SANDBOX_CJK_FONT), metrics)
+            .or_else(|| {
+                CJK_FONT_DIRECTORIES
+                    .iter()
+                    .find_map(|directory| Self::discover_cjk_in(Path::new(directory), metrics))
+            })
+            .or_else(|| {
+                CJK_FONT_CANDIDATES
+                    .iter()
+                    .find_map(|candidate| Self::load_cjk(Path::new(candidate), metrics))
+            })
+    }
+
+    fn discover_cjk_in(directory: &Path, metrics: DisplayMetrics) -> Option<Self> {
+        let mut candidates: Vec<PathBuf> = fs::read_dir(directory)
+            .ok()?
+            .take(MAX_CJK_FONT_FILES)
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|extension| {
+                    ["ttf", "otf", "ttc"]
+                        .iter()
+                        .any(|kind| extension.eq_ignore_ascii_case(kind))
+                })
+            })
+            .collect();
+        candidates.sort_unstable();
+        candidates
+            .iter()
+            .find_map(|path| Self::load_cjk(path, metrics))
+    }
+
+    fn load_cjk(path: &Path, metrics: DisplayMetrics) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_CJK_FONT_BYTES {
+            return None;
+        }
+        Self::load(path, metrics).ok().filter(|face| {
+            TRADITIONAL_CHINESE_PROBE
+                .chars()
+                .all(|character| face.has(character))
         })
     }
 
@@ -919,6 +968,15 @@ fn kern(font: &Font, previous: char, current: char, pixels: f32) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Returns the validated CJK face chosen by the most recent process-wide install.
+///
+/// The runtime uses this to expose one read-only font inside each application
+/// jail without granting access to the device's font directories.
+#[must_use]
+pub fn installed_cjk_source() -> Option<&'static Path> {
+    INSTALLED_CJK_SOURCE.get().map(PathBuf::as_path)
+}
+
 /// Installs the best available face into `kobo-ui`.
 ///
 /// Returns the path that was loaded, or an error explaining why the built-in
@@ -930,6 +988,9 @@ fn kern(font: &Font, previous: char, current: char, pixels: f32) -> f32 {
 pub fn install(metrics: DisplayMetrics) -> Result<PathBuf, Error> {
     let fonts = SystemFonts::discover(metrics)?;
     let source = fonts.text_source().to_path_buf();
+    if let Some(cjk) = &fonts.cjk {
+        let _ = INSTALLED_CJK_SOURCE.set(cjk.source().to_path_buf());
+    }
     // A second install means something already chose a face; that is not a
     // failure worth reporting to a caller that only wanted text to look right.
     let _ = kobo_ui::install_typesetter(Box::new(fonts));
@@ -1220,6 +1281,51 @@ mod tests {
                 character as u32
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installed_cjk_source_is_available_to_an_application_sandbox() {
+        install(kobo_ui::CLARA_BW_METRICS).expect("install fonts");
+
+        let source = installed_cjk_source().expect("CJK source");
+        let face = Typeface::load(source, kobo_ui::CLARA_BW_METRICS).expect("load CJK source");
+        assert!(TRADITIONAL_CHINESE_PROBE
+            .chars()
+            .all(|character| face.has(character)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kobo_user_font_directory_supplies_a_validated_cjk_fallback() {
+        let root = std::env::temp_dir().join(format!("kobo-user-cjk-font-{}", std::process::id()));
+        let _ignored = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("font directory");
+        std::fs::write(root.join("broken.ttf"), b"not a font").expect("broken font");
+        std::os::unix::fs::symlink(
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            root.join("traditional-chinese.ttf"),
+        )
+        .expect("CJK font");
+
+        let face = Typeface::discover_cjk_in(&root, CLARA).expect("user CJK font");
+
+        assert!(TRADITIONAL_CHINESE_PROBE
+            .chars()
+            .all(|character| face.has(character)));
+        assert_eq!(face.source(), root.join("traditional-chinese.ttf"));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn oversized_cjk_candidates_are_rejected_before_loading() {
+        let path = std::env::temp_dir().join(format!("kobo-oversized-cjk-{}", std::process::id()));
+        let file = fs::File::create(&path).expect("font candidate");
+        file.set_len(MAX_CJK_FONT_BYTES + 1)
+            .expect("sparse oversized candidate");
+
+        assert!(Typeface::load_cjk(&path, CLARA).is_none());
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

@@ -577,6 +577,9 @@ pub fn present(application: &Path, limits: Limits) -> Result<String, String> {
         ),
         Err(error) => format!("none ({error})"),
     };
+    let cjk_typeface = kobo_text::installed_cjk_source()
+        .map_or_else(|| "none".to_owned(), |path| path.display().to_string());
+    trace(&format!("typeface {typeface}; CJK fallback {cjk_typeface}"));
 
     let geometry = display.geometry();
     let whole_screen = Rect {
@@ -1057,6 +1060,24 @@ struct AppLaunch {
     sandbox: Option<kobo_abi::sandbox::Sandbox>,
 }
 
+fn expose_cjk_font(root: &Path, source: Option<&Path>) -> Result<(), String> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let resolved = fs::canonicalize(source)
+        .map_err(|error| format!("resolve CJK font {}: {error}", source.display()))?;
+    let destination = root.join(kobo_text::SANDBOX_CJK_FONT.trim_start_matches('/'));
+    fs::copy(&resolved, &destination).map_err(|error| {
+        format!(
+            "copy CJK font {} into application sandbox: {error}",
+            source.display()
+        )
+    })?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("protect sandbox CJK font: {error}"))?;
+    Ok(())
+}
+
 impl AppLaunch {
     fn prepare(path: &Path, id: u64) -> Result<Self, String> {
         if kobo_abi::sandbox::is_root() {
@@ -1101,6 +1122,7 @@ impl AppLaunch {
                 .map_err(|error| format!("copy {} into sandbox: {error}", path.display()))?;
             fs::set_permissions(&program, fs::Permissions::from_mode(0o555))
                 .map_err(|error| format!("protect sandboxed application: {error}"))?;
+            expose_cjk_font(&root, kobo_text::installed_cjk_source())?;
             let socket_path = root.join("runtime.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket_path)
                 .map_err(|error| format!("bind sandbox application socket: {error}"))?;
@@ -4019,6 +4041,53 @@ mod tests {
 
     fn hello() -> Screen {
         Screen::new(1, Vec::new()).with_top_bar(kobo_ui::TopBar::new(kobo_ui::NodeId(1), "Hello"))
+    }
+
+    #[test]
+    fn application_sandbox_exposes_the_runtime_cjk_font() {
+        let root = std::env::temp_dir().join(format!("kobo-cjk-sandbox-{}", std::process::id()));
+        let _ignored = fs::remove_dir_all(&root);
+        let jail = root.join("jail");
+        fs::create_dir_all(&jail).expect("sandbox");
+        let backing = root.join("firmware-cjk.ttf");
+        fs::write(&backing, b"validated CJK font").expect("font");
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o666))
+            .expect("writable source mode");
+        let source = root.join("device-cjk.ttf");
+        std::os::unix::fs::symlink(&backing, &source).expect("firmware font symlink");
+
+        expose_cjk_font(&jail, Some(&source)).expect("expose CJK font");
+
+        let exposed = jail.join(kobo_text::SANDBOX_CJK_FONT.trim_start_matches('/'));
+        assert!(
+            fs::symlink_metadata(&exposed)
+                .expect("sandbox font metadata")
+                .file_type()
+                .is_file(),
+            "the sandbox received a symlink whose target is outside the chroot"
+        );
+        assert_eq!(
+            fs::read(&exposed).expect("sandbox font"),
+            b"validated CJK font"
+        );
+        assert_eq!(
+            fs::metadata(&exposed)
+                .expect("sandbox font mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        assert_eq!(
+            fs::metadata(&backing)
+                .expect("source font mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o666,
+            "protecting the jail font changed the source inode"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

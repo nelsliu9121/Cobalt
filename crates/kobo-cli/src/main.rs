@@ -5917,7 +5917,10 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "kobo-bomtoon")
             .expect("private device payload must include BOMTOON");
-        assert_eq!(*features, None, "BOMTOON needs no package-only Cargo feature");
+        assert_eq!(
+            *features, None,
+            "BOMTOON needs no package-only Cargo feature"
+        );
     }
 
     /// The daemon shipped in the package was built without `device-write` for
