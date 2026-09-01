@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation complete for the original design. A follow-up layout correction is approved and pending implementation: page 1 retains the full metadata preview, later pages retain only the comic title, transient episode warnings move to dismissible modals, and an opt-in edge pager places the existing minimum-height page controls flush with the panel bottom. Focused format, test, Clippy, workspace build, browser simulator, and one-shot runtime simulator gates passed for the original implementation. The browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
+Implementation complete. Page 1 retains title, creators, synopsis preview, and conditional `More`; later pages retain only the title and use separately measured episode ranges. Transient warnings render as modals without reserving row space, and the opt-in episode pager reaches the panel bottom while retaining full-height targets. Focused format, test, Clippy, browser simulator, and layout-diagnostics gates pass. The authenticated browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
 
 ## Goal
 
