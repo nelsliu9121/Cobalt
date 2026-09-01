@@ -1136,7 +1136,7 @@ struct Bomtoon {
     synopsis: SynopsisState,
     episode_title_preview: String,
     episode_creators_preview: String,
-    episode_items_per_page: Option<usize>,
+    episode_pages: Vec<std::ops::Range<usize>>,
     reader_selection: Option<EpisodeSelection>,
     reader_after_content_refresh: Option<usize>,
     reader: Option<ReaderState>,
@@ -1249,9 +1249,8 @@ impl Bomtoon {
                 MainDestination::Featured | MainDestination::Recent | MainDestination::Library => {}
             },
             View::Episodes => {
-                let rows = self.episode_rows_per_page();
-                let (start, end) = page_bounds(self.page, self.episodes.len(), rows);
-                for episode in &self.episodes[start..end] {
+                let range = self.episode_page_range(self.page);
+                for episode in &self.episodes[range] {
                     push(episode.thumbnail_url.as_ref());
                 }
             }
@@ -1996,13 +1995,12 @@ impl Bomtoon {
             preview,
             truncated,
         );
-        let pages = self.episodes.len().max(1);
-        (0..pages).all(|page| {
-            let screen = self.add_episode_body(header.clone(), 1, page, true).build();
-            !screen
-                .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
-                .has_errors()
-        })
+        let screen = self
+            .add_episode_body(header, 0..self.episodes.len().min(1), 0, 1, true)
+            .build();
+        !screen
+            .diagnostics(&CLARA_BW_METRICS, &Chrome::measuring(true))
+            .has_errors()
     }
 
     fn measure_episode_synopsis_preview(&self) -> (String, bool) {
@@ -2049,53 +2047,61 @@ impl Bomtoon {
         comment_preview(text, boundaries[best.unwrap_or(0)])
     }
 
-    fn add_episode_header(&self, screen: ScreenBuilder) -> ScreenBuilder {
-        self.add_episode_header_preview(
-            screen,
-            self.synopsis.preview.clone(),
-            self.synopsis.preview_truncated,
-        )
+    fn add_episode_header(&self, screen: ScreenBuilder, page: usize) -> ScreenBuilder {
+        if page == 0 {
+            self.add_episode_header_preview(
+                screen,
+                self.synopsis.preview.clone(),
+                self.synopsis.preview_truncated,
+            )
+        } else {
+            screen.heading(self.episode_title_preview.clone())
+        }
     }
 
-    fn episode_capacity_fits(&self, header: &ScreenBuilder, rows_per_page: usize) -> bool {
-        let pages = self.episodes.len().div_ceil(rows_per_page).max(1);
-        (0..pages).all(|page| {
-            let actual = self.episode_screen_for(page, rows_per_page, false);
+    fn episode_ranges_fit(&self, ranges: &[std::ops::Range<usize>]) -> bool {
+        ranges.iter().enumerate().all(|(page, range)| {
+            let actual = self.episode_screen_for(page, ranges, false);
             if !episode_screen_layout_fits(&actual) {
                 return false;
             }
+            let header = self.add_episode_header(
+                ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
+                page,
+            );
             let reserved = self
-                .add_episode_body(header.clone(), rows_per_page, page, true)
+                .add_episode_body(header, range.clone(), page, ranges.len().max(1), true)
                 .build();
             episode_screen_layout_fits(&reserved)
         })
     }
 
-    fn measure_episode_page_capacity(&mut self) -> Option<usize> {
-        let header = self.add_episode_header(
-            ScreenBuilder::new("bomtoon-episode-capacity-measure").top_bar("Episodes"),
-        );
-        let mut stable_capacity = EPISODE_ITEMS_PER_PAGE;
-        for _ in 0..2 {
-            let measured_capacity = (1..=EPISODE_ITEMS_PER_PAGE).rev().find(|rows_per_page| {
-                self.episode_items_per_page = Some(*rows_per_page);
-                self.episode_capacity_fits(&header, *rows_per_page)
-            });
-            let Some(measured_capacity) = measured_capacity else {
-                self.episode_items_per_page = None;
-                return None;
-            };
-            stable_capacity = stable_capacity.min(measured_capacity);
-        }
-        let capacity = if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES
-            || self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES
-        {
+    fn measure_episode_pages(&self) -> Option<Vec<std::ops::Range<usize>>> {
+        let title_capacity_limit = if self.selected_title.len() > EPISODE_TITLE_PREVIEW_BYTES {
             1
         } else {
-            stable_capacity
+            EPISODE_ITEMS_PER_PAGE
         };
-        self.episode_capacity_fits(&header, capacity)
-            .then_some(capacity)
+        let first_capacity_limit =
+            if self.selected_creators.len() > EPISODE_CREATORS_PREVIEW_BYTES {
+                1
+            } else {
+                title_capacity_limit
+            };
+        (1..=first_capacity_limit)
+            .rev()
+            .find_map(|first_capacity| {
+                (1..=title_capacity_limit)
+                    .rev()
+                    .find_map(|later_capacity| {
+                        let ranges = episode_page_ranges(
+                            self.episodes.len(),
+                            first_capacity,
+                            later_capacity,
+                        );
+                        self.episode_ranges_fit(&ranges).then_some(ranges)
+                    })
+            })
     }
 
     fn prepare_episode_layout(&mut self) {
@@ -2109,7 +2115,7 @@ impl Bomtoon {
             (48, 48),
             (24, 24),
         ] {
-            self.episode_items_per_page = None;
+            self.episode_pages.clear();
             let title_bytes = if title_fits_default {
                 EPISODE_TITLE_PREVIEW_BYTES
             } else {
@@ -2127,8 +2133,8 @@ impl Bomtoon {
             let (preview, preview_truncated) = self.measure_episode_synopsis_preview();
             self.synopsis.preview = preview;
             self.synopsis.preview_truncated = preview_truncated;
-            if let Some(rows_per_page) = self.measure_episode_page_capacity() {
-                self.episode_items_per_page = Some(rows_per_page);
+            if let Some(ranges) = self.measure_episode_pages() {
+                self.episode_pages = ranges;
                 return;
             }
         }
@@ -2153,47 +2159,48 @@ impl Bomtoon {
         );
         self.synopsis.preview.clear();
         self.synopsis.preview_truncated = !self.selected_synopsis.is_empty();
-        self.episode_items_per_page = None;
-        let rows_per_page = self
-            .measure_episode_page_capacity()
+        self.episode_pages.clear();
+        self.episode_pages = self
+            .measure_episode_pages()
             .expect("minimal episode header must fit one measured row");
-        self.episode_items_per_page = Some(rows_per_page);
     }
 
-    fn episode_rows_per_page(&self) -> usize {
-        self.episode_items_per_page.unwrap_or(1)
+    fn episode_page_range(&self, page: usize) -> std::ops::Range<usize> {
+        self.episode_pages.get(page).cloned().unwrap_or(0..0)
+    }
+
+    fn episode_page_count(&self) -> usize {
+        self.episode_pages.len().max(1)
     }
 
     fn visible_episode_anchor(&self) -> Option<usize> {
         if self.view != View::Episodes {
             return None;
         }
-        let (start, end) =
-            page_bounds(self.page, self.episodes.len(), self.episode_rows_per_page());
-        (start < end).then(|| self.episodes[start].id)
+        self.episode_page_range(self.page)
+            .next()
+            .map(|index| self.episodes[index].id)
     }
 
     fn restore_episode_page(&mut self, anchor: Option<usize>, fallback_page: usize) {
-        let rows_per_page = self.episode_rows_per_page();
-        let last_page = self
-            .episodes
-            .len()
-            .saturating_sub(1)
-            .checked_div(rows_per_page)
-            .unwrap_or(0);
         self.page = anchor
             .and_then(|id| self.episodes.iter().position(|episode| episode.id == id))
-            .map_or_else(
-                || fallback_page.min(last_page),
-                |index| index / rows_per_page,
-            );
+            .and_then(|index| {
+                self.episode_pages
+                    .iter()
+                    .position(|range| range.contains(&index))
+            })
+            .unwrap_or_else(|| {
+                fallback_page.min(self.episode_page_count().saturating_sub(1))
+            });
     }
 
     fn add_episode_body(
         &self,
         screen: ScreenBuilder,
-        rows_per_page: usize,
+        range: std::ops::Range<usize>,
         page: usize,
+        page_count: usize,
         reserve_transient_space: bool,
     ) -> ScreenBuilder {
         let mut screen = if reserve_transient_space || self.gifts.error {
@@ -2215,9 +2222,8 @@ impl Bomtoon {
                 "A purchase is unresolved for another account. Restore the original account to refresh its status.",
             );
         }
-        let (start, end) = page_bounds(page, self.episodes.len(), rows_per_page);
         let now_ms = unix_time_ms();
-        screen = screen.rows_with_trailing((start..end).map(|index| {
+        screen = screen.rows_with_trailing(range.map(|index| {
             let episode = &self.episodes[index];
             let title = display_text(&episode.title, &format!("Episode {}", episode.alias));
             let action = if episode.purchase.is_readable()
@@ -2236,17 +2242,26 @@ impl Bomtoon {
                 episode_status(episode, now_ms),
             )
         }));
-        let episode_pages = self.episodes.len().div_ceil(rows_per_page).max(1);
         screen.page_turns(PREVIOUS_PAGE, NEXT_PAGE).page_position(
             u16::try_from(page.saturating_add(1)).unwrap_or(u16::MAX),
-            u16::try_from(episode_pages).unwrap_or(u16::MAX),
+            u16::try_from(page_count).unwrap_or(u16::MAX),
         )
     }
 
-    fn episode_screen_for(&self, page: usize, rows_per_page: usize, modal: bool) -> Screen {
-        let header =
-            self.add_episode_header(ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"));
-        let mut screen = self.add_episode_body(header, rows_per_page, page, false);
+    fn episode_screen_for(
+        &self,
+        page: usize,
+        ranges: &[std::ops::Range<usize>],
+        modal: bool,
+    ) -> Screen {
+        let page = page.min(ranges.len().saturating_sub(1));
+        let header = self.add_episode_header(
+            ScreenBuilder::new("bomtoon-episodes").top_bar("Episodes"),
+            page,
+        );
+        let range = ranges.get(page).cloned().unwrap_or(0..0);
+        let mut screen =
+            self.add_episode_body(header, range, page, ranges.len().max(1), false);
         if modal {
             if let Some((synopsis_page, range)) =
                 self.synopsis.open_page.and_then(|synopsis_page| {
@@ -2273,14 +2288,7 @@ impl Bomtoon {
     }
 
     fn episode_screen(&self) -> Screen {
-        let rows_per_page = self.episode_rows_per_page();
-        let last_page = self
-            .episodes
-            .len()
-            .saturating_sub(1)
-            .checked_div(rows_per_page)
-            .unwrap_or(0);
-        self.episode_screen_for(self.page.min(last_page), rows_per_page, true)
+        self.episode_screen_for(self.page, &self.episode_pages, true)
     }
 
     fn reader_screen(&self) -> Screen {
@@ -3770,7 +3778,7 @@ impl Bomtoon {
         self.synopsis = SynopsisState::default();
         self.episode_title_preview.clear();
         self.episode_creators_preview.clear();
-        self.episode_items_per_page = None;
+        self.episode_pages.clear();
         self.reader_selection = None;
         self.problem = None;
         self.retry = Retry::Restart;
@@ -5225,7 +5233,7 @@ impl Bomtoon {
         self.synopsis = SynopsisState::default();
         self.episode_title_preview.clear();
         self.episode_creators_preview.clear();
-        self.episode_items_per_page = None;
+        self.episode_pages.clear();
         self.problem = None;
         self.retry = Retry::Restart;
         self.request_foreground(context, Pending::Content(pending_index));
@@ -6958,28 +6966,28 @@ impl KoboApp for Bomtoon {
         } else if action == action_id(PREVIOUS_PAGE) {
             self.page = self.page.saturating_sub(1);
         } else if action == action_id(NEXT_PAGE) {
-            let items_per_page = if self.view == View::Episodes {
-                self.episode_rows_per_page()
-            } else {
-                LIBRARY_ITEMS_PER_PAGE
-            };
-            let next_start = self.page.saturating_add(1).saturating_mul(items_per_page);
             if self.view == View::Episodes {
-                if next_start < self.episodes.len() {
+                if self.page.saturating_add(1) < self.episode_page_count() {
                     self.page = self.page.saturating_add(1);
                 }
-            } else if next_start < self.destination_len() {
-                self.page = self.page.saturating_add(1);
-            } else if let Some(next) = self.destination_next_page() {
-                let pending = match self.destination {
-                    MainDestination::Recent => Pending::Recent(next),
-                    MainDestination::Library => Pending::Library(next),
-                    MainDestination::Featured => {
-                        self.show(context);
-                        return;
-                    }
-                };
-                self.request_foreground(context, pending);
+            } else {
+                let next_start = self
+                    .page
+                    .saturating_add(1)
+                    .saturating_mul(LIBRARY_ITEMS_PER_PAGE);
+                if next_start < self.destination_len() {
+                    self.page = self.page.saturating_add(1);
+                } else if let Some(next) = self.destination_next_page() {
+                    let pending = match self.destination {
+                        MainDestination::Recent => Pending::Recent(next),
+                        MainDestination::Library => Pending::Library(next),
+                        MainDestination::Featured => {
+                            self.show(context);
+                            return;
+                        }
+                    };
+                    self.request_foreground(context, pending);
+                }
             }
         } else if self.view == View::Main && self.destination != MainDestination::Featured {
             for index in 0..self.destination_len() {
@@ -7810,6 +7818,24 @@ fn same_assets(current: &[EpisodeImage], refreshed: &[EpisodeImage]) -> bool {
 fn page_bounds(page: usize, count: usize, items_per_page: usize) -> (usize, usize) {
     let start = page.saturating_mul(items_per_page).min(count);
     (start, start.saturating_add(items_per_page).min(count))
+}
+
+fn episode_page_ranges(
+    total: usize,
+    first_capacity: usize,
+    later_capacity: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let first_capacity = first_capacity.max(1);
+    let later_capacity = later_capacity.max(1);
+    let first_end = total.min(first_capacity);
+    let mut ranges = vec![0..first_end];
+    let mut start = first_end;
+    while start < total {
+        let end = start.saturating_add(later_capacity).min(total);
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
 }
 
 fn main() -> ExitCode {
@@ -9890,7 +9916,7 @@ mod tests {
         assert!(app.selected_creators.is_empty());
         assert!(app.selected_synopsis.is_empty());
         assert_eq!(app.synopsis, SynopsisState::default());
-        assert_eq!(app.episode_items_per_page, None);
+        assert!(app.episode_pages.is_empty());
         assert_eq!(app.page, 0);
         assert_eq!(app.next_library_page, None);
         assert_eq!(app.next_recent_page, None);
@@ -10494,6 +10520,17 @@ mod tests {
             .collect()
     }
 
+    fn episode_rows(screen: &Screen) -> &[kobo_sdk::Row] {
+        screen
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Rows { rows, .. } => Some(rows.as_slice()),
+                _ => None,
+            })
+            .expect("episode rows")
+    }
+
     fn overlay_text(overlay: &Overlay) -> String {
         overlay
             .nodes
@@ -10531,6 +10568,78 @@ mod tests {
         assert!(drawn.contains(synopsis));
         assert!(!screen_button_actions(&screen).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
         assert_fits(&screen);
+    }
+
+    #[test]
+    fn synopsis_and_creators_appear_only_on_page_one() {
+        let synopsis = "A complete synopsis that belongs only on the first episode page.";
+        let mut app = episode_metadata_app(synopsis.to_owned());
+        app.episodes = (0..12)
+            .map(|index| Episode {
+                id: 900 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        app.prepare_episode_layout();
+
+        app.page = 0;
+        let first = app.episode_screen();
+        let first_drawn = format!("{first:?}");
+        assert!(first_drawn.contains("Hunter Q"));
+        assert!(first_drawn.contains("Writer | Artist"));
+        assert!(first_drawn.contains(synopsis));
+        let first_rows = episode_rows(&first).len();
+        assert_fits(&first);
+
+        app.page = 1;
+        let later = app.episode_screen();
+        let later_drawn = format!("{later:?}");
+        assert!(later_drawn.contains("Hunter Q"));
+        assert!(!later_drawn.contains("Writer | Artist"));
+        assert!(!later_drawn.contains(synopsis));
+        assert!(!screen_button_actions(&later).contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+        assert!(episode_rows(&later).len() > first_rows);
+        assert_fits(&later);
+    }
+
+    #[test]
+    fn variable_episode_ranges_cover_every_episode_once() {
+        let mut app = episode_metadata_app(long_synopsis());
+        app.episodes = (0..19)
+            .map(|index| Episode {
+                id: 1_000 + index,
+                alias: format!("ep-{index}"),
+                title: format!("Episode {index}"),
+                opened_at: 1_709_136_000_000,
+                thumbnail_url: None,
+                purchase: model::PurchaseState::Owned,
+                rent_expires_at: None,
+                rent_coin: None,
+                purchase_coin: None,
+                gift_eligible: false,
+            })
+            .collect();
+        app.prepare_episode_layout();
+
+        let observed = app
+            .episode_pages
+            .iter()
+            .flat_map(|range| range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, (0..app.episodes.len()).collect::<Vec<_>>());
+        assert!(
+            app.episode_pages
+                .windows(2)
+                .all(|pages| pages[0].end == pages[1].start)
+        );
     }
     #[test]
     fn whitespace_collapsed_synopsis_pages_remain_protocol_encodable() {
@@ -10583,7 +10692,10 @@ mod tests {
         loop {
             let screen = runner.app().episode_screen();
             let actions = screen_button_actions(&screen);
-            assert!(actions.contains(&action_id(EXPECTED_SYNOPSIS_MORE)));
+            assert_eq!(
+                actions.contains(&action_id(EXPECTED_SYNOPSIS_MORE)),
+                runner.app().page == 0
+            );
             let rows = screen
                 .nodes
                 .iter()
@@ -10616,6 +10728,8 @@ mod tests {
             observed,
             (0..EPISODE_ITEMS_PER_PAGE).collect::<BTreeSet<_>>()
         );
+
+        runner.app_mut().page = 0;
 
         runner.action(action_id(EXPECTED_SYNOPSIS_MORE));
         let mut modal_text = String::new();
@@ -10694,8 +10808,10 @@ mod tests {
         const OWNER: &[u8; 32] = b"ffeeddccbbaa99887766554433221100";
         const READER: &[u8; 32] = b"00112233445566778899aabbccddeeff";
 
-        fn snapshot(app: &Bomtoon) -> (usize, (u16, u16), BTreeSet<usize>) {
-            let capacity = app.episode_rows_per_page();
+        fn snapshot(
+            app: &Bomtoon,
+        ) -> (std::ops::Range<usize>, (u16, u16), BTreeSet<usize>) {
+            let range = app.episode_page_range(app.page);
             let screen = app.episode_screen();
             assert_fits(&screen);
             let position = screen
@@ -10719,7 +10835,7 @@ mod tests {
                         .expect("row identifies an episode")
                 })
                 .collect();
-            (capacity, position, indexes)
+            (range, position, indexes)
         }
 
         let mut app = episode_metadata_app("Short synopsis.".to_owned());
@@ -10742,7 +10858,7 @@ mod tests {
         runner.app_mut().prepare_episode_layout();
         runner.app_mut().page = 1;
         let baseline = snapshot(runner.app());
-        assert!(baseline.0 > 1, "{baseline:?}");
+        assert!(baseline.0.len() > 1, "{baseline:?}");
         assert!(!baseline.2.is_empty());
 
         runner.app_mut().gifts.error = true;
@@ -10826,7 +10942,7 @@ mod tests {
         app.covers
             .entries
             .insert(thumbnail_url, CoverState::Ready(picture));
-        app.episode_items_per_page = Some(app.episodes.len());
+        app.episode_pages = vec![0..app.episodes.len()];
         let account_scope = app.account_scope.expect("account scope");
         let _ = app.commerce.marker_loaded(None);
         let _ = app.commerce.safety_changed(
@@ -10905,8 +11021,12 @@ mod tests {
             })
             .collect();
         app.prepare_episode_layout();
-        let capacity = app.episode_rows_per_page();
-        assert!((1..=EPISODE_ITEMS_PER_PAGE).contains(&capacity));
+        let ranges = app.episode_pages.clone();
+        assert!(
+            ranges
+                .iter()
+                .all(|range| (1..=EPISODE_ITEMS_PER_PAGE).contains(&range.len()))
+        );
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
         let mut observed = BTreeSet::new();
 
@@ -10940,13 +11060,13 @@ mod tests {
                 break;
             }
             runner.action(action_id(NEXT_PAGE));
-            assert_eq!(runner.app().episode_rows_per_page(), capacity);
+            assert_eq!(runner.app().episode_pages, ranges);
         }
         assert_eq!(observed, (0..runner.app().episodes.len()).collect());
 
         runner.app_mut().gifts.error = true;
         runner.app_mut().purchase_rejection_notice = Some("FAIL");
-        assert_eq!(runner.app().episode_rows_per_page(), capacity);
+        assert_eq!(runner.app().episode_pages, ranges);
         assert_fits(&runner.app().episode_screen());
     }
 
@@ -10976,7 +11096,7 @@ mod tests {
         assert!(!app.episode_title_preview.contains('\n'));
         assert!(!app.episode_creators_preview.contains('\n'));
 
-        assert!(app.episode_items_per_page.is_some());
+        assert!(!app.episode_pages.is_empty());
         let screen = app.episode_screen();
         assert!(
             episode_screen_layout_fits(&screen),
@@ -11039,10 +11159,9 @@ mod tests {
             })
             .collect();
         app.prepare_episode_layout();
-        let capacity = app.episode_rows_per_page();
-        assert!(app.episodes.len() > capacity);
+        assert!(app.episode_pages.len() > 1);
         app.page = 1;
-        let anchor_index = capacity;
+        let anchor_index = app.episode_page_range(app.page).start;
         let anchor_alias = app.episodes[anchor_index].alias.clone();
         app.episodes[anchor_index].purchase = model::PurchaseState::Rented;
         app.episodes[anchor_index].rent_expires_at = Some(now_ms - HOUR_MS);
@@ -11073,14 +11192,19 @@ mod tests {
             .iter()
             .position(|episode| episode.alias == anchor_alias)
             .expect("refreshed anchor");
-        let refreshed_capacity = runner.app().episode_rows_per_page();
-        assert_eq!(runner.app().page, refreshed_index / refreshed_capacity);
-        let (start, end) = page_bounds(
-            runner.app().page,
-            runner.app().episodes.len(),
-            refreshed_capacity,
+        let refreshed_page = runner
+            .app()
+            .episode_pages
+            .iter()
+            .position(|range| range.contains(&refreshed_index))
+            .expect("page containing refreshed anchor");
+        assert_eq!(runner.app().page, refreshed_page);
+        assert!(
+            runner
+                .app()
+                .episode_page_range(runner.app().page)
+                .contains(&refreshed_index)
         );
-        assert!((start..end).contains(&refreshed_index));
     }
 
     #[test]
@@ -11096,7 +11220,7 @@ mod tests {
         );
         assert_eq!(runner.app().synopsis.open_page, None);
         assert!(!runner.app().synopsis.pages.is_empty());
-        assert!(runner.app().episode_items_per_page.is_some());
+        assert!(!runner.app().episode_pages.is_empty());
         assert!(!runner.app().synopsis.preview.is_empty());
     }
 
@@ -11119,7 +11243,7 @@ mod tests {
         runner.action(action_id("comic-0"));
 
         assert_eq!(runner.app().synopsis, SynopsisState::default());
-        assert_eq!(runner.app().episode_items_per_page, None);
+        assert!(runner.app().episode_pages.is_empty());
     }
 
     #[test]
@@ -11226,11 +11350,10 @@ mod tests {
         let commands = runner.action(action_id("comic-0"));
         let (content_task, _) = only_spawn(&commands);
         runner.task_outcome(content_task, TaskOutcome::Completed(content_response()));
-        let capacity = runner.app().episode_rows_per_page();
-        let pages = runner.app().episodes.len().div_ceil(capacity);
+        let ranges = runner.app().episode_pages.clone();
         let mut actions = Vec::new();
-        for page in 0..pages {
-            let screen = runner.app().episode_screen_for(page, capacity, false);
+        for page in 0..ranges.len() {
+            let screen = runner.app().episode_screen_for(page, &ranges, false);
             actions.extend(
                 screen
                     .nodes
@@ -14852,16 +14975,9 @@ mod tests {
     }
 
     #[test]
-    fn episode_pagination_keeps_six_items_per_page_and_stops_at_the_final_page() {
+    fn episode_pagination_uses_explicit_ranges_and_stops_at_the_final_page() {
         assert_eq!(EPISODE_ITEMS_PER_PAGE, 6);
-        assert_eq!(
-            page_bounds(0, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
-            (0, 6)
-        );
-        assert_eq!(
-            page_bounds(1, EPISODE_ITEMS_PER_PAGE + 1, EPISODE_ITEMS_PER_PAGE),
-            (6, 7)
-        );
+        assert_eq!(episode_page_ranges(7, 2, 6), vec![0..2, 2..7]);
         let episodes = (0..=EPISODE_ITEMS_PER_PAGE)
             .map(|index| Episode {
                 id: index,
@@ -14883,6 +14999,22 @@ mod tests {
             ..Bomtoon::default()
         });
         runner.app_mut().prepare_episode_layout();
+        assert_eq!(
+            runner
+                .app()
+                .episode_pages
+                .iter()
+                .flat_map(|range| range.clone())
+                .collect::<Vec<_>>(),
+            (0..=EPISODE_ITEMS_PER_PAGE).collect::<Vec<_>>()
+        );
+        assert!(
+            runner
+                .app()
+                .episode_pages
+                .iter()
+                .all(|range| range.len() <= EPISODE_ITEMS_PER_PAGE)
+        );
 
         let commands = runner.action(action_id(NEXT_PAGE));
         assert_eq!(runner.app().page, 1);
@@ -17165,7 +17297,7 @@ mod tests {
         app.episodes = (0..count)
             .map(|index| thumbnail_episode(index, episode_thumbnail_url(index)))
             .collect();
-        app.episode_items_per_page = None;
+        app.episode_pages.clear();
         app.prepare_episode_layout();
         app
     }
@@ -17198,12 +17330,13 @@ mod tests {
     #[test]
     fn episode_thumbnails_request_only_the_visible_page() {
         let mut runner = episode_thumbnail_runner(12);
-        let rows = runner.app().episode_rows_per_page();
-        assert!(runner.app().episodes.len() > rows);
-        let first_page = (0..rows)
+        let first_range = runner.app().episode_page_range(0);
+        let second_range = runner.app().episode_page_range(1);
+        assert!(!second_range.is_empty());
+        let first_page = first_range
             .map(episode_thumbnail_url)
             .collect::<BTreeSet<_>>();
-        let second_page = (rows..rows.saturating_mul(2).min(12))
+        let second_page = second_range
             .map(episode_thumbnail_url)
             .collect::<BTreeSet<_>>();
 
@@ -17270,13 +17403,9 @@ mod tests {
     #[test]
     fn repeated_episode_thumbnail_url_remains_owned_across_pages() {
         let mut app = episode_thumbnail_app(12);
-        let rows = app.episode_rows_per_page();
+        let second_start = app.episode_page_range(1).start;
         let shared = episode_thumbnail_url(0);
-        app.episodes[rows].thumbnail_url = Some(shared.clone());
-        app.episode_items_per_page = None;
-        app.prepare_episode_layout();
-        let rows = app.episode_rows_per_page();
-        app.episodes[rows].thumbnail_url = Some(shared.clone());
+        app.episodes[second_start].thumbnail_url = Some(shared.clone());
         let mut runner = AppRunner::with_metrics(app, CLARA_BW_METRICS);
 
         let commands = runner.action(action_id("refresh-layout"));
@@ -17631,10 +17760,10 @@ mod tests {
         assert!(cover_fetches(&commands).is_empty());
 
         let mut page_app = episode_thumbnail_app(12);
-        let rows = page_app.episode_rows_per_page();
         let public_urls = (0..4).map(episode_thumbnail_url).collect::<Vec<_>>();
         add_public_episode_covers(&mut page_app, &public_urls);
-        let second_page_urls = (rows..rows.saturating_mul(2).min(page_app.episodes.len()))
+        let second_page_urls = page_app
+            .episode_page_range(1)
             .map(episode_thumbnail_url)
             .collect::<BTreeSet<_>>();
         let mut page = AppRunner::with_metrics(page_app, CLARA_BW_METRICS);
