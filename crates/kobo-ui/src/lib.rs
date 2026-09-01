@@ -1433,6 +1433,19 @@ impl PagingState {
 /// front light, bookmarks and marked passages were all built, shipped, and
 /// impossible to get at with a finger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadingProgress {
+    pub percent: u8,
+    pub previous: bool,
+    pub next: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrawableReadingPosition {
+    Page(u16, u16),
+    Progress(ReadingProgress),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageTurns {
     pub previous: ActionId,
     pub next: ActionId,
@@ -1445,6 +1458,8 @@ pub struct PageTurns {
     /// to fifty-four shelves and never told the reader which one they were on,
     /// so turning the page was indistinguishable from the list not moving.
     pub position: Option<(u16, u16)>,
+    /// Whole-strip progress for a reading surface.
+    pub progress: Option<ReadingProgress>,
 }
 
 impl PageTurns {
@@ -1455,6 +1470,7 @@ impl PageTurns {
             next,
             menu: None,
             position: None,
+            progress: None,
         }
     }
 
@@ -1466,6 +1482,19 @@ impl PageTurns {
     #[must_use]
     pub const fn with_position(mut self, page: u16, of: u16) -> Self {
         self.position = Some((page, of));
+        self.progress = None;
+        self
+    }
+
+    /// The same, showing whole-strip progress and the available footer turns.
+    #[must_use]
+    pub const fn with_progress(mut self, percent: u8, previous: bool, next: bool) -> Self {
+        self.position = None;
+        self.progress = Some(ReadingProgress {
+            percent: if percent > 100 { 100 } else { percent },
+            previous,
+            next,
+        });
         self
     }
 
@@ -1473,6 +1502,14 @@ impl PageTurns {
     const fn drawable_position(self) -> Option<(u16, u16)> {
         match self.position {
             Some((page, of)) if page >= 1 && (of == 0 || page <= of) => Some((page, of)),
+            _ => None,
+        }
+    }
+
+    const fn drawable_reading_position(self) -> Option<DrawableReadingPosition> {
+        match (self.drawable_position(), self.progress) {
+            (Some((page, of)), None) => Some(DrawableReadingPosition::Page(page, of)),
+            (None, Some(progress)) => Some(DrawableReadingPosition::Progress(progress)),
             _ => None,
         }
     }
@@ -1533,6 +1570,54 @@ fn layout_page_position(
         });
     }
     if of == 0 || page < of {
+        layout.nodes.push(LayoutNode {
+            id: NodeId(0),
+            rect: Rect {
+                x: band.x + band.width - side,
+                width: side,
+                ..band
+            },
+            kind: LayoutKind::PageNext(turns.next),
+            text_lines: Vec::new(),
+        });
+    }
+}
+
+fn layout_reading_progress(
+    turns: PageTurns,
+    progress: ReadingProgress,
+    busy: bool,
+    band: Rect,
+    metrics: &DisplayMetrics,
+    layout: &mut Layout,
+) {
+    let position = if busy {
+        format!("{}% - Loading...", progress.percent)
+    } else {
+        format!("{}%", progress.percent)
+    };
+    layout.nodes.push(LayoutNode {
+        id: NodeId(0),
+        rect: band,
+        kind: LayoutKind::PagePosition,
+        text_lines: vec![position],
+    });
+    if busy {
+        return;
+    }
+    let side = min(metrics.touch_target_default(), band.width / 3);
+    if progress.previous {
+        layout.nodes.push(LayoutNode {
+            id: NodeId(0),
+            rect: Rect {
+                width: side,
+                ..band
+            },
+            kind: LayoutKind::PagePrevious(turns.previous),
+            text_lines: Vec::new(),
+        });
+    }
+    if progress.next {
         layout.nodes.push(LayoutNode {
             id: NodeId(0),
             rect: Rect {
@@ -1869,10 +1954,11 @@ impl Screen {
             if let Some(top_bar) = &self.top_bar {
                 layout_top_bar(top_bar, chrome, metrics, 0, &mut layout);
             }
-            if let Some((turns, (page, of))) = self
-                .page_turns
-                .and_then(|turns| turns.drawable_position().map(|position| (turns, position)))
-            {
+            if let Some((turns, position)) = self.page_turns.and_then(|turns| {
+                turns
+                    .drawable_reading_position()
+                    .map(|position| (turns, position))
+            }) {
                 let height = metrics.page_position_band();
                 let band = Rect {
                     x: 0,
@@ -1886,16 +1972,25 @@ impl Screen {
                     kind: LayoutKind::ReadingFooter,
                     text_lines: Vec::new(),
                 });
-                if surface.chrome == ReadingChrome::OverlayBusy {
-                    layout.nodes.push(LayoutNode {
-                        id: NodeId(0),
-                        rect: band,
-                        kind: LayoutKind::PagePosition,
-                        text_lines: vec!["Loading page...".to_owned()],
-                    });
+                let busy = surface.chrome == ReadingChrome::OverlayBusy;
+                match position {
+                    DrawableReadingPosition::Page(_, _) if busy => {
+                        layout.nodes.push(LayoutNode {
+                            id: NodeId(0),
+                            rect: band,
+                            kind: LayoutKind::PagePosition,
+                            text_lines: vec!["Loading page...".to_owned()],
+                        });
+                    }
+                    DrawableReadingPosition::Page(page, of) => {
+                        layout_page_position(turns, page, of, band, metrics, &mut layout);
+                    }
+                    DrawableReadingPosition::Progress(progress) => {
+                        layout_reading_progress(turns, progress, busy, band, metrics, &mut layout);
+                    }
+                }
+                if busy {
                     layout.page_turns = PagingState::SuppressedByOverlay;
-                } else {
-                    layout_page_position(turns, page, of, band, metrics, &mut layout);
                 }
             }
         }
@@ -15087,6 +15182,52 @@ mod page_turn_tests {
             layout.hit_page_turn(CLARA_BW_METRICS.width / 2, CLARA_BW_METRICS.height / 2),
             None
         );
+    }
+
+    #[test]
+    fn reading_progress_preserves_visible_progress_while_loading() {
+        let picture = TilePicture::new(
+            PictureHandle(41),
+            CLARA_BW_METRICS.width as u32,
+            CLARA_BW_METRICS.height as u32,
+        );
+        let screen = |chrome| {
+            let mut screen = Screen::new(7, Vec::new()).with_page_turns(ActionId(10), ActionId(11));
+            screen.page_turns = screen
+                .page_turns
+                .map(|turns| turns.with_progress(37, true, false));
+            screen
+                .with_reading_surface(Some(ReadingSurface::new(NodeId(2), picture, chrome)))
+                .layout_with(&CLARA_BW_METRICS, &Chrome::with_back(true))
+        };
+
+        let overlay = screen(ReadingChrome::Overlay);
+        let progress = overlay
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::PagePosition)
+            .expect("progress footer");
+        assert_eq!(progress.text_lines, ["37%"]);
+        assert!(overlay
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::PagePrevious(ActionId(10))));
+        assert!(!overlay
+            .nodes
+            .iter()
+            .any(|node| node.kind == LayoutKind::PageNext(ActionId(11))));
+
+        let busy = screen(ReadingChrome::OverlayBusy);
+        let status = busy
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::PagePosition)
+            .expect("busy progress footer");
+        assert_eq!(status.text_lines, ["37% - Loading..."]);
+        assert!(!busy.nodes.iter().any(|node| matches!(
+            node.kind,
+            LayoutKind::PagePrevious(_) | LayoutKind::PageNext(_)
+        )));
     }
 
     #[test]
