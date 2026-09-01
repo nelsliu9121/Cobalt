@@ -261,6 +261,8 @@ pub const MAX_ROWS: usize = 32;
 
 /// The most cover targets one image strip may declare.
 pub const MAX_IMAGE_STRIP_ITEMS: usize = 3;
+const IMAGE_STRIP_ASPECT_WIDTH: i32 = 289;
+const IMAGE_STRIP_ASPECT_HEIGHT: i32 = 345;
 
 /// The most cards one media grid may declare.
 pub const MAX_MEDIA_GRID_ITEMS: usize = 6;
@@ -5000,6 +5002,33 @@ fn fit_within(source: (u32, u32), max_width: i32, max_height: i32) -> (i32, i32)
         max_height,
     )
 }
+fn scale_within(source: (u32, u32), max_width: i32, max_height: i32) -> (i32, i32) {
+    let max_width = max(0, max_width);
+    let max_height = max(0, max_height);
+    let width = i32::try_from(source.0).unwrap_or(i32::MAX);
+    let height = i32::try_from(source.1).unwrap_or(i32::MAX);
+    if width <= 0 || height <= 0 || max_width == 0 || max_height == 0 {
+        return (0, 0);
+    }
+
+    let scaled_height = max(
+        1,
+        i32::try_from(i64::from(max_width) * i64::from(height) / i64::from(width))
+            .unwrap_or(i32::MAX),
+    );
+    if scaled_height <= max_height {
+        return (max_width, scaled_height);
+    }
+
+    (
+        max(
+            1,
+            i32::try_from(i64::from(max_height) * i64::from(width) / i64::from(height))
+                .unwrap_or(i32::MAX),
+        ),
+        max_height,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceWindow {
@@ -7107,7 +7136,11 @@ fn layout_node(
             let columns = 3_i32;
             let gutter = metrics.space(Space::Small);
             let cell_width = (width - gutter * 2) / columns;
-            let cell_height = cell_width * TileShape::Portrait.eighths() / 8;
+            let cell_height = i32::try_from(
+                i64::from(cell_width.max(0)) * i64::from(IMAGE_STRIP_ASPECT_HEIGHT)
+                    / i64::from(IMAGE_STRIP_ASPECT_WIDTH),
+            )
+            .unwrap_or(i32::MAX);
             if tiles.is_empty() || y.saturating_add(cell_height) > bottom {
                 return y;
             }
@@ -7135,24 +7168,36 @@ fn layout_node(
                     ),
                     text_lines: Vec::new(),
                 });
-                let (kind, mark_width, mark_height) = if let Some(picture) = tile.picture {
-                    (
-                        LayoutKind::FramedPicture(picture.handle, PictureFit::Cover),
-                        cell_width,
-                        cell_height,
-                    )
-                } else {
-                    let size = min(
-                        metrics.tenth_mm(110),
-                        min(cell_width.max(0), cell_height.max(0)),
-                    );
-                    (LayoutKind::TileGlyph(tile.glyph), size, size)
-                };
+                let fitted_picture = tile.picture.and_then(|picture| {
+                    let (width, height) =
+                        scale_within(picture.source, cell_width, cell_height);
+                    (width > 0 && height > 0).then_some((picture, width, height))
+                });
+                let (kind, mark_width, mark_height, mark_y) =
+                    if let Some((picture, picture_width, picture_height)) = fitted_picture {
+                        (
+                            LayoutKind::FramedPicture(picture.handle, PictureFit::Contain),
+                            picture_width,
+                            picture_height,
+                            cell_height.saturating_sub(picture_height),
+                        )
+                    } else {
+                        let size = min(
+                            metrics.tenth_mm(110),
+                            min(cell_width.max(0), cell_height.max(0)),
+                        );
+                        (
+                            LayoutKind::TileGlyph(tile.glyph),
+                            size,
+                            size,
+                            (cell_height - size) / 2,
+                        )
+                    };
                 layout.nodes.push(LayoutNode {
                     id: *id,
                     rect: Rect {
                         x: cell_x.saturating_add((cell_width - mark_width) / 2),
-                        y: y.saturating_add((cell_height - mark_height) / 2),
+                        y: y.saturating_add(mark_y),
                         width: mark_width,
                         height: mark_height,
                     },
@@ -21536,7 +21581,7 @@ mod feature_feed_tests {
     use super::*;
 
     #[test]
-    fn image_strip_is_three_equal_image_only_targets() {
+    fn image_strip_uses_three_responsive_banner_slots() {
         let screen = Screen::new(
             1,
             vec![Node::ImageStrip {
@@ -21544,8 +21589,7 @@ mod feature_feed_tests {
                 tiles: (0..3)
                     .map(|index| {
                         Tile::new(ActionId(index + 1), "", Glyph::Book).with_picture(
-                            TilePicture::new(PictureHandle(index + 1), 300, 500)
-                                .with_fit(PictureFit::Cover),
+                            TilePicture::new(PictureHandle(index + 1), 2_890, 3_450),
                         )
                     })
                     .collect(),
@@ -21557,22 +21601,135 @@ mod feature_feed_tests {
             .iter()
             .filter(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
             .collect::<Vec<_>>();
+        let gutter = CLARA_BW_METRICS.space(Space::Small);
+
         assert_eq!(targets.len(), 3);
         assert!(targets
             .windows(2)
             .all(|pair| pair[0].rect.width == pair[1].rect.width));
-        assert!(layout
-            .nodes
-            .iter()
-            .all(|node| node.kind != LayoutKind::TileLabel));
+        assert!(targets.iter().all(|target| {
+            target.rect.height
+                == i32::try_from(i64::from(target.rect.width) * 345 / 289)
+                    .expect("banner height fits i32")
+        }));
+        let margin = CLARA_BW_METRICS.screen_margin();
+        assert_eq!(targets[0].rect.x, margin);
+        assert_eq!(
+            targets[1].rect.x,
+            targets[0]
+                .rect
+                .x
+                .saturating_add(targets[0].rect.width)
+                .saturating_add(gutter)
+        );
+        assert_eq!(
+            targets[2].rect.x,
+            targets[1]
+                .rect
+                .x
+                .saturating_add(targets[1].rect.width)
+                .saturating_add(gutter)
+        );
+        let used = targets[0].rect.width.saturating_mul(3).saturating_add(gutter * 2);
+        assert!((layout.content.width - margin * 2 - used).abs() < 3);
+        assert!(layout.nodes.iter().all(|node| node.kind != LayoutKind::TileLabel));
         assert_eq!(
             layout
                 .nodes
                 .iter()
-                .filter(|node| matches!(node.kind, LayoutKind::FramedPicture(_, PictureFit::Cover)))
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        LayoutKind::FramedPicture(_, PictureFit::Contain)
+                    )
+                })
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn image_strip_contains_centers_and_bottom_aligns_each_source() {
+        let sources = [(2_890, 3_450), (5_780, 3_450), (2_890, 6_900)];
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: sources
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (width, height))| {
+                        let handle =
+                            u32::try_from(index + 1).expect("three banner handles fit u32");
+                        Tile::new(ActionId(handle), "", Glyph::Book).with_picture(
+                            TilePicture::new(PictureHandle(handle), width, height),
+                        )
+                    })
+                    .collect(),
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let targets = layout
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
+            .collect::<Vec<_>>();
+
+        for (index, source) in sources.into_iter().enumerate() {
+            let handle =
+                PictureHandle(u32::try_from(index + 1).expect("three banner handles fit u32"));
+            let picture = layout
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.kind == LayoutKind::FramedPicture(handle, PictureFit::Contain)
+                })
+                .expect("contained banner picture");
+            let slot = targets[index].rect;
+            let expected = scale_within(source, slot.width, slot.height);
+
+            assert_eq!((picture.rect.width, picture.rect.height), expected);
+            assert_eq!(
+                picture.rect.y.saturating_add(picture.rect.height),
+                slot.y.saturating_add(slot.height)
+            );
+            assert!(
+                (picture.rect.x * 2 + picture.rect.width - (slot.x * 2 + slot.width)).abs() <= 1
+            );
+            assert!(picture.rect.width <= slot.width);
+            assert!(picture.rect.height <= slot.height);
+        }
+    }
+
+    #[test]
+    fn image_strip_zero_sized_picture_uses_centered_placeholder() {
+        let screen = Screen::new(
+            1,
+            vec![Node::ImageStrip {
+                id: NodeId(1),
+                tiles: vec![
+                    Tile::new(ActionId(1), "", Glyph::Book)
+                        .with_picture(TilePicture::new(PictureHandle(1), 0, 0)),
+                ],
+            }],
+        );
+        let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::default());
+        let slot = layout
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, LayoutKind::Tile(_, _)))
+            .expect("banner slot")
+            .rect;
+        let glyph = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == LayoutKind::TileGlyph(Glyph::Book))
+            .expect("zero-sized picture placeholder")
+            .rect;
+
+        assert!(glyph.width > 0 && glyph.height > 0);
+        assert!((glyph.x * 2 + glyph.width - (slot.x * 2 + slot.width)).abs() <= 1);
+        assert!((glyph.y * 2 + glyph.height - (slot.y * 2 + slot.height)).abs() <= 1);
     }
 
     #[test]
