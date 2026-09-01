@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation complete. Focused format, test, Clippy, workspace build, browser simulator, and one-shot runtime simulator gates pass. The browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
+Implementation complete for the original design. A follow-up pagination correction is approved and pending implementation: page 1 retains the full metadata preview, while later pages retain only the comic title and use the freed space for additional episode rows. Focused format, test, Clippy, workspace build, browser simulator, and one-shot runtime simulator gates passed for the original implementation. The browser flow was non-spending. The runtime simulator has no post-start action channel and does not reuse browser simulator credentials, so authenticated detail interaction was exercised in the browser simulator; runtime proof covers the host build, SDK IPC, `kobod` startup, device-result handling, and frame rendering.
 
 ## Goal
 
@@ -12,15 +12,16 @@ Redesign the signed-in comic episode view so it presents the comic's title, crea
 
 - Load the selected comic from `https://www.bomtoon.tw/detail/{alias}` with the managed BOMTOON credential.
 - Parse `script#__NEXT_DATA__`, require `props.pageProps.ssrPersonalized == true`, and read only `props.pageProps.ssrDetail`.
-- Show the comic title, ordered creator names, and a synopsis preview above the episode list on every episode page.
-- Show a `More` action only when the synopsis is longer than its preview.
+- Show the comic title, ordered creator names, and synopsis preview above the episode list on page 1.
+- On pages after page 1, show only the comic title above the balances and episode rows.
+- Show a `More` action on page 1 only, and only when the synopsis is longer than its preview.
 - Open the full synopsis in a modal over the unchanged episode page.
 - Paginate a long synopsis inside the modal and preserve all text.
 - Render each episode as a rich row with a thumbnail lead, title, Taipei `YYYY-MM-DD` published date, and optional trailing access label.
 - Use `purchaseStatus` and the existing access rules as the authority for possession, rental, free, and sample state.
 - Show `Owned` for permanent possession, ceiling-rounded rental time for active rentals, `Free` for free episodes, and `Sample` for samples or previews.
 - Leave the trailing status empty for an unowned episode. Tapping it continues to open the existing purchase options.
-- Preserve existing title Gift and Coin balance presentation, purchase rejection notices, unresolved-commerce notices, purchase flow, reader flow, and episode pagination behavior.
+- Preserve existing title Gift and Coin balance presentation, purchase rejection notices, unresolved-commerce notices, purchase flow, reader flow, and episode navigation semantics.
 - Fetch thumbnails only for the visible episode page and release or cancel episode thumbnail resources when they are no longer relevant.
 - Fall back to the existing book glyph when a thumbnail is absent, unsafe, loading, or failed.
 - Keep every screen and modal page within `CLARA_BW_METRICS`.
@@ -78,11 +79,11 @@ The episode screen uses existing `ScreenBuilder` primitives.
 +------------------------------------------------+
 ```
 
-The top bar says `Episodes`; the comic title appears once in the content header. Existing problem, purchase-rejection, cross-account marker, and Gift retry surfaces remain above the list in their current priority order. Their presence can reduce the number of episode rows, but must never cause overflow.
+The top bar says `Episodes`; the comic title appears once in the content header. On page 1, the content header also shows creators, the synopsis preview, and conditional `More`. On later pages, the content header contains only the comic title. Existing problem, purchase-rejection, cross-account marker, and Gift retry surfaces remain above the list in their current priority order. Their presence can reduce the number of episode rows, but must never cause overflow.
 
-The implementation measures candidate screens using the existing layout-issue mechanism and selects the largest fixed number of rows that fits. It must not assume the existing six-row page size remains valid after adding metadata. Page bounds and page count use the selected episode-row capacity consistently.
+The implementation measures page 1 and later pages separately using the existing layout-issue mechanism. It selects the largest episode-row capacity, up to the existing six-row ceiling, that fits each header shape and the reserved transient controls. Pagination stores explicit episode ranges because page 1 and later pages can have different capacities. Navigation, page count, visible-thumbnail scheduling, and refresh anchoring use those same ranges so every episode appears exactly once without gaps or duplicates.
 
-Creator names retain remote order and are joined with ` | `. Empty creator names are rejected at the parser boundary. The synopsis preview preserves UTF-8 boundaries and indicates omitted text. `More` is absent when the full synopsis fits in the preview allocation.
+Creator names retain remote order and are joined with ` | `. Empty creator names are rejected at the parser boundary. The page-1 synopsis preview preserves UTF-8 boundaries and indicates omitted text. `More` is absent when the full synopsis fits in the preview allocation and from every later page.
 
 ## Synopsis modal
 
@@ -199,7 +200,7 @@ Episodes
 
 Episodes
   -> episode page Previous/Next
-  -> same comic header plus new visible episode rows
+  -> page 1 keeps title, creators, and synopsis; page 2+ keeps the title only
 
 Episodes unowned row
   -> existing quote and purchase flow
@@ -234,13 +235,14 @@ No new source module, dependency, capability, origin, or SDK change is required.
 
 ### Screen and behavior contracts
 
-- Header shows title, creators, synopsis preview, and conditional `More`.
+- Page 1 shows title, creators, synopsis preview, and conditional `More`.
+- Pages after page 1 show only the comic title above balances and episode rows.
 - Existing balance, Gift retry, commerce notices, and purchase rejection remain visible and ordered.
 - Rows show thumbnail or fallback, title, exact Taipei date, and the approved optional status.
 - Unowned rows have empty trailing status but remain actionable.
 - Owned, rented, free, and sample rows retain existing reader behavior.
 - Modal pagination preserves the complete synopsis, fits every page, and closes to the same episode page.
-- Episode pagination uses the measured row capacity and stops at the final page.
+- Episode pagination uses separately measured first-page and later-page capacities, explicit non-overlapping ranges, and stops at the final page.
 - Only visible episode thumbnails request work; stale completions do not install; leaving the view cancels and drops resources.
 - Post-purchase reconciliation updates the row through the personalized HTML parser while preserving commerce safety state.
 
