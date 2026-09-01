@@ -21687,7 +21687,12 @@ mod feature_feed_tests {
                 .find(|node| node.kind == LayoutKind::FramedPicture(handle, PictureFit::Contain))
                 .expect("contained banner picture");
             let slot = targets[index].rect;
-            let expected = scale_within(source, slot.width, slot.height);
+            let expected = match source {
+                (2_890, 3_450) => (slot.width, slot.height),
+                (5_780, 3_450) => (slot.width, slot.width * 3_450 / 5_780),
+                (2_890, 6_900) => (slot.height * 2_890 / 6_900, slot.height),
+                _ => unreachable!("all banner source ratios have exact expectations"),
+            };
 
             assert_eq!((picture.rect.width, picture.rect.height), expected);
             assert_eq!(
