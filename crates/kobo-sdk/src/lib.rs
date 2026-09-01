@@ -1988,7 +1988,7 @@ impl ScreenBuilder {
         self
     }
 
-    /// Adds up to three equal image-only cover targets.
+    /// Adds up to three equal image-only banner targets.
     #[must_use]
     pub fn image_strip<I, N>(mut self, items: I) -> Self
     where
@@ -2001,7 +2001,7 @@ impl ScreenBuilder {
         for (name, glyph, picture) in source.by_ref().take(MAX_IMAGE_STRIP_ITEMS) {
             let tile = Tile::new(self.register(name.as_ref()), "", glyph);
             tiles.push(match picture {
-                Some(picture) => tile.with_picture(picture.with_fit(PictureFit::Cover)),
+                Some(picture) => tile.with_picture(picture),
                 None => tile,
             });
         }
@@ -6983,7 +6983,7 @@ mod feature_feed_tests {
         assert_eq!(tiles.len(), MAX_IMAGE_STRIP_ITEMS);
         assert_eq!(
             tiles[0].picture.expect("strip picture").fit,
-            PictureFit::Cover
+            PictureFit::Contain
         );
         let Node::MediaGrid { tiles, .. } = &screen.nodes[1] else {
             panic!("media grid builder emitted another node");
